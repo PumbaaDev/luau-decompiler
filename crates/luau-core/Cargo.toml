@@ -1,0 +1,24 @@
+[package]
+name = "luau-core"
+description = "Core Luau bytecode parser, disassembler, and decompiler library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+# serde is always used for ground-truth JSON parsing; the optional feature
+# is retained for downstream BytecodeInfo/ProtoInfo Serialize/Deserialize.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+serde = []
+
+[dev-dependencies]
+# Phase C4 bonus: parse decompiler output to assert syntactic validity in the
+# Konstant-crasher regression fixtures (tests/konstant_crashers.rs).
+full_moon = { version = "2.1", features = ["luau"] }

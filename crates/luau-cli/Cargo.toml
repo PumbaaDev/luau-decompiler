@@ -1,0 +1,22 @@
+[package]
+name = "luau-cli"
+description = "CLI for decompiling Luau bytecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "luau-decompiler"
+path = "src/main.rs"
+
+[dependencies]
+luau-core = { path = "../luau-core", features = ["serde"] }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Luau parser for the `validate` command (syntax-check decompiled output).
+# `luau` feature enables Luau-specific syntax (typed params, compound ops, etc.).
+full_moon = { version = "2.1", features = ["luau"] }
