@@ -1118,6 +1118,55 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
     stmts
 }
 
+/// Lift the body of one if/else branch.
+///
+/// Historically each branch was lifted one CFG basic block at a time. That
+/// silently dropped every conditional jump nested inside the branch: the only
+/// code that turns a conditional jump into a nested `Stat::If` lives in
+/// `lift_instruction_range` and is gated on `target > pc && target <= end`, but
+/// `ControlFlowGraph::build` makes a block ending in a conditional branch end at
+/// `branch_pc + 1`. With a single block as the range, a forward jump target is
+/// always past `end`, so the guard can never hold — and the trailing fallback
+/// only emits anything when `in_loop` is true, which it is not here. The nested
+/// branch vanished without a trace (an `elseif` arm disappearing entirely, after
+/// which the dead-code and ternary passes correctly folded the wrong input).
+///
+/// Lifting the whole branch as ONE contiguous PC span lets that existing
+/// machinery fire. The contiguity check is load-bearing rather than defensive:
+/// when a merge block sits between two branch blocks, a naive span would swallow
+/// or duplicate it, so non-contiguous branches keep the per-block behaviour.
+#[allow(clippy::too_many_arguments)]
+fn lift_branch_region(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    sorted_blocks: &[usize],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    let ranges: Vec<(usize, usize)> = sorted_blocks
+        .iter()
+        .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+        .collect();
+
+    let contiguous = !ranges.is_empty()
+        && ranges.windows(2).all(|w| w[0].1 == w[1].0);
+
+    if contiguous {
+        let start = ranges[0].0;
+        let end = ranges[ranges.len() - 1].1;
+        lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+    } else {
+        for &(start, end) in &ranges {
+            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+        }
+    }
+}
+
 /// Lift a single region into statements
 fn lift_region(
     ctx: &mut DecompileContext,
@@ -1156,11 +1205,7 @@ fn lift_region(
             let mut then_sorted = then_region.clone();
             then_sorted.sort_unstable();
             let mut then_stmts = Vec::new();
-            for &block_id in &then_sorted {
-                if let Some(b) = cfg.blocks.get(&block_id) {
-                    lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut then_stmts, false);
-                }
-            }
+            lift_branch_region(ctx, proto, proto_index, cfg, depth, &then_sorted, regs, locals, &mut then_stmts, false);
             let regs_after_then = regs.clone();
 
             // Restore pre-branch state for the else-branch. Clone so we can
@@ -1172,11 +1217,7 @@ fn lift_region(
             else_sorted.sort_unstable();
             let else_body = if !else_sorted.is_empty() {
                 let mut else_stmts = Vec::new();
-                for &block_id in &else_sorted {
-                    if let Some(b) = cfg.blocks.get(&block_id) {
-                        lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut else_stmts, false);
-                    }
-                }
+                lift_branch_region(ctx, proto, proto_index, cfg, depth, &else_sorted, regs, locals, &mut else_stmts, false);
                 Some(else_stmts)
             } else {
                 None
@@ -1287,18 +1328,50 @@ fn lift_region(
                 lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, stmts, false);
             }
 
+            // Force-materialize loop-carried registers BEFORE extracting the
+            // condition. Ordering is load-bearing: `extract_branch_condition`
+            // reads the registers directly, so if an accumulator is still a
+            // parked literal we get a constant condition like `while 1 <= 5`
+            // (an infinite loop) instead of `while j <= 5`.
+            //
+            // The header's own pre-branch range is part of the write set: in
+            // the rotated repeat-until shape the induction update lives in the
+            // header block, not in `body_blocks`.
+            {
+                let mut writes = collect_body_writes(&proto.code, block.start, branch_pc);
+                let mut loop_end = block.end;
+                for &block_id in body_blocks {
+                    if block_id == *header { continue; }
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &writes, &[], block.start, Some((block.start, loop_end)),
+                );
+            }
+
             let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
 
             let snap = locals.snapshot();
             let mut sorted_body = body_blocks.clone();
             sorted_body.sort_unstable();
             let mut body_stmts = Vec::new();
-            for &block_id in &sorted_body {
-                if block_id == *header { continue; }
-                if let Some(b) = cfg.blocks.get(&block_id) {
-                    lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
-                }
-            }
+            // Lift the body as ONE contiguous span (see `lift_branch_region`).
+            // Block-at-a-time lifting drops any conditional nested inside the
+            // loop body: the nested-if machinery in `lift_instruction_range`
+            // requires the jump target to fall inside the lifted range, which a
+            // single basic block can never satisfy. The `if/else` inside
+            // `while n > 1 do if n % 2 == 0 then ... else ... end end`
+            // degraded into a pair of `break`s.
+            let body_only: Vec<usize> = sorted_body.iter().copied()
+                .filter(|id| id != header)
+                .collect();
+            lift_branch_region(ctx, proto, proto_index, cfg, depth, &body_only, regs, locals, &mut body_stmts, true);
             // Remove trailing JUMPBACK if present
             remove_trailing_jump(&mut body_stmts);
 
@@ -1321,6 +1394,30 @@ fn lift_region(
         }
 
         Region::WhileTrue { header: _, body_blocks } => {
+            // Force-materialize loop-carried registers before the body lift —
+            // same defect as `Region::WhileDo` above, minus the condition
+            // consequence (this loop's condition is a literal `true`).
+            {
+                let mut writes: Vec<usize> = Vec::new();
+                let mut loop_start = usize::MAX;
+                let mut loop_end = 0usize;
+                for &block_id in body_blocks {
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        loop_start = loop_start.min(b.start);
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                if loop_start != usize::MAX {
+                    premateralize_loop_carried(
+                        ctx, proto, regs, locals, stmts,
+                        &writes, &[], loop_start, Some((loop_start, loop_end)),
+                    );
+                }
+            }
+
             let snap = locals.snapshot();
             let mut sorted_body = body_blocks.clone();
             sorted_body.sort_unstable();
@@ -1342,6 +1439,40 @@ fn lift_region(
         }
 
         Region::RepeatUntil { header: _, body_blocks, cond_pc } => {
+            // Force-materialize loop-carried registers before the body lift,
+            // for the same reason as `Region::WhileDo` above: an accumulator
+            // left parked as a literal makes the body fold into itself and
+            // emit nothing, and leaves the `until` condition reading the
+            // one-iteration literal.
+            {
+                let mut writes: Vec<usize> = Vec::new();
+                let mut loop_start = usize::MAX;
+                let mut loop_end = 0usize;
+                for &block_id in body_blocks {
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        if block_id != *cond_pc {
+                            writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        }
+                        loop_start = loop_start.min(b.start);
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                if let Some(cb) = cfg.blocks.get(cond_pc) {
+                    let cbranch = find_branch_pc(proto, cb.end);
+                    writes.extend(collect_body_writes(&proto.code, cb.start, cbranch));
+                    loop_start = loop_start.min(cb.start);
+                    loop_end = loop_end.max(cb.end);
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                if loop_start != usize::MAX {
+                    premateralize_loop_carried(
+                        ctx, proto, regs, locals, stmts,
+                        &writes, &[], loop_start, Some((loop_start, loop_end)),
+                    );
+                }
+            }
+
             let snap = locals.snapshot();
             let mut sorted_body = body_blocks.clone();
             sorted_body.sort_unstable();
@@ -1422,43 +1553,10 @@ fn lift_region(
             // the loop variable name below.
             {
                 let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
-                for reg in body_writes {
-                    if reg == a || reg == a + 1 || reg == a + 2 {
-                        continue;
-                    }
-                    let is_live_literal = matches!(
-                        regs.get(reg),
-                        Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_))
-                    );
-                    if !is_live_literal {
-                        continue;
-                    }
-                    // Snapshot the pending value and force-emit it as a local.
-                    // Phase B0.49: classify_write for shadow-on-rename.
-                    let pending = match &regs[reg] {
-                        RegVal::Expr(e) => e.clone(),
-                        _ => continue,
-                    };
-                    // C10d: stdlib-shadow sanitize at force-materialize path.
-                    let pending = sanitize_leaked_global_string(pending);
-                    let new_name = ctx.reg_name(proto, reg as u8, *prep_pc);
-                    let (kind, name) = locals.classify_write(reg, &new_name);
-                    match kind {
-                        WriteKind::FirstDecl | WriteKind::Shadow => {
-                            stmts.push(Stat::Local {
-                                names: vec![name.clone()],
-                                values: vec![pending],
-                            });
-                        }
-                        WriteKind::Reassign => {
-                            stmts.push(Stat::Assign {
-                                targets: vec![Expr::Name(name.clone())],
-                                values: vec![pending],
-                            });
-                        }
-                    }
-                    regs[reg] = RegVal::Expr(Expr::Name(name));
-                }
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &body_writes, &[a, a + 1, a + 2], *prep_pc, None,
+                );
             }
 
             // Phase B0.3 fix: bind the loop variable register to its symbolic
@@ -1678,6 +1776,24 @@ fn lift_region(
             // variants, so `LoopVar` registers are NOT absorbed as trailing call
             // arguments — fixing the regression where B0.10 caused inner vararg
             // CALLs to pick up loop variable registers as extra args.
+            // Force-materialize loop-carried registers before the body lift —
+            // same defect as `Region::WhileDo` above. This must run AFTER
+            // `var_names` is built (so the loop-variable count is known) and
+            // BEFORE the LoopVar seeding below, so a stale literal in a
+            // loop-variable slot is not turned into a bogus `local k = <stale>`
+            // that the seeding then shadows.
+            {
+                let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
+                let mut skip = vec![a, a + 1, a + 2];
+                for i in 0..var_names.len() {
+                    skip.push(a + 3 + i);
+                }
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &body_writes, &skip, *prep_pc, Some((*body_start, *body_end)),
+                );
+            }
+
             {
                 let mut reg = a + 3;
                 for name in &var_names {
@@ -3408,6 +3524,14 @@ fn stmt_reads_name_deep(stmt: &Stat, name: &str) -> bool {
             iterators.iter().any(|it| expr_uses_name_deep(it, name))
             || body.iter().any(|s| stmt_reads_name_deep(s, name)),
         Stat::DoBlock { body } => body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        // A closure body reads outer locals as UPVALUES. `convert_local_
+        // function_sugar` rewrites `local f = function() ... end` into these
+        // variants, and without an arm here the sugar hides every upvalue read
+        // from the deep scan — so a local captured only by a closure looks
+        // dead and gets dropped, leaving the closure referencing a nil global.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            expr_uses_name_deep(func, name)
+        }
         _ => false,
     }
 }
@@ -3574,6 +3698,23 @@ fn stmt_writes_name(stmt: &Stat, name: &str) -> bool {
         Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
             body.iter().any(|s| stmt_writes_name(s, name))
         }
+        // A closure body can WRITE an outer local through an upvalue
+        // (`local n = 0; local function f() n = n + 1 end`). Counting that as
+        // a write keeps the outer declaration alive.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            expr_writes_name_in_closure(func, name)
+        }
+        _ => false,
+    }
+}
+
+/// Does any closure body inside `expr` assign to `name`?
+///
+/// Used to keep a local alive when the only writes to it happen through an
+/// upvalue inside a nested function.
+fn expr_writes_name_in_closure(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Function { body, .. } => body.iter().any(|s| stmt_writes_name(s, name)),
         _ => false,
     }
 }
@@ -4513,6 +4654,86 @@ fn absorb_numeric_for_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], reg: usize) 
         }
     }
     reg_expr(regs, reg)
+}
+
+/// Force-materialize loop-carried registers as named locals before a loop.
+///
+/// The lifter is a symbolic-execution engine: `store_complex` parks "inlinable"
+/// values in `regs` without emitting a statement. For a loop-carried
+/// accumulator like `local sum = 0; while ... do sum = sum + i end`, `LOADN R1,
+/// 0` parks `Number(0)` with no statement, and the body's `ADD R1, R1, R4`
+/// builds `BinOp{Number(0), Add, Name(i)}` — which is *also* inlinable, so it
+/// too emits nothing. The net result is an empty loop body plus a stale
+/// one-iteration expression leaking past the loop. For `while`/`repeat` the
+/// damage is worse: the branch condition is extracted from the still-literal
+/// register, producing constant-true conditions like `while 1 <= 5` — an
+/// infinite loop.
+///
+/// Materializing the register up front turns it into `local v1 = 0`, after
+/// which the body's ADD reads `Name(v1) + Name(i)` and the self-mutation
+/// detection in `store_complex` emits the expected `v1 = v1 + i`.
+///
+/// `writes` is the candidate register set (see `collect_body_writes`); `skip`
+/// lists loop-control/loop-variable registers that must NOT be materialized
+/// because they are either already absorbed into the loop header or about to be
+/// rebound to the loop variable name.
+///
+/// `pin_range` pins the chosen name over the loop's PC span. Without it,
+/// `ctx.reg_name` can answer `import` here and `import2` at the body PC, which
+/// the body then treats as a semantic rename and emits `local import2 = ...`
+/// inside the loop — re-declaring the accumulator every iteration instead of
+/// updating it. Pass `None` to preserve a call site's historical naming.
+fn premateralize_loop_carried(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    writes: &[usize],
+    skip: &[usize],
+    pc: usize,
+    pin_range: Option<(usize, usize)>,
+) {
+    for &reg in writes {
+        if skip.contains(&reg) {
+            continue;
+        }
+        let is_live_literal = matches!(
+            regs.get(reg),
+            Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_))
+        );
+        if !is_live_literal {
+            continue;
+        }
+        // Snapshot the pending value and force-emit it as a local.
+        // Phase B0.49: classify_write for shadow-on-rename.
+        let pending = match &regs[reg] {
+            RegVal::Expr(e) => e.clone(),
+            _ => continue,
+        };
+        // C10d: stdlib-shadow sanitize at force-materialize path.
+        let pending = sanitize_leaked_global_string(pending);
+        let new_name = ctx.reg_name(proto, reg as u8, pc);
+        let (kind, name) = locals.classify_write(reg, &new_name);
+        match kind {
+            WriteKind::FirstDecl | WriteKind::Shadow => {
+                stmts.push(Stat::Local {
+                    names: vec![name.clone()],
+                    values: vec![pending],
+                });
+            }
+            WriteKind::Reassign => {
+                stmts.push(Stat::Assign {
+                    targets: vec![Expr::Name(name.clone())],
+                    values: vec![pending],
+                });
+            }
+        }
+        if let Some((pin_start, pin_end)) = pin_range {
+            ctx.pin_reg_name(reg as u8, &name, pin_start, pin_end);
+        }
+        regs[reg] = RegVal::Expr(Expr::Name(name));
+    }
 }
 
 /// Try to absorb the iterator setup from the preceding statement for a generic

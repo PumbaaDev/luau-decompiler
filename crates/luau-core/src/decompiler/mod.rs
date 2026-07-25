@@ -112,11 +112,18 @@ impl ProtoNaming {
         } else {
             format!("{}{}", prefix, count)
         };
-        // If it collides with a global reserved name, bump further
+        // If it collides with a global reserved name, keep bumping until the
+        // name is actually free. A single bump could still hand back a
+        // colliding name (`result2` taken → returns `result3`, but `result3`
+        // may be taken too).
         if used_names.contains(&name) {
-            *count += 1;
-            let alt = format!("{}{}", prefix, count);
-            return alt;
+            loop {
+                *count += 1;
+                let alt = format!("{}{}", prefix, count);
+                if !used_names.contains(&alt) {
+                    return alt;
+                }
+            }
         }
         name
     }
@@ -167,6 +174,15 @@ pub struct DecompileContext<'a> {
     /// Maps child_proto_index -> vec of (child_upval_slot, parent_proto_index, parent_upval_slot).
     /// After rename_upvals resolves the parent's names, we re-propagate to children.
     pub upval_parent_links: std::collections::HashMap<usize, Vec<(usize, usize, u8)>>,
+    /// True when the chunk is canonical open-source Luau bytecode rather than
+    /// Roblox's shuffled dialect.
+    ///
+    /// Roblox repurposes several standard opcodes (LENGTH / NOT / MINUS) as
+    /// type-annotation passthroughs, so the lifter deliberately drops those
+    /// operators. That is correct for Roblox and wrong for canonical Luau,
+    /// where `#t` must lift to a real `UnOp::Length`. DEFAULTS TO FALSE, so any
+    /// caller that does not explicitly opt in keeps the Roblox behaviour.
+    pub is_canonical_luau: bool,
 }
 
 impl<'a> DecompileContext<'a> {
@@ -180,7 +196,13 @@ impl<'a> DecompileContext<'a> {
             proto_naming: std::collections::HashMap::new(),
             current_proto_index: None,
             upval_parent_links: std::collections::HashMap::new(),
+            is_canonical_luau: false,
         }
+    }
+
+    /// Mark this chunk as canonical (non-Roblox) Luau bytecode.
+    pub fn set_canonical_luau(&mut self, canonical: bool) {
+        self.is_canonical_luau = canonical;
     }
 
     /// Initialize naming context for a proto with register hints from pre-pass.
@@ -215,6 +237,32 @@ impl<'a> DecompileContext<'a> {
     pub fn reserve_name(&mut self, name: &str) -> String {
         self.used_names.insert(name.to_string());
         name.to_string()
+    }
+
+    /// Pin `name` as the answer `reg_name` gives for `reg` at every PC in
+    /// `[start_pc, end_pc)`.
+    ///
+    /// `reg_name` is PC-scoped and `unique_name` bumps its per-prefix counter on
+    /// every miss, so the SAME register with the SAME hint yields `import` at
+    /// one PC and `import2` at another. For a register that a loop carries
+    /// across iterations that is fatal, not cosmetic: the lifter sees the two
+    /// names disagree, classifies the body's write as a semantic Shadow, and
+    /// emits `local import2 = import * j` inside the loop instead of
+    /// `import = import * j` — so the accumulator is re-declared every
+    /// iteration and never accumulates.
+    ///
+    /// Pinning is only used for registers that have just been force-
+    /// materialized as loop-carried locals, where a single stable name for the
+    /// whole loop is the correct answer by construction. Existing entries are
+    /// never overwritten, so a name already committed at a PC still wins.
+    pub fn pin_reg_name(&mut self, reg: u8, name: &str, start_pc: usize, end_pc: usize) {
+        if let Some(pi) = self.current_proto_index {
+            if let Some(naming) = self.proto_naming.get_mut(&pi) {
+                for pc in start_pc..end_pc {
+                    naming.assigned.entry((reg, pc)).or_insert_with(|| name.to_string());
+                }
+            }
+        }
     }
 
     /// Get a register name from debug info, or synthesize a meaningful one

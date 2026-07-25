@@ -43,6 +43,7 @@ use super::{
     is_roblox_method_lvalue_artifact,
     is_self_referential_field_assign,
     mk_binop,
+    stmt_reads_name,
     mk_binop_k,
     mk_concat,
     mk_unop,
@@ -101,6 +102,101 @@ fn is_generic_placeholder(name: &str) -> bool {
     match rest {
         Some(r) if !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()) => true,
         _ => false,
+    }
+}
+
+/// Detect the `if/else` diamond behind an inline forward branch.
+///
+/// Given a then-body spanning `[then_start, target)`, check whether its final
+/// instruction is an unconditional forward JUMP that lands past `target` but
+/// still inside `end`. That jump is the compiler's else-skip, so the real then
+/// body stops before it and `[target, jump_target)` is the else body.
+///
+/// Returns `(then_end, else_range)`; `else_range` is `None` when the shape does
+/// not match, in which case `then_end == target` and the caller behaves exactly
+/// as it did before.
+fn detect_else_skip(
+    code: &[u32],
+    then_start: usize,
+    target: usize,
+    end: usize,
+) -> (usize, Option<(usize, usize)>) {
+    if target <= then_start || target > code.len() {
+        return (target, None);
+    }
+    let last_pc = target - 1;
+    if last_pc < then_start {
+        return (target, None);
+    }
+    let last = code[last_pc];
+    let lop = LuauOpcode::from_u8(insn_op(last));
+    let jump_target = match lop {
+        LuauOpcode::Jump => (last_pc as i32 + insn_d(last) as i32 + 1) as usize,
+        LuauOpcode::JumpX => (last_pc as i32 + insn_e(last) + 1) as usize,
+        _ => return (target, None),
+    };
+    if jump_target > target && jump_target <= end {
+        (last_pc, Some((target, jump_target)))
+    } else {
+        (target, None)
+    }
+}
+
+/// Recover SETLIST values when the destination register no longer holds a
+/// pending `Expr::Table`.
+///
+/// The NEWTABLE arm materializes `local M = {}` eagerly for a table at the
+/// start of a proto (the Roblox ModuleScript shape), which overwrites `regs[a]`
+/// with an `Expr::Name`. A later SETLIST then found no pending table and — with
+/// no `else` on its match — silently discarded every value: no field added, no
+/// assignment emitted, no diagnostic. In canonical Luau a main proto always
+/// starts with PREPVARARGS, so a top-level table literal on the first source
+/// line always tripped this and `{10, 20, 30}` decompiled to `{}`.
+///
+/// Preferred recovery is to back-patch the `local NAME = {}` that the NEWTABLE
+/// arm just emitted, which restores the clean `local t = {10, 20, 30}`.
+/// Otherwise fall back to explicit `t[i] = v` assignments, which are correct
+/// for any shape (including a table that reached this register some other way).
+fn store_setlist_values(
+    regs: &mut [RegVal],
+    stmts: &mut Vec<Stat>,
+    a: usize,
+    aux: Option<u32>,
+    values: Vec<Expr>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    // AUX is the 1-based index of the first value.
+    let start_index = aux.unwrap_or(1).max(1) as usize;
+
+    let target = match regs.get(a) {
+        Some(RegVal::Expr(Expr::Name(n))) => n.clone(),
+        _ => return,
+    };
+
+    // Back-patch the immediately preceding `local <target> = { .. }`.
+    if start_index == 1 {
+        if let Some(Stat::Local { names, values: lvals }) = stmts.last_mut() {
+            if names.len() == 1 && names[0] == target && lvals.len() == 1 {
+                if let Expr::Table { fields } = &mut lvals[0] {
+                    for val in values {
+                        fields.push(TableField::Sequential(val));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    for (i, val) in values.into_iter().enumerate() {
+        stmts.push(Stat::Assign {
+            targets: vec![Expr::Index {
+                object: Box::new(Expr::Name(target.clone())),
+                key: Box::new(Expr::Number((start_index + i) as f64)),
+            }],
+            values: vec![val],
+        });
     }
 }
 
@@ -177,6 +273,19 @@ pub(super) fn lift_instruction_range(
     let mut pc = start;
     // Track pending FastCall builtin ID so the next CALL can use it
     let mut pending_fastcall: Option<(u8, usize)> = None; // (builtin_id, target_reg)
+    // A CALL with nresults==0 produces a VARIABLE number of results, but it is
+    // materialized as a plain `local` (so the expression is not duplicated at
+    // every use site), which loses its multret-ness. Remember where that
+    // statement went so an immediately following RETURN can fold it back in.
+    // (result_reg, index into `stmts`)
+    //
+    // Deliberately narrow: the slot is cleared at the start of EVERY
+    // instruction, so it only ever survives into the instruction directly
+    // after the CALL. That is the shape the compiler emits for
+    // `return a, f(...)`, and it makes it impossible to attach an unrelated
+    // call to a RETURN across a branch or label — a silent semantic
+    // corruption that would be very hard to spot.
+    let mut pending_multret: Option<(usize, usize)> = None;
     // Phase C1: per-instruction budget accounting. Records how many Stats
     // this dispatch loop appended since the previous tick, and stops early
     // once the proto-wide cap has been hit.
@@ -193,6 +302,9 @@ pub(super) fn lift_instruction_range(
             return;
         }
         last_len = stmts.len();
+        // Consume (and thereby clear) any multret CALL recorded by the
+        // PREVIOUS instruction. Only the Return arm looks at this.
+        let multret_from_prev = pending_multret.take();
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
         let a = insn_a(insn) as usize;
@@ -922,15 +1034,24 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against impossible-NOT — `not <function>` is
                 // a strong signal of bad opmap detection. Emit a Comment when
                 // the source register holds a Function literal.
-                if let Some(RegVal::Expr(Expr::Function { .. })) = regs.get(b as usize) {
-                    stmts.push(Stat::Comment(format!(
-                        "-- lifter error: NOT on Function  raw_opcode=0x{:08x}",
-                        insn
-                    )));
-                }
-                let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
-                if a < regs.len() {
-                    regs[a] = val;
+                if ctx.is_canonical_luau {
+                    // Canonical Luau uses NOT as the real `not` operator.
+                    let e = Expr::UnOp {
+                        op: UnOp::Not,
+                        operand: Box::new(reg_expr(regs, b as usize)),
+                    };
+                    store_complex(ctx, proto, regs, locals, stmts, a, pc, e);
+                } else {
+                    if let Some(RegVal::Expr(Expr::Function { .. })) = regs.get(b as usize) {
+                        stmts.push(Stat::Comment(format!(
+                            "-- lifter error: NOT on Function  raw_opcode=0x{:08x}",
+                            insn
+                        )));
+                    }
+                    let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
+                    if a < regs.len() {
+                        regs[a] = val;
+                    }
                 }
             }
             LuauOpcode::Minus => {
@@ -947,24 +1068,38 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against `-<bool>`, `-<string>`, `-<function>`.
                 // Luau coerces strings to numbers in some arithmetic contexts
                 // but never bool/function; either way it's a bad-opmap signal.
-                let bad_kind: Option<&'static str> = match regs.get(b as usize) {
-                    Some(RegVal::Expr(Expr::Bool(_))) => Some("Bool"),
-                    Some(RegVal::Expr(Expr::String(_))) => Some("String"),
-                    Some(RegVal::Expr(Expr::Function { .. })) => Some("Function"),
-                    _ => None,
-                };
-                if let Some(k) = bad_kind {
-                    stmts.push(Stat::Comment(format!(
-                        "-- lifter error: MINUS on {}  raw_opcode=0x{:08x}",
-                        k, insn
-                    )));
-                }
-                let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
-                if a < regs.len() {
-                    regs[a] = val;
+                if ctx.is_canonical_luau {
+                    // Canonical Luau uses MINUS as the real unary `-` operator.
+                    let e = Expr::UnOp {
+                        op: UnOp::Negate,
+                        operand: Box::new(reg_expr(regs, b as usize)),
+                    };
+                    store_complex(ctx, proto, regs, locals, stmts, a, pc, e);
+                } else {
+                    let bad_kind: Option<&'static str> = match regs.get(b as usize) {
+                        Some(RegVal::Expr(Expr::Bool(_))) => Some("Bool"),
+                        Some(RegVal::Expr(Expr::String(_))) => Some("String"),
+                        Some(RegVal::Expr(Expr::Function { .. })) => Some("Function"),
+                        _ => None,
+                    };
+                    if let Some(k) = bad_kind {
+                        stmts.push(Stat::Comment(format!(
+                            "-- lifter error: MINUS on {}  raw_opcode=0x{:08x}",
+                            k, insn
+                        )));
+                    }
+                    let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
+                    if a < regs.len() {
+                        regs[a] = val;
+                    }
                 }
             }
             LuauOpcode::Length => {
+                // Canonical Luau uses LENGTH as the real `#` operator, so build
+                // a genuine UnOp there. The Roblox passthrough below stays the
+                // default and is unchanged: `is_canonical_luau` defaults to
+                // false, so shuffled bytecode never reaches this branch.
+                //
                 // B0.73: Roblox repurposed standard LENGTH as passthrough
                 // (same pattern as NOT/BNOT/MINUS). Evidence (380 corpus hits):
                 //   `Color3.fromRGB(Image2, Item6, #v15)` — length as color channel
@@ -977,21 +1112,30 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against `#<bool>`, `#<number>`, `#<function>` —
                 // all three are runtime errors in Luau and strong signals of a
                 // misidentified LENGTH opcode.
-                let bad_kind: Option<&'static str> = match regs.get(b as usize) {
-                    Some(RegVal::Expr(Expr::Bool(_))) => Some("Bool"),
-                    Some(RegVal::Expr(Expr::Number(_))) => Some("Number"),
-                    Some(RegVal::Expr(Expr::Function { .. })) => Some("Function"),
-                    _ => None,
-                };
-                if let Some(k) = bad_kind {
-                    stmts.push(Stat::Comment(format!(
-                        "-- lifter error: LENGTH on {}  raw_opcode=0x{:08x}",
-                        k, insn
-                    )));
-                }
-                let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
-                if a < regs.len() {
-                    regs[a] = val;
+                if ctx.is_canonical_luau {
+                    // Canonical Luau uses LENGTH as the real `#` operator.
+                    let e = Expr::UnOp {
+                        op: UnOp::Length,
+                        operand: Box::new(reg_expr(regs, b as usize)),
+                    };
+                    store_complex(ctx, proto, regs, locals, stmts, a, pc, e);
+                } else {
+                    let bad_kind: Option<&'static str> = match regs.get(b as usize) {
+                        Some(RegVal::Expr(Expr::Bool(_))) => Some("Bool"),
+                        Some(RegVal::Expr(Expr::Number(_))) => Some("Number"),
+                        Some(RegVal::Expr(Expr::Function { .. })) => Some("Function"),
+                        _ => None,
+                    };
+                    if let Some(k) = bad_kind {
+                        stmts.push(Stat::Comment(format!(
+                            "-- lifter error: LENGTH on {}  raw_opcode=0x{:08x}",
+                            k, insn
+                        )));
+                    }
+                    let val = regs.get(b as usize).cloned().unwrap_or(RegVal::Unknown);
+                    if a < regs.len() {
+                        regs[a] = val;
+                    }
                 }
             }
 
@@ -1050,16 +1194,25 @@ pub(super) fn lift_instruction_range(
                 // SETLIST A B C AUX: bulk-set sequential table entries in R(A)
                 // A = table register
                 // B = first value register
-                // C = count of values (0 = up to top-of-stack, i.e. vararg/multret)
+                // C = nvalues + 1 (raw C == 0 is the multret sentinel; the VM
+                //     does `int c = LUAU_INSN_C(insn) - 1` with -1 == LUA_MULTRET)
                 // AUX = table index offset (1-based start index, usually 1)
-                // Source values are in registers B through B+C-1
-                let count = c;
+                // Source values are in registers B through B+count-1
+                //
+                // The `- 1` is load-bearing: reading C as the count directly
+                // appends one phantom element read from an uninitialized
+                // register, so `print({"a","b","c"})` decompiled to
+                // `print({"a","b","c",v5})`. Split the multret sentinel out
+                // explicitly rather than reusing `count == 0`, so a legitimate
+                // zero-element SETLIST (raw C == 1) is not misread as multret.
+                let is_multret = c == 0;
+                let count = c.saturating_sub(1);
                 // Ensure register vector covers the source range
                 let needed = b + count.max(1);
                 if needed > regs.len() {
                     regs.resize(needed + 8, RegVal::Unknown);
                 }
-                if count == 0 {
+                if is_multret {
                     // C=0: vararg/multret - the preceding CALL or GETVARARGS set
                     // a variable number of results starting at register B.
                     // Scan forward from B collecting known values until we hit Unknown.
@@ -1080,9 +1233,11 @@ pub(super) fn lift_instruction_range(
                             new_fields.push(TableField::Sequential(val));
                         }
                         regs[a] = RegVal::Expr(Expr::Table { fields: new_fields });
+                    } else {
+                        store_setlist_values(regs, stmts, a, aux, values);
                     }
                 } else {
-                    // Fixed count: collect exactly C values from registers B..B+C-1
+                    // Fixed count: collect exactly `count` values from B..B+count-1
                     let values: Vec<Expr> = (0..count.min(256)).map(|i| reg_expr(regs, b + i)).collect();
                     if let RegVal::Expr(Expr::Table { fields }) = &regs[a] {
                         let mut new_fields = fields.clone();
@@ -1090,6 +1245,8 @@ pub(super) fn lift_instruction_range(
                             new_fields.push(TableField::Sequential(val));
                         }
                         regs[a] = RegVal::Expr(Expr::Table { fields: new_fields });
+                    } else {
+                        store_setlist_values(regs, stmts, a, aux, values);
                     }
                 }
             }
@@ -1431,6 +1588,76 @@ pub(super) fn lift_instruction_range(
                                 }
                                 _ => String::new(),
                             };
+
+                            // A register captured by CAPTURE VAL/REF is by
+                            // definition a named, addressable location — but
+                            // `store_complex` parks "inlinable" values in `regs`
+                            // without emitting a statement, so `local n = 0`
+                            // never reaches the parent. The child then correctly
+                            // emits `n += 1` against an upvalue that was never
+                            // declared, i.e. a nil global:
+                            //   "attempt to perform arithmetic (add) on nil".
+                            // Force the captured register to become a real local
+                            // before the child proto is lifted.
+                            //
+                            // Two guards. (1) Only when the slot holds a concrete
+                            // value — never `Unknown`, or we would emit a
+                            // declaration with nothing to declare. (2) Only when
+                            // this really is a CAPTURE, never when the structural
+                            // fallback above merely guessed one: on shuffled
+                            // Roblox bytecode a misfire currently costs a wrong
+                            // upvalue name, and must not be escalated into an
+                            // injected statement.
+                            // Self-recursive closure: this CAPTURE grabs the
+                            // very register the closure is about to be stored
+                            // in (`local function fact` capturing `fact`).
+                            //
+                            // `reg_name` memoizes on the (reg, pc) PAIR and
+                            // `unique_name` bumps its counter on every miss, so
+                            // naming the register here at `cap_pc` and again at
+                            // the declaration site below at `pc` allocated TWO
+                            // names: the body called `fact` while the statement
+                            // declared `fact3` — a call to a nil global. Look
+                            // the name up at the declaration site's pc so the
+                            // later call hits the memo and exactly one name is
+                            // ever allocated.
+                            let name = if matches!(cap_type, 0 | 1) && cap_idx as usize == a {
+                                ctx.reg_name(proto, a as u8, pc)
+                            } else {
+                                name
+                            };
+
+                            let name = if matches!(cap_type, 0 | 1)
+                                && cap_idx as usize != a
+                                && cap_op == LuauOpcode::Capture
+                            {
+                                let pending = match regs.get(cap_idx as usize) {
+                                    Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_)) => {
+                                        Some(e.clone())
+                                    }
+                                    _ => None,
+                                };
+                                match pending {
+                                    Some(value) => {
+                                        emit_local_or_assign(
+                                            ctx, proto, regs, locals, stmts,
+                                            cap_idx as usize, cap_pc, value,
+                                        );
+                                        // Re-read the name that was actually
+                                        // bound: `classify_write` may shadow or
+                                        // rename, and a divergence here would
+                                        // just swap one nil global for another.
+                                        match regs.get(cap_idx as usize) {
+                                            Some(RegVal::Expr(Expr::Name(n))) => n.clone(),
+                                            _ => name,
+                                        }
+                                    }
+                                    None => name,
+                                }
+                            } else {
+                                name
+                            };
+
                             inferred_upval_names.push(name);
                             cap_pc += 1;
                         } else {
@@ -2037,6 +2264,10 @@ pub(super) fn lift_instruction_range(
                                 names: vec![name.clone()],
                                 values: vec![call_expr],
                             });
+                            // Only a `local` is foldable back into a RETURN:
+                            // a Reassign writes a binding that may be read
+                            // elsewhere, so it must stay put.
+                            pending_multret = Some((a, stmts.len() - 1));
                         }
                         WriteKind::Reassign => {
                             stmts.push(Stat::Assign {
@@ -2091,13 +2322,55 @@ pub(super) fn lift_instruction_range(
                 let mut values = Vec::new();
                 if b == 0 {
                     // B=0: return all values from R(A) to top of stack (multret).
-                    // Used for `return f()` (call with C=0) or `return ...`.
-                    // The preceding instruction placed the expression in R(A);
-                    // return it directly so the call/varargs expands at runtime.
-                    // B0.127: sanitize stdlib-name string leakage in return values.
-                    let expr = sanitize_leaked_global_string(reg_expr(regs, a));
-                    if !matches!(&expr, Expr::Nil) {
-                        values.push(expr);
+                    // Used for `return f()`, `return ...`, and `return a, f()`.
+                    //
+                    // The last form is why this is not just `reg_expr(regs, a)`:
+                    // the compiler puts the fixed values at R(A).. and the
+                    // multret-producing CALL at the top, so returning only R(A)
+                    // dropped every value above it AND left the call stranded as
+                    // a dead `local result = select("#", ...)`.
+                    let folded = match multret_from_prev {
+                        Some((m, idx)) if m >= a && idx + 1 == stmts.len() => {
+                            match &stmts[idx] {
+                                Stat::Local { names, values: lv }
+                                    if names.len() == 1 && lv.len() == 1 =>
+                                {
+                                    // The temp must not be referenced anywhere
+                                    // else, or removing it would leave a
+                                    // dangling name; and it must not be
+                                    // duplicated, or a side-effecting call would
+                                    // run twice.
+                                    let name = names[0].clone();
+                                    let referenced_elsewhere = stmts[..idx]
+                                        .iter()
+                                        .any(|s| stmt_reads_name(s, &name));
+                                    if referenced_elsewhere {
+                                        None
+                                    } else {
+                                        Some(lv[0].clone())
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(call_expr) = folded {
+                        let (m, idx) = multret_from_prev.unwrap();
+                        stmts.remove(idx);
+                        // Fixed values sit at R(A)..R(m-1); the multret call is
+                        // the final value so it expands at runtime.
+                        for i in a..m {
+                            values.push(sanitize_leaked_global_string(reg_expr(regs, i)));
+                        }
+                        values.push(call_expr);
+                    } else {
+                        // B0.127: sanitize stdlib-name string leakage in return values.
+                        let expr = sanitize_leaked_global_string(reg_expr(regs, a));
+                        if !matches!(&expr, Expr::Nil) {
+                            values.push(expr);
+                        }
                     }
                 } else {
                     let raw_count = b - 1; // B=1 means 0 values, B=2 means 1
@@ -2302,17 +2575,37 @@ pub(super) fn lift_instruction_range(
                     // Isolate register state so then-body doesn't corrupt fall-through.
                     let regs_snapshot = regs.clone();
                     let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
-                    let mut then_stmts = Vec::new();
                     let jump_next = pc + 2; // these have AUX word
-                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, target, regs, locals, &mut then_stmts, in_loop);
+
+                    // If/else diamond: when the then-range's LAST instruction is
+                    // an unconditional forward JUMP past `target`, that jump is
+                    // the else-skip and `[target, jump_target)` is the else body.
+                    // Without this the jump falls through to the out-of-range
+                    // handler and becomes a spurious `break` inside loops, and
+                    // the else body is lifted as if it were unconditional.
+                    let (then_end, else_range) =
+                        detect_else_skip(code, jump_next, target, end);
+
+                    let mut then_stmts = Vec::new();
+                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+
+                    let else_body = if let Some((es, ee)) = else_range {
+                        *regs = regs_snapshot.clone();
+                        let mut else_stmts = Vec::new();
+                        lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        Some(else_stmts)
+                    } else {
+                        None
+                    };
+
                     *regs = regs_snapshot;
                     stmts.push(Stat::If {
                         condition: guard_cond,
                         then_body: then_stmts,
                         elseif_clauses: vec![],
-                        else_body: None,
+                        else_body,
                     });
-                    pc = target;
+                    pc = else_range.map_or(target, |(_, ee)| ee);
                     continue;
                 } else if target <= pc {
                     if in_loop {

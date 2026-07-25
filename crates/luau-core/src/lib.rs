@@ -544,6 +544,13 @@ pub fn decompile_with_opmap(
 ) -> Result<(String, Option<[u8; 256]>)> {
     let mut chunk = parser::parse(bytecode)?;
 
+    // Canonical (non-Roblox) Luau bytecode needs a handful of opcodes lifted
+    // with their real semantics rather than Roblox's passthrough behaviour.
+    // Captured here because `is_canonical_luau` inspects the chunk before it
+    // is remapped.
+    let is_canonical_luau = !parser::opmap::OpcodeMap::needs_remapping(&chunk)
+        && parser::opmap::OpcodeMap::is_canonical_luau(&chunk);
+
     // Auto-detect and apply opcode remapping for Roblox-shuffled bytecode
     let opmap_info = if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
         // Phase B0.31: Self-detect-first. Always try solo detection before applying
@@ -654,6 +661,7 @@ pub fn decompile_with_opmap(
     }
     let main = &chunk.protos[main_idx];
     let mut ctx = decompiler::DecompileContext::new(&chunk);
+    ctx.set_canonical_luau(is_canonical_luau);
     let source = decompiler::decompile_proto(&mut ctx, main, main_idx, 0);
 
     // Safety: if the decompiled source is absurdly large, truncate it
