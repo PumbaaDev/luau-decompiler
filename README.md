@@ -130,6 +130,29 @@ call twice, which would change behaviour silently rather than visibly, so the an
 deliberately gives up instead. Values joined across control flow are otherwise recovered
 generally, including the idiomatic `t and t.field or default` accessor.
 
+### What that number does and does not cover
+
+**It covers standard Luau bytecode**, where opcodes carry their canonical numbering, such as
+the output of `luau-compile --binary` or a Luau runtime's `string.dump`. If that is your
+input, this is the figure that matters.
+
+**It does not cover opcode-shuffled bytecode.** Some hosts permute the opcode numbering, and
+this decompiler infers the permutation before lifting. That inference is a separate stage,
+and the corpus above does not exercise it at all.
+
+Measuring the shuffled path separately, by permuting the same corpus and running the same
+round trip, gives a much weaker result: on short programs the detector recovers under half
+of the opcode bytes, and no file in the corpus survives the round trip intact. Real scripts
+are far larger and give the inference considerably more structural evidence to work from, so
+this is a worst case rather than a typical one, but it is not currently a measured claim
+either way.
+
+**The important caveat is that a poor inference does not announce itself.** Unmapped opcodes
+are currently filled in to complete the permutation, so a substantially wrong map still
+produces clean, well-formed, plausible output. Absence of errors in the output is therefore
+not evidence that the mapping was correct. Treat results on shuffled input as unverified,
+and prefer checking recovered behaviour over reading the recovered source.
+
 ## Project layout
 
 | Crate | What it is |
