@@ -603,6 +603,7 @@ pub fn decompile_with_opmap(
                     heuristic_map: fresh_heuristic,
                     heuristic_count: detected_opmap.heuristic_count,
                     heuristic_evidence: detected_opmap.heuristic_evidence,
+                    pre_completion_map: fresh_heuristic,
                 };
                 (decompile_opmap, mapped_count, fresh_heuristic)
             } else {
@@ -629,6 +630,10 @@ pub fn decompile_with_opmap(
                     heuristic_map: fresh_heuristic,
                     heuristic_count: detected_opmap.heuristic_count,
                     heuristic_evidence: detected_opmap.heuristic_evidence,
+                    // Cache entries carry cross-script consensus, so the merged
+                    // map — not this file's detections alone — is the evidence
+                    // that existed before completion filled the rest.
+                    pre_completion_map: cache_map,
                 };
                 (decompile_opmap, merged_count, cache_map)
             }
@@ -639,9 +644,12 @@ pub fn decompile_with_opmap(
             (detected_opmap, mapped, cache_map)
         };
 
+        // Measure how much of this decode rests on evidence BEFORE remap_chunk
+        // rewrites the opcode bytes out from under the walk.
+        let coverage = decompile_map.coverage(&chunk);
         // Return the heuristic-only map for safe caching (no speculative guesses).
         let (remap_unknowns, unknown_byte_freq, unknown_byte_sample) = decompile_map.remap_chunk(&mut chunk);
-        Some((mapped, cache_return_map, remap_unknowns, unknown_byte_freq, unknown_byte_sample))
+        Some((mapped, cache_return_map, remap_unknowns, unknown_byte_freq, unknown_byte_sample, coverage))
     } else if parser::opmap::OpcodeMap::is_canonical_luau(&chunk) {
         // Standard/canonical open-source Luau bytecode (e.g. from `luau-compile`).
         // It carries no Roblox opcode shuffle, but its canonical opcode numbering
@@ -690,7 +698,7 @@ pub fn decompile_with_opmap(
     // Use the accurate unknown count from remap_chunk (which walks bytecode correctly,
     // properly skipping AUX words) instead of post-remap counting which misattributes
     // AUX words as unknown instructions.
-    let opmap_dump = if let Some((_, ref detected, _, _, _)) = opmap_info {
+    let opmap_dump = if let Some((_, ref detected, _, _, _, _)) = opmap_info {
         let map = detected;
         let mut dump = String::from("-- SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
         let mut mappings: Vec<(u8, u8)> = map.iter().enumerate()
@@ -707,11 +715,12 @@ pub fn decompile_with_opmap(
         None
     };
 
-    let mapped_count = opmap_info.as_ref().map(|(m, _, _, _, _)| *m);
-    let unknown_insn_count = opmap_info.as_ref().map(|(_, _, u, _, _)| *u).unwrap_or(0);
-    let unknown_byte_freq: Option<[u32; 256]> = opmap_info.as_ref().map(|(_, _, _, f, _)| *f);
-    let unknown_byte_sample: Option<[Option<u32>; 256]> = opmap_info.as_ref().map(|(_, _, _, _, s)| *s);
-    let returned_opmap = opmap_info.map(|(_, detected, _, _, _)| detected);
+    let mapped_count = opmap_info.as_ref().map(|(m, _, _, _, _, _)| *m);
+    let unknown_insn_count = opmap_info.as_ref().map(|(_, _, u, _, _, _)| *u).unwrap_or(0);
+    let unknown_byte_freq: Option<[u32; 256]> = opmap_info.as_ref().map(|(_, _, _, f, _, _)| *f);
+    let unknown_byte_sample: Option<[Option<u32>; 256]> = opmap_info.as_ref().map(|(_, _, _, _, s, _)| *s);
+    let opmap_coverage = opmap_info.as_ref().map(|(_, _, _, _, _, c)| *c);
+    let returned_opmap = opmap_info.map(|(_, detected, _, _, _, _)| detected);
 
     // Add header with remap info
     if let Some(mapped) = mapped_count {
@@ -719,6 +728,47 @@ pub fn decompile_with_opmap(
             "-- Luau Decompiler v{}\n-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
             VERSION, mapped, chunk.protos.len(), chunk.main_proto
         );
+        // Evidence line. Deliberately unconditional: the failure mode this
+        // guards against is a wholly mis-detected shuffle producing output that
+        // is clean, plausible and wrong with no marker of any kind. The
+        // "opcodes detected" count above cannot serve as that marker — it is
+        // inflated by bijection filling of bytes this chunk never uses, so a
+        // chunk where completion invented 45 mappings scores HIGHER than one
+        // whose detectors covered everything it actually contains.
+        //
+        // This line reports provenance, NOT correctness, and is worded so it
+        // cannot be read as the latter. Measured against ground truth on a
+        // 47-program shuffled corpus, the evidence-backed share correlates with
+        // per-byte accuracy at only r=+0.26: a detector can be confidently,
+        // structurally, repeatably wrong. What the line does tell you is which
+        // part of the map anything downstream may lean on.
+        if let Some(cov) = opmap_coverage {
+            header.push_str(&format!(
+                "-- opmap evidence: {}/{} opcode bytes used by this chunk were pinned by \
+                 detectors ({}% of instruction words), {} filled by bijection completion, \
+                 {} left unmapped; {} further mappings are for bytes this chunk never uses\n",
+                cov.present_confident,
+                cov.present_bytes,
+                cov.confidence_pct(),
+                cov.present_invented,
+                cov.present_unmapped,
+                cov.ghost_mappings,
+            ));
+            // Observability bound. This is a fact about the input, not a guess
+            // about the output: a chunk that only ever executes N distinct
+            // opcodes constrains at most N of the ~84 entries in the shuffle,
+            // whatever the detectors report. Every other entry is unfalsifiable
+            // from this chunk alone. Worth saying out loud before anyone feeds
+            // such a map into a cross-script consensus cache.
+            const OBSERVABILITY_FLOOR: usize = 60;
+            if cov.present_bytes < OBSERVABILITY_FLOOR {
+                header.push_str(&format!(
+                    "-- NOTE: this chunk exercises only {} of ~84 opcodes, so most of the \
+                     shuffle is unconstrained by it; treat the mapping as provisional\n",
+                    cov.present_bytes,
+                ));
+            }
+        }
         if unknown_insn_count > 0 {
             header.push_str(&format!("-- {} unresolved instructions (unmapped opcodes)\n", unknown_insn_count));
             // Emit per-byte breakdown of unresolved bytes with instruction pattern samples
@@ -829,6 +879,7 @@ pub fn disassemble_with_opmap(
 
         let decompile_map = if let Some(cached) = cached_opmap {
             let mut merged = merge_cache_first(&fresh_heuristic, cached);
+            let pre_completion_map = merged;
             parser::opmap::OpcodeMap::permutation_complete_map(&mut merged, &chunk);
             let merged_count = merged.iter().filter(|&&v| v != 255).count();
             parser::opmap::OpcodeMap {
@@ -837,6 +888,7 @@ pub fn disassemble_with_opmap(
                 heuristic_map: fresh_heuristic,
                 heuristic_count: fresh_opmap.heuristic_count,
                 heuristic_evidence: fresh_opmap.heuristic_evidence,
+                pre_completion_map,
             }
         } else {
             fresh_opmap

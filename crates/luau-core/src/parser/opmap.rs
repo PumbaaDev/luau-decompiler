@@ -316,6 +316,84 @@ pub struct OpcodeMap {
     /// Higher values = more detector passes confirmed this mapping.
     /// Used for conflict resolution when merging maps across scripts.
     pub heuristic_evidence: [u16; 256],
+    /// The exact map that was handed to `permutation_complete`, i.e. everything
+    /// that had real evidence behind it — detector findings plus, on the cached
+    /// path, the merged prior. Distinct from `heuristic_map`, which is always
+    /// *this file's* detections only. Bytes present here are evidence-backed;
+    /// bytes that appear only in `shuffled_to_standard` were invented by the
+    /// bijection-completion tier and carry no evidence at all.
+    pub pre_completion_map: [u8; 256],
+}
+
+/// Per-file confidence summary for a detected opcode map.
+///
+/// Every count here is over *true instruction positions*. `compute_frequencies`
+/// counts every 32-bit word in the code array, including AUX data words, so a
+/// raw frequency table is not a usable denominator: an AUX word carrying the
+/// value 4 in its low byte is indistinguishable from an occurrence of opcode
+/// byte 0x04. `walk_instruction_positions` skips AUX using the map's own
+/// knowledge of which opcodes carry one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpmapCoverage {
+    /// Distinct shuffled bytes that actually occur at an instruction position.
+    /// This is the true denominator — the only bytes whose mapping can affect
+    /// the decode of this file.
+    pub present_bytes: usize,
+    /// Of `present_bytes`, how many were assigned before speculative completion.
+    pub present_confident: usize,
+    /// Of `present_bytes`, how many were supplied by bijection completion alone.
+    /// These decode as a concrete opcode with nothing behind the choice — the
+    /// silent-wrongness bucket.
+    pub present_invented: usize,
+    /// Of `present_bytes`, how many are still unmapped in the final map and will
+    /// therefore surface as unresolved instructions. Honest doubt.
+    pub present_unmapped: usize,
+    /// Total instruction words in the chunk.
+    pub insn_words: u32,
+    /// Instruction words whose opcode byte was assigned before completion.
+    pub insn_words_confident: u32,
+    /// Instruction words decoded through a completion-invented mapping.
+    pub insn_words_invented: u32,
+    /// Mappings in the final map for bytes that never occur at an instruction
+    /// position. These are pure bijection filler: they cannot affect this file's
+    /// decode, but their presence is what makes `mapped_count` a misleading
+    /// confidence signal.
+    pub ghost_mappings: usize,
+}
+
+impl OpmapCoverage {
+    /// Share of the program (weighted by instruction words, not by distinct
+    /// bytes) that was decoded through an evidence-backed mapping.
+    pub fn confidence_pct(&self) -> u32 {
+        if self.insn_words == 0 { return 100; }
+        (self.insn_words_confident as u64 * 100 / self.insn_words as u64) as u32
+    }
+}
+
+/// Walk the instruction stream, counting only true instruction positions.
+///
+/// AUX words are skipped using `map`'s knowledge of which opcodes carry one.
+/// An unmapped byte is assumed to carry no AUX and is stepped over by one —
+/// the same conservative assumption `infer_from_instruction_positions` makes.
+fn walk_instruction_positions(chunk: &Chunk, map: &[u8; 256]) -> ([u32; 256], u32) {
+    let mut freq = [0u32; 256];
+    let mut total = 0u32;
+    for proto in &chunk.protos {
+        let code = &proto.code;
+        let mut i = 0usize;
+        while i < code.len() {
+            let op = insn_op(code[i]);
+            freq[op as usize] += 1;
+            total += 1;
+            let mapped = map[op as usize];
+            if mapped != 255 && LuauOpcode::from_u8(mapped).has_aux() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    (freq, total)
 }
 
 impl OpcodeMap {
@@ -413,7 +491,38 @@ impl OpcodeMap {
             heuristic_map: map,
             heuristic_count: mapped,
             heuristic_evidence: evidence,
+            // A canonical translation is exact by construction: nothing here was
+            // completed speculatively, so every mapped byte is fully confident.
+            pre_completion_map: map,
         }
+    }
+
+    /// Summarise how much of this chunk's decode rests on real evidence versus
+    /// bijection filling. See `OpmapCoverage`.
+    ///
+    /// Must be called BEFORE `remap_chunk`, which rewrites the opcode bytes.
+    pub fn coverage(&self, chunk: &Chunk) -> OpmapCoverage {
+        let (freq, insn_words) = walk_instruction_positions(chunk, &self.shuffled_to_standard);
+        let mut cov = OpmapCoverage { insn_words, ..OpmapCoverage::default() };
+        for b in 0..256usize {
+            if freq[b] == 0 {
+                if self.shuffled_to_standard[b] != 255 {
+                    cov.ghost_mappings += 1;
+                }
+                continue;
+            }
+            cov.present_bytes += 1;
+            if self.pre_completion_map[b] != 255 {
+                cov.present_confident += 1;
+                cov.insn_words_confident += freq[b];
+            } else if self.shuffled_to_standard[b] != 255 {
+                cov.present_invented += 1;
+                cov.insn_words_invented += freq[b];
+            } else {
+                cov.present_unmapped += 1;
+            }
+        }
+        cov
     }
 
     /// Detect whether `chunk` is *standard* (canonical) open-source Luau
@@ -935,7 +1044,14 @@ impl OpcodeMap {
         permutation_complete(chunk, &mut ctx);
 
         let mapped_count = ctx.map.iter().filter(|&&v| v != 255).count();
-        OpcodeMap { shuffled_to_standard: ctx.map, mapped_count, heuristic_map, heuristic_count, heuristic_evidence }
+        OpcodeMap {
+            shuffled_to_standard: ctx.map,
+            mapped_count,
+            heuristic_map,
+            heuristic_count,
+            heuristic_evidence,
+            pre_completion_map: heuristic_map,
+        }
     }
 
     // NOTE: permutation_complete_map is defined at the top of the impl block (line 132)
@@ -1137,34 +1253,48 @@ impl OpcodeMap {
 // ═══════════════════════════════════════════════════════════════
 
 fn detect_return(chunk: &Chunk, ctx: &mut DetectCtx) {
-    let mut candidates: HashMap<u8, usize> = HashMap::new();
+    // The final word of a proto is the RETURN instruction itself: the compiler
+    // terminates every proto with RETURN and RETURN carries no AUX word, so the
+    // last position can never hold trailing AUX data.
+    //
+    // The second-to-last position is a much weaker signal — the instruction
+    // immediately before the terminating RETURN is very often CALL. Pooling the
+    // two positions into one candidate table made `CALL; RETURN` tails a
+    // coin flip in chunks with few protos: both bytes score the same count and
+    // the tie-break simply hands RETURN to whichever byte is numerically
+    // smaller. Score the true end position first and consult the second-to-last
+    // position only as a fallback.
+    let mut last_candidates: HashMap<u8, usize> = HashMap::new();
+    let mut penultimate_candidates: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         if proto.code.is_empty() { continue; }
-        // Check last instruction — but also check second-to-last in case last is AUX data
         let last_op = insn_op(*proto.code.last().unwrap());
-        *candidates.entry(last_op).or_insert(0) += 1;
+        *last_candidates.entry(last_op).or_insert(0) += 1;
 
-        // Also check second-to-last: if the last real instruction has AUX,
-        // the actual last instruction is at code.len()-2
         if proto.code.len() >= 2 {
             let second_last_op = insn_op(proto.code[proto.code.len() - 2]);
             if second_last_op != last_op {
-                *candidates.entry(second_last_op).or_insert(0) += 1;
+                *penultimate_candidates.entry(second_last_op).or_insert(0) += 1;
             }
         }
     }
     // RETURN appears at end of nearly every function.
     // Use lower threshold for small proto counts — even 2 protos is enough
     let num_protos = chunk.protos.len().max(1);
-    if let Some((&op, &count)) = candidates.iter()
-        .filter(|(&op, _)| !ctx.is_mapped(op))
-        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-    {
-        let pct = count * 100 / num_protos;
-        if pct >= 50 || (count >= 2 && pct >= 30) || (num_protos <= 3 && count >= 1) {
-            // Use force assignment — last-instruction detection is structurally reliable
-            // and RETURN can be very rare in data-heavy scripts (failing frequency guards)
-            ctx.try_assign_force(op, LuauOpcode::Return as u8);
+    for candidates in [&last_candidates, &penultimate_candidates] {
+        if ctx.find_shuffled(LuauOpcode::Return as u8).is_some() {
+            return;
+        }
+        if let Some((&op, &count)) = candidates.iter()
+            .filter(|(&op, _)| !ctx.is_mapped(op))
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        {
+            let pct = count * 100 / num_protos;
+            if pct >= 50 || (count >= 2 && pct >= 30) || (num_protos <= 3 && count >= 1) {
+                // Use force assignment — last-instruction detection is structurally reliable
+                // and RETURN can be very rare in data-heavy scripts (failing frequency guards)
+                ctx.try_assign_force(op, LuauOpcode::Return as u8);
+            }
         }
     }
 }
@@ -1504,6 +1634,11 @@ fn detect_generic_for(chunk: &Chunk, ctx: &mut DetectCtx) {
     // The lifter and CFG both use this convention.
     let mut prep_cand: HashMap<u8, usize> = HashMap::new();
     let mut loop_cand: HashMap<u8, usize> = HashMap::new();
+    // Split prep candidates by whether the FORGLOOP they reach carries the ipairs
+    // fast-path flag in AUX bit 31. The AUX word is already in hand below; only
+    // its low bits were being consulted. See the assignment site for why.
+    let mut prep_inext: HashMap<u8, usize> = HashMap::new();
+    let mut prep_plain: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         for i in 0..proto.code.len() {
             let insn = proto.code[i];
@@ -1527,6 +1662,11 @@ fn detect_generic_for(chunk: &Chunk, ctx: &mut DetectCtx) {
                         if (back - (i as i32 + 1)).abs() <= 1 {
                             *prep_cand.entry(insn_op(insn)).or_insert(0) += 1;
                             *loop_cand.entry(insn_op(ti)).or_insert(0) += 1;
+                            if aux & 0x8000_0000 != 0 {
+                                *prep_inext.entry(insn_op(insn)).or_insert(0) += 1;
+                            } else {
+                                *prep_plain.entry(insn_op(insn)).or_insert(0) += 1;
+                            }
                         }
                     }
                 }
@@ -1537,7 +1677,31 @@ fn detect_generic_for(chunk: &Chunk, ctx: &mut DetectCtx) {
         .filter(|(&op, _)| !ctx.is_mapped(op))
         .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
     {
-        if count >= 1 { ctx.try_assign(op, LuauOpcode::ForGPrep as u8); }
+        if count >= 1 {
+            // Which prep variant is this? The compiler sets AUX bit 31 exactly
+            // when it selected the ipairs specialisation, and the instruction
+            // that prepares such a loop is FORGPREP_INEXT, not FORGPREP.
+            //
+            // Labelling it FORGPREP — which is what picking the single
+            // highest-count candidate does — is wrong twice over: the byte gets
+            // the wrong opcode AND the real FORGPREP byte is left with nowhere
+            // to go, because `assigned[ForGPrep]` is now taken. A chunk whose
+            // generic-for loops are all `ipairs` loops is the common case, and
+            // this misorder alone accounted for 13 of 47 corpus files under
+            // every shuffle seed measured.
+            //
+            // Only act on unanimous evidence; a byte seen preparing both loop
+            // kinds is not a variant-specific opcode and falls through to the
+            // historical behaviour.
+            let ipairs_hits = prep_inext.get(&op).copied().unwrap_or(0);
+            let plain_hits = prep_plain.get(&op).copied().unwrap_or(0);
+            let variant = if ipairs_hits > 0 && plain_hits == 0 {
+                LuauOpcode::ForGPrepINext
+            } else {
+                LuauOpcode::ForGPrep
+            };
+            ctx.try_assign(op, variant as u8);
+        }
     }
     if let Some((&op, &count)) = loop_cand.iter()
         .filter(|(&op, _)| !ctx.is_mapped(op))
@@ -1557,10 +1721,13 @@ fn detect_forgprep_variants(chunk: &Chunk, ctx: &mut DetectCtx) {
 
     // Collect all prep candidates: AD-format, forward jump D>0, target is FORGLOOP
     let mut prep_cand: HashMap<u8, usize> = HashMap::new();
-    // Also track which candidates jump to a FORGLOOP that uses ipairs-style iteration
-    // (AUX has specific patterns for inext vs next)
+    // Split those candidates by the kind of FORGLOOP they jump to. FORGLOOP's AUX
+    // is `nresults | (is_ipairs << 31)`; bit 31 is the ipairs fast-path flag the
+    // disassembler already renders as `[inext]` (disasm/mod.rs). A prep byte whose
+    // targets all carry that flag is FORGPREP_INEXT; one whose targets never do is
+    // plain FORGPREP.
     let mut inext_cand: HashMap<u8, usize> = HashMap::new();
-    let mut next_cand: HashMap<u8, usize> = HashMap::new();
+    let mut plain_cand: HashMap<u8, usize> = HashMap::new();
 
     for proto in &chunk.protos {
         for i in 0..proto.code.len() {
@@ -1581,18 +1748,18 @@ fn detect_forgprep_variants(chunk: &Chunk, ctx: &mut DetectCtx) {
             {
                 *prep_cand.entry(op).or_insert(0) += 1;
 
-                // Check if the FORGLOOP's AUX word gives a hint about the iterator type
-                // FORGPREPINEXT: used with ipairs (integer index iterator)
-                // FORGPREPNEXT: used with pairs/next iterator
-                // The AUX of FORGLOOP encodes the number of loop variables
+                // Classify by the FORGLOOP's AUX ipairs flag (bit 31), NOT by the
+                // loop-variable count in the low bits. The count cannot separate
+                // the variants — `for i, v in ipairs(t)` and `for k, v in pairs(t)`
+                // both yield 2 — whereas the flag is set by the compiler precisely
+                // when it selected the ipairs specialisation, which is exactly when
+                // the prep instruction is FORGPREP_INEXT.
                 if target + 1 < proto.code.len() {
                     let aux = proto.code[target + 1];
-                    if (aux & 0x7FFFFFFF) == 2 {
-                        // ipairs typically yields 2 vars (index, value)
+                    if aux & 0x8000_0000 != 0 {
                         *inext_cand.entry(op).or_insert(0) += 1;
-                    } else if (aux & 0x7FFFFFFF) == 1 {
-                        // pairs/next typically yields 1 var count in AUX
-                        *next_cand.entry(op).or_insert(0) += 1;
+                    } else {
+                        *plain_cand.entry(op).or_insert(0) += 1;
                     }
                 }
             }
@@ -1615,6 +1782,31 @@ fn detect_forgprep_variants(chunk: &Chunk, ctx: &mut DetectCtx) {
     // ForGPrepINext ↔ ForGLoopINext structural pair without knowing either byte.
     for &(op, count) in &sorted {
         if count < 1 { continue; }
+
+        // Unambiguous AUX evidence wins over frequency order.
+        //
+        // Without this, a chunk whose only generic-for loops are `ipairs` loops —
+        // extremely common — hands its FORGPREP_INEXT byte to plain FORGPREP purely
+        // because it is the single highest-count candidate, and the true FORGPREP
+        // byte is then homeless. That single misorder accounted for 13 of 47 files
+        // in every shuffle seed measured. The classification below is unanimous on
+        // that corpus: every prep byte reaching an ipairs-flagged FORGLOOP is
+        // FORGPREP_INEXT, and every prep byte reaching an unflagged one is FORGPREP.
+        let ipairs_hits = inext_cand.get(&op).copied().unwrap_or(0);
+        let plain_hits = plain_cand.get(&op).copied().unwrap_or(0);
+        if ipairs_hits > 0 && plain_hits == 0 {
+            if !ctx.assigned[LuauOpcode::ForGPrepINext as usize] {
+                let _ = ctx.try_assign(op, LuauOpcode::ForGPrepINext as u8);
+                continue;
+            }
+        } else if plain_hits > 0 && ipairs_hits == 0 {
+            if !ctx.assigned[LuauOpcode::ForGPrep as usize] {
+                let _ = ctx.try_assign(op, LuauOpcode::ForGPrep as u8);
+                continue;
+            }
+        }
+
+        // Mixed or absent AUX evidence: fall back to frequency order.
         if !ctx.assigned[LuauOpcode::ForGPrep as usize] {
             let _ = ctx.try_assign(op, LuauOpcode::ForGPrep as u8);
         } else if !ctx.assigned[LuauOpcode::ForGPrepNext as usize] {
@@ -1709,7 +1901,7 @@ fn detect_forgloopinext(chunk: &Chunk, ctx: &mut DetectCtx) {
         .filter(|(&op, _)| !ctx.is_mapped(op))
         .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
     {
-        if count >= 1 {
+        if count >= 1 && loop_byte_frequency_is_plausible(ctx, op, count) {
             // Phase B0.14+B0.15: use try_assign_force to bypass the 2%-frequency
             // rare-opcode cap. Animate.lua has 69 ForGLoopINext instructions (many
             // ipairs loops), and structural evidence (ForGPrepINext → ForGLoopINext
@@ -1717,6 +1909,33 @@ fn detect_forgloopinext(chunk: &Chunk, ctx: &mut DetectCtx) {
             ctx.try_assign_force(op, LuauOpcode::Deprecated61 as u8);
         }
     }
+}
+
+/// Is `loop_byte` frequent enough to be ForGLoopINext, given that only `pair_count`
+/// of its occurrences were confirmed as the target of a ForGPrepINext jump?
+///
+/// Every ForGLoopINext instruction is by construction the jump target of a
+/// ForGPrepINext — the compiler emits the two together, one pair per ipairs loop.
+/// So for the true byte, essentially every occurrence is accounted for by the pair
+/// scan. Both pair detectors, however, assign on `count >= 1` and do it through
+/// `try_assign_force`, which deliberately bypasses the rare-opcode frequency cap in
+/// `try_assign`. On a large module a single coincidental match can therefore claim a
+/// byte that occurs hundreds of times.
+///
+/// That failure is unusually damaging because the lifter emits nothing at all for
+/// Deprecated61 (`opcode_handlers.rs`: `LuauOpcode::Deprecated61 => {}`). Every
+/// instruction carrying the stolen byte is dropped from the output without a
+/// diagnostic — clean, plausible, and missing 8% of the program.
+///
+/// The bound is deliberately loose. `ctx.freq` counts every word including AUX data,
+/// so a genuine ForGLoopINext byte can be diluted by unrelated AUX words that happen
+/// to share its value — but not by an order of magnitude. Requiring the pair evidence
+/// to explain a tenth of the raw occurrences rejects the coincidences while leaving
+/// real ipairs-heavy scripts (Animate.lua: 69 ForGLoopINext instructions, ~69 pairs)
+/// far inside the limit.
+fn loop_byte_frequency_is_plausible(ctx: &DetectCtx, loop_byte: u8, pair_count: usize) -> bool {
+    let freq = ctx.freq[loop_byte as usize] as usize;
+    freq == 0 || pair_count.saturating_mul(10) >= freq
 }
 
 /// Detect ForGPrepINext (canonical 60) and Deprecated61/ForGLoopINext (canonical 61) as a
@@ -1879,7 +2098,12 @@ fn detect_forgprep_inext_pair(chunk: &Chunk, ctx: &mut DetectCtx) {
         })
         .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.1.cmp(&a.0.1)))
     {
-        if count >= 1 {
+        // Reject a pair whose loop byte is far too frequent to be explained by the
+        // handful of matches found. See `loop_byte_frequency_is_plausible`: a single
+        // coincidental pair must not be allowed to claim a byte that occurs hundreds
+        // of times, because Deprecated61 lifts to nothing and those instructions then
+        // vanish from the output with no diagnostic.
+        if count >= 1 && loop_byte_frequency_is_plausible(ctx, loop_byte, count) {
             if !ctx.assigned[LuauOpcode::ForGPrepINext as usize] {
                 // try_assign_force: bypasses the 2%-frequency rare-opcode cap.
                 // ForGPrepINext may appear many times in scripts with many ipairs loops
@@ -2084,26 +2308,66 @@ fn detect_namecall(chunk: &Chunk, ctx: &mut DetectCtx) {
 
 fn detect_loadk(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut candidates: HashMap<u8, (usize, usize)> = HashMap::new(); // (valid_count, total_count)
+    // Purity bookkeeping, kept separate so the selection logic below is untouched.
+    //   seen     — EVERY occurrence of the byte, including ones the window test
+    //              rejects. The pair above only counts in-window occurrences, so
+    //              on its own it can never expose impurity: the disqualifying
+    //              evidence is discarded before it is counted.
+    //   loadable — in-range constants whose type LOADK can actually load.
+    let mut seen: HashMap<u8, usize> = HashMap::new();
+    let mut loadable: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         for &insn in &proto.code {
             let op = insn_op(insn);
             if ctx.is_mapped(op) { continue; }
             let a = insn_a(insn);
             let d = insn_d(insn);
+            *seen.entry(op).or_insert(0) += 1;
             // LOADK: AD format, A = target register, D = constant index (signed i16).
             // Must use `d as u16 as usize` for constant lookup (see CLAUDE.md).
-            // Accept ANY constant type, not just String/Number — LOADK can load
-            // booleans, nil, vectors, table keys, closures, etc.
             if d >= 0 && a < proto.max_stack_size {
                 let d_idx = d as u16 as usize;
                 let entry = candidates.entry(op).or_insert((0, 0));
                 entry.1 += 1; // total instances of this opcode
                 if d_idx < proto.constants.len() {
                     entry.0 += 1; // valid constant index
+                    // Which constant types does LOADK actually load? Not "any":
+                    // the compiler emits LOADNIL for nil, LOADB for booleans,
+                    // GETIMPORT for imports, DUPTABLE for table templates and
+                    // DUPCLOSURE/NEWCLOSURE for closures. That leaves numbers,
+                    // strings and vectors. Measured over a 47-program corpus and
+                    // over a 314-proto Roblox module, the true LOADK byte scored
+                    // 427/427 and 934/934 on this test — exactly 100% both times.
+                    if matches!(
+                        proto.constants.get(d_idx),
+                        Some(Constant::Number(_)) | Some(Constant::String(_)) | Some(Constant::Vector(..))
+                    ) {
+                        *loadable.entry(op).or_insert(0) += 1;
+                    }
                 }
             }
         }
     }
+
+    // Purity veto.
+    //
+    // Both selection paths below rank on the ABSOLUTE count of conforming
+    // instances. That loses to LOADN on frequency alone: LOADN is AD-format with
+    // D = a small integer literal, so a literal below the constant-table size is
+    // indistinguishable from a constant index, and LOADN is simply more common.
+    // Measured on the corpus: the true LOADK byte is 427/427 = 100% in-range,
+    // the true LOADN byte 433/587 = 74%, yet 433 > 427 so LOADN wins the count.
+    // A ratio separates them unanimously; nothing here computed one.
+    //
+    // Tolerance is 5% rather than 0 because on real bytecode AUX words collide
+    // with every byte value, diluting an otherwise pure candidate. On both
+    // corpora the true byte had the full 5 points of headroom.
+    candidates.retain(|op, &mut (valid, _total)| {
+        let all = seen.get(op).copied().unwrap_or(0);
+        let typed = loadable.get(op).copied().unwrap_or(0);
+        valid * 20 >= all * 19 && typed * 20 >= valid * 19
+    });
+
     // Sort by valid count descending.
     // Primary path: `valid >= 5` (robust on medium/large protos).
     // Fallback path: `valid >= 2 && valid == total` (100% consistency) — catches
@@ -2428,6 +2692,12 @@ fn detect_table_ops(chunk: &Chunk, ctx: &mut DetectCtx) {
 
 fn detect_conditional_jumps(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut candidates: HashMap<u8, usize> = HashMap::new();
+    // Purity bookkeeping. The conforming-occurrence count below cannot expose a
+    // non-jump: occurrences that fail the shape test are dropped rather than
+    // counted against the byte, so a byte that behaves like a jump a tenth of the
+    // time scores exactly like one that always does.
+    let mut seen: HashMap<u8, usize> = HashMap::new();
+    let mut jumplike: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         for (i, &insn) in proto.code.iter().enumerate() {
             let op = insn_op(insn);
@@ -2439,8 +2709,42 @@ fn detect_conditional_jumps(chunk: &Chunk, ctx: &mut DetectCtx) {
             if a > 0 && a < proto.max_stack_size && d > 0 && target >= 0 && (target as usize) < proto.code.len() {
                 *candidates.entry(op).or_insert(0) += 1;
             }
+
+            *seen.entry(op).or_insert(0) += 1;
+            // The invariant: a real branch never leaves its proto. Under VM
+            // semantics it lands at pc + D + 1.
+            //
+            // Note what is deliberately NOT tested here. "D != 0" is an equally
+            // clean separator on synthetic corpora — the compiler never emits a
+            // zero-displacement jump — but it misfires badly on real bytecode:
+            // an AUX data word whose upper 16 bits are zero decodes as D == 0, so
+            // the test marks every such word against whichever byte its low octet
+            // happens to match. On a 314-proto Roblox module that alone pushed the
+            // true JUMPIFNOT byte below the purity floor and cost 105 extra
+            // unresolved instructions. The range test is far less AUX-sensitive:
+            // a small AUX value lands harmlessly inside the proto.
+            let landing = i as i32 + d + 1;
+            if landing >= 0 && landing <= proto.code.len() as i32 {
+                *jumplike.entry(op).or_insert(0) += 1;
+            }
         }
     }
+    // Purity veto.
+    //
+    // Measured over the 47-program corpus: the true JUMPIF, JUMPIFNOT, JUMP and
+    // JUMPBACK bytes satisfy both invariants in 100% of their occurrences. The
+    // true LOADN byte fails them in 19% (11% D==0, 10% target outside the proto,
+    // because its D is an integer literal rather than a displacement) and the
+    // true LOADK byte in 15%. Ranking on absolute conforming counts hands
+    // JUMPIFNOT to LOADN regardless, because LOADN is by far the more frequent
+    // opcode — 587 occurrences against 5 across the whole corpus.
+    //
+    // 5% slack absorbs AUX words that happen to carry the candidate's byte value.
+    candidates.retain(|op, _| {
+        let all = seen.get(op).copied().unwrap_or(0);
+        let ok = jumplike.get(op).copied().unwrap_or(0);
+        ok * 20 >= all * 19
+    });
     // Phase B0.1 fix: reject LOADN-shape false positives via a raw-frequency
     // cap. LOADN instructions are AD-format with A = register (a>0 trivially
     // satisfied, a<max_stack always true) and D = signed literal number
@@ -3738,6 +4042,11 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut a_ne_b_counts: HashMap<u8, usize> = HashMap::new();
     let mut in_no_upval: HashMap<u8, usize> = HashMap::new();
     let mut all_c_zero: HashMap<u8, bool> = HashMap::new();
+    // Every occurrence of the byte, and the subset carrying MOVE's full operand
+    // shape. `totals` above only counts occurrences that already pass the register
+    // window, so on its own it cannot register an occurrence that disproves MOVE.
+    let mut seen: HashMap<u8, usize> = HashMap::new();
+    let mut move_shape: HashMap<u8, usize> = HashMap::new();
 
     for proto in &chunk.protos {
         for &insn in &proto.code {
@@ -3746,6 +4055,10 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
             let a = insn_a(insn);
             let b = insn_b(insn);
             let c = insn_c(insn);
+            *seen.entry(op).or_insert(0) += 1;
+            if a < proto.max_stack_size && b < proto.max_stack_size && c == 0 {
+                *move_shape.entry(op).or_insert(0) += 1;
+            }
             if a < proto.max_stack_size && b < proto.max_stack_size {
                 *totals.entry(op).or_insert(0) += 1;
                 if c != 0 { all_c_zero.insert(op, false); }
@@ -3756,13 +4069,42 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
         }
     }
 
-    let min_count: usize = if ctx.total_insns > 1000 { 10 } else if ctx.total_insns > 100 { 3 } else { 1 };
+    // A single matching instruction is not evidence: this detector FORCE-assigns,
+    // and MOVE's shape (A,B registers, C=0) is shared by LOADK, GETVARARGS,
+    // GETUPVAL and the unary ops. On a short script that contains no MOVE at all
+    // — common; MOVE is absent from 7 of the 47 canonical corpus programs — a
+    // lone LOADK would otherwise be force-labelled MOVE and the real LOADK left
+    // homeless. Require at least two occurrences before claiming the byte.
+    let min_count: usize = if ctx.total_insns > 1000 { 10 } else if ctx.total_insns > 100 { 3 } else { 2 };
 
     // Filter: must have ALL instances C=0, meet minimum count
     let mut verified: Vec<(u8, usize, f64)> = Vec::new(); // (op, total, score)
     for (&op, &total) in &totals {
         if ctx.is_mapped(op) || total < min_count { continue; }
         if all_c_zero.get(&op) != Some(&true) { continue; }
+
+        // Operand-shape purity gate.
+        //
+        // MOVE's A and B are both register indices and its C is unused, so EVERY
+        // occurrence of the real MOVE byte satisfies A,B < max_stack_size and
+        // C == 0. LOADN is AD-format with D = an integer literal; a small
+        // non-negative literal decodes as B = literal, C = 0 — exactly the shape
+        // scored above — and LOADN is both more frequent than MOVE and present in
+        // more protos, so absolute counts favour it. Nothing else here separates
+        // the two.
+        //
+        // The separator is the literal escaping the register window, or spilling
+        // into C once it exceeds 255. Measured over the 47-program corpus, the
+        // true MOVE byte satisfies the full shape in 262/262 occurrences and the
+        // true LOADN byte in 407/587 (69%); on a 314-proto Roblox module the true
+        // MOVE byte scored 454/454. Testing the whole shape over EVERY occurrence
+        // — rather than the register window over the surviving ones — is what
+        // makes the ratio meaningful.
+        //
+        // 5% slack absorbs AUX words that happen to carry this byte value.
+        let all_seen = seen.get(&op).copied().unwrap_or(0);
+        let shaped = move_shape.get(&op).copied().unwrap_or(0);
+        if shaped * 20 < all_seen * 19 { continue; }
 
         // Score the candidate: MOVE should be high-frequency AND appear in non-upval protos
         let mut score = total as f64;
@@ -6497,8 +6839,16 @@ fn permutation_complete(chunk: &Chunk, ctx: &mut DetectCtx) {
         sb.cmp(&sa).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1))
     });
 
-    // Greedy assignment — progressive thresholds (high confidence first, then lower)
-    for threshold in &[0.30, 0.20, 0.15] {
+    // Greedy assignment — high-confidence pairs only.
+    //
+    // This cascade used to descend to 0.20 and then 0.15, which is where most of
+    // the pipeline's invented mappings were actually made: by the time Phase 2
+    // runs there is often nothing left for it to do. A score that low means the
+    // AUX/format validator found the pair barely more plausible than chance, and
+    // the resulting mapping is indistinguishable in the output from one a
+    // structural detector earned. Bytes that clear no threshold are left unmapped
+    // so `remap_chunk` can report them as unresolved instructions.
+    for threshold in &[COMPLETION_MIN_SCORE] {
         for &(shuffled, standard, score) in &pairs {
             if ctx.is_mapped(shuffled) || ctx.assigned[standard as usize] { continue; }
             if score >= *threshold {
@@ -6569,6 +6919,22 @@ fn permutation_complete(chunk: &Chunk, ctx: &mut DetectCtx) {
             for (i, j) in assignment.iter().enumerate() {
                 let std_op = remaining_std[i];
                 let shuf = remaining_shuffled[*j];
+                // The search maximises the TOTAL score, so an individual pair can
+                // be arbitrarily bad as long as the rest of the permutation carries
+                // it. Nothing here used to check that; whatever the argmax returned
+                // was applied. Hold each pair to the same bar the greedy fallback
+                // uses, and to the same requirement that it beat the alternatives
+                // for its byte — otherwise leave the byte unmapped so it surfaces
+                // as an unresolved instruction instead of a confident guess.
+                let score = score_matrix[i][*j];
+                if score < PERMUTATION_MIN_SCORE { continue; }
+                let runner_up = (0..n_shuf)
+                    .filter(|&k| k != *j)
+                    .map(|k| score_matrix[i][k])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if runner_up.is_finite() && score - runner_up < COMPLETION_MIN_MARGIN {
+                    continue;
+                }
                 if !ctx.is_mapped(shuf) && !ctx.assigned[std_op as usize] {
                     ctx.try_assign_force(shuf, std_op);
                 }
@@ -6596,17 +6962,19 @@ fn permutation_complete(chunk: &Chunk, ctx: &mut DetectCtx) {
             .copied().collect();
 
         // Non-AUX: scored greedy assignment
-        scored_greedy_assign(chunk, ctx, &mut noaux_std, &noaux_shuffled, &std_has_aux, &aux_behavior);
+        scored_greedy_assign(chunk, ctx, &mut noaux_std, &noaux_shuffled, &std_has_aux, &aux_behavior, COMPLETION_MIN_SCORE);
 
         // AUX: scored greedy assignment
-        scored_greedy_assign(chunk, ctx, &mut aux_std, &aux_shuffled, &std_has_aux, &aux_behavior);
+        scored_greedy_assign(chunk, ctx, &mut aux_std, &aux_shuffled, &std_has_aux, &aux_behavior, COMPLETION_MIN_SCORE);
 
-        // Ambiguous: assign to whatever standard opcodes remain (except structural-required)
-        let mut final_std: Vec<u8> = (0..84u8)
-            .filter(|&s| !ctx.assigned[s as usize]
-                && !DetectCtx::is_structural_required_standard_opcode(s))
-            .collect();
-        scored_greedy_assign(chunk, ctx, &mut final_std, &ambiguous_shuffled, &std_has_aux, &aux_behavior);
+        // The third bucket — bytes whose AUX behaviour could not be classified at
+        // all — used to be handed EVERY remaining non-structural opcode with no
+        // score floor whatsoever. That is the most speculative assignment in the
+        // pipeline: an unknown byte paired with an arbitrary opcode purely to
+        // complete the bijection. Leaving those bytes unmapped lets `remap_chunk`
+        // report them as unresolved instructions, which is the honest outcome —
+        // an unmapped opcode is visible, a wrong one is not.
+        let _ = &ambiguous_shuffled;
     }
 
     // ── Final: assign remaining zero-freq shuffled bytes to any leftover standard opcodes ──
@@ -6630,6 +6998,27 @@ fn permutation_complete(chunk: &Chunk, ctx: &mut DetectCtx) {
 /// Greedy assignment: for each (standard, shuffled) pair, score compatibility and
 /// assign the best-scoring pairs first. Much better than zip-matching because it
 /// considers per-pair compatibility instead of relying on frequency-rank alignment.
+/// Score below which bijection completion refuses to guess.
+///
+/// Matches the first of the three thresholds Phase 1 of `permutation_complete`
+/// already applies. The greedy fallback below used to apply none at all: it
+/// computed a compatibility score for every pair, sorted by it, and then threw it
+/// away — the assignment loop destructured it into `_score`. Every remaining byte
+/// was therefore mapped no matter how badly it fitted, purely to complete the
+/// bijection, and the result was indistinguishable in the output from a mapping
+/// the structural detectors had actually earned.
+const COMPLETION_MIN_SCORE: f64 = 0.45;
+
+/// How much better the winning opcode must fit a byte than the runner-up before
+/// bijection completion is allowed to commit to it. See the ambiguity gate in
+/// `scored_greedy_assign`.
+const COMPLETION_MIN_MARGIN: f64 = 0.05;
+
+/// Per-pair floor for the small-N brute-force path. Scored on a different scale
+/// from `COMPLETION_MIN_SCORE`: that phase caps around 0.85, this one adds an
+/// AUX-agreement bonus on top of a full-weight format score and reaches ~1.4.
+const PERMUTATION_MIN_SCORE: f64 = 0.75;
+
 fn scored_greedy_assign(
     chunk: &Chunk,
     ctx: &mut DetectCtx,
@@ -6637,6 +7026,7 @@ fn scored_greedy_assign(
     shuffled_candidates: &[u8],
     std_has_aux: &[bool],
     aux_behavior: &HashMap<u8, bool>,
+    min_score: f64,
 ) {
     let mut scored_pairs: Vec<(u8, u8, f64)> = Vec::new();
     for &std_op in std_ops.iter() {
@@ -6663,8 +7053,39 @@ fn scored_greedy_assign(
         let sb = (b.2 * 1000.0) as i64;
         sb.cmp(&sa).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1))
     });
-    for &(shuf, std_op, _score) in &scored_pairs {
+    // Ambiguity gate.
+    //
+    // A score floor alone is toothless here, and it is worth saying why. The
+    // per-pair score is dominated by `format_score_for_opcode`, which collapses
+    // the non-AUX opcodes into a handful of behavioural classes — a dozen of them
+    // reduce to "A is a valid register". Most pairs therefore score near the top
+    // of the range, and a threshold that rejects anything also rejects everything.
+    //
+    // What the score CAN express is whether one opcode fits a byte better than
+    // the alternatives. When the best and second-best candidates for a byte are
+    // indistinguishable, completion is choosing by sort order, not by evidence,
+    // and the resulting mapping is a coin flip presented as a fact. Leave those
+    // bytes unmapped: `remap_chunk` reports an unmapped opcode as an unresolved
+    // instruction, which is visible, whereas a wrong opcode is not.
+    let mut best_for_byte: HashMap<u8, (f64, f64)> = HashMap::new(); // shuf -> (best, second)
+    for &(shuf, _std_op, score) in &scored_pairs {
+        let e = best_for_byte.entry(shuf).or_insert((f64::NEG_INFINITY, f64::NEG_INFINITY));
+        if score > e.0 {
+            e.1 = e.0;
+            e.0 = score;
+        } else if score > e.1 {
+            e.1 = score;
+        }
+    }
+
+    for &(shuf, std_op, score) in &scored_pairs {
+        if score < min_score { break; } // sorted descending — nothing after this qualifies
         if ctx.is_mapped(shuf) || ctx.assigned[std_op as usize] { continue; }
+        if let Some(&(best, second)) = best_for_byte.get(&shuf) {
+            if second.is_finite() && best - second < COMPLETION_MIN_MARGIN {
+                continue;
+            }
+        }
         ctx.try_assign_force(shuf, std_op);
     }
 }
@@ -7725,6 +8146,116 @@ mod tests {
             LuauOpcode::ForGPrep as u8,
             "detect_forgprep_variants failed to map FORGPREP byte given known FORGLOOP"
         );
+    }
+
+    /// Same shape as `build_generic_for_proto` but the FORGLOOP's AUX carries the
+    /// ipairs fast-path flag (bit 31), i.e. the loop the compiler emits for
+    /// `for i, v in ipairs(t)`.
+    fn build_ipairs_for_proto(forgprep_byte: u8, forgloop_byte: u8) -> Chunk {
+        let code = vec![
+            insn_ad(forgprep_byte, 0, 3),
+            insn_abc(0xAA, 1, 0, 0),
+            0x00000000,
+            insn_abc(0xBB, 1, 1, 0),
+            insn_ad(forgloop_byte, 0, -4),
+            0x8000_0002, // AUX: nresults=2, ipairs flag set
+            insn_abc(0xCC, 0, 0, 0),
+        ];
+        chunk_from_code(code, 4)
+    }
+
+    #[test]
+    fn detect_forgprep_variants_prefers_inext_when_forgloop_is_ipairs() {
+        // A chunk whose only generic-for is an ipairs loop must yield
+        // FORGPREP_INEXT, not plain FORGPREP. Assigning FORGPREP here — which the
+        // frequency-ordered fallback does — leaves the real FORGPREP byte homeless
+        // and was the single most seed-stable confusion in the corpus.
+        let prep: u8 = 0xA1;
+        let loop_b: u8 = 0xB2;
+        let chunk = build_ipairs_for_proto(prep, loop_b);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        ctx.map[loop_b as usize] = LuauOpcode::ForGLoop as u8;
+        ctx.assigned[LuauOpcode::ForGLoop as usize] = true;
+
+        detect_forgprep_variants(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[prep as usize],
+            LuauOpcode::ForGPrepINext as u8,
+            "prep byte reaching an ipairs-flagged FORGLOOP must be FORGPREP_INEXT"
+        );
+        assert!(
+            !ctx.assigned[LuauOpcode::ForGPrep as usize],
+            "plain FORGPREP must be left free for its own byte"
+        );
+    }
+
+    #[test]
+    fn detect_forgprep_variants_keeps_plain_prep_when_flag_absent() {
+        // The converse: an unflagged FORGLOOP is a `pairs`/generic loop, so its
+        // prep is plain FORGPREP and FORGPREP_INEXT must stay unassigned.
+        let prep: u8 = 0xA1;
+        let loop_b: u8 = 0xB2;
+        let chunk = build_generic_for_proto(prep, loop_b);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        ctx.map[loop_b as usize] = LuauOpcode::ForGLoop as u8;
+        ctx.assigned[LuauOpcode::ForGLoop as usize] = true;
+
+        detect_forgprep_variants(&chunk, &mut ctx);
+
+        assert_eq!(ctx.map[prep as usize], LuauOpcode::ForGPrep as u8);
+        assert!(
+            !ctx.assigned[LuauOpcode::ForGPrepINext as usize],
+            "FORGPREP_INEXT must not be claimed without the ipairs flag"
+        );
+    }
+
+    #[test]
+    fn detect_forgprep_variants_separates_both_variants_in_one_chunk() {
+        // Both loop kinds present: each prep byte must land on its own opcode
+        // regardless of which is more frequent. The ipairs byte is deliberately
+        // given the HIGHER count so frequency order alone would mislabel it.
+        let plain_prep: u8 = 0xA1;
+        let inext_prep: u8 = 0xA3;
+        let loop_b: u8 = 0xB2;
+        let code = vec![
+            // pairs loop
+            insn_ad(plain_prep, 0, 3),
+            insn_abc(0xAA, 1, 0, 0),
+            0x00000000,
+            insn_abc(0xBB, 1, 1, 0),
+            insn_ad(loop_b, 0, -4),
+            0x0000_0002,
+            // two ipairs loops
+            insn_ad(inext_prep, 0, 3),
+            insn_abc(0xAA, 1, 0, 0),
+            0x00000000,
+            insn_abc(0xBB, 1, 1, 0),
+            insn_ad(loop_b, 0, -4),
+            0x8000_0002,
+            insn_ad(inext_prep, 0, 3),
+            insn_abc(0xAA, 1, 0, 0),
+            0x00000000,
+            insn_abc(0xBB, 1, 1, 0),
+            insn_ad(loop_b, 0, -4),
+            0x8000_0002,
+            insn_abc(0xCC, 0, 0, 0),
+        ];
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        ctx.map[loop_b as usize] = LuauOpcode::ForGLoop as u8;
+        ctx.assigned[LuauOpcode::ForGLoop as usize] = true;
+
+        detect_forgprep_variants(&chunk, &mut ctx);
+
+        assert_eq!(ctx.map[inext_prep as usize], LuauOpcode::ForGPrepINext as u8);
+        assert_eq!(ctx.map[plain_prep as usize], LuauOpcode::ForGPrep as u8);
     }
 
     #[test]
@@ -13442,5 +13973,338 @@ mod tests {
             !ctx.assigned[LuauOpcode::JumpXEqKNil as usize],
             "JumpXEqKNil must remain unmapped when the only candidate is already taken"
         );
+    }
+
+    #[test]
+    fn detect_move_rejects_byte_whose_operands_leave_the_register_window() {
+        // A LOADN-shaped byte in a proto with a small register window: the small
+        // literals decode as a valid MOVE, the large ones do not. The true MOVE
+        // byte never produces the latter, so a byte that does must be vetoed even
+        // though its conforming count is the highest in the chunk.
+        let literal_byte: u8 = 0x71;
+        let real_move: u8 = 0x72;
+        let mut code = Vec::new();
+        for _ in 0..8 {
+            code.push(insn_abc(literal_byte, 1, 2, 0)); // looks like MOVE
+        }
+        for _ in 0..8 {
+            code.push(insn_abc(literal_byte, 1, 200, 0)); // literal past the window
+        }
+        for _ in 0..4 {
+            code.push(insn_abc(real_move, 1, 2, 0));
+        }
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_move(&chunk, &mut ctx);
+
+        assert_ne!(
+            ctx.map[literal_byte as usize],
+            LuauOpcode::Move as u8,
+            "a byte that half the time addresses a non-register is not MOVE"
+        );
+        assert_eq!(
+            ctx.map[real_move as usize],
+            LuauOpcode::Move as u8,
+            "the fully-conforming byte must win despite its lower count"
+        );
+    }
+
+    #[test]
+    fn detect_conditional_jumps_rejects_byte_that_branches_out_of_the_proto() {
+        // A LOADN-shaped byte: A is a register and D is positive, so it satisfies
+        // the conditional-jump shape test, and it is far more frequent than any
+        // real branch. What gives it away is that D is a literal, not a
+        // displacement, so a good share of its "targets" fall past the end of the
+        // proto — something a real branch never does.
+        let literal_byte: u8 = 0x39;
+        let mut code = Vec::new();
+        for _ in 0..6 {
+            code.push(insn_ad(literal_byte, 1, 3)); // lands in range
+        }
+        for _ in 0..6 {
+            code.push(insn_ad(literal_byte, 1, 900)); // lands far past the proto
+        }
+        code.push(insn_abc(0xCC, 0, 0, 0));
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_conditional_jumps(&chunk, &mut ctx);
+
+        assert_ne!(ctx.map[literal_byte as usize], LuauOpcode::JumpIfNot as u8);
+        assert_ne!(ctx.map[literal_byte as usize], LuauOpcode::JumpIf as u8);
+    }
+
+    #[test]
+    fn detect_conditional_jumps_still_accepts_a_well_behaved_branch() {
+        // The converse: every occurrence lands inside the proto, so the veto must
+        // not interfere.
+        let branch: u8 = 0x3A;
+        let mut code = Vec::new();
+        for _ in 0..6 {
+            code.push(insn_ad(branch, 1, 4));
+        }
+        for _ in 0..6 {
+            code.push(insn_abc(0xAA, 1, 0, 0));
+        }
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_conditional_jumps(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[branch as usize],
+            LuauOpcode::JumpIfNot as u8,
+            "a byte whose branches all stay in-proto must still be detectable"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // detect_loadk purity veto
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn detect_loadk_prefers_pure_low_count_candidate_over_impure_high_count() {
+        // The shape that defeats absolute-count ranking. `impure` is a LOADN-like
+        // byte: more occurrences, but a third of its D values run past the end of
+        // the constant table because they are integer literals, not indices.
+        // `pure` is the real LOADK: fewer occurrences, every D in range and every
+        // referenced constant of a type LOADK can actually load.
+        let pure: u8 = 0x31;
+        let impure: u8 = 0x32;
+        let mut code = Vec::new();
+        for i in 0..6u8 {
+            code.push(insn_ad(pure, 1, (i % 4) as i16));
+        }
+        for i in 0..9u8 {
+            // 6 in range, 3 well past the 4-entry constant table
+            let d = if i < 6 { (i % 4) as i16 } else { 900 };
+            code.push(insn_ad(impure, 1, d));
+        }
+        let mut chunk = chunk_from_code(code, 4);
+        chunk.protos[0].constants = vec![
+            Constant::Number(1.0),
+            Constant::String("a".into()),
+            Constant::Number(2.0),
+            Constant::String("b".into()),
+        ];
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_loadk(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[pure as usize],
+            LuauOpcode::LoadK as u8,
+            "the pure candidate must win even though it has fewer conforming hits"
+        );
+        assert_ne!(ctx.map[impure as usize], LuauOpcode::LoadK as u8);
+    }
+
+    #[test]
+    fn detect_loadk_rejects_import_indexed_byte() {
+        // GETIMPORT's D is an index into the constant table too, so it passes the
+        // range test with 100% purity. What separates it is the constant TYPE:
+        // imports are never loaded by LOADK. Measured on a real Roblox module,
+        // the GETIMPORT byte scored 99.9% in-range but 0.1% loadable.
+        let import_byte: u8 = 0x41;
+        let code: Vec<u32> = (0..8u8).map(|i| insn_ad(import_byte, 1, (i % 2) as i16)).collect();
+        let mut chunk = chunk_from_code(code, 4);
+        chunk.protos[0].constants = vec![Constant::Import(0x4010_0000), Constant::Import(0x4020_0000)];
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_loadk(&chunk, &mut ctx);
+
+        assert_ne!(
+            ctx.map[import_byte as usize],
+            LuauOpcode::LoadK as u8,
+            "a byte whose constants are all imports is GETIMPORT, not LOADK"
+        );
+        assert!(!ctx.assigned[LuauOpcode::LoadK as usize]);
+    }
+
+    #[test]
+    fn detect_loadk_counts_out_of_window_occurrences_as_impurity() {
+        // Occurrences failing the `d >= 0 && a < max_stack` window are the very
+        // evidence that the byte is not LOADK, yet the original accumulator only
+        // incremented inside that window — so they could never show up as
+        // impurity. A byte that is in-window a third of the time must be vetoed.
+        let byte: u8 = 0x37;
+        let mut code = Vec::new();
+        for i in 0..4u8 {
+            code.push(insn_ad(byte, 1, (i % 2) as i16));
+        }
+        for _ in 0..8 {
+            code.push(insn_ad(byte, 200, 1)); // A beyond max_stack
+        }
+        let mut chunk = chunk_from_code(code, 4);
+        chunk.protos[0].constants = vec![Constant::Number(1.0), Constant::String("x".into())];
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_loadk(&chunk, &mut ctx);
+
+        assert_ne!(ctx.map[byte as usize], LuauOpcode::LoadK as u8);
+    }
+
+    #[test]
+    fn detect_forgloopinext_rejects_byte_far_too_frequent_for_its_pair_evidence() {
+        // One structurally valid ForGPrepINext -> ForGLoopINext pair, but the
+        // candidate loop byte occurs 40 times in the chunk. A real ForGLoopINext
+        // is emitted once per ipairs loop, always as the target of its own prep,
+        // so 1 match cannot account for 40 occurrences — the byte is something
+        // else (on real Roblox bytecode it was LOADK, appearing 934 times).
+        //
+        // This matters more than a normal mis-assignment: the lifter emits
+        // NOTHING for Deprecated61, so every stolen instruction disappears from
+        // the output silently.
+        let prep: u8 = 0x64;
+        let loop_b: u8 = 0x35;
+        let mut code = vec![
+            insn_ad(prep, 0, 2),        // 0: prep, jumps to 3
+            insn_abc(0xAA, 1, 0, 0),    // 1
+            insn_abc(0xBB, 1, 1, 0),    // 2
+            insn_ad(loop_b, 0, 30),     // 3: the one genuine-looking target
+        ];
+        // Bulk out the chunk with unrelated uses of the same byte.
+        for _ in 0..39 {
+            code.push(insn_ad(loop_b, 1, 5));
+        }
+        code.push(insn_abc(0xCC, 0, 0, 0));
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        ctx.try_assign_force(prep, LuauOpcode::ForGPrepINext as u8);
+
+        detect_forgloopinext(&chunk, &mut ctx);
+
+        assert_ne!(
+            ctx.map[loop_b as usize],
+            LuauOpcode::Deprecated61 as u8,
+            "a byte occurring 40 times with a single pair match must not be claimed \
+             as ForGLoopINext"
+        );
+        assert!(!ctx.assigned[LuauOpcode::Deprecated61 as usize]);
+    }
+
+    #[test]
+    fn loop_byte_frequency_gate_admits_fully_explained_byte() {
+        // The converse: when the pair evidence accounts for the byte's
+        // occurrences, the gate must not interfere. Animate.lua's ~69 ipairs
+        // loops produce ~69 pairs for ~69 occurrences.
+        let mut ctx = DetectCtx::new();
+        ctx.freq[0x35] = 69;
+        assert!(loop_byte_frequency_is_plausible(&ctx, 0x35, 69));
+        assert!(loop_byte_frequency_is_plausible(&ctx, 0x35, 7));
+        assert!(!loop_byte_frequency_is_plausible(&ctx, 0x35, 6));
+        // A byte that never occurs cannot contradict the evidence.
+        assert!(loop_byte_frequency_is_plausible(&ctx, 0x99, 1));
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Coverage / confidence accounting
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Build an OpcodeMap directly from a final map plus the map that existed
+    /// before speculative completion. Mirrors the shape lib.rs assembles.
+    fn opmap_from(final_map: [u8; 256], pre: [u8; 256]) -> OpcodeMap {
+        OpcodeMap {
+            shuffled_to_standard: final_map,
+            mapped_count: final_map.iter().filter(|&&v| v != 255).count(),
+            heuristic_map: pre,
+            heuristic_count: pre.iter().filter(|&&v| v != 255).count(),
+            heuristic_evidence: [0u16; 256],
+            pre_completion_map: pre,
+        }
+    }
+
+    #[test]
+    fn coverage_counts_instruction_positions_not_aux_words() {
+        // GETIMPORT carries an AUX word. Choose an AUX payload whose low byte
+        // collides with a real opcode byte: a naive frequency count would see
+        // two occurrences of 0x11, the instruction walk must see one.
+        let import_byte: u8 = 0x10;
+        let other_byte: u8 = 0x11;
+        let aux_colliding_with_other: u32 = 0x0000_0011;
+        let chunk = chunk_from_code(
+            vec![
+                insn_abc(import_byte, 0, 0, 0),
+                aux_colliding_with_other,
+                insn_abc(other_byte, 1, 0, 0),
+            ],
+            4,
+        );
+
+        let mut map = [255u8; 256];
+        map[import_byte as usize] = LuauOpcode::GetImport as u8;
+        map[other_byte as usize] = LuauOpcode::Move as u8;
+
+        let cov = opmap_from(map, map).coverage(&chunk);
+
+        assert_eq!(cov.insn_words, 2, "AUX word must not count as an instruction");
+        assert_eq!(cov.present_bytes, 2);
+        assert_eq!(cov.present_confident, 2);
+        assert_eq!(cov.confidence_pct(), 100);
+    }
+
+    #[test]
+    fn coverage_separates_invented_from_unmapped_and_unused() {
+        // Three bytes at instruction positions: one evidence-backed, one filled
+        // in only by completion, one left unmapped entirely. Plus one mapping
+        // for a byte the chunk never uses.
+        let backed: u8 = 0x20;
+        let invented: u8 = 0x21;
+        let unmapped: u8 = 0x22;
+        let unused: u8 = 0x23;
+        let chunk = chunk_from_code(
+            vec![
+                insn_abc(backed, 0, 0, 0),
+                insn_abc(backed, 1, 0, 0),
+                insn_abc(invented, 2, 0, 0),
+                insn_abc(unmapped, 3, 0, 0),
+            ],
+            4,
+        );
+
+        let mut pre = [255u8; 256];
+        pre[backed as usize] = LuauOpcode::Move as u8;
+        let mut final_map = pre;
+        final_map[invented as usize] = LuauOpcode::LoadNil as u8;
+        final_map[unused as usize] = LuauOpcode::Break as u8;
+
+        let cov = opmap_from(final_map, pre).coverage(&chunk);
+
+        assert_eq!(cov.present_bytes, 3);
+        assert_eq!(cov.present_confident, 1);
+        assert_eq!(cov.present_invented, 1, "completion-filled byte is not evidence");
+        assert_eq!(cov.present_unmapped, 1, "unmapped byte is honest doubt, not invention");
+        assert_eq!(cov.ghost_mappings, 1, "mapping for an absent byte is pure filler");
+        assert_eq!(cov.insn_words, 4);
+        assert_eq!(cov.insn_words_confident, 2);
+        assert_eq!(cov.insn_words_invented, 1);
+        assert_eq!(cov.confidence_pct(), 50);
+    }
+
+    #[test]
+    fn canonical_map_is_fully_confident() {
+        // A canonical translation is exact by construction. Nothing in it may
+        // ever be reported as a guess, whatever confidence floors are added to
+        // the shuffled path.
+        let chunk = chunk_from_code(
+            vec![
+                insn_abc(LuauOpcode::Move as u8, 0, 1, 0),
+                insn_abc(LuauOpcode::Return as u8, 0, 1, 0),
+            ],
+            4,
+        );
+        let cov = OpcodeMap::canonical_luau().coverage(&chunk);
+        assert_eq!(cov.present_invented, 0);
+        assert_eq!(cov.present_unmapped, 0);
+        assert_eq!(cov.confidence_pct(), 100);
     }
 }

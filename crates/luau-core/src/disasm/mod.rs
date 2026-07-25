@@ -282,7 +282,13 @@ fn format_instruction(
         LuauOpcode::DupTable => format!("R{} K{}", a, d),
         LuauOpcode::SetList => {
             let offset = aux.unwrap_or(0);
-            format!("R{} R{}..R{} offset={}", a, b, b as u16 + c as u16 - 1, offset)
+            // C==0 is the legitimate "up to top of stack" encoding; the closed
+            // form b+c-1 underflows for it.
+            if c == 0 {
+                format!("R{} R{}..top offset={}", a, b, offset)
+            } else {
+                format!("R{} R{}..R{} offset={}", a, b, b as u16 + c as u16 - 1, offset)
+            }
         }
 
         LuauOpcode::ForNPrep => format!("R{} -> +{}", a, d),
