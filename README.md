@@ -10,7 +10,7 @@ Feed it compiled Luau bytecode and get readable Luau source back. Everything run
 
 ## Features
 
-- **Decompiler** — lifts Luau bytecode back into readable Luau source, handling the **full Luau opcode set** (every standard opcode *and* Roblox's bytecode extensions), register-based VM state, control-flow reconstruction (if/while/repeat/for), and constant/upvalue recovery.
+- **Decompiler** — lifts Luau bytecode back into readable Luau source: register-based VM state, control-flow reconstruction (if/while/repeat/for), tables, upvalues and constant recovery. Every opcode in the instruction set has a handler, including Roblox's bytecode extensions.
 - **Bytecode versions 3–8** supported.
 - **Disassembler** — human-readable opcode listing, with optional debug info (line numbers, local names) and an opmap-remap diagnostic view.
 - **Info** — dump bytecode metadata (protos, strings, params, stack sizes) as text or JSON.
@@ -97,6 +97,30 @@ cargo run --release -p luau-compiler -- crates/luau-compiler/tests/fixtures/hell
 ```
 
 It prints `luau-protect: wrote <N> bytes to hello.protected.lua`, and the result is valid Luau that runs anywhere the original did. Add `--max` to enable every protection phase.
+
+## Correctness
+
+Decompilation is lossy by nature: variable names, comments and some structure are discarded
+at compile time, so no decompiler can reproduce the original source exactly. "Looks
+plausible" is therefore a weak standard, and it is the one most decompilers are measured by.
+
+This project uses a stricter one: **semantic round-trip testing**. For each program in the
+test corpus the suite
+
+1. runs the original with the Luau interpreter and records its output,
+2. compiles it to bytecode,
+3. decompiles that bytecode back to source,
+4. **runs the recovered source**, and
+5. requires its output to match the original exactly.
+
+Anything less than an exact match is a failure, including output that merely looks right.
+This catches whole classes of bug that a visual inspection sails past: dropped loop
+increments, upvalues that silently stop being captured, off-by-one table construction,
+branches that collapse into the wrong arm.
+
+The corpus covers arithmetic and operators, strings, tables, control flow, and closures /
+varargs / metatables / OOP patterns. It is deliberately adversarial rather than a happy path,
+and the pass rate is treated as the project's real quality metric.
 
 ## Project layout
 
