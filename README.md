@@ -1,6 +1,6 @@
 # luau-decompiler
 
-[![CI](https://github.com/pumbadev/luau-decompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/pumbadev/luau-decompiler/actions/workflows/ci.yml)
+[![CI](https://github.com/PumbaaDev/luau-decompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/PumbaaDev/luau-decompiler/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 
@@ -23,7 +23,7 @@ Feed it compiled Luau bytecode and get readable Luau source back. Everything run
 Build from source (requires a [Rust toolchain](https://rustup.rs)):
 
 ```sh
-git clone https://github.com/pumbadev/luau-decompiler
+git clone https://github.com/PumbaaDev/luau-decompiler
 cd luau-decompiler
 cargo build --release
 ```
