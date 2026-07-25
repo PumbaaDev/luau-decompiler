@@ -183,6 +183,24 @@ pub struct DecompileContext<'a> {
     /// where `#t` must lift to a real `UnOp::Length`. DEFAULTS TO FALSE, so any
     /// caller that does not explicitly opt in keeps the Roblox behaviour.
     pub is_canonical_luau: bool,
+    /// Temps holding the result of a CALL whose C operand pinned it to exactly
+    /// one result (`local x = (f())` in source terms).
+    ///
+    /// `Expr::Call` carries no result arity, so inlining such a temp into a
+    /// tail-expanding slot — the last argument of a call, the last return
+    /// value, the last array field of a table — would silently re-expand the
+    /// call to all its results. Keeping the temp visible preserves the
+    /// truncation without needing a parenthesis node in the AST.
+    pub arity_pinned_temps: std::collections::HashSet<String>,
+    /// First PC *after* the innermost enclosing loop, when known.
+    ///
+    /// The lifter classifies jumps against the current instruction RANGE, which
+    /// shrinks with every nested if-body, so "left this range" and "left this
+    /// loop" became the same test and any forward jump that merely skipped to
+    /// the loop's own condition block was emitted as `break`. A `continue` in
+    /// `repeat ... until c` targets the until-test — still inside the loop —
+    /// so a target below this bound is an intra-iteration jump, not an exit.
+    pub current_loop_end: Option<usize>,
 }
 
 impl<'a> DecompileContext<'a> {
@@ -197,6 +215,8 @@ impl<'a> DecompileContext<'a> {
             current_proto_index: None,
             upval_parent_links: std::collections::HashMap::new(),
             is_canonical_luau: false,
+            arity_pinned_temps: std::collections::HashSet::new(),
+            current_loop_end: None,
         }
     }
 
@@ -861,6 +881,23 @@ pub fn is_valid_luau_identifier(s: &str) -> bool {
         | "continue" | "type" | "export")
 }
 
+/// Like [`is_valid_luau_identifier`], but for GETIMPORT path segments.
+///
+/// `type`, `export` and `continue` are CONTEXTUAL keywords in Luau, not
+/// reserved words, so they are legal global/field names — and `type` is a
+/// stdlib global. Rejecting them here made `GETIMPORT type` fall through to
+/// the constant path and emit the string literal `("type")`, which is not
+/// callable. The stricter predicate above is kept for local-name hygiene.
+pub fn is_import_path_identifier(s: &str) -> bool {
+    if s.is_empty() { return false; }
+    let first = s.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' { return false; }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    !matches!(s, "and" | "break" | "do" | "else" | "elseif" | "end" | "false"
+        | "for" | "function" | "if" | "in" | "local" | "nil" | "not" | "or"
+        | "repeat" | "return" | "then" | "true" | "until" | "while")
+}
+
 /// Pre-pass: analyze a proto's bytecode to classify register usage.
 /// Returns hints keyed by register number. Each hint is tagged with the PC at
 /// which it was observed so that `synthesize_name` can pick the most recent
@@ -923,13 +960,16 @@ pub fn analyze_register_usage(
                                 if d_unsigned < all_protos.len() { Some(d_unsigned) } else { None }
                             })
                     } else {
+                        // Constant::Closure holds a GLOBAL proto index; try it first
+                        // (mirrors the DupClosure resolution in opcode_handlers.rs).
                         let from_const = match proto.constants.get(d_unsigned) {
                             Some(Constant::Closure(child_idx)) => {
-                                proto.child_protos.get(*child_idx as usize).map(|&i| i as usize)
-                                    .or_else(|| {
-                                        let g = *child_idx as usize;
-                                        if g < all_protos.len() { Some(g) } else { None }
-                                    })
+                                let g = *child_idx as usize;
+                                if g < all_protos.len() {
+                                    Some(g)
+                                } else {
+                                    proto.child_protos.get(g).map(|&i| i as usize)
+                                }
                             }
                             _ => None,
                         };
@@ -1782,7 +1822,7 @@ pub fn constant_to_expr(k: &Constant, strings: &[String], proto_constants: &[Con
             // Guard: all resolved parts must be valid identifiers, otherwise
             // the import IDs pointed at data strings (not global/field names).
             let all_valid = !parts.is_empty()
-                && parts.iter().all(|p| is_valid_luau_identifier(p));
+                && parts.iter().all(|p| is_import_path_identifier(p));
             if all_valid && parts.len() == 1 {
                 Expr::Name(parts[0].clone())
             } else if all_valid && parts.len() >= 2 {

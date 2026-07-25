@@ -16,6 +16,7 @@
 //! `pub(super)` visibility from `naming.rs`; we pull them in via
 //! `super::{RegVal, LocalTracker, WriteKind}`.
 
+use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain};
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
 use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext};
 use crate::parser::opcodes::{builtin_name, LuauOpcode};
@@ -49,6 +50,7 @@ use super::{
     mk_unop,
     reg_expr,
     sanitize_leaked_global_string,
+    simplify_expr,
     store_complex,
     table_expr,
     // Recursive closure lifting — called on every `NewClosure` opcode.
@@ -140,6 +142,92 @@ fn detect_else_skip(
     } else {
         (target, None)
     }
+}
+
+/// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
+fn is_control_flow_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Jump
+            | LuauOpcode::JumpBack
+            | LuauOpcode::JumpX
+            | LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+            | LuauOpcode::ForNPrep
+            | LuauOpcode::ForNLoop
+            | LuauOpcode::ForGPrep
+            | LuauOpcode::ForGPrepINext
+            | LuauOpcode::ForGPrepNext
+            | LuauOpcode::ForGLoop
+            | LuauOpcode::Return
+    )
+}
+
+/// How far ahead `table_needs_binding` will look for a cross-branch use.
+/// Bounded so a proto with many table constructors stays linear-ish; protos
+/// longer than this keep the historical park-the-literal behaviour.
+const TABLE_USE_SCAN_LIMIT: usize = 1024;
+
+/// Should the table created at `pc` in register `a` be materialised as a real
+/// `local NAME = {}` binding instead of being parked as a pending literal?
+///
+/// A parked table is handed out as a fresh CLONE at every read (`reg_expr`),
+/// which is correct only while the whole constructor is one straight-line run.
+/// The moment the table is filled or read on the far side of a branch — the
+/// `local t = {} ; for i = 1, n do t[i] = ... end ; print(#t)` shape — cloning
+/// silently forks it: the loop body mutates a throwaway copy and the read after
+/// the loop sees an undeclared name. Binding it first keeps one identity.
+///
+/// Returns false for straight-line constructors, so short `{a = 1, b = 2}`
+/// literals still inline exactly as before.
+fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
+    if pc >= code.len() {
+        return false;
+    }
+    let start_op = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if start_op.has_aux() { 2 } else { 1 };
+    let scan_end = code.len().min(pc + TABLE_USE_SCAN_LIMIT);
+    let mut crossed_branch = false;
+    while i < scan_end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if is_control_flow_op(op) {
+            crossed_branch = true;
+        } else if crossed_branch {
+            let ia = insn_a(insn) as usize;
+            let ib = insn_b(insn) as usize;
+            let touches = match op {
+                // R(A) is the table being filled.
+                LuauOpcode::SetList => ia == a,
+                // R(B) is the table being indexed, read or copied out.
+                LuauOpcode::SetTable
+                | LuauOpcode::SetTableKS
+                | LuauOpcode::SetTableN
+                | LuauOpcode::GetTable
+                | LuauOpcode::GetTableKS
+                | LuauOpcode::GetTableN
+                | LuauOpcode::NameCall
+                | LuauOpcode::Length
+                | LuauOpcode::Move => ib == a,
+                _ => false,
+            };
+            if touches {
+                return true;
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Recover SETLIST values when the destination register no longer holds a
@@ -286,6 +374,11 @@ pub(super) fn lift_instruction_range(
     // call to a RETURN across a branch or label — a silent semantic
     // corruption that would be very hard to spot.
     let mut pending_multret: Option<(usize, usize)> = None;
+    // Registers this range explicitly wrote with LOADNIL. `RegVal::Expr(Expr::Nil)`
+    // alone cannot distinguish a real `f(x, nil)` argument from a stale nil left
+    // over in an adjacent register, so the trailing-nil leak guard below used to
+    // discard genuine nil arguments (`tostring(nil)` became `tostring()`).
+    let mut explicit_nil_regs: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // Phase C1: per-instruction budget accounting. Records how many Stats
     // this dispatch loop appended since the previous tick, and stops early
     // once the proto-wide cap has been hit.
@@ -330,6 +423,7 @@ pub(super) fn lift_instruction_range(
                 // Downstream code that uses this register will inline the nil.
                 // This matches LOADK's store_complex behavior (nil is "simple").
                 regs[a] = RegVal::Expr(Expr::Nil);
+                explicit_nil_regs.insert(a);
             }
             LuauOpcode::LoadB => {
                 if c != 0 {
@@ -478,7 +572,16 @@ pub(super) fn lift_instruction_range(
                 // name. If the upval was genuinely needed, the downstream
                 // misalignment will surface as a separate test failure to fix.
                 if !locals.declared.contains(&a) {
-                    regs[a] = RegVal::Expr(Expr::Name(name));
+                    regs[a] = RegVal::Expr(Expr::Name(name.clone()));
+                    // The register is now an ALIAS of an existing binding (the
+                    // upvalue), not a fresh slot. Without recording that, the
+                    // read-modify-write `GETUPVAL / ADDK / SETUPVAL` lowered its
+                    // middle step through `needs_local` and emitted
+                    // `local hits = hits + 1` — a shadow that made the following
+                    // `hits = hits` a self-assign, which dead-store elimination
+                    // deleted, silently dropping the upvalue write entirely.
+                    locals.pre_declare(a);
+                    locals.record_name(a, &name);
                 }
             }
             LuauOpcode::SetUpval => {
@@ -679,7 +782,7 @@ pub(super) fn lift_instruction_range(
                 // import resolution produced data strings, not global/field names.
                 // Fall through to get_const_expr which emits Expr::String (quoted).
                 let all_valid_ids = !parts.is_empty()
-                    && parts.iter().all(|p| is_valid_luau_identifier(p));
+                    && parts.iter().all(|p| crate::decompiler::is_import_path_identifier(p));
 
                 let expr = if all_valid_ids && parts.len() == 1 {
                     Expr::Name(parts[0].clone())
@@ -1153,7 +1256,12 @@ pub(super) fn lift_instruction_range(
                 // For non-proto-start NEWTABLE (locally scoped tables, loop
                 // bodies, expression positions), keep the pending-table
                 // behavior so that short `{a=1, b=2}` literals can inline.
-                let is_proto_start = pc <= 1;
+                // Also materialise when the table is filled or read on the far
+                // side of a branch: a parked literal is cloned at every read, so
+                // `local t = {} ; for i = 1, n do t[i] = x end` would mutate a
+                // throwaway copy and leave the later `#t` reading an undeclared
+                // name. See `table_needs_binding`.
+                let is_proto_start = pc <= 1 || table_needs_binding(code, pc, a);
                 if is_proto_start {
                     // Phase B0.49: classify_write for shadow-on-rename.
                     let new_name = ctx.reg_name(proto, a as u8, pc);
@@ -1217,14 +1325,49 @@ pub(super) fn lift_instruction_range(
                     // a variable number of results starting at register B.
                     // Scan forward from B collecting known values until we hit Unknown.
                     let mut values = Vec::new();
+                    let mut last_reg: Option<usize> = None;
                     let limit = proto.max_stack_size as usize;
                     for i in b..limit.min(regs.len()).min(b + 256) {
                         match regs.get(i) {
                             Some(RegVal::Expr(e)) if !matches!(e, Expr::Nil) => {
                                 values.push(e.clone());
+                                last_reg = Some(i);
                             }
                             Some(RegVal::Unknown) => break,
                             _ => break,
+                        }
+                    }
+                    // A multret CALL immediately before a multret SETLIST was
+                    // materialized as `local t = f()` and collected above as the
+                    // plain name `t` — that truncates the call to ONE result.
+                    // Restore the call expression as the final field so its
+                    // results expand into the table tail, exactly as the RETURN
+                    // B=0 arm does. Gated identically: the temp must be the last
+                    // statement, hold a single name/value, and be unreferenced.
+                    if let (Some((m, idx)), false) = (multret_from_prev, values.is_empty()) {
+                        if last_reg == Some(m) && idx + 1 == stmts.len() {
+                            let folded = match &stmts[idx] {
+                                Stat::Local { names, values: lv }
+                                    if names.len() == 1 && lv.len() == 1 =>
+                                {
+                                    let name = names[0].clone();
+                                    let matches_tail =
+                                        matches!(values.last(), Some(Expr::Name(n)) if *n == name);
+                                    if !matches_tail
+                                        || stmts[..idx].iter().any(|s| stmt_reads_name(s, &name))
+                                    {
+                                        None
+                                    } else {
+                                        Some(lv[0].clone())
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(call_expr) = folded {
+                                stmts.remove(idx);
+                                let last = values.len() - 1;
+                                values[last] = call_expr;
+                            }
                         }
                     }
                     if let RegVal::Expr(Expr::Table { fields }) = &regs[a] {
@@ -1316,20 +1459,23 @@ pub(super) fn lift_instruction_range(
                         })
                 } else {
                     // DupClosure: D indexes the constants table to a Constant::Closure.
-                    // Standard Luau: Closure(child_idx) → child_protos[child_idx] → global proto index.
-                    // Roblox: child_protos is always empty.  Constant::Closure(child_idx) stores
-                    // the GLOBAL chunk proto index directly (same as LBC_CONSTANT_CLOSURE in LOADKX).
+                    // Per Luau's loader, LBC_CONSTANT_CLOSURE holds a GLOBAL chunk
+                    // proto index (`protos[fid]`), NOT a child-list position — so the
+                    // global lookup must be tried FIRST.  Resolving through
+                    // `child_protos` first silently binds the wrong proto whenever the
+                    // parent's child list is not the identity map, which happens as
+                    // soon as an earlier sibling function itself contains a nested
+                    // function.  Roblox protos have an empty child_protos, so they were
+                    // already taking the global path; this only changes the populated,
+                    // non-identity case.
                     let from_const = match proto.constants.get(d_unsigned) {
                         Some(Constant::Closure(child_idx)) => {
-                            proto.child_protos.get(*child_idx as usize).copied()
-                                .or_else(|| {
-                                    let global_idx = *child_idx as usize;
-                                    if global_idx < ctx.chunk.protos.len() {
-                                        Some(*child_idx)
-                                    } else {
-                                        None
-                                    }
-                                })
+                            let global_idx = *child_idx as usize;
+                            if global_idx < ctx.chunk.protos.len() {
+                                Some(*child_idx)
+                            } else {
+                                proto.child_protos.get(global_idx).copied()
+                            }
                         }
                         _ => None,
                     };
@@ -1466,6 +1612,13 @@ pub(super) fn lift_instruction_range(
                                     // Priority: Name > extract from complex expr > debug info > v{N}
                                     match regs.get(cap_idx as usize) {
                                         Some(RegVal::Expr(Expr::Name(n))) => n.clone(),
+                                        // A loop variable is by construction a real,
+                                        // correctly-named binding. Without this arm it
+                                        // fell through to the raw-bytecode backscan,
+                                        // which walks backwards past the loop header and
+                                        // returns whatever LOADK last wrote that register
+                                        // (e.g. the strings staged for the iterated table).
+                                        Some(RegVal::LoopVar(n)) => n.clone(),
                                         Some(RegVal::Expr(expr)) => {
                                             // Extract a name from complex expressions:
                                             // Field access (e.g., game.Foo) -> use the field name
@@ -1897,8 +2050,14 @@ pub(super) fn lift_instruction_range(
                             Some(RegVal::Expr(e)) if !matches!(e, Expr::Nil) => {
                                 args.push(e.clone());
                             }
-                            // Unknown or Nil marks the boundary of intentionally-set args.
-                            // Stop here to prevent stale register values from leaking in.
+                            // An explicitly LOADNIL'd register is a real argument
+                            // (`f(nil, x)`), not a leak — keep collecting.
+                            Some(RegVal::Expr(Expr::Nil)) if explicit_nil_regs.contains(&r) => {
+                                args.push(Expr::Nil);
+                            }
+                            // Unknown or a stale Nil marks the boundary of
+                            // intentionally-set args. Stop here to prevent stale
+                            // register values from leaking in.
                             _ => break,
                         }
                     }
@@ -1917,7 +2076,14 @@ pub(super) fn lift_instruction_range(
                         let is_generic = matches!(&arg_expr, Expr::Name(n)
                             if n.starts_with('v') && n.len() >= 2
                                 && n[1..].chars().all(|c| c.is_ascii_digit()));
-                        let arg_expr = if is_generic && reg <= u8::MAX as usize {
+                        // Never rename a register that is already BOUND to a
+                        // local: `reg_name` returns the most recent hint for the
+                        // register across the whole proto, so a hint installed by
+                        // a LATER instruction would win and `print(count)` became
+                        // `print(w)` — a read of an undeclared global.
+                        let is_bound_local = locals.declared.contains(&reg)
+                            || matches!(&arg_expr, Expr::Name(n) if locals.is_bound_name(n));
+                        let arg_expr = if is_generic && !is_bound_local && reg <= u8::MAX as usize {
                             let hinted = ctx.reg_name(proto, reg as u8, pc);
                             // Only promote when the synthesized name is TRULY
                             // semantic. Rejecting other generic families (fn\d+,
@@ -1938,7 +2104,11 @@ pub(super) fn lift_instruction_range(
                     // Trim trailing nil args from non-vararg calls too —
                     // these are typically LOADNIL initialization artifacts
                     // from cross-region register state leaking.
-                    while args.last().map_or(false, |a| matches!(a, Expr::Nil)) {
+                    // Only trim nils that this range did NOT explicitly LOADNIL —
+                    // an explicit nil is a real argument the caller wrote.
+                    while args.last().map_or(false, |v| matches!(v, Expr::Nil))
+                        && !explicit_nil_regs.contains(&(a + arg_start + args.len() - 1))
+                    {
                         args.pop();
                     }
                 }
@@ -2213,6 +2383,13 @@ pub(super) fn lift_instruction_range(
                                     });
                                 }
                             }
+                            // Raw C == 2 means the VM keeps exactly ONE result,
+                            // i.e. the source wrote `(f())`. Record the temp so
+                            // the inliner will not splice it into a slot where
+                            // the call would re-expand to all its results.
+                            if raw_nresults == 2 {
+                                ctx.arity_pinned_temps.insert(name.clone());
+                            }
                             regs[a] = RegVal::Expr(Expr::Name(name));
                         }
                     } else {
@@ -2315,6 +2492,7 @@ pub(super) fn lift_instruction_range(
                 let clear_start = if nresults == 1 { a } else { result_end };
                 for r in clear_start..regs.len() {
                     regs[r] = RegVal::Unknown;
+                    explicit_nil_regs.remove(&r);
                 }
             }
 
@@ -2371,6 +2549,25 @@ pub(super) fn lift_instruction_range(
                         if !matches!(&expr, Expr::Nil) {
                             values.push(expr);
                         }
+                        // `return a, ...` puts the fixed values at R(A).. and the
+                        // varargs on top; reading only R(A) silently truncated the
+                        // tail. Extend only when the contiguous run above R(A) ends
+                        // in `Expr::Varargs` — stale registers above the return base
+                        // are common, so a general widening would inject garbage.
+                        if !values.is_empty() {
+                            let mut tail = Vec::new();
+                            for r in (a + 1)..regs.len() {
+                                match regs.get(r) {
+                                    Some(RegVal::Expr(e)) => tail.push(e.clone()),
+                                    _ => break,
+                                }
+                            }
+                            if matches!(tail.last(), Some(Expr::Varargs)) {
+                                for e in tail {
+                                    values.push(sanitize_leaked_global_string(e));
+                                }
+                            }
+                        }
                     }
                 } else {
                     let raw_count = b - 1; // B=1 means 0 values, B=2 means 1
@@ -2405,7 +2602,13 @@ pub(super) fn lift_instruction_range(
                 } else if target > pc {
                     // Forward jump out of range
                     if in_loop {
-                        stmts.push(Stat::Break);
+                        // A forward jump that stays INSIDE the loop skips the
+                        // rest of the iteration; it is `continue`, not `break`.
+                        if ctx.current_loop_end.map_or(false, |le| target < le) {
+                            stmts.push(Stat::Continue);
+                        } else {
+                            stmts.push(Stat::Break);
+                        }
                     }
                     // Unconditional jump — remaining instructions are dead code
                     break;
@@ -2423,7 +2626,77 @@ pub(super) fn lift_instruction_range(
                 let cond = reg_expr(regs, a);
                 let target = (pc as i32 + d as i32 + 1) as usize;
 
-                if target > pc && target <= end {
+                // `local x = <cond>` compiles to a branch over a LOADB pair.
+                // Store the predicate as a value instead of lowering it to
+                // control flow (which loses one half of the pair).
+                if let Some(idiom) = recognize_bool_idiom(code, pc) {
+                    let taken = if op == LuauOpcode::JumpIf {
+                        cond
+                    } else {
+                        Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) }
+                    };
+                    let value = if idiom.taken_value {
+                        taken
+                    } else {
+                        Expr::UnOp { op: UnOp::Not, operand: Box::new(taken) }
+                    };
+                    let value = simplify_expr(&value);
+                    store_complex(ctx, proto, regs, locals, stmts, idiom.dest, pc, value);
+                    pc = idiom.end_pc;
+                    continue;
+                }
+
+                // `a or b or c` / `a and b and c` merge their operands in one
+                // register. Rebuild the expression rather than lowering it to
+                // control flow, which loses every operand but the first.
+                if let Some(chain) = recognize_or_and_chain(code, pc) {
+                    let mut acc = reg_expr(regs, chain.dest);
+                    let mut ok = true;
+                    for &(seg_start, seg_end) in &chain.segments {
+                        let mut seg_stmts = Vec::new();
+                        lift_instruction_range(
+                            ctx, proto, proto_index, depth + 1,
+                            seg_start, seg_end,
+                            regs, locals, &mut seg_stmts, in_loop,
+                        );
+                        let operand = match seg_stmts.len() {
+                            // Pure value computation — read it straight back.
+                            0 => reg_expr(regs, chain.dest),
+                            // The operand was materialized as a temp; fold the
+                            // temp away so the short-circuit stays an expression.
+                            1 => match &seg_stmts[0] {
+                                Stat::Local { names, values }
+                                    if names.len() == 1 && values.len() == 1
+                                        && matches!(regs.get(chain.dest),
+                                            Some(RegVal::Expr(Expr::Name(n))) if *n == names[0]) =>
+                                {
+                                    values[0].clone()
+                                }
+                                _ => { ok = false; break; }
+                            },
+                            // Anything else has side effects we cannot inline.
+                            _ => { ok = false; break; }
+                        };
+                        acc = Expr::BinOp {
+                            left: Box::new(acc),
+                            op: if chain.is_or { BinOp::Or } else { BinOp::And },
+                            right: Box::new(operand),
+                        };
+                    }
+                    if ok {
+                        let acc = simplify_expr(&acc);
+                        store_complex(ctx, proto, regs, locals, stmts, chain.dest, pc, acc);
+                        pc = chain.end_pc;
+                        continue;
+                    }
+                }
+
+                // A jump that reaches the END of the enclosing loop leaves it,
+                // even when it is still inside the current lift range. Treating
+                // it as an inline if produced a guard with no else, so a failing
+                // guard just fell through and the loop never terminated.
+                let exits_loop = ctx.current_loop_end.map_or(false, |le| target >= le);
+                if target > pc && target <= end && !exits_loop {
                     // Forward jump within our range → inline if-then block
                     // The condition SKIPS to target, so the "then" body is the code between
                     // JumpIfNot condition means: if NOT cond, skip to target
@@ -2437,21 +2710,36 @@ pub(super) fn lift_instruction_range(
                     // assignments inside the then-body don't corrupt the
                     // fall-through path's register view.
                     let regs_snapshot = regs.clone();
-                    let mut then_stmts = Vec::new();
                     let jump_next = pc + 1 + if op.has_aux() { 1 } else { 0 };
-                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, target, regs, locals, &mut then_stmts, in_loop);
+
+                    // If/else diamond: see the JumpXEqK* arm below.
+                    let (then_end, else_range) =
+                        detect_else_skip(code, jump_next, target, end);
+
+                    let mut then_stmts = Vec::new();
+                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+
+                    let else_body = if let Some((es, ee)) = else_range {
+                        *regs = regs_snapshot.clone();
+                        let mut else_stmts = Vec::new();
+                        lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        Some(else_stmts)
+                    } else {
+                        None
+                    };
+
                     *regs = regs_snapshot;
                     stmts.push(Stat::If {
                         condition,
                         then_body: then_stmts,
                         elseif_clauses: vec![],
-                        else_body: None,
+                        else_body,
                     });
                     // Skip past the instructions we just lifted
-                    pc = target;
+                    pc = else_range.map_or(target, |(_, ee)| ee);
                     continue;
                 } else if target > pc {
-                    // Forward jump beyond our range
+                    // Forward jump beyond our range (or out of the loop)
                     if in_loop {
                         let condition = if op == LuauOpcode::JumpIf {
                             cond
@@ -2460,7 +2748,11 @@ pub(super) fn lift_instruction_range(
                         };
                         stmts.push(Stat::If {
                             condition,
-                            then_body: vec![Stat::Break],
+                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
+                                Stat::Continue
+                            } else {
+                                Stat::Break
+                            }],
                             elseif_clauses: vec![],
                             else_body: None,
                         });
@@ -2512,22 +2804,55 @@ pub(super) fn lift_instruction_range(
                 let condition = Expr::BinOp { left: Box::new(left.clone()), op: cmp, right: Box::new(right.clone()) };
                 let target = (pc as i32 + d as i32 + 1) as usize;
 
-                if target > pc && target <= end {
+                // `local x = a < b` compiles to a branch over a LOADB pair —
+                // store the comparison as a value, not as control flow.
+                if let Some(idiom) = recognize_bool_idiom(code, pc) {
+                    let value = if idiom.taken_value {
+                        condition
+                    } else {
+                        Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) }
+                    };
+                    store_complex(ctx, proto, regs, locals, stmts, idiom.dest, pc, value);
+                    pc = idiom.end_pc;
+                    continue;
+                }
+
+                // See the JumpIf arm: a jump reaching the end of the enclosing
+                // loop exits it, even when still inside the current lift range.
+                let exits_loop = ctx.current_loop_end.map_or(false, |le| target >= le);
+                if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
                     // Isolate register state so then-body doesn't corrupt fall-through.
                     let regs_snapshot = regs.clone();
                     let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
-                    let mut then_stmts = Vec::new();
                     let jump_next = pc + 2; // comparison jumps have AUX word
-                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, target, regs, locals, &mut then_stmts, in_loop);
+
+                    // If/else diamond: see the JumpXEqK* arm below. Without this
+                    // the compiler's else-skip JUMP falls through to the
+                    // out-of-range handler and becomes a spurious `break`.
+                    let (then_end, else_range) =
+                        detect_else_skip(code, jump_next, target, end);
+
+                    let mut then_stmts = Vec::new();
+                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+
+                    let else_body = if let Some((es, ee)) = else_range {
+                        *regs = regs_snapshot.clone();
+                        let mut else_stmts = Vec::new();
+                        lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        Some(else_stmts)
+                    } else {
+                        None
+                    };
+
                     *regs = regs_snapshot;
                     stmts.push(Stat::If {
                         condition: guard_cond,
                         then_body: then_stmts,
                         elseif_clauses: vec![],
-                        else_body: None,
+                        else_body,
                     });
-                    pc = target;
+                    pc = else_range.map_or(target, |(_, ee)| ee);
                     continue;
                 } else if target <= pc {
                     if in_loop {
@@ -2542,7 +2867,11 @@ pub(super) fn lift_instruction_range(
                     if in_loop {
                         stmts.push(Stat::If {
                             condition,
-                            then_body: vec![Stat::Break],
+                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
+                                Stat::Continue
+                            } else {
+                                Stat::Break
+                            }],
                             elseif_clauses: vec![],
                             else_body: None,
                         });
@@ -2570,7 +2899,23 @@ pub(super) fn lift_instruction_range(
                 let condition = Expr::BinOp { left: Box::new(left.clone()), op: cmp, right: Box::new(right.clone()) };
                 let target = (pc as i32 + d as i32 + 1) as usize;
 
-                if target > pc && target <= end {
+                // `local x = a < b` compiles to a branch over a LOADB pair —
+                // store the comparison as a value, not as control flow.
+                if let Some(idiom) = recognize_bool_idiom(code, pc) {
+                    let value = if idiom.taken_value {
+                        condition
+                    } else {
+                        Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) }
+                    };
+                    store_complex(ctx, proto, regs, locals, stmts, idiom.dest, pc, value);
+                    pc = idiom.end_pc;
+                    continue;
+                }
+
+                // See the JumpIf arm: a jump reaching the end of the enclosing
+                // loop exits it, even when still inside the current lift range.
+                let exits_loop = ctx.current_loop_end.map_or(false, |le| target >= le);
+                if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
                     // Isolate register state so then-body doesn't corrupt fall-through.
                     let regs_snapshot = regs.clone();
@@ -2620,7 +2965,11 @@ pub(super) fn lift_instruction_range(
                     if in_loop {
                         stmts.push(Stat::If {
                             condition,
-                            then_body: vec![Stat::Break],
+                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
+                                Stat::Continue
+                            } else {
+                                Stat::Break
+                            }],
                             elseif_clauses: vec![],
                             else_body: None,
                         });

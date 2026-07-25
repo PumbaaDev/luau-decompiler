@@ -72,6 +72,18 @@ impl ControlFlowGraph {
                 | LuauOpcode::JumpXEqKN | LuauOpcode::JumpXEqKS
                 | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
                 | LuauOpcode::Deprecated61 => {
+                    // The compare-to-boolean idiom (`local x = a < b`) is a value
+                    // computation, not control flow. Splitting it into blocks
+                    // makes its two LOADB halves un-pairable downstream, so the
+                    // comparison degenerates into a constant. Keep it whole; the
+                    // lifter recognises the same exact shape and stores the
+                    // comparison straight into the destination register.
+                    if crate::analysis::bool_idiom::recognize_bool_idiom(code, pc).is_some()
+                        || crate::analysis::bool_idiom::recognize_or_and_chain(code, pc).is_some()
+                    {
+                        pc = next_pc;
+                        continue;
+                    }
                     let target = (pc as i32 + d as i32 + 1) as usize;
                     if target < code.len() {
                         leaders.insert(target);

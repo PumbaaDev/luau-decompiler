@@ -38,6 +38,8 @@ use super::{
     replace_name_in_stmt,
     stmt_has_observable_side_effect,
     stmt_reads_name,
+    stmt_reads_name_deep,
+    stmt_writes_name,
     stmts_reassign_name,
 };
 
@@ -614,22 +616,107 @@ fn target_has_name_root(expr: &Expr, name: &str) -> bool {
     }
 }
 
+/// Does `Name(name)` appear anywhere in `expr` in a slot that expands a
+/// multi-result call — the last argument of a call, or the last array element
+/// of a table constructor?
+fn expr_uses_name_in_tail_position(expr: &Expr, name: &str) -> bool {
+    let is_target = |e: &Expr| matches!(e, Expr::Name(n) if n == name);
+    match expr {
+        Expr::Call { func, args } => {
+            args.last().map_or(false, &is_target)
+                || expr_uses_name_in_tail_position(func, name)
+                || args.iter().any(|a| expr_uses_name_in_tail_position(a, name))
+        }
+        Expr::MethodCall { object, args, .. } => {
+            args.last().map_or(false, &is_target)
+                || expr_uses_name_in_tail_position(object, name)
+                || args.iter().any(|a| expr_uses_name_in_tail_position(a, name))
+        }
+        Expr::Table { fields } => {
+            let tail_is_target = matches!(
+                fields.last(),
+                Some(TableField::Sequential(e)) if is_target(e)
+            );
+            tail_is_target
+                || fields.iter().any(|f| match f {
+                    TableField::Sequential(e) => expr_uses_name_in_tail_position(e, name),
+                    TableField::Named(_, e) => expr_uses_name_in_tail_position(e, name),
+                    TableField::Indexed(k, v) => {
+                        expr_uses_name_in_tail_position(k, name)
+                            || expr_uses_name_in_tail_position(v, name)
+                    }
+                })
+        }
+        Expr::Field { object, .. } => expr_uses_name_in_tail_position(object, name),
+        Expr::Index { object, key } => {
+            expr_uses_name_in_tail_position(object, name)
+                || expr_uses_name_in_tail_position(key, name)
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_uses_name_in_tail_position(left, name)
+                || expr_uses_name_in_tail_position(right, name)
+        }
+        Expr::UnOp { operand, .. } => expr_uses_name_in_tail_position(operand, name),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_uses_name_in_tail_position(cond, name)
+                || expr_uses_name_in_tail_position(then_expr, name)
+                || expr_uses_name_in_tail_position(else_expr, name)
+        }
+        _ => false,
+    }
+}
+
+/// Statement-level wrapper for [`expr_uses_name_in_tail_position`]; also treats
+/// the final value of a `return` and the final value of a multi-value
+/// assignment as expanding slots.
+fn stmt_uses_name_in_tail_position(stmt: &Stat, name: &str) -> bool {
+    let is_target = |e: &Expr| matches!(e, Expr::Name(n) if n == name);
+    let tail_of = |vals: &Vec<Expr>| vals.last().map_or(false, &is_target);
+    match stmt {
+        Stat::Return { values } => {
+            tail_of(values) || values.iter().any(|v| expr_uses_name_in_tail_position(v, name))
+        }
+        Stat::Local { values, .. } => {
+            tail_of(values) || values.iter().any(|v| expr_uses_name_in_tail_position(v, name))
+        }
+        Stat::Assign { targets, values } => {
+            tail_of(values)
+                || values.iter().any(|v| expr_uses_name_in_tail_position(v, name))
+                || targets.iter().any(|t| expr_uses_name_in_tail_position(t, name))
+        }
+        Stat::ExprStat(e) => expr_uses_name_in_tail_position(e, name),
+        _ => false,
+    }
+}
+
+/// Convenience entry point with no arity-pinned temps. Used by the unit tests,
+/// which build ASTs directly and therefore have no bytecode-level arity info.
+#[cfg(test)]
 pub(super) fn inline_single_use_temps(stmts: &mut Vec<Stat>) {
+    inline_single_use_temps_pinned(stmts, &std::collections::HashSet::new());
+}
+
+/// As [`inline_single_use_temps`], but refuses to inline a temp listed in
+/// `arity_pinned` into a slot where a multi-result call would re-expand.
+pub(super) fn inline_single_use_temps_pinned(
+    stmts: &mut Vec<Stat>,
+    arity_pinned: &std::collections::HashSet<String>,
+) {
     // Recurse into nested blocks first
     for stmt in stmts.iter_mut() {
         match stmt {
             Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                inline_single_use_temps(then_body);
+                inline_single_use_temps_pinned(then_body, arity_pinned);
                 for (_, body) in elseif_clauses {
-                    inline_single_use_temps(body);
+                    inline_single_use_temps_pinned(body, arity_pinned);
                 }
-                if let Some(eb) = else_body { inline_single_use_temps(eb); }
+                if let Some(eb) = else_body { inline_single_use_temps_pinned(eb, arity_pinned); }
             }
-            Stat::While { body, .. } => inline_single_use_temps(body),
-            Stat::Repeat { body, .. } => inline_single_use_temps(body),
-            Stat::NumericFor { body, .. } => inline_single_use_temps(body),
-            Stat::GenericFor { body, .. } => inline_single_use_temps(body),
-            Stat::DoBlock { body } => inline_single_use_temps(body),
+            Stat::While { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
+            Stat::Repeat { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
+            Stat::NumericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
+            Stat::GenericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
+            Stat::DoBlock { body } => inline_single_use_temps_pinned(body, arity_pinned),
             _ => {}
         }
     }
@@ -801,6 +888,19 @@ pub(super) fn inline_single_use_temps(stmts: &mut Vec<Stat>) {
             // Produces garbled `({}).field`, `({}):Method()`, `({})("arg")` etc.
             // Keep the local declaration so the code remains readable.
             if matches!(&def_expr, Expr::Table { .. }) && stmt_uses_name_as_expr_base(&stmts[j], &def_name) {
+                i += 1;
+                continue;
+            }
+
+            // The temp holds a call the bytecode pinned to exactly one result
+            // (`local x = (f())`). Splicing it into a tail-expanding slot — the
+            // last argument of a call, the last return value, the last array
+            // field of a table — would re-expand the call to all its results,
+            // turning `print((s:gsub(a, b)))` back into `print(s:gsub(a, b))`.
+            // Keep the temp visible instead; it is semantically exact.
+            if arity_pinned.contains(&def_name)
+                && stmt_uses_name_in_tail_position(&stmts[j], &def_name)
+            {
                 i += 1;
                 continue;
             }
@@ -1046,6 +1146,23 @@ pub(super) fn inline_pure_literals(stmts: &mut Vec<Stat>) {
         // Konstant-style: capitalized names are kept visible (matches the
         // existing `inline_single_use_temps` policy, see B0.45A).
         if def_name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+            i += 1;
+            continue;
+        }
+
+        // A local captured as an upvalue must not be inlined or removed.
+        // `stmt_reads_name` / `stmt_writes_name_recursive` below do not descend
+        // into `Expr::Function` bodies, so a captured local looked completely
+        // dead: its literal was constant-propagated into the one visible read
+        // site and the declaration was then deleted, silently turning the
+        // upvalue into an undeclared global. Detect references that exist ONLY
+        // inside a closure body and leave the binding alone.
+        let captured_by_closure = stmts[(i + 1)..].iter().any(|s| {
+            (stmt_reads_name_deep(s, &def_name) && !stmt_reads_name(s, &def_name))
+                || (stmt_writes_name(s, &def_name)
+                    && !stmt_writes_name_recursive(s, &def_name))
+        });
+        if captured_by_closure {
             i += 1;
             continue;
         }

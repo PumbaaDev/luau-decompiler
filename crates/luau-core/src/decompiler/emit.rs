@@ -921,7 +921,11 @@ fn is_valid_identifier(name: &str) -> bool {
         "and" | "break" | "continue" | "do" | "else" | "elseif" | "end"
             | "false" | "for" | "function" | "if" | "in" | "local" | "nil"
             | "not" | "or" | "repeat" | "return" | "then" | "true" | "until"
-            | "while" | "type" | "export"
+            | "while"
+        // NOTE: `type` and `export` are CONTEXTUAL keywords in Luau, not
+        // reserved words — `local type = 5` and `t.export` are both legal.
+        // Listing them here turned the stdlib global `type` into the string
+        // literal `("type")`, which is not callable.
     )
 }
 

@@ -26,7 +26,6 @@ use post_passes::{
     collapse_elseif_chains,
     collapse_nil_init_conditional,
     collapse_short_circuit_assignments,
-    inline_single_use_temps,
     inline_pure_literals,
 };
 
@@ -37,6 +36,8 @@ use opcode_handlers::lift_instruction_range;
 // which reach these helpers via `super::super::<name>`. They are not referenced
 // by non-test lifter code, so the re-import is test-gated to keep the regular
 // build warning-free.
+#[cfg(test)]
+use post_passes::inline_single_use_temps;
 #[cfg(test)]
 use table_reconstruction::{is_pure_two_step_value, two_step_field_absorb};
 #[cfg(test)]
@@ -1041,7 +1042,8 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
 
     // Inline single-use call/method temps into their use sites:
     // `call7 = chain:Build()` + `call8 = Y:Add(call7)` → `call8 = Y:Add(chain:Build())`
-    inline_single_use_temps(&mut stmts);
+    let arity_pinned = ctx.arity_pinned_temps.clone();
+    post_passes::inline_single_use_temps_pinned(&mut stmts, &arity_pinned);
 
     // Phase B0.51B: inline pure literal locals at ALL read sites
     // (regardless of read count) up to the next reassignment.  Targets
@@ -1371,9 +1373,15 @@ fn lift_region(
             let body_only: Vec<usize> = sorted_body.iter().copied()
                 .filter(|id| id != header)
                 .collect();
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = body_blocks
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
             lift_branch_region(ctx, proto, proto_index, cfg, depth, &body_only, regs, locals, &mut body_stmts, true);
             // Remove trailing JUMPBACK if present
             remove_trailing_jump(&mut body_stmts);
+            ctx.current_loop_end = prev_loop_end;
 
             // Re-lift the header's pre-branch instructions at the end of the
             // loop body. In the original bytecode, JUMPBACK returns control to
@@ -1422,11 +1430,23 @@ fn lift_region(
             let mut sorted_body = body_blocks.clone();
             sorted_body.sort_unstable();
             let mut body_stmts = Vec::new();
+            // A forward jump to the loop's LATCH block skips the rest of the
+            // iteration and re-tests — that is `continue`, not `break`. The
+            // latch is the last block of the loop, so it has the highest start
+            // pc. Without this, `repeat ... if c then continue end ... until d`
+            // (which structures as a while-true) emitted `break` and exited the
+            // loop on the first skipped iteration.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = sorted_body
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
             for &block_id in &sorted_body {
                 if let Some(b) = cfg.blocks.get(&block_id) {
                     lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
                 }
             }
+            ctx.current_loop_end = prev_loop_end;
             remove_trailing_jump(&mut body_stmts);
 
             // Hoist locals first declared inside the loop body
@@ -1477,12 +1497,21 @@ fn lift_region(
             let mut sorted_body = body_blocks.clone();
             sorted_body.sort_unstable();
             let mut body_stmts = Vec::new();
+            // A `continue` inside `repeat ... until c` targets the UNTIL TEST,
+            // which is not part of the body span — without this the jump reads
+            // as "leaves the range" and is emitted as `break`.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = body_blocks
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
             for &block_id in &sorted_body {
                 if block_id == *cond_pc { continue; } // condition is separate
                 if let Some(b) = cfg.blocks.get(&block_id) {
                     lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
                 }
             }
+            ctx.current_loop_end = prev_loop_end;
 
             // Lift the condition block's pre-branch instructions so that
             // registers used in the condition are populated. For example,
@@ -1555,7 +1584,8 @@ fn lift_region(
                 let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
                 premateralize_loop_carried(
                     ctx, proto, regs, locals, stmts,
-                    &body_writes, &[a, a + 1, a + 2], *prep_pc, None,
+                    &body_writes, &[a, a + 1, a + 2], *prep_pc,
+                    Some((*body_start, *body_end)),
                 );
             }
 
@@ -3081,12 +3111,22 @@ fn simplify_expr(expr: &Expr) -> Expr {
                     if matches!(r, Expr::Number(n) if n == 1.0) { return l; }
                     if matches!(r, Expr::Number(n) if n == 0.0) { return Expr::Number(1.0); }
                 }
-                // x .. ""  →  x  (only safe when x is already a string-producing expr,
-                //                 but in practice the bytecode only emits CONCAT when
-                //                 TOSTRING has already been applied; emit as-is otherwise)
+                // x .. ""  →  x  — ONLY when the surviving operand is already
+                // string-typed. `"" .. 42` is the string "42", not the number
+                // 42, and dropping the concat turned `#("" .. n)` into `#42`,
+                // which the `#<Number> → 0` artifact guard below then folded to
+                // a silent, wrong `0`.
                 BinOp::Concat => {
-                    if matches!(&r, Expr::String(s) if s.is_empty()) { return l; }
-                    if matches!(&l, Expr::String(s) if s.is_empty()) { return r; }
+                    let is_stringy = |e: &Expr| {
+                        matches!(e, Expr::String(_))
+                            || matches!(e, Expr::BinOp { op: BinOp::Concat, .. })
+                    };
+                    if matches!(&r, Expr::String(s) if s.is_empty()) && is_stringy(&l) {
+                        return l;
+                    }
+                    if matches!(&l, Expr::String(s) if s.is_empty()) && is_stringy(&r) {
+                        return r;
+                    }
                 }
                 // true and x   ->  x,   false and x  ->  false
                 // nil and x    ->  nil   (nil is falsy, short-circuits)
@@ -4303,7 +4343,18 @@ fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
 /// and the value expression is structurally equal to the base table
 /// expression, indicating a spurious self-assignment that should be
 /// suppressed.
+/// Metamethod keys are EXEMPT: `Vec.__index = Vec` is the canonical
+/// OOP-class idiom, not an artifact.  A misidentified NAMECALL always names a
+/// callable method, never a `__`-prefixed metamethod, so this exemption cannot
+/// re-admit the `pairs.GetService = pairs` shape the guard exists to kill.
+/// Dropping the `__index` line silently broke every method dispatch through
+/// a metatable.
 pub(super) fn is_self_referential_field_assign(target: &Expr, value: &Expr) -> bool {
+    if let Expr::Field { field, .. } = target {
+        if field.starts_with("__") {
+            return false;
+        }
+    }
     match target {
         Expr::Field { object, .. } => expr_structurally_eq(object, value),
         Expr::Index { object, .. } => expr_structurally_eq(object, value),
@@ -4962,7 +5013,11 @@ pub(super) fn table_expr(regs: &[RegVal], idx: usize) -> Expr {
 /// Field, Index, Name, Varargs) are allowed through.
 pub(super) fn is_impossible_as_table(e: &Expr) -> bool {
     match e {
-        Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
+        // `Expr::String` is deliberately NOT rejected: Luau strings carry a
+        // metatable, so `("x"):upper()` and `s:sub(1, 5)` are legal. Rejecting
+        // them made `table_expr` invent the undeclared name `vN`, which emitted
+        // `v1:upper()` for a perfectly good string literal.
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
         Expr::UnOp { op, .. } => matches!(
             op,
             UnOp::Negate | UnOp::Length | UnOp::BNot | UnOp::Not

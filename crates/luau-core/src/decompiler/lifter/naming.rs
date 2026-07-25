@@ -120,6 +120,15 @@ impl LocalTracker {
         self.declared.insert(reg);
     }
 
+    /// Is `name` the local currently bound to some register in this proto?
+    ///
+    /// Copy-propagated registers (a plain `MOVE` emits no statement) are not in
+    /// `declared`, so a register-keyed check cannot tell that a call argument is
+    /// an alias of a real binding. Checking the NAME does.
+    pub(super) fn is_bound_name(&self, name: &str) -> bool {
+        self.current_names.values().any(|n| n == name)
+    }
+
     /// Record the current local name for a register.  Callers that emit a
     /// `Stat::Local` via the existing `needs_local`/push flow (e.g., multi-
     /// return CALL, GETVARARGS) can call this to keep `current_names` in
