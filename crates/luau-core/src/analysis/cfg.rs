@@ -78,9 +78,26 @@ impl ControlFlowGraph {
                     // comparison degenerates into a constant. Keep it whole; the
                     // lifter recognises the same exact shape and stores the
                     // comparison straight into the destination register.
-                    if crate::analysis::bool_idiom::recognize_bool_idiom(code, pc).is_some()
-                        || crate::analysis::bool_idiom::recognize_or_and_chain(code, pc).is_some()
-                    {
+                    //
+                    // The same holds for an `and`/`or` chain — but only while
+                    // the chain really is the sole way into its own span. When
+                    // an *outside* jump lands in the middle of it, the span is
+                    // shared with real control flow: suppressing the split
+                    // deletes the leader that edge needs, the edge is dropped
+                    // as dangling, and the block it pointed at becomes
+                    // unreachable. Keep the boundaries in that case and let the
+                    // value-join structuring handle the shape.
+                    let keep_whole = crate::analysis::bool_idiom::recognize_bool_idiom(code, pc)
+                        .is_some()
+                        || crate::analysis::bool_idiom::recognize_or_and_chain(code, pc).map_or(
+                            false,
+                            |c| {
+                                !crate::analysis::bool_idiom::span_has_external_entry(
+                                    code, pc, c.end_pc,
+                                )
+                            },
+                        );
+                    if keep_whole {
                         pc = next_pc;
                         continue;
                     }
@@ -153,19 +170,23 @@ impl ControlFlowGraph {
                 continue;
             }
 
-            // Find last real instruction (skip back past AUX words)
-            // If instruction at (last_pc - 1) has_aux(), then code[last_pc] is its AUX word,
-            // so the last real instruction is at (last_pc - 1)
-            let mut last_pc = block_end - 1;
-            if last_pc > start {
-                // Check if the previous instruction has an AUX word, making current position an AUX
-                let check_pc = last_pc - 1;
-                if let Some(&check_insn) = code.get(check_pc) {
-                    let check_op = LuauOpcode::from_u8(insn_op(check_insn));
-                    if check_op.has_aux() {
-                        last_pc = check_pc;
-                    }
-                }
+            // Find the last real instruction by walking the block FORWARD,
+            // instruction-aligned. Stepping backwards and asking whether the
+            // second-to-last word "has an AUX" is not decidable: that word may
+            // itself be an AUX, and an AUX holding e.g. a constant index 7
+            // decodes as GETGLOBAL, which does carry an AUX. A block ending
+            // `GETTABLEKS <aux> JUMPIF` was therefore judged to end at the AUX,
+            // so the conditional jump was never seen and the block lost its
+            // branch edge entirely.
+            let mut last_pc = start;
+            let mut w = start;
+            while w < block_end {
+                last_pc = w;
+                w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() {
+                    2
+                } else {
+                    1
+                };
             }
 
             // Bounds-checked — malformed `block_end` could exceed code length.

@@ -1142,6 +1142,45 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
 /// when a merge block sits between two branch blocks, a naive span would swallow
 /// or duplicate it, so non-contiguous branches keep the per-block behaviour.
 #[allow(clippy::too_many_arguments)]
+/// Find every value join wholly contained in `[start, end)`, in program order.
+///
+/// Returns `(entry, arms, join, join_start)` tuples. Only joins that both begin
+/// and reconverge inside the span are reported, so splicing them into the span's
+/// lift can never claim an instruction outside it.
+fn collect_value_joins_in_span(
+    cfg: &ControlFlowGraph,
+    proto: &Proto,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, Vec<usize>, usize, usize)> {
+    // No loop-header set is needed here, and computing one would run a full
+    // dominator analysis for every branch arm and loop body in the proto. It is
+    // also unnecessary: a loop can only be re-entered through a back edge, and
+    // every back edge is rejected outright — either structurally (a successor at
+    // or before the entry) or because its latch carries `JUMPBACK` / `FOR*LOOP`,
+    // none of which are in the purity allowlist.
+    let headers = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut pc = start;
+    while pc < end {
+        let block = match cfg.blocks.get(&pc) {
+            Some(b) => b,
+            None => break,
+        };
+        if let Some(vj) = crate::analysis::value_region::find_value_join(cfg, &proto.code, pc, &headers)
+        {
+            let join_start = cfg.blocks.get(&vj.join).map(|b| b.start).unwrap_or(end + 1);
+            if join_start <= end {
+                out.push((vj.entry, vj.arms, vj.join, join_start));
+                pc = join_start;
+                continue;
+            }
+        }
+        pc = block.end;
+    }
+    out
+}
+
 fn lift_branch_region(
     ctx: &mut DecompileContext,
     proto: &Proto,
@@ -1165,12 +1204,488 @@ fn lift_branch_region(
     if contiguous {
         let start = ranges[0].0;
         let end = ranges[ranges.len() - 1].1;
-        lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+        // A loop body or branch arm is lifted as one raw span, so a value join
+        // inside it never reaches the region structurer. Splice the ones that
+        // are there back in; when there are none this is exactly the single
+        // `lift_instruction_range` call it replaces.
+        let joins = collect_value_joins_in_span(cfg, proto, start, end);
+        if joins.is_empty() {
+            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+        } else {
+            let mut cursor = start;
+            for (entry, arms, join, join_start) in joins {
+                let entry_start = cfg.blocks.get(&entry).map(|b| b.start).unwrap_or(cursor);
+                if entry_start < cursor {
+                    continue;
+                }
+                if cursor < entry_start {
+                    lift_instruction_range(ctx, proto, proto_index, depth, cursor, entry_start, regs, locals, out, in_loop);
+                }
+                lift_value_join(ctx, proto, proto_index, cfg, entry, &arms, join, regs, locals, depth, out, in_loop);
+                cursor = join_start;
+            }
+            if cursor < end {
+                lift_instruction_range(ctx, proto, proto_index, depth, cursor, end, regs, locals, out, in_loop);
+            }
+        }
     } else {
         for &(start, end) in &ranges {
             lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
         }
     }
+}
+
+/// Hard cap on how many root-to-join paths a value join may have. Each path
+/// contributes one operand to the reconstructed expression.
+const MAX_VALUE_JOIN_PATHS: usize = 16;
+
+/// One root-to-join path through a value join: the condition under which it is
+/// taken, and the register file it produces.
+struct ValuePath {
+    condition: Expr,
+    regs: Vec<RegVal>,
+}
+
+/// Split a basic block into the pc range of its body and the pc of its
+/// terminating branch, if it has one.
+///
+/// `find_branch_pc` assumes the block ends in a branch and always excludes its
+/// last word. That is wrong for a block reached by falling through and left the
+/// same way — its final instruction is ordinary value code, and excluding it
+/// silently drops the value the block exists to compute.
+fn block_body_and_terminator(proto: &Proto, start: usize, end: usize) -> (usize, Option<usize>) {
+    if end <= start || end > proto.code.len() {
+        return (end.min(proto.code.len()), None);
+    }
+    // Walk forward, instruction-aligned. Scanning backwards cannot tell an
+    // instruction from an AUX word: an AUX is arbitrary data that may decode as
+    // any opcode, including one that itself carries an AUX.
+    let mut last = start;
+    let mut w = start;
+    while w < end {
+        last = w;
+        w += if LuauOpcode::from_u8(insn_op(proto.code[w])).has_aux() {
+            2
+        } else {
+            1
+        };
+    }
+    let op = LuauOpcode::from_u8(insn_op(proto.code[last]));
+    let is_branch = matches!(
+        op,
+        LuauOpcode::Jump
+            | LuauOpcode::JumpBack
+            | LuauOpcode::JumpX
+            | LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    );
+    if is_branch {
+        (last, Some(last))
+    } else {
+        (end, None)
+    }
+}
+
+/// Conjoin two path conditions, dropping the vacuous `true`.
+fn and_conditions(acc: &Expr, next: Expr) -> Expr {
+    if matches!(acc, Expr::Bool(true)) {
+        return next;
+    }
+    Expr::BinOp {
+        left: Box::new(acc.clone()),
+        op: BinOp::And,
+        right: Box::new(next),
+    }
+}
+
+/// Combine one guarded value with the expression covering every later path.
+///
+/// Returns `None` when no *sound* pure-expression form exists, in which case
+/// the caller lowers the whole join to an explicit if/elseif/else chain.
+///
+/// The three rules mirror what the Luau compiler actually emitted:
+///  * `cond` IS the value — that is `cond or rest`, i.e. an `or` chain;
+///  * `cond` is `X and Y` and the value is `Y` — Lua's `and` yields its right
+///    operand, so `cond or rest` reproduces it exactly (an identity, not an
+///    approximation);
+///  * otherwise a ternary, which `emit.rs` renders as `cond and v or rest` and
+///    is therefore only faithful when `v` cannot be `false` or `nil`.
+fn combine_guarded_value(cond: &Expr, value: &Expr, rest: Expr) -> Option<Expr> {
+    if exprs_structurally_equal(cond, value) {
+        return Some(Expr::BinOp {
+            left: Box::new(value.clone()),
+            op: BinOp::Or,
+            right: Box::new(rest),
+        });
+    }
+    if let Expr::BinOp { op: BinOp::And, right, .. } = cond {
+        if exprs_structurally_equal(right, value) {
+            return Some(Expr::BinOp {
+                left: Box::new(cond.clone()),
+                op: BinOp::Or,
+                right: Box::new(rest),
+            });
+        }
+    }
+    if crate::decompiler::emit::is_provably_truthy(value) {
+        return Some(Expr::Ternary {
+            cond: Box::new(cond.clone()),
+            then_expr: Box::new(value.clone()),
+            else_expr: Box::new(rest),
+        });
+    }
+    None
+}
+
+/// Fold the per-path values of one register into a single expression.
+///
+/// Paths carrying the same value are grouped first, and the largest group
+/// becomes the default arm. That is deliberately independent of the order the
+/// paths were enumerated in: `t and t.n or -1` has three paths but only two
+/// distinct values (`-1` twice, `t.n` once), and the `-1` paths are not
+/// adjacent in any traversal order. Grouping collapses them regardless, leaving
+/// the single guarded value that the source actually wrote.
+fn fold_register_paths(paths: &[ValuePath], values: &[Expr]) -> Option<Expr> {
+    debug_assert_eq!(paths.len(), values.len());
+    if values.is_empty() {
+        return None;
+    }
+    // Group path indices by structurally equal value, preserving first-seen
+    // order so the reconstructed expression follows program order.
+    let mut groups: Vec<(Expr, Vec<usize>)> = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        match groups.iter_mut().find(|(g, _)| exprs_structurally_equal(g, v)) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((v.clone(), vec![i])),
+        }
+    }
+    if groups.len() == 1 {
+        return Some(groups[0].0.clone());
+    }
+    // Default arm: the value the most paths agree on. Ties go to the group
+    // seen last, which is the fall-back the compiler laid out last.
+    let default_idx = (0..groups.len())
+        .max_by_key(|&i| (groups[i].1.len(), i))
+        .expect("groups is non-empty");
+    let default_value = groups[default_idx].0.clone();
+
+    let mut acc = default_value;
+    for gi in (0..groups.len()).rev() {
+        if gi == default_idx {
+            continue;
+        }
+        let (value, idxs) = &groups[gi];
+        // A guard spanning many paths would produce an unreadable disjunction;
+        // fall back to the explicit statement form instead.
+        if idxs.len() > 2 {
+            return None;
+        }
+        let mut cond = paths[idxs[0]].condition.clone();
+        for &i in &idxs[1..] {
+            cond = Expr::BinOp {
+                left: Box::new(cond),
+                op: BinOp::Or,
+                right: Box::new(paths[i].condition.clone()),
+            };
+        }
+        acc = combine_guarded_value(&cond, value, acc)?;
+    }
+    Some(acc)
+}
+
+/// Enumerate every root-to-join path of a value join, lifting each with its own
+/// register file. Returns `None` if any path emits a statement (the region is
+/// then not a pure value selection after all) or if the caps are exceeded.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_value_paths(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    entry: usize,
+    members: &std::collections::BTreeSet<usize>,
+    join: usize,
+    base_regs: &[RegVal],
+    locals: &LocalTracker,
+    in_loop: bool,
+) -> Option<Vec<ValuePath>> {
+    let mut out: Vec<ValuePath> = Vec::new();
+    // Depth-first, fall-through edge first, so paths come back in program
+    // order and the last one is the natural default arm.
+    let mut stack: Vec<(usize, Expr, Vec<RegVal>)> =
+        vec![(entry, Expr::Bool(true), base_regs.to_vec())];
+
+    while let Some((block_id, cond, mut regs)) = stack.pop() {
+        if block_id == join {
+            if out.len() >= MAX_VALUE_JOIN_PATHS {
+                return None;
+            }
+            out.push(ValuePath { condition: cond, regs });
+            continue;
+        }
+        if !members.contains(&block_id) {
+            return None;
+        }
+        let block = cfg.blocks.get(&block_id)?;
+        let (body_end, terminator) = block_body_and_terminator(proto, block.start, block.end);
+        // The entry block's pre-branch code has already been lifted into the
+        // real statement list; only its branch belongs to the path walk.
+        let body_start = if block_id == entry { body_end } else { block.start };
+
+        if body_start < body_end {
+            let mut scratch = Vec::new();
+            let mut trial_locals = locals.clone();
+            lift_instruction_range(
+                ctx, proto, proto_index, depth + 1, body_start, body_end,
+                &mut regs, &mut trial_locals, &mut scratch, in_loop,
+            );
+            // A statement means a side effect (or a materialised temp) that a
+            // per-path expression cannot represent without duplicating it.
+            if !scratch.is_empty() {
+                return None;
+            }
+        }
+
+        match block.successors.len() {
+            1 => stack.push((block.successors[0], cond, regs)),
+            2 => {
+                let branch_pc = terminator?;
+                let fall_cond = extract_branch_condition(ctx, proto, branch_pc, &regs);
+                // Pushed in reverse so the fall-through edge is popped first.
+                stack.push((
+                    block.successors[1],
+                    and_conditions(&cond, negate_condition(&fall_cond)),
+                    regs.clone(),
+                ));
+                stack.push((
+                    block.successors[0],
+                    and_conditions(&cond, fall_cond),
+                    regs,
+                ));
+            }
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Which registers does `[start, end)` read before writing them?
+///
+/// Used to decide what has to be bound to a name BEFORE a value join is lifted.
+/// A register still holding a pending table constructor would otherwise be
+/// materialised *inside* an arm, which both emits a statement (defeating the
+/// pure-value reconstruction) and duplicates the constructor once per path.
+fn regs_read_in_range(code: &[u32], start: usize, end: usize) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b, c) = (
+            insn_a(insn) as usize,
+            insn_b(insn) as usize,
+            insn_c(insn) as usize,
+        );
+        match op {
+            LuauOpcode::Move
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN => {
+                out.insert(b);
+            }
+            LuauOpcode::GetTable => {
+                out.insert(b);
+                out.insert(c);
+            }
+            LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS => {
+                out.insert(a);
+            }
+            _ => {}
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    out
+}
+
+/// Lift a `Region::ValueJoin`.
+///
+/// Reconstructs, for every register the arms disagree on, the value it carries
+/// at the join. When each disagreement folds into a sound expression the region
+/// collapses to plain values (`t and t.n or -1`); otherwise it lowers to an
+/// explicit `if/elseif/else` assignment chain, which is correct for any runtime
+/// value at the cost of being wordier.
+#[allow(clippy::too_many_arguments)]
+fn lift_value_join(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    entry: usize,
+    arms: &[usize],
+    join: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    depth: usize,
+    stmts: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    let entry_block = match cfg.blocks.get(&entry) {
+        Some(b) => b,
+        None => return,
+    };
+    let (entry_body_end, entry_terminator) =
+        block_body_and_terminator(proto, entry_block.start, entry_block.end);
+    let branch_pc = match entry_terminator {
+        Some(t) => t,
+        None => return,
+    };
+    let join_start = cfg.blocks.get(&join).map(|b| b.start).unwrap_or(branch_pc);
+
+    // The entry block's pre-branch code runs unconditionally.
+    lift_instruction_range(
+        ctx, proto, proto_index, depth, entry_block.start, entry_body_end, regs, locals, stmts,
+        in_loop,
+    );
+
+    // Bind any value the arms READ that is still an unnamed compound (a pending
+    // table constructor, a call result, …). Done before the walk so no arm has
+    // to materialise it, which would emit a statement mid-region.
+    let free_reads = regs_read_in_range(&proto.code, branch_pc, join_start);
+    for r in free_reads {
+        if r < regs.len() {
+            ensure_lvalue_base_materialized(ctx, proto, regs, locals, stmts, r, branch_pc);
+        }
+    }
+
+    let members: std::collections::BTreeSet<usize> =
+        arms.iter().copied().chain(std::iter::once(entry)).collect();
+    let base_regs = regs.clone();
+    let paths = enumerate_value_paths(
+        ctx, proto, proto_index, cfg, depth, entry, &members, join, &base_regs, locals, in_loop,
+    );
+    let paths = match paths {
+        Some(p) if p.len() >= 2 => p,
+        // Not a pure value selection after all. Fall back to the linear lift of
+        // the whole span, which is exactly what a `Region::Linear` would do.
+        _ => {
+            lift_instruction_range(
+                ctx, proto, proto_index, depth, branch_pc, join_start, regs, locals, stmts, in_loop,
+            );
+            return;
+        }
+    };
+
+    // Registers every path agrees on keep their value — strictly better than
+    // the two-way merge, which can only agree or forget.
+    let width = paths.iter().map(|p| p.regs.len()).min().unwrap_or(0);
+    let mut divergent: Vec<usize> = Vec::new();
+    for i in 0..width {
+        let first = &paths[0].regs[i];
+        let same = paths[1..].iter().all(|p| match (first, &p.regs[i]) {
+            (RegVal::Expr(a), RegVal::Expr(b)) => exprs_structurally_equal(a, b),
+            (RegVal::LoopVar(a), RegVal::LoopVar(b)) => a == b,
+            (RegVal::Unknown, RegVal::Unknown) => true,
+            _ => false,
+        });
+        if same {
+            regs[i] = first.clone();
+            continue;
+        }
+        // `Unknown` means "no information", not "some value". Reconstructing a
+        // phi from it would invent a reference to an undeclared name, so fall
+        // back to the conservative merge result for that register.
+        if paths.iter().any(|p| matches!(p.regs[i], RegVal::Unknown)) {
+            regs[i] = RegVal::Unknown;
+            continue;
+        }
+        divergent.push(i);
+    }
+
+    // Try the pure-expression reconstruction for every divergent register. It
+    // is all-or-nothing: a partial fold would leave some registers described by
+    // an expression and others by a statement chain guarded by the same
+    // conditions, evaluating them twice.
+    let mut folded: Vec<(usize, Expr)> = Vec::new();
+    let mut all_folded = true;
+    for &i in &divergent {
+        let values: Vec<Expr> = paths.iter().map(|p| reg_expr(&p.regs, i)).collect();
+        match fold_register_paths(&paths, &values) {
+            Some(e) => folded.push((i, simplify_expr(&e))),
+            None => {
+                all_folded = false;
+                break;
+            }
+        }
+    }
+
+    if all_folded {
+        for (i, value) in folded {
+            store_complex(ctx, proto, regs, locals, stmts, i, join_start, value);
+        }
+        return;
+    }
+
+    // Fallback lowering: `local r; if c1 then r = v1 elseif c2 then ... else
+    // r = vn end`. Always sound, whatever the values turn out to be.
+    let mut names: Vec<String> = Vec::new();
+    for &i in &divergent {
+        let name = ctx.reg_name(proto, i as u8, join_start);
+        let (_, name) = locals.classify_write(i, &name);
+        names.push(name.clone());
+        regs[i] = RegVal::Expr(Expr::Name(name.clone()));
+        stmts.push(Stat::Local {
+            names: vec![name],
+            values: vec![],
+        });
+    }
+    let assigns = |p: &ValuePath| -> Vec<Stat> {
+        divergent
+            .iter()
+            .zip(names.iter())
+            .map(|(&i, n)| Stat::Assign {
+                targets: vec![Expr::Name(n.clone())],
+                values: vec![reg_expr(&p.regs, i)],
+            })
+            .collect()
+    };
+    let last = paths.len() - 1;
+    let elseifs: Vec<(Expr, Vec<Stat>)> = paths[1..last]
+        .iter()
+        .map(|p| (simplify_expr(&p.condition), assigns(p)))
+        .collect();
+    stmts.push(Stat::If {
+        condition: simplify_expr(&paths[0].condition),
+        then_body: assigns(&paths[0]),
+        elseif_clauses: elseifs,
+        else_body: Some(assigns(&paths[last])),
+    });
 }
 
 /// Lift a single region into statements
@@ -1188,6 +1703,12 @@ fn lift_region(
     match region {
         Region::Linear { start, end } => {
             lift_instruction_range(ctx, proto, proto_index, depth, *start, *end, regs, locals, stmts, false);
+        }
+
+        Region::ValueJoin { entry, arms, join } => {
+            lift_value_join(
+                ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, stmts, false,
+            );
         }
 
         Region::IfThenElse {
@@ -1285,6 +1806,71 @@ fn lift_region(
                 }
             }
 
+            // Materialize a phi for registers that the two arms disagree on.
+            //
+            // `merge_regs` is a two-outcome lattice meet: identical values
+            // survive, everything else collapses to `Unknown`. That is correct
+            // for statement-shaped branches, but it destroys the *value* of a
+            // pure-value diamond — `local x; if c then x = a else x = b end`
+            // compiles to two register parks and no statements at all, so after
+            // the merge the register is Unknown, `reg_expr` renders it as an
+            // undeclared global, and `is_empty_if` then deletes the (now
+            // statement-free) `if` along with its condition. The value is lost
+            // twice over.
+            //
+            // Where the disagreement is the ONLY thing the branch did, the
+            // register's value at the join is exactly `cond ? then : else`, so
+            // reconstruct it. This is deliberately confined to arms that emit
+            // no statements: with no statements there is no side effect and no
+            // evaluation-order question, and the `if` itself is redundant.
+            let mut hoisted_phis: Vec<Stat> = Vec::new();
+            if let Some(mpc) = merge_pc {
+                let arms_are_pure_value = then_stmts.is_empty()
+                    && else_body.as_ref().map_or(false, |b: &Vec<Stat>| b.is_empty());
+                // The condition is about to appear inside the reconstructed
+                // expression. If evaluating it has side effects, doing so would
+                // duplicate them (the empty `if` survives `is_empty_if` in that
+                // case and would evaluate the condition a second time).
+                if arms_are_pure_value && !has_side_effects(&condition) {
+                    let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                    for i in 0..n {
+                        // Only registers merge_regs actually gave up on.
+                        if !matches!(regs[i], RegVal::Unknown) {
+                            continue;
+                        }
+                        let (t, e) = match (&regs_after_then[i], &regs_after_else[i]) {
+                            (RegVal::Expr(t), RegVal::Expr(e)) => (t.clone(), e.clone()),
+                            _ => continue,
+                        };
+                        if exprs_structurally_equal(&t, &e) {
+                            continue;
+                        }
+                        // Cap expression growth: a phi of two large trees would
+                        // duplicate them at every use site.
+                        if !expr_is_leaf(&t) || !expr_is_leaf(&e) {
+                            continue;
+                        }
+                        let phi = Expr::Ternary {
+                            cond: Box::new(condition.clone()),
+                            then_expr: Box::new(t.clone()),
+                            else_expr: Box::new(e),
+                        };
+                        // `emit.rs` renders every Ternary in expression position
+                        // as `cond and a or b`, which only matches ternary
+                        // semantics when the then-arm is truthy. When it is not,
+                        // force a `Stat::Local`, where B0.108 expands it into a
+                        // real if/else that is sound for any runtime value.
+                        if crate::decompiler::emit::is_provably_truthy(&t) {
+                            store_complex(ctx, proto, regs, locals, &mut hoisted_phis, i, *mpc, phi);
+                        } else {
+                            emit_local_or_assign(
+                                ctx, proto, regs, locals, &mut hoisted_phis, i, *mpc, phi,
+                            );
+                        }
+                    }
+                }
+            }
+
             // B0.57: hoist `Stat::Local` declarations out of branch bodies
             // when the register escapes (i.e. post-merge `regs` still holds
             // an `Expr::Name(n)` matching the declared local). Without this,
@@ -1304,6 +1890,9 @@ fn lift_region(
                 None
             };
             stmts.extend(hoisted);
+            // After the B0.57 hoists: a reconstructed phi may reference a local
+            // that the hoist just lifted out of a branch.
+            stmts.extend(hoisted_phis);
 
             // If condition is always true (unknown branch opcode), inline the body directly
             if matches!(&condition, Expr::Bool(true)) {
@@ -2191,11 +2780,20 @@ fn is_safe_hoist_init(init: &Expr, pre_names: &std::collections::HashSet<String>
     match init {
         Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Varargs => true,
         Expr::Name(n) => pre_names.contains(n),
-        // An empty table literal is always safe — this covers the common
-        // `local M = {}` module-table seed case that's the whole point of
-        // the hoist. Non-empty constructors reference arbitrary expressions
-        // so we bail on those.
-        Expr::Table { fields } => fields.is_empty(),
+        // A table literal is safe when every element is itself safe. The empty
+        // constructor covers the common `local M = {}` module-table seed that
+        // is the whole point of the hoist; a populated one such as
+        // `local t = { n = 0 }` is equally safe as long as nothing inside it
+        // reads a branch-local temp. Leaving those unhoistable declares the
+        // local inside the branch while the merged register still names it, so
+        // every later reference parses as a bare global read.
+        Expr::Table { fields } => fields.iter().all(|f| match f {
+            TableField::Sequential(v) => is_safe_hoist_init(v, pre_names),
+            TableField::Named(_, v) => is_safe_hoist_init(v, pre_names),
+            TableField::Indexed(k, v) => {
+                is_safe_hoist_init(k, pre_names) && is_safe_hoist_init(v, pre_names)
+            }
+        }),
         _ => false,
     }
 }

@@ -687,16 +687,30 @@ fn emit_expr(expr: &Expr, depth: usize) -> String {
 ///
 /// Any expression whose value depends on runtime state (Name, Call, Index,
 /// BinOp, UnOp, etc.) is NOT provably truthy and forces the safe form.
-fn is_provably_truthy(e: &Expr) -> bool {
-    matches!(
-        e,
+pub(crate) fn is_provably_truthy(e: &Expr) -> bool {
+    match e {
         Expr::Bool(true)
-            | Expr::Number(_)
-            | Expr::String(_)
-            | Expr::Table { .. }
-            | Expr::Function { .. }
-            | Expr::Vector(..)
-    )
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Table { .. }
+        | Expr::Function { .. }
+        | Expr::Vector(..) => true,
+        // `a or b` yields `a` when `a` is truthy and `b` otherwise, so the
+        // result cannot be falsy once `b` cannot be. This is what makes the
+        // null-safe accessor `t and (t.n or default) or default` expressible
+        // as `and`/`or`: the inner `or` is always truthy even though neither
+        // operand is on its own.
+        Expr::BinOp { op: BinOp::Or, right, .. } => is_provably_truthy(right),
+        // `a and b` yields `a` when `a` is falsy, so BOTH sides must be truthy.
+        Expr::BinOp { op: BinOp::And, left, right } => {
+            is_provably_truthy(left) && is_provably_truthy(right)
+        }
+        // A ternary is truthy exactly when both of its arms are.
+        Expr::Ternary { then_expr, else_expr, .. } => {
+            is_provably_truthy(then_expr) && is_provably_truthy(else_expr)
+        }
+        _ => false,
+    }
 }
 
 fn emit_number(n: f64) -> String {
@@ -1839,6 +1853,55 @@ mod tests {
         assert!(is_provably_truthy(&Expr::Table { fields: vec![] }));
         assert!(is_provably_truthy(&func(vec![], false, vec![])));
         assert!(is_provably_truthy(&Expr::Vector(0.0, 0.0, 0.0)));
+        // `a or b` cannot be falsy once `b` cannot be.
+        assert!(is_provably_truthy(&binop(
+            name("x"),
+            BinOp::Or,
+            Expr::Number(-1.0)
+        )));
+        assert!(is_provably_truthy(&binop(
+            Expr::Field { object: Box::new(name("t")), field: "n".to_string() },
+            BinOp::Or,
+            Expr::String("d".to_string())
+        )));
+        // Both sides of an `and` have to be truthy.
+        assert!(is_provably_truthy(&binop(
+            Expr::Number(1.0),
+            BinOp::And,
+            Expr::Number(2.0)
+        )));
+        assert!(is_provably_truthy(&Expr::Ternary {
+            cond: Box::new(name("c")),
+            then_expr: Box::new(Expr::Number(1.0)),
+            else_expr: Box::new(Expr::String("a".to_string())),
+        }));
+    }
+
+    #[test]
+    fn is_provably_truthy_rejects_unproven_and_or_shapes() {
+        // The right operand of `or` decides, and a bare name does not qualify.
+        assert!(!is_provably_truthy(&binop(name("x"), BinOp::Or, name("y"))));
+        assert!(!is_provably_truthy(&binop(
+            Expr::Number(1.0),
+            BinOp::Or,
+            Expr::Nil
+        )));
+        // `a and b` is `a` when `a` is falsy, so a runtime left operand blocks it.
+        assert!(!is_provably_truthy(&binop(
+            name("x"),
+            BinOp::And,
+            Expr::Number(1.0)
+        )));
+        assert!(!is_provably_truthy(&binop(
+            Expr::Number(1.0),
+            BinOp::And,
+            name("y")
+        )));
+        assert!(!is_provably_truthy(&Expr::Ternary {
+            cond: Box::new(name("c")),
+            then_expr: Box::new(Expr::Number(1.0)),
+            else_expr: Box::new(Expr::Nil),
+        }));
     }
 
     #[test]

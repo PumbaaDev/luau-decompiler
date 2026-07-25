@@ -67,6 +67,7 @@ pub(super) enum WriteKind {
 /// `phase_b049_shadow_local_tests` for exhaustive coverage.
 // Visible up to `crate::decompiler` because several `pub(super)` lifter helpers
 // (ensure_table_reg_declared, store_complex, …) take it in their signatures.
+#[derive(Clone)]
 pub(in crate::decompiler) struct LocalTracker {
     pub(super) declared: HashSet<usize>,
     param_count: usize,

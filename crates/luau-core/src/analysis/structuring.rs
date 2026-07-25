@@ -23,6 +23,20 @@ pub enum Region {
         merge_pc: Option<usize>,
     },
 
+    /// A branch region whose only result is the value some register carries
+    /// where control flow reconverges — `a and b`, `a or b`, `a and b or c`,
+    /// and any `if` that merely selects between values.
+    ///
+    /// Unlike `IfThenElse` the arms are NOT required to be disjoint, which is
+    /// what lets it represent a short-circuit ladder whose fallback block is
+    /// shared between two arms. `join` is deliberately excluded from the
+    /// region so it keeps its own region and is lifted exactly once.
+    ValueJoin {
+        entry: usize,
+        arms: Vec<usize>,
+        join: usize,
+    },
+
     /// while true do ... end (loop with break-based exit)
     WhileTrue {
         header: usize,
@@ -143,6 +157,7 @@ pub fn structure_control_flow(
 ) -> Vec<Region> {
     let code = &proto.code;
     let loops = cfg.find_loops();
+    let loop_headers_all: BTreeSet<usize> = loops.iter().map(|l| l.header).collect();
     let mut regions = Vec::new();
     let mut handled = BTreeSet::new();
     let rpo = cfg.reverse_postorder();
@@ -193,7 +208,7 @@ pub fn structure_control_flow(
             // GenericFor.body iterator dispatches nested regions recursively.
             let final_region = match region {
                 Region::NumericFor { prep_pc, loop_pc, body_start, body_end, body: _ } => {
-                    let nested = structure_numeric_for_body(code, body_start, body_end);
+                    let nested = structure_numeric_for_body(code, body_start, body_end, cfg, &loop_headers_all);
                     Region::NumericFor {
                         prep_pc,
                         loop_pc,
@@ -203,7 +218,7 @@ pub fn structure_control_flow(
                     }
                 }
                 Region::GenericFor { prep_pc, loop_pc, body_start, body_end, body: _ } => {
-                    let nested = structure_numeric_for_body(code, body_start, body_end);
+                    let nested = structure_numeric_for_body(code, body_start, body_end, cfg, &loop_headers_all);
                     Region::GenericFor {
                         prep_pc,
                         loop_pc,
@@ -277,6 +292,39 @@ pub fn structure_control_flow(
                     handled.insert(b);
                 }
                 continue;
+            }
+        }
+
+        // A branch that only selects a VALUE has to be matched before the
+        // if/then/else fallback. `find_merge_point` is a first-common-node
+        // search, not a post-dominator: given a short-circuit ladder it reports
+        // one of the arms as the merge, because that arm is trivially reachable
+        // from the other. Everything downstream then inherits the wrong join.
+        if block.successors.len() == 2 {
+            if let Some(vj) = crate::analysis::value_region::find_value_join(
+                cfg,
+                code,
+                block_id,
+                &loop_headers_all,
+            ) {
+                // Decline if an enclosing region already claimed any member —
+                // re-lifting a claimed block would duplicate it.
+                let free = !handled.contains(&vj.join)
+                    && vj.arms.iter().all(|b| !handled.contains(b));
+                if free {
+                    handled.insert(block_id);
+                    for &b in &vj.arms {
+                        handled.insert(b);
+                    }
+                    // `join` is intentionally left unhandled: it is the region's
+                    // continuation, not part of it.
+                    regions.push(Region::ValueJoin {
+                        entry: vj.entry,
+                        arms: vj.arms,
+                        join: vj.join,
+                    });
+                    continue;
+                }
             }
         }
 
@@ -448,8 +496,15 @@ fn collect_region_blocks(
         result.push(node);
         if let Some(block) = cfg.blocks.get(&node) {
             for &succ in &block.successors {
-                if boundary == Some(succ) {
-                    continue; // don't cross the merge point
+                // Don't cross the merge point — and don't step OVER it either.
+                // A branch arm ends where control flow reconverges, so an edge
+                // landing at or beyond the merge belongs to the continuation,
+                // not to the arm. Without the `>=` test a short-circuit ladder
+                // (whose then-block also has an edge past the merge, straight
+                // to the real join) drags the entire rest of the function into
+                // the arm, and everything after it stops executing.
+                if boundary.map_or(false, |b| succ >= b) {
+                    continue;
                 }
                 if visited.insert(succ) && !already_handled.contains(&succ) {
                     queue.push_back(succ);
@@ -567,6 +622,8 @@ fn structure_numeric_for_body(
     code: &[u32],
     body_start: usize,
     body_end: usize,
+    cfg: &ControlFlowGraph,
+    loop_headers: &BTreeSet<usize>,
 ) -> Vec<Region> {
     let mut regions: Vec<Region> = Vec::new();
     if body_end <= body_start || body_end > code.len() {
@@ -579,6 +636,46 @@ fn structure_numeric_for_body(
     while pc < body_end {
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
+
+        // ── Value join inside a loop body ────────────────────────────────
+        //
+        // `local row = rows[i]  print(row and row.n or -1)` is the same shape
+        // whether it sits at the top level or inside a `for`. Without this the
+        // body is lifted as raw instructions, the inline-if path discards the
+        // branch's register state wholesale, and the selected value degenerates
+        // into whichever arm happened to be laid out last.
+        //
+        // Matched before every loop shape below: those all key off a for-prep
+        // or a back edge, and a value join contains neither.
+        // The enclosing loop's own header is the first block of its body, and
+        // it has already been claimed by the region that called us — so unlike
+        // at top level it is a legitimate value-join entry here. Headers of
+        // loops NESTED in this body still need protecting.
+        let headers_here: BTreeSet<usize> = loop_headers
+            .iter()
+            .copied()
+            .filter(|&h| h != body_start)
+            .collect();
+        if cfg.blocks.contains_key(&pc) {
+            if let Some(vj) = crate::analysis::value_region::find_value_join(cfg, code, pc, &headers_here) {
+                let join_start = cfg.blocks.get(&vj.join).map(|b| b.start).unwrap_or(body_end);
+                // Must be wholly inside the range being scanned, or the region
+                // would claim instructions this call is not responsible for.
+                if join_start <= body_end {
+                    if linear_start < pc {
+                        regions.push(Region::Linear { start: linear_start, end: pc });
+                    }
+                    regions.push(Region::ValueJoin {
+                        entry: vj.entry,
+                        arms: vj.arms,
+                        join: vj.join,
+                    });
+                    pc = join_start;
+                    linear_start = pc;
+                    continue;
+                }
+            }
+        }
 
         // ── Phase B0.5, Shape A: nested ForGPrep → ForGLoop pair ─────────
         //
@@ -607,7 +704,7 @@ fn structure_numeric_for_body(
                     let inner_body_start = pc + 1;
                     let inner_body_end = loop_end_pc;
                     let nested_body =
-                        structure_numeric_for_body(code, inner_body_start, inner_body_end);
+                        structure_numeric_for_body(code, inner_body_start, inner_body_end, cfg, loop_headers);
                     regions.push(Region::GenericFor {
                         prep_pc: pc,
                         loop_pc: loop_end_pc,
@@ -642,7 +739,7 @@ fn structure_numeric_for_body(
                     let inner_body_start = pc + 1;
                     let inner_body_end = loop_end_pc;
                     let nested_body =
-                        structure_numeric_for_body(code, inner_body_start, inner_body_end);
+                        structure_numeric_for_body(code, inner_body_start, inner_body_end, cfg, loop_headers);
 
                     regions.push(Region::NumericFor {
                         prep_pc: pc,
@@ -751,7 +848,7 @@ fn structure_numeric_for_body(
                     end: header_start,
                 });
             }
-            let nested_body = structure_numeric_for_body(code, inner_body_start, latch_pc);
+            let nested_body = structure_numeric_for_body(code, inner_body_start, latch_pc, cfg, loop_headers);
             regions.push(Region::InlineLoopInLoop {
                 header_start,
                 cond_pc,
@@ -787,7 +884,7 @@ fn structure_numeric_for_body(
                             end: pc,
                         });
                     }
-                    let then_body = structure_numeric_for_body(code, jump_next_pc, target);
+                    let then_body = structure_numeric_for_body(code, jump_next_pc, target, cfg, loop_headers);
                     regions.push(Region::InlineIfThenInLoop {
                         cond_pc: pc,
                         body: then_body,
