@@ -35,6 +35,18 @@ struct Cli {
     #[arg(short, long, global = true)]
     output: Option<PathBuf>,
 
+    /// Shared opcode-shuffle evidence store.
+    ///
+    /// Every script from one Roblox client version shares a single opcode
+    /// permutation, but a single script only exercises a fraction of it. Point
+    /// this at a file and each decompile contributes its own independent
+    /// reading of the shuffle, then decodes using the pooled majority of every
+    /// reading so far. Scripts from different client versions may share one
+    /// store; they are kept apart automatically. Also settable via
+    /// `LUAU_OPMAP_CACHE`.
+    #[arg(long, global = true, value_name = "PATH")]
+    opmap_cache: Option<PathBuf>,
+
     /// Verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -73,7 +85,10 @@ enum Commands {
         folder: PathBuf,
 
         /// Output folder for .lua files
-        #[arg(short, long)]
+        //
+        // No `short`: `-o` is taken by the global `--output`. Declaring it here
+        // too made clap abort on startup, so `watch` could not run at all.
+        #[arg(long)]
         out_dir: Option<PathBuf>,
 
         /// Also produce .disasm files
@@ -91,7 +106,10 @@ enum Commands {
         input: PathBuf,
 
         /// Output folder
-        #[arg(short, long)]
+        //
+        // No `short`: `-o` is taken by the global `--output`. Declaring it here
+        // too made clap abort on startup, so `batch` could not run at all.
+        #[arg(long)]
         out_dir: Option<PathBuf>,
 
         /// File extensions to process (comma-separated)
@@ -158,16 +176,28 @@ fn main() -> Result<()> {
         })
         .init();
 
+    let store = store_path(&cli);
+
     match cli.command {
         Some(Commands::Decompile { input }) => {
             let data = read_input(input.as_deref())?;
-            write_output(cli.output.as_deref(), &luau_core::decompile(&data)?)?;
+            let source = decompile_with_store(&data, store.as_ref())?;
+            write_output(cli.output.as_deref(), &source)?;
         }
 
         Some(Commands::Disassemble { input, debug_info, opmap }) => {
             let data = read_input(input.as_deref())?;
             let text = if opmap {
-                luau_core::disassemble_with_opmap(&data, None)?
+                // Diagnostic view of what the lifter actually processes, so it
+                // must apply the same map the lifter would — including the
+                // shared store, or it would show a map the decompile never used.
+                let consulted = store.as_ref().map(|p| consult_store(p, &data));
+                let prior = consulted.as_ref().and_then(|(m, _)| *m);
+                let text = luau_core::disassemble_with_opmap(&data, prior.as_ref())?;
+                if let (Some(p), Some((_, Some(b)))) = (store.as_ref(), consulted.as_ref()) {
+                    cast_ballot(p, b);
+                }
+                text
             } else {
                 luau_core::disassemble(&data, debug_info)?
             };
@@ -186,11 +216,11 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Watch { folder, out_dir, disasm, interval }) => {
-            run_watch(&folder, out_dir.as_deref(), disasm, interval)?;
+            run_watch(&folder, out_dir.as_deref(), disasm, interval, store.as_ref())?;
         }
 
         Some(Commands::Batch { input, out_dir, extensions, disasm }) => {
-            run_batch(&input, out_dir.as_deref(), &extensions, disasm)?;
+            run_batch(&input, out_dir.as_deref(), &extensions, disasm, store.as_ref())?;
         }
 
         Some(Commands::Validate { input, builtin, no_color }) => {
@@ -225,7 +255,8 @@ fn main() -> Result<()> {
         None => {
             if let Some(ref path) = cli.input {
                 let data = read_input(Some(path.as_path()))?;
-                write_output(cli.output.as_deref(), &luau_core::decompile(&data)?)?;
+                let source = decompile_with_store(&data, store.as_ref())?;
+                write_output(cli.output.as_deref(), &source)?;
             } else {
                 // No args at all — print help hint
                 let c = ansi::choose(true);
@@ -247,9 +278,118 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ── Shared opcode-shuffle evidence store ──
+//
+// A decompiler invocation normally sees one script and must infer the whole
+// opcode permutation from it. That is weak evidence — a typical script
+// exercises well under half the opcode set, so most of the permutation is
+// simply not observable from it. Scripts from one client version all share the
+// SAME permutation, though, so pooling one independent reading per script and
+// taking the majority recovers substantially more of it than any single script
+// can.
+//
+// Deliberately opt-in. With no store configured every code path below is
+// exactly what it was before this existed: solo detection, no shared state, no
+// file I/O. Turning it on is a decision the caller makes.
+
+/// Resolve the store path from the flag, falling back to `LUAU_OPMAP_CACHE`.
+fn store_path(cli: &Cli) -> Option<PathBuf> {
+    cli.opmap_cache.clone().or_else(|| {
+        std::env::var_os("LUAU_OPMAP_CACHE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// Pool the store's evidence into a prior for THIS script.
+///
+/// Only ballots that describe the same opcode permutation take part — a store
+/// that outlives a Roblox client update holds readings of two different
+/// permutations, and pooling those produces a map correct for neither. The
+/// script's own reading is the probe used to pick its peers, so a store may
+/// span any number of client versions without the groups interfering.
+///
+/// A missing or unreadable store is not an error: it means "no evidence yet",
+/// and the caller correctly falls back to solo detection. Corrupt lines are
+/// skipped rather than fatal — a truncated tail from an interrupted write must
+/// cost at most the ballots in it.
+fn load_prior(path: &Path, probe: &luau_core::parser::consensus::Ballot) -> Option<[u8; 256]> {
+    let text = fs::read_to_string(path).ok()?;
+    let book = luau_core::parser::consensus::decode_book(&text);
+    let cfg = luau_core::parser::consensus::ConsensusConfig::default();
+    let resolved = book.resolve_for(probe, &cfg);
+    if resolved.is_empty() {
+        return None;
+    }
+    log::debug!(
+        "opmap consensus: {} of {} ballots share this shuffle, {} byte mappings published",
+        resolved.ballots,
+        book.len(),
+        resolved.published()
+    );
+    Some(resolved.map)
+}
+
+/// Contribute this script's own independent reading of the shuffle.
+///
+/// Append-only, one JSON line per ballot, keyed by content hash so that
+/// re-decompiling the same script REPLACES its vote instead of adding another —
+/// otherwise a script that happens to be processed often would outweigh the
+/// rest of the corpus. Failures are silent by design: contributing evidence is
+/// a side benefit, and it must never turn a successful decompile into an error.
+fn cast_ballot(path: &Path, ballot: &luau_core::parser::consensus::Ballot) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    let line = luau_core::parser::consensus::encode_ballot(ballot);
+    if let Ok(mut fh) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(fh, "{}", line);
+    }
+}
+
+/// The prior for this script, and the ballot to file once it is decoded.
+///
+/// `None` for bytecode carrying no Roblox shuffle — canonical Luau must neither
+/// read from nor vote in a Roblox tally.
+fn consult_store(
+    path: &Path,
+    data: &[u8],
+) -> (Option<[u8; 256]>, Option<luau_core::parser::consensus::Ballot>) {
+    match luau_core::observe_ballot(data) {
+        Some(ballot) => (load_prior(path, &ballot), Some(ballot)),
+        None => (None, None),
+    }
+}
+
+/// Decompile, using and then contributing to the shared store when configured.
+fn decompile_with_store(data: &[u8], store: Option<&PathBuf>) -> Result<String> {
+    let Some(path) = store else {
+        return luau_core::decompile(data);
+    };
+    let (prior, ballot) = consult_store(path, data);
+    let out = luau_core::decompile_with_opmap(data, prior.as_ref()).map(|(src, _)| src);
+    // Cast only after a successful decode, and only what this script itself
+    // observed — never the prior it was handed.
+    if out.is_ok() {
+        if let Some(b) = ballot {
+            cast_ballot(path, &b);
+        }
+    }
+    out
+}
+
 // ── Watch ──
 
-fn run_watch(folder: &Path, out_dir: Option<&Path>, disasm: bool, interval_ms: u64) -> Result<()> {
+fn run_watch(
+    folder: &Path,
+    out_dir: Option<&Path>,
+    disasm: bool,
+    interval_ms: u64,
+    store: Option<&PathBuf>,
+) -> Result<()> {
     let out = out_dir.unwrap_or(folder);
     fs::create_dir_all(out)?;
 
@@ -289,7 +429,7 @@ fn run_watch(folder: &Path, out_dir: Option<&Path>, disasm: bool, interval_ms: u
                 match fs::read(&path) {
                     Ok(data) if !data.is_empty() => {
                         // Decompile
-                        match luau_core::decompile(&data) {
+                        match decompile_with_store(&data, store) {
                             Ok(source) => {
                                 let p = out.join(format!("{}.lua", stem));
                                 let _ = fs::write(&p, &source);
@@ -315,7 +455,13 @@ fn run_watch(folder: &Path, out_dir: Option<&Path>, disasm: bool, interval_ms: u
 
 // ── Batch ──
 
-fn run_batch(input: &Path, out_dir: Option<&Path>, extensions: &str, disasm: bool) -> Result<()> {
+fn run_batch(
+    input: &Path,
+    out_dir: Option<&Path>,
+    extensions: &str,
+    disasm: bool,
+    store: Option<&PathBuf>,
+) -> Result<()> {
     let out = out_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| input.join("decompiled"));
     fs::create_dir_all(&out)?;
 
@@ -326,15 +472,37 @@ fn run_batch(input: &Path, out_dir: Option<&Path>, extensions: &str, disasm: boo
 
     eprintln!("Batch: {} → {}", input.display(), out.display());
 
-    for entry in fs::read_dir(input)?.flatten() {
-        let path = entry.path();
-        if !path.is_file() { continue; }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !exts.contains(&ext) { continue; }
+    let mut files: Vec<PathBuf> = fs::read_dir(input)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| exts.contains(&p.extension().and_then(|e| e.to_str()).unwrap_or("")))
+        .collect();
+    files.sort();
 
+    // Pre-pass: pool every script's reading of the opcode shuffle BEFORE
+    // decoding any of them.
+    //
+    // Decompiling straight through would make the evidence ramp up as it went,
+    // so the first script decoded would see almost none of it. That is not a
+    // small effect — the same folder scores ~63% decoded in arrival order
+    // against ~69% once every script has contributed. A batch, unlike a live
+    // stream, knows its own boundary, so there is no reason to make the early
+    // files pay for arriving early.
+    if let Some(path) = store {
+        for f in &files {
+            if let Ok(data) = fs::read(f) {
+                if let Some(b) = luau_core::observe_ballot(&data) {
+                    cast_ballot(path, &b);
+                }
+            }
+        }
+    }
+
+    for path in files {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
 
-        match fs::read(&path).map(|d| luau_core::decompile(&d)) {
+        match fs::read(&path).map(|d| decompile_with_store(&d, store)) {
             Ok(Ok(source)) => {
                 fs::write(out.join(format!("{}.lua", stem)), &source)?;
                 if disasm {

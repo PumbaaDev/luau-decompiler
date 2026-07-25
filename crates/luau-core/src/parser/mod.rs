@@ -1,3 +1,4 @@
+pub mod consensus;
 pub mod ground_truth;
 pub mod known_shuffles;
 pub mod opcodes;

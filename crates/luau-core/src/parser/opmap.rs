@@ -525,6 +525,27 @@ impl OpcodeMap {
         cov
     }
 
+    /// Which shuffled bytes actually occur at a true instruction position.
+    ///
+    /// This is the honest denominator for any cross-file consensus: it lets a
+    /// tally tell "this file never contained the byte" apart from "this file
+    /// contained it and the detectors declined to call it". The first is an
+    /// absence and must not count against the byte; the second is a genuine
+    /// abstention. Confusing the two would suppress every rare opcode, which is
+    /// most of the structurally important ones.
+    ///
+    /// Uses the same AUX-skipping walk as [`Self::coverage`], so the mask
+    /// cannot count an AUX data word as an opcode occurrence. Must be called
+    /// BEFORE `remap_chunk`, which rewrites the opcode bytes.
+    pub fn present_byte_mask(&self, chunk: &Chunk) -> [bool; 256] {
+        let (freq, _) = walk_instruction_positions(chunk, &self.shuffled_to_standard);
+        let mut mask = [false; 256];
+        for b in 0..256usize {
+            mask[b] = freq[b] > 0;
+        }
+        mask
+    }
+
     /// Detect whether `chunk` is *standard* (canonical) open-source Luau
     /// bytecode — e.g. produced by upstream `luau-compile` — as opposed to
     /// Roblox bytecode (which carries a per-client opcode shuffle this decoder

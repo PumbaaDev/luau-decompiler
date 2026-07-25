@@ -816,6 +816,39 @@ pub fn decompile_with_opmap(
     }
 }
 
+/// Observe this chunk's INDEPENDENT opinion about the opcode shuffle, for
+/// pooling into a cross-script consensus (see [`parser::consensus`]).
+///
+/// Returns `None` for bytecode that carries no Roblox shuffle — canonical Luau
+/// must never vote in a Roblox tally.
+///
+/// Two properties make the returned ballot admissible as evidence, and both are
+/// load-bearing:
+///
+/// * It comes from **prior-free** solo detection. A map produced under a prior
+///   is a copy of that prior, not an independent observation; pooling such maps
+///   lets the first file processed vote once per subsequent file. That
+///   auto-correlation is why a naively shared cache measures *worse* than no
+///   cache at all, and why the damage is worst under the smallest-file-first
+///   ordering production actually uses.
+/// * It carries the **heuristic** map, taken before `permutation_complete`.
+///   Completion invents mappings by bijection from what this one chunk happens
+///   to contain; it is per-chunk guesswork with no evidence behind it. Letting
+///   it into a shared tally would propagate one file's inventions to every
+///   later script — a strictly worse version of the bug being fixed.
+pub fn observe_ballot(bytecode: &[u8]) -> Option<parser::consensus::Ballot> {
+    let chunk = parser::parse(bytecode).ok()?;
+    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        return None;
+    }
+    let solo = parser::opmap::OpcodeMap::detect(&chunk);
+    Some(parser::consensus::Ballot::new(
+        parser::consensus::content_key(bytecode),
+        solo.heuristic_map,
+        solo.present_byte_mask(&chunk),
+    ))
+}
+
 /// Lightweight opcode detection only (no decompilation).
 /// Parses bytecode, runs opcode detection, merges with cached map, returns the
 /// HEURISTIC-only detected opmap (safe to cache, no speculative completion).
