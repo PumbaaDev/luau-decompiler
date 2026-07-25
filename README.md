@@ -122,6 +122,11 @@ The corpus covers arithmetic and operators, strings, tables, control flow, and c
 varargs / metatables / OOP patterns. It is deliberately adversarial rather than a happy path,
 and the pass rate is treated as the project's real quality metric.
 
+**Current: 46 of 47 programs decompile to semantically equivalent source.** The one
+outstanding failure is a nested short-circuit expression (`t and t.n or -1`) whose value is
+produced across a control-flow join; recovering it correctly needs phi-node materialisation
+rather than another pattern match.
+
 ## Project layout
 
 | Crate | What it is |

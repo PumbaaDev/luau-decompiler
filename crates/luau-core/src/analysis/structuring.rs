@@ -63,6 +63,31 @@ pub enum Region {
         body: Vec<Region>,
     },
 
+    /// A `while <cond> do` / `while true do` loop nested inside a for-loop body,
+    /// carried as PC ranges rather than CFG block ids.
+    ///
+    /// `structure_control_flow` claims every block inside a matched for-body as
+    /// `handled` before its natural-loop check runs, so an inner loop's header
+    /// is skipped and no `WhileDo`/`WhileTrue` region is ever produced for it.
+    /// `structure_numeric_for_body` — which structures for-bodies instead — had
+    /// no back-edge recognizer at all, so the inner loop degenerated into a
+    /// forward `if` plus a `continue` and its body ran once per outer iteration.
+    ///
+    /// This variant is emitted by that scan when it finds a JUMPBACK whose
+    /// target lies wholly inside the body range being scanned.
+    InlineLoopInLoop {
+        /// Back-edge target: the loop header, re-executed every iteration.
+        header_start: usize,
+        /// PC of the exit conditional (`while c do`), or `None` (`while true do`).
+        cond_pc: Option<usize>,
+        /// First instruction of the loop body proper.
+        body_start: usize,
+        /// PC of the JUMPBACK latch.
+        latch_pc: usize,
+        /// Structured body regions.
+        body: Vec<Region>,
+    },
+
     /// for k, v in iterator do ... end
     GenericFor {
         prep_pc: usize,
@@ -634,6 +659,110 @@ fn structure_numeric_for_body(
                     continue;
                 }
             }
+        }
+
+        // ── Shape C: a `while` / `while true` loop nested in this body ───
+        //
+        // Must be tried BEFORE Shape B: a while-guard and an if-guard are the
+        // same forward conditional jump instruction, and they differ only by the
+        // JUMPBACK latch that closes the range. Letting Shape B win turns the
+        // loop into `if cond then ... continue end`, so the body runs once per
+        // outer iteration instead of looping.
+        // Two triggers, because the latch is not always the first thing the scan
+        // reaches. `while c do BODY end` leads with its guard, and Shape B below
+        // would claim the whole range at that guard and never look at the latch.
+        //
+        //   (1) a JUMPBACK latch, reached directly (`while true do`, or a guard
+        //       shape this scan did not recognise);
+        //   (2) a forward conditional whose target is preceded by a JUMPBACK
+        //       landing at or before the conditional — the classic
+        //       `while c do BODY end` layout.
+        let shape_c = match op {
+            LuauOpcode::JumpBack if insn_d(insn) < 0 => {
+                let t = pc as i64 + 1 + insn_d(insn) as i64;
+                // Strict containment: the back edge must lie wholly inside the
+                // range being scanned, so this can never claim the enclosing
+                // for-loop's own back edge or an outer while's latch.
+                if t >= body_start as i64 && t <= pc as i64 {
+                    Some((t as usize, None, pc))
+                } else {
+                    None
+                }
+            }
+            _ => match forward_conditional_jump(op, pc, insn) {
+                Some((next_pc, target)) if target > next_pc && target <= body_end => {
+                    // The latch must be the LAST instruction before the target,
+                    // found by walking instruction boundaries so an AUX word is
+                    // never mistaken for a JUMPBACK.
+                    let mut last = None;
+                    let mut w = next_pc;
+                    while w < target {
+                        last = Some(w);
+                        let wop = LuauOpcode::from_u8(insn_op(code[w]));
+                        w += if wop.has_aux() { 2 } else { 1 };
+                    }
+                    last.and_then(|latch| {
+                        let lop = LuauOpcode::from_u8(insn_op(code[latch]));
+                        if lop != LuauOpcode::JumpBack || insn_d(code[latch]) >= 0 {
+                            return None;
+                        }
+                        let h = latch as i64 + 1 + insn_d(code[latch]) as i64;
+                        if h >= body_start as i64 && h <= pc as i64 {
+                            Some((h as usize, Some(pc), latch))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            },
+        };
+
+        if let Some((header_start, mut cond_pc, latch_pc)) = shape_c {
+            let after_latch = latch_pc + 1;
+            let mut inner_body_start = header_start;
+            if let Some(cp) = cond_pc {
+                inner_body_start = forward_conditional_jump(
+                    LuauOpcode::from_u8(insn_op(code[cp])),
+                    cp,
+                    code[cp],
+                )
+                .map(|(next_pc, _)| next_pc)
+                .unwrap_or(header_start);
+            } else {
+                // Reached via the latch: look for an exit test in the header
+                // whose target is the instruction right after the latch.
+                let mut h = header_start;
+                while h < latch_pc {
+                    let hop = LuauOpcode::from_u8(insn_op(code[h]));
+                    if let Some((next_pc, t)) = forward_conditional_jump(hop, h, code[h]) {
+                        if t == after_latch {
+                            cond_pc = Some(h);
+                            inner_body_start = next_pc;
+                            break;
+                        }
+                    }
+                    h += if hop.has_aux() { 2 } else { 1 };
+                }
+            }
+            if linear_start < header_start {
+                regions.push(Region::Linear {
+                    start: linear_start,
+                    end: header_start,
+                });
+            }
+            let nested_body = structure_numeric_for_body(code, inner_body_start, latch_pc);
+            regions.push(Region::InlineLoopInLoop {
+                header_start,
+                cond_pc,
+                body_start: inner_body_start,
+                latch_pc,
+                body: nested_body,
+            });
+            // JUMPBACK has no AUX word.
+            pc = after_latch;
+            linear_start = pc;
+            continue;
         }
 
         // ── Phase B0.5, Shape B: forward conditional jump whose target

@@ -885,7 +885,11 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
         upval_names_clone.as_deref(),
         Some(&ctx.chunk.protos),
     );
-    ctx.init_proto_naming(proto_index, hints);
+    ctx.init_proto_naming(
+        proto_index,
+        hints,
+        upval_names_clone.as_deref().unwrap_or(&[]),
+    );
     let prev_proto = ctx.current_proto_index;
     ctx.current_proto_index = Some(proto_index);
     // B0.134b: push this proto onto the decompilation stack so child
@@ -1351,9 +1355,17 @@ fn lift_region(
                 }
                 writes.sort_unstable();
                 writes.dedup();
+                // Registers whose first touch inside the loop is a pure
+                // definition are re-initialised every iteration, so they carry
+                // nothing in and must not be bound (see `reg_dead_on_entry`).
+                let skip: Vec<usize> = writes
+                    .iter()
+                    .copied()
+                    .filter(|&r| reg_dead_on_entry(&proto.code, block.start, loop_end, r))
+                    .collect();
                 premateralize_loop_carried(
                     ctx, proto, regs, locals, stmts,
-                    &writes, &[], block.start, Some((block.start, loop_end)),
+                    &writes, &skip, block.start, Some((block.start, loop_end)),
                 );
             }
 
@@ -2000,6 +2012,97 @@ fn lift_region(
                 });
             }
         }
+
+        Region::InlineLoopInLoop {
+            header_start,
+            cond_pc,
+            body_start,
+            latch_pc,
+            body,
+        } => {
+            // Mirrors `Region::WhileDo`; the ordering below is load-bearing.
+            //
+            // (a) The header's pre-branch instructions run once on entry.
+            let cond_start = cond_pc.unwrap_or(*body_start);
+            if *header_start < cond_start {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *header_start, cond_start,
+                    regs, locals, stmts, false,
+                );
+            }
+
+            // (b) Materialize this loop's own carried registers BEFORE the
+            //     condition is read. Without it the inner accumulator is still a
+            //     parked literal, so the guard renders as `0 < 2` and the body's
+            //     updates fold away into the register file.
+            {
+                let mut writes =
+                    collect_body_writes(&proto.code, *header_start, *latch_pc);
+                writes.sort_unstable();
+                writes.dedup();
+                let skip: Vec<usize> = writes
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        reg_dead_on_entry(&proto.code, *header_start, *latch_pc, r)
+                    })
+                    .collect();
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &writes, &skip, *header_start,
+                    Some((*header_start, *latch_pc + 1)),
+                );
+            }
+
+            let condition = match cond_pc {
+                Some(cp) => extract_branch_condition(ctx, proto, *cp, regs),
+                None => Expr::Bool(true),
+            };
+
+            let snap = locals.snapshot();
+            let mut body_stmts = Vec::new();
+            // (c) `break`/`continue` inside the body must resolve against THIS
+            //     loop, not the enclosing for.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = Some(*latch_pc);
+            for sub_region in body {
+                match sub_region {
+                    Region::Linear { start, end } => {
+                        lift_instruction_range(
+                            ctx, proto, proto_index, depth,
+                            *start, *end,
+                            regs, locals, &mut body_stmts, true,
+                        );
+                    }
+                    _ => {
+                        lift_region(
+                            ctx, proto, proto_index, cfg, sub_region,
+                            regs, locals, depth + 1, &mut body_stmts,
+                        );
+                    }
+                }
+            }
+            remove_trailing_jump(&mut body_stmts);
+            ctx.current_loop_end = prev_loop_end;
+
+            // (d) Re-lift the header at the bottom so the condition is
+            //     recomputed every iteration.
+            if *header_start < cond_start {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *header_start, cond_start,
+                    regs, locals, &mut body_stmts, true,
+                );
+            }
+
+            hoist_loop_locals(locals, &snap, stmts, &mut body_stmts);
+
+            stmts.push(Stat::While {
+                condition,
+                body: body_stmts,
+            });
+        }
     }
 }
 
@@ -2563,7 +2666,21 @@ pub(super) fn store_complex(
         _ => false,
     };
 
-    if !is_self_mutation && expr_is_inlinable(&value) {
+    // A loop-carried register that `premateralize_loop_carried` turned into a
+    // real local must have EVERY write emitted, not just self-mutating ones.
+    // `while not flag do ... flag = c >= 3 ... end` reads nothing from `flag`,
+    // so `is_self_mutation` is false and the update was parked in the register
+    // file. With no write left in the AST, `inline_pure_literals` then
+    // constant-propagated the initial value into the loop condition and deleted
+    // the declaration, folding the whole thing to `while true do`.
+    //
+    // Gated on the PIN rather than on a bare in-loop flag, so it fires only for
+    // the registers premateralization deliberately bound, and only across that
+    // loop's PC span.
+    let is_pinned_loop_carried = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+        && ctx.is_pinned_reg(reg as u8, pc);
+
+    if !is_self_mutation && !is_pinned_loop_carried && expr_is_inlinable(&value) {
         regs[reg] = RegVal::Expr(value);
     } else {
         // B0.127b: sanitize stdlib-name strings when emitting as a statement.
@@ -3397,20 +3514,24 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
                         let mut found_overwrite = false;
                         for j in (i + 1)..stmts.len() {
                             match &stmts[j] {
-                                // Found an assignment to the same variable - this is a dead store
-                                Stat::Assign { targets: t2, values: v2 } if t2.len() == 1 => {
-                                    if let Expr::Name(n2) = &t2[0] {
-                                        if n2 == var_name {
-                                            // Only a dead store if the overwriting RHS
-                                            // does NOT read the variable being assigned.
-                                            // e.g. `x = 5; x = x + 3` — first store is NOT dead.
-                                            let rhs_uses_var = v2.iter().any(|v| expr_uses_name(v, var_name));
-                                            if !rhs_uses_var {
-                                                found_overwrite = true;
-                                            }
-                                            break;
-                                        }
+                                // Found an assignment to the same variable - this is a dead store.
+                                // The guard must require a Name target matching var_name: a
+                                // broader guard (e.g. just `t2.len() == 1`) would also capture
+                                // `t[k] = x`, `t.f = x` and `y = f(x)`, whose reads of var_name
+                                // would then never reach the stmt_reads_name arm below.
+                                Stat::Assign { targets: t2, values: v2 }
+                                    if t2.len() == 1
+                                        && matches!(&t2[0], Expr::Name(n2) if n2 == var_name) =>
+                                {
+                                    // Only a dead store if the overwriting RHS
+                                    // does NOT read the variable being assigned.
+                                    // e.g. `x = 5; x = x + 3` — first store is NOT dead.
+                                    let rhs_uses_var =
+                                        v2.iter().any(|v| expr_uses_name(v, var_name));
+                                    if !rhs_uses_var {
+                                        found_overwrite = true;
                                     }
+                                    break;
                                 }
                                     // Phase B0.92: use stmt_reads_name to precisely check
                                 // whether intervening statements reference the variable.
@@ -4579,6 +4700,158 @@ fn strip_trailing_breaks(mut stmts: Vec<Stat>) -> Vec<Stat> {
 /// SUPERset of the true write set (safe to over-materialize, unsafe to
 /// under-materialize). Aux-bearing opcodes advance PC by 2 to avoid
 /// mis-reading the AUX word as a new instruction's opcode.
+/// Is `reg` dead on entry to the instruction range `[start, end)`?
+///
+/// True when the first instruction in the range that touches `reg` is a pure
+/// definition — a load or constructor that writes R(A) and reads no register.
+/// Such a register is a scratch temp the loop re-initialises every iteration
+/// (`while k < 2` compiles the bound `2` into a register inside the header
+/// block), not a value carried in from before the loop.
+///
+/// Premateralizing one is actively harmful: it invents `local bound = 2`, pins
+/// that name over the whole loop, and a body write to the same slot — Luau
+/// reuses it for the per-iteration local — then lands on the pinned name as a
+/// reassignment. The loop's bound and the body's local collapse into one
+/// variable.
+///
+/// Deliberately conservative: any opcode outside the pure-definition list
+/// counts as a READ of `reg` whenever `reg` appears in one of its operand
+/// slots, so the answer defaults to "live on entry" and premateralization keeps
+/// its historical behaviour.
+fn reg_dead_on_entry(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let ia = insn_a(insn) as usize;
+        let ib = insn_b(insn) as usize;
+        let ic = insn_c(insn) as usize;
+        let pure_def = matches!(
+            op,
+            LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::LoadKX
+                | LuauOpcode::GetImport
+                | LuauOpcode::GetGlobal
+                | LuauOpcode::GetUpval
+                | LuauOpcode::NewTable
+                | LuauOpcode::DupTable
+                | LuauOpcode::NewClosure
+                | LuauOpcode::DupClosure
+                | LuauOpcode::GetVarargs
+        );
+        if pure_def {
+            if ia == reg {
+                return true;
+            }
+        } else if op == LuauOpcode::Move {
+            if ib == reg {
+                return false;
+            }
+            if ia == reg {
+                return true;
+            }
+        } else if ia == reg || ib == reg || ic == reg {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Does any instruction in `[start, end)` mention `reg` in a register operand?
+///
+/// Deliberately an over-approximation (a `c` field that is really a jump offset
+/// still counts), because the only caller uses it to decide whether to give a
+/// register a name — a false positive costs one extra `local`, a false negative
+/// loses a value.
+fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg
+            || insn_b(insn) as usize == reg
+            || insn_c(insn) as usize == reg
+        {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Give a name to registers that an inline branch writes and later code reads.
+///
+/// The inline if-then path in `lift_instruction_range` lifts the guarded range
+/// with the live register file and then hard-restores the pre-branch snapshot,
+/// so a value produced inside the branch is annihilated at the join. When the
+/// register held a parked literal beforehand, the join silently reads that stale
+/// literal: `flag = c >= 3 and c % 3 == 0` lifted as `flag = false`, and the
+/// enclosing `while not flag` never terminated.
+///
+/// Materializing the register from its PRE-branch value first turns the shape
+/// into the correct
+///
+/// ```luau
+/// local t = false
+/// if c >= 3 then t = c % 3 == 0 end
+/// flag = t
+/// ```
+///
+/// Pinning over the branch range routes the in-body write through
+/// `store_complex`'s pinned-register path so it is emitted rather than folded.
+///
+/// Narrow by construction: only registers that (a) the branch writes, (b)
+/// currently hold a parked LITERAL, and (c) are read after the branch.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn premateralize_branch_escapes(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    branch_start: usize,
+    branch_end: usize,
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    if branch_end <= branch_start || after_end <= after_start {
+        return;
+    }
+    let mut writes = collect_body_writes(&proto.code, branch_start, branch_end);
+    writes.sort_unstable();
+    writes.dedup();
+    for reg in writes {
+        if reg >= regs.len() {
+            continue;
+        }
+        let parked_literal = matches!(
+            regs.get(reg),
+            Some(RegVal::Expr(
+                Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_)
+            ))
+        );
+        if !parked_literal {
+            continue;
+        }
+        if !reg_used_in_range(&proto.code, after_start, after_end, reg) {
+            continue;
+        }
+        let value = reg_expr(regs, reg);
+        emit_local_or_assign(ctx, proto, regs, locals, stmts, reg, pc, value);
+        if let RegVal::Expr(Expr::Name(n)) = &regs[reg] {
+            let name = n.clone();
+            ctx.pin_reg_name(reg as u8, &name, branch_start, branch_end);
+        }
+    }
+}
+
 fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec<usize> {
     use std::collections::BTreeSet;
     let mut out: BTreeSet<usize> = BTreeSet::new();
@@ -5001,6 +5274,35 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
 pub(super) fn table_expr(regs: &[RegVal], idx: usize) -> Expr {
     let e = reg_expr(regs, idx);
     if is_impossible_as_table(&e) {
+        return Expr::Name(format!("v{}", idx));
+    }
+    e
+}
+
+/// Receiver resolution for NAMECALL (`obj:method()`).
+///
+/// Deliberately more permissive than `table_expr`. Arithmetic, concat, length
+/// and negation results are rejected there because a *table base* built from
+/// them (`(#v32).lastUpdate = X`) is almost always a decode artifact — but as a
+/// *method receiver* they are legitimate: Luau's `__add`/`__sub`/`__mul`/
+/// `__div`/`__mod`/`__pow`/`__idiv`/`__concat`/`__unm`/`__len` metamethods may
+/// all return a table, so `(a + b):method()` is valid operator-overload code.
+///
+/// Only values whose runtime type no metamethod can change are rejected:
+/// number/bool/nil literals, `not x`, and comparisons (Luau coerces the results
+/// of `__eq`/`__lt`/`__le` to boolean).
+pub(super) fn method_receiver_expr(regs: &[RegVal], idx: usize) -> Expr {
+    let e = reg_expr(regs, idx);
+    let impossible = match &e {
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
+        Expr::UnOp { op, .. } => matches!(op, UnOp::Not),
+        Expr::BinOp { op, .. } => matches!(
+            op,
+            BinOp::Eq | BinOp::NotEq | BinOp::LT | BinOp::LE | BinOp::GT | BinOp::GE
+        ),
+        _ => false,
+    };
+    if impossible {
         return Expr::Name(format!("v{}", idx));
     }
     e

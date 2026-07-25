@@ -60,6 +60,24 @@ struct ProtoNaming {
     /// proto's lifetime; the hint relevant to a read is the most recent write
     /// that precedes it, not the globally-last hint).
     hints: std::collections::HashMap<u8, Vec<(usize, RegisterHint)>>,
+    /// Identifiers this proto has already inherited as UPVALUE names.
+    ///
+    /// A proto's own bindings share one lexical scope with its upvalues, so a
+    /// locally-allocated name that equals an upvalue name shadows it. That is
+    /// invisible to `prefix_counts` (upvalues never pass through the counter)
+    /// and to `used_names` (which stable hints deliberately bypass so nested
+    /// params may shadow outer params). `compose(f, g)` capturing `arg1`/`arg2`
+    /// and then naming its own `Param(0)` `arg1` produced
+    /// `function(arg1) return arg1(arg2(arg1)) end` — the parameter ate the
+    /// captured `f`.
+    reserved: std::collections::HashSet<String>,
+    /// `(register, pc)` pairs covered by `pin_reg_name`, i.e. registers that
+    /// `premateralize_loop_carried` turned into a real local for the span of a
+    /// loop. `assigned` cannot answer this — ordinary `reg_name` memoization
+    /// writes there too — and the lifter needs to distinguish "this register is
+    /// a loop-carried binding whose writes must be emitted" from "this register
+    /// happens to have a name".
+    pinned: std::collections::HashSet<(u8, usize)>,
 }
 
 /// Phase B0.51C — compact key encoding a stable-identity hint.  Used by
@@ -98,6 +116,8 @@ impl ProtoNaming {
             assigned: std::collections::HashMap::new(),
             stable_names: std::collections::HashMap::new(),
             hints: std::collections::HashMap::new(),
+            reserved: std::collections::HashSet::new(),
+            pinned: std::collections::HashSet::new(),
         }
     }
 
@@ -116,11 +136,11 @@ impl ProtoNaming {
         // name is actually free. A single bump could still hand back a
         // colliding name (`result2` taken → returns `result3`, but `result3`
         // may be taken too).
-        if used_names.contains(&name) {
+        if used_names.contains(&name) || self.reserved.contains(&name) {
             loop {
                 *count += 1;
                 let alt = format!("{}{}", prefix, count);
-                if !used_names.contains(&alt) {
+                if !used_names.contains(&alt) && !self.reserved.contains(&alt) {
                     return alt;
                 }
             }
@@ -142,13 +162,20 @@ impl ProtoNaming {
     /// counter, so two distinct stable-identity registers with the same
     /// prefix (e.g., two separate generic-for loops both asking for `k`)
     /// correctly produce `k`, `k2`, ….
+    /// Names inherited as upvalues are still skipped: shadowing an *outer
+    /// param* is intended, shadowing *this proto's own upvalue* is a bug.
     fn unique_stable_name(&mut self, prefix: &str) -> String {
-        let count = self.prefix_counts.entry(prefix.to_string()).or_insert(0);
-        *count += 1;
-        if *count == 1 {
-            prefix.to_string()
-        } else {
-            format!("{}{}", prefix, count)
+        loop {
+            let count = self.prefix_counts.entry(prefix.to_string()).or_insert(0);
+            *count += 1;
+            let name = if *count == 1 {
+                prefix.to_string()
+            } else {
+                format!("{}{}", prefix, count)
+            };
+            if !self.reserved.contains(&name) {
+                return name;
+            }
         }
     }
 }
@@ -226,9 +253,23 @@ impl<'a> DecompileContext<'a> {
     }
 
     /// Initialize naming context for a proto with register hints from pre-pass.
-    pub fn init_proto_naming(&mut self, proto_index: usize, hints: std::collections::HashMap<u8, Vec<(usize, RegisterHint)>>) {
+    ///
+    /// `upval_names` are the identifiers this proto sees as upvalues. They share
+    /// the proto's lexical scope, so they are reserved: a local or parameter
+    /// allocated with the same identifier would shadow the capture.
+    pub fn init_proto_naming(
+        &mut self,
+        proto_index: usize,
+        hints: std::collections::HashMap<u8, Vec<(usize, RegisterHint)>>,
+        upval_names: &[String],
+    ) {
         let mut naming = ProtoNaming::new();
         naming.hints = hints;
+        naming.reserved = upval_names
+            .iter()
+            .filter(|n| !n.is_empty())
+            .cloned()
+            .collect();
         self.proto_naming.insert(proto_index, naming);
     }
 
@@ -280,9 +321,21 @@ impl<'a> DecompileContext<'a> {
             if let Some(naming) = self.proto_naming.get_mut(&pi) {
                 for pc in start_pc..end_pc {
                     naming.assigned.entry((reg, pc)).or_insert_with(|| name.to_string());
+                    naming.pinned.insert((reg, pc));
                 }
             }
         }
+    }
+
+    /// Was `reg` pinned at `pc` by `premateralize_loop_carried`?
+    ///
+    /// True only for registers that pass materialized into a real local for the
+    /// span of a loop — the loop-carried accumulators and flags whose in-body
+    /// writes must be EMITTED rather than folded into the register file.
+    pub fn is_pinned_reg(&self, reg: u8, pc: usize) -> bool {
+        self.current_proto_index
+            .and_then(|pi| self.proto_naming.get(&pi))
+            .is_some_and(|naming| naming.pinned.contains(&(reg, pc)))
     }
 
     /// Get a register name from debug info, or synthesize a meaningful one
@@ -2565,7 +2618,7 @@ mod hint_path_tests {
             main_proto: 0,
         };
         let mut ctx = DecompileContext::new(&chunk);
-        ctx.init_proto_naming(0, std::collections::HashMap::new());
+        ctx.init_proto_naming(0, std::collections::HashMap::new(), &[]);
         ctx.current_proto_index = Some(0);
         // Force the synthesizer path: empty naming state, call the helper.
         let name = ctx.name_from_call_result("pcall");
@@ -2592,7 +2645,7 @@ mod hint_path_tests {
         // counter-suffix shape (first use = bare prefix, second = "prefix2")
         // instead of the fallback "prefix_1", "prefix_2" shape used when no
         // proto is active.
-        ctx.init_proto_naming(0, std::collections::HashMap::new());
+        ctx.init_proto_naming(0, std::collections::HashMap::new(), &[]);
         ctx.current_proto_index = Some(0);
         ctx.name_from_call_result(func)
     }
@@ -3301,14 +3354,14 @@ mod b0106_reserved_word_guard_tests {
         let mut ctx = DecompileContext::new(chunk);
         let mut hints: HashMap<u8, Vec<(usize, RegisterHint)>> = HashMap::new();
         hints.entry(reg).or_default().push((pc, hint));
-        ctx.init_proto_naming(0, hints);
+        ctx.init_proto_naming(0, hints, &[]);
         ctx.current_proto_index = Some(0);
         ctx
     }
 
     fn make_ctx(chunk: &Chunk) -> DecompileContext<'_> {
         let mut ctx = DecompileContext::new(chunk);
-        ctx.init_proto_naming(0, HashMap::new());
+        ctx.init_proto_naming(0, HashMap::new(), &[]);
         ctx.current_proto_index = Some(0);
         ctx
     }
@@ -3705,7 +3758,7 @@ mod b51c_stable_hint_naming_tests {
         for (reg, hs) in reg_to_hints {
             hints.insert(*reg, hs.clone());
         }
-        ctx.init_proto_naming(proto_idx, hints);
+        ctx.init_proto_naming(proto_idx, hints, &[]);
         ctx.current_proto_index = Some(proto_idx);
     }
 
@@ -4219,7 +4272,7 @@ mod b066_tests {
         for (reg, hs) in reg_to_hints {
             hints.insert(*reg, hs.clone());
         }
-        ctx.init_proto_naming(proto_idx, hints);
+        ctx.init_proto_naming(proto_idx, hints, &[]);
         ctx.current_proto_index = Some(proto_idx);
     }
 

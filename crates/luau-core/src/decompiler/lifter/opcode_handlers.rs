@@ -43,6 +43,7 @@ use super::{
     // Small expression builders.
     is_roblox_method_lvalue_artifact,
     is_self_referential_field_assign,
+    method_receiver_expr,
     mk_binop,
     stmt_reads_name,
     mk_binop_k,
@@ -51,6 +52,7 @@ use super::{
     reg_expr,
     sanitize_leaked_global_string,
     simplify_expr,
+    premateralize_branch_escapes,
     store_complex,
     table_expr,
     // Recursive closure lifting — called on every `NewClosure` opcode.
@@ -173,6 +175,105 @@ fn is_control_flow_op(op: LuauOpcode) -> bool {
     )
 }
 
+/// Is register `a` a live local that an earlier closure captured BY REFERENCE?
+///
+/// Luau's register allocator may not reuse a REF-captured slot for a *different*
+/// local before a CLOSEUPVALS on it, so every write to such a register between
+/// the CAPTURE and that CLOSEUPVALS is by construction an assignment to the SAME
+/// variable — never the declaration of a new one. Without this the classic
+/// forward-declaration shape
+///
+/// ```luau
+/// local isOdd
+/// local function isEven(n) ... isOdd(n - 1) ... end   -- CAPTURE REF R0
+/// function isOdd(n) ... end                           -- DUPCLOSURE R0
+/// ```
+///
+/// re-derives R0's name through the uniquing allocator, gets `isOdd3`, and
+/// declares a second binding — leaving `isEven`'s upvalue pointing at the
+/// still-nil original.
+///
+/// Only a properly remapped `CAPTURE` counts. The structural fallback used
+/// elsewhere for shuffled Roblox bytecode merely *guesses*, and a misfire must
+/// not be escalated into silently dropping a binding.
+fn reg_is_open_ref_capture(code: &[u32], upto_pc: usize, a: usize) -> bool {
+    let mut open = false;
+    let mut i = 0usize;
+    let end = upto_pc.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        match op {
+            // CAPTURE A B: A is the capture kind (1 == LCL_REF), B the register.
+            LuauOpcode::Capture => {
+                if insn_a(insn) == 1 && insn_b(insn) as usize == a {
+                    open = true;
+                }
+            }
+            // CLOSEUPVALS A closes every upvalue at or above register A, which
+            // is exactly where Luau is free to rebind the slot.
+            LuauOpcode::CloseUpvals => {
+                if (insn_a(insn) as usize) <= a {
+                    open = false;
+                }
+            }
+            _ => {}
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    open
+}
+
+/// Does this opcode define (write) register R(A)?
+///
+/// Used by `table_needs_binding` to stop scanning once the constructor's
+/// register has been reused for an unrelated value. Written as an EXCLUSION
+/// list so an unrecognised or Roblox-extension opcode counts as a definition:
+/// stopping the scan early under-counts reads, which is the safe direction —
+/// it keeps the historical park-the-literal behaviour.
+fn insn_defines_reg_a(op: LuauOpcode) -> bool {
+    !matches!(
+        op,
+        LuauOpcode::Nop
+            | LuauOpcode::Break
+            | LuauOpcode::Coverage
+            // A is a value being READ out of, not written into.
+            | LuauOpcode::SetGlobal
+            | LuauOpcode::SetUpval
+            | LuauOpcode::SetTable
+            | LuauOpcode::SetTableKS
+            | LuauOpcode::SetTableN
+            // A is the table / range base, not a fresh definition.
+            | LuauOpcode::SetList
+            | LuauOpcode::CloseUpvals
+            | LuauOpcode::Return
+            // A is a tested register.
+            | LuauOpcode::Jump
+            | LuauOpcode::JumpBack
+            | LuauOpcode::JumpX
+            | LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+            // A is a capture kind / builtin id / param count.
+            | LuauOpcode::Capture
+            | LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3
+            | LuauOpcode::PrepVarargs
+    )
+}
+
 /// How far ahead `table_needs_binding` will look for a cross-branch use.
 /// Bounded so a proto with many table constructors stays linear-ish; protos
 /// longer than this keep the historical park-the-literal behaviour.
@@ -188,8 +289,17 @@ const TABLE_USE_SCAN_LIMIT: usize = 1024;
 /// silently forks it: the loop body mutates a throwaway copy and the read after
 /// the loop sees an undeclared name. Binding it first keeps one identity.
 ///
-/// Returns false for straight-line constructors, so short `{a = 1, b = 2}`
-/// literals still inline exactly as before.
+/// Cloning also forks the table when it is simply READ twice in straight-line
+/// code — `local names = {...} ; table.sort(names) ; table.concat(names, ",")`
+/// compiles to `MOVE Rarg, Rtable` twice with no branch anywhere between the
+/// constructor and either read. Each read would materialise an independent
+/// literal, so `table.sort` sorts a throwaway and `table.concat` reads a
+/// different one. Two or more reads therefore force a binding regardless of
+/// branches.
+///
+/// Returns false for straight-line constructors read at most once, so
+/// one-shot literals like `print(#{1, 2, 3})` and `table.concat({}, ",")`
+/// still inline exactly as before.
 fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
     if pc >= code.len() {
         return false;
@@ -198,31 +308,66 @@ fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
     let mut i = pc + if start_op.has_aux() { 2 } else { 1 };
     let scan_end = code.len().min(pc + TABLE_USE_SCAN_LIMIT);
     let mut crossed_branch = false;
+    let mut reads = 0usize;
     while i < scan_end {
         let insn = code[i];
         let op = LuauOpcode::from_u8(insn_op(insn));
+        let ia = insn_a(insn) as usize;
+        let ib = insn_b(insn) as usize;
         if is_control_flow_op(op) {
             crossed_branch = true;
-        } else if crossed_branch {
-            let ia = insn_a(insn) as usize;
-            let ib = insn_b(insn) as usize;
-            let touches = match op {
-                // R(A) is the table being filled.
-                LuauOpcode::SetList => ia == a,
-                // R(B) is the table being indexed, read or copied out.
-                LuauOpcode::SetTable
-                | LuauOpcode::SetTableKS
-                | LuauOpcode::SetTableN
-                | LuauOpcode::GetTable
-                | LuauOpcode::GetTableKS
-                | LuauOpcode::GetTableN
-                | LuauOpcode::NameCall
-                | LuauOpcode::Length
-                | LuauOpcode::Move => ib == a,
-                _ => false,
-            };
-            if touches {
-                return true;
+        } else {
+            // A multret SETLIST (`{ 1, 2, f() }`) splices ALL of the call's
+            // results into the array part. There is no statement form that
+            // reproduces that against a bound name — `t[21] = f()` truncates to
+            // one value — so such a table must stay a pending literal and be
+            // emitted as a constructor, whatever its read count.
+            if matches!(op, LuauOpcode::SetList) && ia == a && insn_c(insn) == 0 {
+                return false;
+            }
+            // A read hands the table's value to another register or consumer.
+            // The constructor's own fill run (SETLIST with A == a, SETTABLE*
+            // with B == a) is deliberately NOT counted here — it builds the
+            // literal rather than aliasing it.
+            let reads_table = matches!(
+                op,
+                LuauOpcode::GetTable
+                    | LuauOpcode::GetTableKS
+                    | LuauOpcode::GetTableN
+                    | LuauOpcode::NameCall
+                    | LuauOpcode::Length
+                    | LuauOpcode::Move
+            ) && ib == a;
+            if reads_table {
+                reads += 1;
+                if reads >= 2 {
+                    return true;
+                }
+            }
+            if crossed_branch {
+                let touches = match op {
+                    // R(A) is the table being filled.
+                    LuauOpcode::SetList => ia == a,
+                    // R(B) is the table being indexed, read or copied out.
+                    LuauOpcode::SetTable
+                    | LuauOpcode::SetTableKS
+                    | LuauOpcode::SetTableN
+                    | LuauOpcode::GetTable
+                    | LuauOpcode::GetTableKS
+                    | LuauOpcode::GetTableN
+                    | LuauOpcode::NameCall
+                    | LuauOpcode::Length
+                    | LuauOpcode::Move => ib == a,
+                    _ => false,
+                };
+                if touches {
+                    return true;
+                }
+            }
+            // The register now holds an unrelated value; every later mention of
+            // it refers to a different object, so stop counting.
+            if ia == a && insn_defines_reg_a(op) {
+                return false;
             }
         }
         i += if op.has_aux() { 2 } else { 1 };
@@ -525,6 +670,33 @@ pub(super) fn lift_instruction_range(
                 // destination a name to prevent future duplication.
                 // Table literals are kept pending so SETTABLEKS can fill them in-place.
                 let src_expr = reg_expr(regs, b);
+                // A loop-carried register that `premateralize_loop_carried`
+                // bound to a real local keeps its identity: copy-propagating
+                // over it drops the assignment entirely and silently rebinds the
+                // name. `acc = bit32.bxor(...)` compiles to `CALL R4` +
+                // `MOVE R0 R4`, and swallowing that MOVE left `acc` never
+                // updated while `acc`'s later reads resolved to the loop-body
+                // temp. Table sources stay pending so SETTABLEKS can still fill
+                // them in place.
+                let pinned_dest = match regs.get(a) {
+                    Some(RegVal::Expr(Expr::Name(n)))
+                        if ctx.is_pinned_reg(a as u8, pc)
+                            && !matches!(&src_expr, Expr::Table { .. })
+                            && !matches!(&src_expr, Expr::Name(s) if *s == *n) =>
+                    {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(bound) = pinned_dest {
+                    stmts.push(Stat::Assign {
+                        targets: vec![Expr::Name(bound.clone())],
+                        values: vec![src_expr],
+                    });
+                    regs[a] = RegVal::Expr(Expr::Name(bound));
+                    pc += 1;
+                    continue;
+                }
                 match &src_expr {
                     Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
                     | Expr::String(_) | Expr::Varargs | Expr::Table { .. } => {
@@ -571,7 +743,21 @@ pub(super) fn lift_instruction_range(
                 // Keep the local binding; don't clobber regs[a] with the upval
                 // name. If the upval was genuinely needed, the downstream
                 // misalignment will surface as a separate test failure to fix.
-                if !locals.declared.contains(&a) {
+                //
+                // The guard must not be tripped by this handler's OWN
+                // `pre_declare` below. A proto that reads two different
+                // upvalues through one scratch register —
+                // `GETUPVAL R2 U0 … GETUPVAL R2 U1` — would otherwise keep the
+                // first alias forever, and `reads = reads + 1` lifted as
+                // `reads = n + 1`, silently reading the wrong upvalue. A
+                // register whose current binding is itself an upvalue alias is
+                // scratch, never the seeded module-table local guarded here.
+                let holds_upval_alias = match locals.current_name(a) {
+                    Some(cur) => (0..proto.num_upvalues)
+                        .any(|u| ctx.upval_name(proto, proto_index, u) == cur),
+                    None => false,
+                };
+                if !locals.declared.contains(&a) || holds_upval_alias {
                     regs[a] = RegVal::Expr(Expr::Name(name.clone()));
                     // The register is now an ALIAS of an existing binding (the
                     // upvalue), not a fresh slot. Without recording that, the
@@ -1866,6 +2052,30 @@ pub(super) fn lift_instruction_range(
                     // `reverse_k_arith = function()...end` bug in
                     // `ModuleScript.lua` where two NEWCLOSUREs to R1 with
                     // distinct debug_names used to produce a global write.
+                    // Storing into a register that an earlier closure captured by
+                    // reference, and which still holds that binding: this is an
+                    // assignment to the existing variable, not a new declaration.
+                    // Re-deriving the name here would allocate a fresh `isOdd3`
+                    // and strand the captured `isOdd` at nil.
+                    let carried_ref_binding = match regs.get(a) {
+                        Some(RegVal::Expr(Expr::Name(n)))
+                            if locals.current_name(a) == Some(n.as_str())
+                                && reg_is_open_ref_capture(code, pc, a) =>
+                        {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(existing) = carried_ref_binding {
+                        stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(existing.clone())],
+                            values: vec![func_expr],
+                        });
+                        regs[a] = RegVal::Expr(Expr::Name(existing));
+                        pc = cap_pc;
+                        continue;
+                    }
+
                     let mut new_name = ctx.reg_name(proto, a as u8, pc);
                     // B0.129: if the name resolved to "self", it's carried from
                     // a previous NAMECALL that stored the receiver object in this
@@ -1922,7 +2132,20 @@ pub(super) fn lift_instruction_range(
                 // AUX is a 0-based index into proto.constants. The CALL instruction follows.
                 let method = aux.map(|ax| get_method_string_from_aux(proto, &ctx.chunk.strings, ax))
                     .unwrap_or_else(|| format!("method_{}", pc));
-                let obj = table_expr(regs, b);
+                // A pending table literal in the receiver register is handed out
+                // as a fresh CLONE at every read, so `obj:bump(5)`, `obj:bump(7)`
+                // and `obj.total` each built their own private copy and the two
+                // mutations landed on different objects. Materialize R(B) itself
+                // — not just the R(A+1) self slot below — so every later consumer
+                // shares one identity.
+                //
+                // Gated on `Expr::Table` only: `ensure_lvalue_base_materialized`
+                // also materializes Call/MethodCall, which would break the
+                // deliberate `a == b` method-chain pass-through below.
+                if matches!(regs.get(b), Some(RegVal::Expr(Expr::Table { .. }))) {
+                    ensure_lvalue_base_materialized(ctx, proto, regs, locals, stmts, b, pc);
+                }
+                let obj = method_receiver_expr(regs, b);
                 // If the object is a complex expression (call, field chain, etc.),
                 // emit a local first so it doesn't get duplicated inside the
                 // MethodCall expression and at every later use site.
@@ -2823,7 +3046,6 @@ pub(super) fn lift_instruction_range(
                 if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
                     // Isolate register state so then-body doesn't corrupt fall-through.
-                    let regs_snapshot = regs.clone();
                     let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
                     let jump_next = pc + 2; // comparison jumps have AUX word
 
@@ -2832,6 +3054,19 @@ pub(super) fn lift_instruction_range(
                     // out-of-range handler and becomes a spurious `break`.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end);
+
+                    // Name any parked literal this branch overwrites and later
+                    // code reads, BEFORE snapshotting — otherwise the restore
+                    // below annihilates the branch's result and the join silently
+                    // reads the stale pre-branch literal.
+                    let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    premateralize_branch_escapes(
+                        ctx, proto, regs, locals, stmts,
+                        jump_next, construct_end, construct_end, end, pc,
+                    );
+
+                    // Isolate register state so then-body doesn't corrupt fall-through.
+                    let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);

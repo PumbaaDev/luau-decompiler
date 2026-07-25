@@ -120,6 +120,11 @@ impl LocalTracker {
         self.declared.insert(reg);
     }
 
+    /// The local name currently bound to `reg`, if it holds a live binding.
+    pub(super) fn current_name(&self, reg: usize) -> Option<&str> {
+        self.current_names.get(&reg).map(|s| s.as_str())
+    }
+
     /// Is `name` the local currently bound to some register in this proto?
     ///
     /// Copy-propagated registers (a plain `MOVE` emits no statement) are not in

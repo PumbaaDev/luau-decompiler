@@ -798,6 +798,24 @@ pub(super) fn inline_single_use_temps_pinned(
                 continue;
             }
 
+            // A local captured as an upvalue must not be inlined or removed.
+            // `count_name_reads_in_expr` returns 0 for `Expr::Function`, so a
+            // binding read once at this level and otherwise only from inside a
+            // closure body looks single-use: the value was substituted into the
+            // visible read and the declaration deleted, turning the closure's
+            // upvalue into an undeclared global (`local counter = 0` +
+            // `api.inc` → `counter += 1` against nil). This is the same guard
+            // `inline_pure_literals` already applies; it was never ported here.
+            let captured_by_closure = stmts[(i + 1)..].iter().any(|s| {
+                (stmt_reads_name_deep(s, &def_name) && !stmt_reads_name(s, &def_name))
+                    || (stmt_writes_name(s, &def_name)
+                        && !stmt_writes_name_recursive(s, &def_name))
+            });
+            if captured_by_closure {
+                i += 1;
+                continue;
+            }
+
             // Find the use site (first reader at this block level).
             let mut reader_idx: Option<usize> = None;
             for j in (i + 1)..stmts.len() {
@@ -811,6 +829,20 @@ pub(super) fn inline_single_use_temps_pinned(
                 i += 1;
                 continue;
             };
+
+            // A write to `def_name` between the definition and the reader means
+            // the reader observes the NEW value, not the initializer. Reads are
+            // counted from expressions only, so an assignment target is
+            // invisible to `read_count` and
+            // `local t = false ; if c then t = e end ; x = t`
+            // looked single-use and inlined the stale `false`.
+            if stmts[(i + 1)..j]
+                .iter()
+                .any(|s| stmt_writes_name_recursive(s, &def_name))
+            {
+                i += 1;
+                continue;
+            }
 
             // Phase B0.45A safety checks ─────────────────────────────────
             //
