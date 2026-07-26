@@ -274,7 +274,24 @@ pub fn resolve(ballots: &[Ballot], cfg: &ConsensusConfig) -> Resolved {
             .max()
             .unwrap_or(0);
 
+        // The six comparison branches (27..=32) are the one family where a lone
+        // vote is worth less than no vote. They are mutually confusable by
+        // construction — same encoding, same operand shape, differing only in
+        // which way the test runs — so a single file's reading of one is close
+        // to a coin flip. Worse, pinning one wrongly denies that opcode to the
+        // byte that really holds it, and the family fills from a fixed
+        // elimination order, so one bad pin cascades through the rest of it.
+        //
+        // Requiring a second, independent file to agree before pinning a member
+        // of this family measured as a strict improvement: pooled round trip
+        // 54 -> 56 over seven permutations, with no file lost on any seed.
+        // Members that fail the gate are withheld rather than guessed, which
+        // leaves the opcode free for a better-supported byte to claim.
+        let is_comparison_branch = (27..=32).contains(&oi);
+        let family_floor = if is_comparison_branch { 2 } else { cfg.min_votes };
+
         let passes = count >= cfg.min_votes
+            && count >= family_floor
             && count as u64 * 100 >= support as u64 * cfg.min_share_pct as u64
             && (count.saturating_sub(runner)) as u64 * 100
                 >= support as u64 * cfg.min_margin_pct as u64;
