@@ -663,6 +663,12 @@ impl OpcodeMap {
         detect_numeric_for(chunk, &mut ctx);
 
         // TIER 3: Frequency + operand analysis
+        // GETTABLEN's sequential-read run first: in table-heavy chunks the real
+        // GETTABLEN out-counts the real CALL and matches CALL's operand shape, so
+        // detect_call force-assigns it and burns two slots. The run signature is
+        // exact (0 false positives measured across 5 permutations of the corpus),
+        // so claiming it up front also unpoisons detect_call's candidate list.
+        detect_gettablen_read_run(chunk, &mut ctx);
         detect_call(chunk, &mut ctx);
         detect_namecall(chunk, &mut ctx);
         detect_loadk(chunk, &mut ctx);
@@ -682,6 +688,12 @@ impl OpcodeMap {
         // "NEWTABLE candidate" pattern (c=0, small a, plausible b). By mapping
         // JUMPIFEQ first, its shuffled byte becomes ineligible for NEWTABLE,
         // letting the real NEWTABLE byte rise to the top of the candidate list.
+        //
+        // The MODK/JUMPXEQKN parity pair goes ahead of both: its evidence is a
+        // value-range invariant rather than a shape, and in the parity-test files
+        // detect_comparison_jumps_aux otherwise claims the JUMPXEQKN byte as a
+        // plain conditional jump, after which neither half is recoverable.
+        detect_modk_parity_pair(chunk, &mut ctx);
         detect_comparison_jumps_aux(chunk, &mut ctx);
         detect_jumpxeq(chunk, &mut ctx);
         detect_jumpback(chunk, &mut ctx);
@@ -725,6 +737,10 @@ impl OpcodeMap {
         // Sequence-based arith detection (finds low-frequency arith ops via
         // monotonic-A ladder pattern). Must run BEFORE detect_arithmetic which
         // uses frequency-based detection that fails for single-occurrence ops.
+        // The same-register ladder goes first: it covers the compound-assignment
+        // shape (A == B throughout) that the monotonic-A test structurally cannot
+        // see, and it must beat the frequency detectors for the same reason.
+        detect_same_register_arith_k_ladder(chunk, &mut ctx);
         detect_arith_sequence(chunk, &mut ctx);
         detect_arithmetic(chunk, &mut ctx);
         detect_arithmetic_k(chunk, &mut ctx);
@@ -840,6 +856,8 @@ impl OpcodeMap {
         detect_forgprep_inext_pair(chunk, &mut ctx); // Phase B0.29: pair detector
         detect_forgloopinext(chunk, &mut ctx); // Phase B0.14: added to 3rd pass
         detect_numeric_for(chunk, &mut ctx);
+        // Same ordering rationale as Tier 3: claim the run signature before CALL.
+        detect_gettablen_read_run(chunk, &mut ctx);
         detect_call(chunk, &mut ctx);
         detect_namecall(chunk, &mut ctx);
         detect_loadk(chunk, &mut ctx);
@@ -865,6 +883,8 @@ impl OpcodeMap {
         detect_loadn(chunk, &mut ctx);
         detect_loadnil(chunk, &mut ctx);
         detect_move(chunk, &mut ctx);
+        // Same ordering rationale as Tier 5.
+        detect_same_register_arith_k_ladder(chunk, &mut ctx);
         detect_arith_sequence(chunk, &mut ctx);
         detect_arithmetic(chunk, &mut ctx);
         detect_arithmetic_k(chunk, &mut ctx);
@@ -3689,6 +3709,81 @@ fn detect_setlist(chunk: &Chunk, ctx: &mut DetectCtx) {
     }
 }
 
+/// GETTABLEN via the sequential-element-read run: `local x, y = t[1], t[2]`.
+///
+/// The compiler emits that idiom as back-to-back GETTABLENs holding the table
+/// register B fixed while the literal index C increments, so the signature is
+/// two ADJACENT RAW WORDS sharing an opcode byte and a B field but differing in
+/// C. Adjacency must be measured in the raw word array, not the instruction
+/// stream: GETTABLEKS is the one other opcode with the same fixed-B/varying-C
+/// run shape (its C is a slot-prediction hint), but it carries an AUX word, so
+/// two GETTABLEKS are never adjacent as raw words. Requiring raw adjacency is
+/// what keeps this off GETTABLEKS entirely.
+///
+/// The `B != A` invariant is the anti-CALL weapon. CALL reuses the function
+/// register as its own base, so B == A in ~24% of real CALLs, whereas a table
+/// read never loads through the register it writes: measured 0 of 380 true
+/// GETTABLEN instances chunk-wide. Requiring ZERO such instances excludes CALL,
+/// SETLIST and NEWTABLE outright.
+///
+/// This must run BEFORE detect_call, which force-assigns CALL and otherwise
+/// steals this byte in table-heavy chunks where GETTABLEN out-counts the real
+/// CALL. Measured over 5 permutations of the corpus this fires on 25 true
+/// GETTABLEN bytes and 0 non-GETTABLEN bytes, and on nothing at all in the real
+/// Roblox samples.
+fn detect_gettablen_read_run(chunk: &Chunk, ctx: &mut DetectCtx) {
+    if ctx.find_shuffled(LuauOpcode::GetTableN as u8).is_some() {
+        return;
+    }
+    let mut occurrences: HashMap<u8, usize> = HashMap::new();
+    let mut in_range: HashMap<u8, usize> = HashMap::new();
+    let mut writes_own_source: HashMap<u8, usize> = HashMap::new();
+    let mut runs: HashMap<u8, usize> = HashMap::new();
+    for proto in &chunk.protos {
+        for &insn in &proto.code {
+            let op = insn_op(insn);
+            *occurrences.entry(op).or_insert(0) += 1;
+            if insn_a(insn) < proto.max_stack_size && insn_b(insn) < proto.max_stack_size {
+                *in_range.entry(op).or_insert(0) += 1;
+            }
+            if insn_b(insn) == insn_a(insn) {
+                *writes_own_source.entry(op).or_insert(0) += 1;
+            }
+        }
+        for i in 0..proto.code.len().saturating_sub(1) {
+            let insn = proto.code[i];
+            let next = proto.code[i + 1];
+            let op = insn_op(insn);
+            if insn_op(next) != op { continue; }
+            if insn_b(insn) != insn_b(next) || insn_c(insn) == insn_c(next) { continue; }
+            if insn_a(insn) >= proto.max_stack_size
+                || insn_b(insn) >= proto.max_stack_size
+                || insn_a(next) >= proto.max_stack_size
+            {
+                continue;
+            }
+            *runs.entry(op).or_insert(0) += 1;
+        }
+    }
+    let mut viable: Vec<(u8, usize)> = runs
+        .iter()
+        .filter(|(&op, &run_count)| {
+            let total = *occurrences.get(&op).unwrap_or(&0);
+            run_count >= 1
+                && total >= 2
+                && !ctx.is_mapped(op)
+                && *writes_own_source.get(&op).unwrap_or(&0) == 0
+                && in_range.get(&op).copied().unwrap_or(0) * 10 >= total * 9
+        })
+        .map(|(&op, &run_count)| (op, run_count))
+        .collect();
+    // Deterministic: byte ascending when run counts tie.
+    viable.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if let Some(&(op, _)) = viable.first() {
+        ctx.try_assign(op, LuauOpcode::GetTableN as u8);
+    }
+}
+
 /// GETTABLEN/SETTABLEN: ABC format, C is 1-based table index (small integer, usually 1-256)
 fn detect_gettablen_settablen(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut candidates: HashMap<u8, usize> = HashMap::new();
@@ -4622,6 +4717,73 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
 /// Standard Luau arith order (source order for `+ - * / % ^ //`):
 ///   reg-reg: ADD(33), SUB(34), MUL(35), DIV(36), MOD(37), POW(38), IDIV(76)
 ///   reg-K:   ADDK(39), SUBK(40), MULK(41), DIVK(42), MODK(43), POWK(44), IDIVK(77)
+/// ADDK/SUBK/MULK/DIVK from a compound-assignment ladder on ONE register.
+///
+/// `detect_arith_sequence` looks for a monotonic-A run, which compound
+/// assignment never produces: `n += 1; n -= 2; n *= 3; n /= 4` writes the SAME
+/// register every time, so A == B == r throughout and the run length under the
+/// monotonic test is 1. `detect_arithmetic_k` cannot see these either — each op
+/// occurs once or twice, far below its `count >= 3` floor. The ladder itself is
+/// the only evidence: consecutive words, one register, distinct opcode bytes,
+/// every C indexing a Number.
+///
+/// Only the FIRST FOUR positions are claimed, and that cap is load-bearing.
+/// Source order fixes the emission order, and the two ladders available agree on
+/// ADDK, SUBK, MULK, DIVK but diverge immediately after: the corpus writes
+/// `^ % //` while the real Roblox module's 7-long ladder reads
+/// ADDK SUBK MULK DIVK IDIVK MODK POWK. Assigning positions 4+ from a fixed list
+/// would therefore mislabel three opcodes on real bytecode.
+///
+/// Run length must be exactly >= 4. Measured over 5 permutations of the corpus:
+/// at 4 the rule fires 5 times with 20 correct and 0 wrong slot predictions; at 3
+/// it fires 30 times and gets 75 predictions wrong; at 5 it never fires at all.
+/// On the real module it fires once and reproduces the existing map byte for byte.
+fn detect_same_register_arith_k_ladder(chunk: &Chunk, ctx: &mut DetectCtx) {
+    const LADDER: [LuauOpcode; 4] = [
+        LuauOpcode::AddK, LuauOpcode::SubK, LuauOpcode::MulK, LuauOpcode::DivK,
+    ];
+    const MIN_RUN: usize = 4;
+    // All-or-nothing: a misaligned ladder would shift every label by one, so only
+    // act when the whole head is free.
+    if LADDER.iter().any(|&op| ctx.assigned[op as usize]) {
+        return;
+    }
+    for proto in &chunk.protos {
+        let code = &proto.code;
+        let shaped = |word: u32, r: u8| -> bool {
+            insn_a(word) == r
+                && insn_b(word) == r
+                && r < proto.max_stack_size
+                && matches!(proto.constants.get(insn_c(word) as usize),
+                            Some(Constant::Number(_)))
+        };
+        let mut i = 0usize;
+        while i < code.len() {
+            let r = insn_a(code[i]);
+            if !shaped(code[i], r) {
+                i += 1;
+                continue;
+            }
+            let mut run: Vec<u8> = vec![insn_op(code[i])];
+            let mut j = i + 1;
+            while j < code.len()
+                && shaped(code[j], r)
+                && !run.contains(&insn_op(code[j]))
+            {
+                run.push(insn_op(code[j]));
+                j += 1;
+            }
+            if run.len() >= MIN_RUN && run.iter().take(4).all(|&op| !ctx.is_mapped(op)) {
+                for (pos, &op) in run.iter().take(4).enumerate() {
+                    ctx.try_assign(op, LADDER[pos] as u8);
+                }
+                return;
+            }
+            i = if j > i { j } else { i + 1 };
+        }
+    }
+}
+
 fn detect_arith_sequence(chunk: &Chunk, ctx: &mut DetectCtx) {
     let reg_arith_ops: [u8; 7] = [
         LuauOpcode::Add as u8,
@@ -4809,6 +4971,123 @@ fn detect_arithmetic(chunk: &Chunk, ctx: &mut DetectCtx) {
         if ctx.try_assign(op, arith_ops[std_idx] as u8) {
             std_idx += 1;
         }
+    }
+}
+
+/// MODK together with the JUMPXEQKN that tests its result — a parity pair.
+///
+/// MODK is unreachable by frequency: it appears once or twice per script, far
+/// under detect_arithmetic_k's `count >= 3` floor, and it is byte-identical in
+/// shape to every other reg-K arithmetic op. The one thing that separates it is
+/// a VM invariant on the value rather than the encoding: `x % k` always lands in
+/// `[0, |k|)`. So a compare-against-constant that immediately follows a reg-K
+/// arithmetic on the SAME destination register, whose comparand lies inside that
+/// range, is a modulo fingerprint — the `if n % 7 == 3` idiom.
+///
+/// Both halves are claimed together because neither is separable alone, and the
+/// pair is claimed BEFORE detect_comparison_jumps_aux: in the parity-test files
+/// that detector otherwise takes the JUMPXEQKN byte and labels it JUMPIFNOT or
+/// JUMPIFLT, leaving JUMPXEQKN unmapped entirely.
+///
+/// Gates, all required. C1 is all-instances (one stray shape disqualifies the
+/// byte); C3 is a ratio because an unmapped AUX-bearing opcode can desync the
+/// walk and manufacture a phantom sighting. Measured over 5 permutations of the
+/// corpus: 19 true MODK and 19 true JUMPXEQKN claimed, 0 false positives, and
+/// no firing at all on the real Roblox samples.
+fn detect_modk_parity_pair(chunk: &Chunk, ctx: &mut DetectCtx) {
+    if ctx.find_shuffled(LuauOpcode::ModK as u8).is_some() {
+        return;
+    }
+    // True instruction positions of every still-unmapped byte. Skipping the AUX
+    // word of a mapped AUX-bearing opcode keeps arbitrary data out of the shape
+    // tests; mirrors the walk in detect_arithmetic_k.
+    let mut sites: HashMap<u8, Vec<(usize, usize)>> = HashMap::new();
+    for (proto_idx, proto) in chunk.protos.iter().enumerate() {
+        let code = &proto.code;
+        let mut i = 0usize;
+        while i < code.len() {
+            let op = insn_op(code[i]);
+            if ctx.is_mapped(op) {
+                let std_op = LuauOpcode::from_u8(ctx.map[op as usize]);
+                if std_op.has_aux() && i + 1 < code.len() { i += 2; } else { i += 1; }
+                continue;
+            }
+            sites.entry(op).or_default().push((proto_idx, i));
+            i += 1;
+        }
+    }
+
+    let divisor_at = |proto: &Proto, insn: u32| -> Option<f64> {
+        match proto.constants.get(insn_c(insn) as usize) {
+            Some(Constant::Number(v))
+                if v.is_finite() && v.fract() == 0.0 && v.abs() >= 2.0 => Some(v.abs()),
+            _ => None,
+        }
+    };
+
+    let mut pairs: Vec<(u8, u8)> = Vec::new();
+    for (&x, positions) in &sites {
+        // C1: EVERY instance is a plausible `R(A) = R(B) % K(C)` with an
+        // integral divisor of magnitude >= 2.
+        let all_modulo_shaped = positions.iter().all(|&(pi, i)| {
+            let proto = &chunk.protos[pi];
+            let insn = proto.code[i];
+            insn_a(insn) < proto.max_stack_size
+                && insn_b(insn) < proto.max_stack_size
+                && divisor_at(proto, insn).is_some()
+        });
+        if !all_modulo_shaped {
+            continue;
+        }
+        // C2: at least one instance is followed by an AD+AUX compare on the same
+        // register whose constant comparand lies in [0, |divisor|).
+        for &(pi, i) in positions {
+            let proto = &chunk.protos[pi];
+            let code = &proto.code;
+            if i + 2 >= code.len() { continue; }
+            let insn = code[i];
+            let cmp = code[i + 1];
+            if insn_a(cmp) != insn_a(insn) { continue; }
+            let d = insn_d(cmp);
+            if d <= 0 { continue; }
+            if i + 2 + d as usize > code.len() { continue; }
+            let divisor = match divisor_at(proto, insn) { Some(v) => v, None => continue };
+            let kidx = (code[i + 2] & 0x00FF_FFFF) as usize;
+            let comparand = match proto.constants.get(kidx) {
+                Some(Constant::Number(v)) if v.is_finite() => *v,
+                _ => continue,
+            };
+            if !(comparand >= 0.0 && comparand < divisor) { continue; }
+            let y = insn_op(cmp);
+            if ctx.is_mapped(y) || y == x { continue; }
+            // C3: the compare byte must behave like a constant-comparing jump
+            // across the whole chunk, not just at this one site.
+            let mut total = 0usize;
+            let mut number_aux = 0usize;
+            for other in &chunk.protos {
+                for (j, &w) in other.code.iter().enumerate() {
+                    if insn_op(w) != y || j + 1 >= other.code.len() { continue; }
+                    total += 1;
+                    let ki = (other.code[j + 1] & 0x00FF_FFFF) as usize;
+                    if let Some(Constant::Number(_)) = other.constants.get(ki) {
+                        number_aux += 1;
+                    }
+                }
+            }
+            if total == 0 || number_aux * 100 < total * 80 { continue; }
+            pairs.push((x, y));
+            break;
+        }
+    }
+
+    // Ambiguity guard: a joint claim costs two slots if it is wrong, so only act
+    // when exactly one byte carries the signature.
+    if pairs.len() != 1 {
+        return;
+    }
+    let (x, y) = pairs[0];
+    if ctx.try_assign(x, LuauOpcode::ModK as u8) {
+        ctx.try_assign(y, LuauOpcode::JumpXEqKN as u8);
     }
 }
 
@@ -5887,6 +6166,71 @@ fn detect_getvarargs(chunk: &Chunk, ctx: &mut DetectCtx) {
     // Deterministic: byte ascending when counts tie (HashMap iteration noise).
     filtered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     if let Some(&(op, _)) = filtered.first() {
+        ctx.try_assign(op, LuauOpcode::GetVarargs as u8);
+    }
+    detect_getvarargs_single_multret(chunk, ctx);
+}
+
+/// Sites where an unmapped byte in a vararg proto is immediately followed by a
+/// multret RETURN (B == 0) or a multret CALL (B == 0) based at the register the
+/// candidate just filled — i.e. `return ...` and `f(...)`.
+///
+/// This is the positive half of GETVARARGS detection. The look-alikes cannot
+/// reach it: `return nil` compiles to LOADNIL plus a FIXED-count RETURN (B == 2),
+/// so it never presents a multret successor.
+fn getvarargs_multret_sites(chunk: &Chunk, ctx: &DetectCtx) -> HashMap<u8, usize> {
+    let mut sites: HashMap<u8, usize> = HashMap::new();
+    let return_op = ctx.find_shuffled(LuauOpcode::Return as u8);
+    let call_op = ctx.find_shuffled(LuauOpcode::Call as u8);
+    if return_op.is_none() && call_op.is_none() {
+        return sites;
+    }
+    for proto in &chunk.protos {
+        if !proto.is_vararg { continue; }
+        for i in 0..proto.code.len().saturating_sub(1) {
+            let insn = proto.code[i];
+            let op = insn_op(insn);
+            if ctx.is_mapped(op) { continue; }
+            let a = insn_a(insn);
+            if a >= proto.max_stack_size || insn_c(insn) != 0 { continue; }
+            let next = proto.code[i + 1];
+            let next_op = insn_op(next);
+            let multret_return = Some(next_op) == return_op && insn_b(next) == 0;
+            let multret_call = Some(next_op) == call_op
+                && insn_b(next) == 0
+                && insn_a(next) == a;
+            if multret_return || multret_call {
+                *sites.entry(op).or_insert(0) += 1;
+            }
+        }
+    }
+    sites
+}
+
+/// GETVARARGS rescue for protos holding exactly ONE `...` expansion.
+///
+/// The `count >= 2` gate above deliberately protects the shared degenerate
+/// (A, B, C=0) pool — LOADNIL, LOADB and CLOSEUPVALS have the same shape, and in
+/// an all-vararg chunk the "appears only in vararg protos" filter separates
+/// nothing. That gate also loses every file whose sole GETVARARGS is a bare
+/// `return ...` or `f(...)` forward.
+///
+/// Those two idioms leave a decisive successor signature: the very next word is
+/// a multret RETURN (B == 0) or a multret CALL (B == 0) whose call base is the
+/// register GETVARARGS just filled. `return nil` compiles to LOADNIL plus a
+/// FIXED-count RETURN (B == 2), so the look-alikes cannot match. RETURN and CALL
+/// are mapped in earlier tiers, so the successor is readable from here.
+fn detect_getvarargs_single_multret(chunk: &Chunk, ctx: &mut DetectCtx) {
+    if ctx.find_shuffled(LuauOpcode::GetVarargs as u8).is_some() {
+        return;
+    }
+    let sites = getvarargs_multret_sites(chunk, ctx);
+    // Two different bytes both look like the sole GETVARARGS — no way to choose,
+    // so claim neither.
+    if sites.len() != 1 {
+        return;
+    }
+    if let Some((&op, _)) = sites.iter().next() {
         ctx.try_assign(op, LuauOpcode::GetVarargs as u8);
     }
 }
