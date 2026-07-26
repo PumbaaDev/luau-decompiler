@@ -1,6 +1,8 @@
 mod validate;
 mod compare;
 mod ansi;
+mod probe_cmd;
+mod opmap_db_cmd;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,6 +49,23 @@ struct Cli {
     /// `LUAU_OPMAP_CACHE`.
     #[arg(long, global = true, value_name = "PATH")]
     opmap_cache: Option<PathBuf>,
+
+    /// Database of MEASURED opcode permutations.
+    ///
+    /// Where `--opmap-cache` pools guesses, this holds permutations that were
+    /// read off a client's own compiler with `probe align`. When an entry
+    /// applies to a file, it is used exactly and no detector runs. When none
+    /// applies, the decode is byte-for-byte what it would have been without
+    /// this flag. Also settable via `LUAU_OPMAP_DB`.
+    #[arg(long, global = true, value_name = "PATH")]
+    opmap_db: Option<PathBuf>,
+
+    /// Force one database entry by id instead of matching.
+    ///
+    /// If the named entry cannot decode the file this is an error, not a
+    /// fallback: you asked for that entry and need to be told it does not fit.
+    #[arg(long, global = true, value_name = "ID")]
+    opmap_db_entry: Option<String>,
 
     /// Verbose logging
     #[arg(short, long, global = true)]
@@ -143,6 +162,23 @@ enum Commands {
         extensions: String,
     },
 
+    /// Read a client's opcode permutation off its own compiler
+    ///
+    /// Every other path in this tool INFERS the permutation from structure,
+    /// which has a ceiling. This one does not infer anything. Compile a set of
+    /// programs you already have with a compiler whose numbering is documented,
+    /// compile the same programs with the client whose numbering is secret, and
+    /// line the two instruction streams up. The permutation is then a fact.
+    #[command(subcommand)]
+    Probe(ProbeCmd),
+
+    /// Inspect and populate the measured-permutation database
+    ///
+    /// Read-only except for `import`, so a decompile can consult this database
+    /// but never write to it.
+    #[command(subcommand, name = "opmap-db")]
+    OpmapDb(OpmapDbCmd),
+
     /// Validate Luau source — syntax-check a .lua/.luau file
     ///
     /// Uses external `luau`/`luau-analyze` if found on PATH for a full parse.
@@ -187,6 +223,101 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum OpmapDbCmd {
+    /// List every entry
+    List,
+
+    /// Show one entry's full opcode table
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Add a map produced by `probe align`
+    Import {
+        /// The `probe align --out` document, or a bare {hex: NAME} map
+        report: PathBuf,
+
+        /// Override the id recorded in the report
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Human-readable label for this client build
+        #[arg(long)]
+        build: Option<String>,
+
+        /// Replace an existing entry with the same id
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Explain, stage by stage, why a file does or does not match an entry
+    Match {
+        /// Bytecode file to test against the database
+        input: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProbeCmd {
+    /// Write the probe source set to a folder, ready to be compiled twice
+    ///
+    /// These are ordinary Luau programs, written to force the compiler to emit
+    /// every opcode it can be made to emit — including the ones no real script
+    /// ever produces by accident.
+    Emit {
+        /// Folder to write the sources and manifest into
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Which tier to write: core (small, 77 opcodes), heavy (two more,
+        /// hundreds of KB), or all
+        #[arg(long, default_value = "core")]
+        tier: String,
+    },
+
+    /// Derive the permutation from two compilations of the probe sources
+    ///
+    /// Pairs files by name across the two folders. A file that does not align
+    /// is reported and skipped; a prototype that does not align is reported and
+    /// skipped. Nothing is ever guessed to fill a gap.
+    Align {
+        /// Folder (or single file) of probe sources compiled by upstream
+        /// `luau-compile` — the numbering we already know
+        #[arg(long)]
+        canonical: PathBuf,
+
+        /// Folder (or single file) of the SAME sources compiled by the client
+        /// whose numbering is being derived
+        #[arg(long)]
+        client: PathBuf,
+
+        /// Write the derived map here, ready for `opmap-db import`
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Label for this build, recorded in the derived map
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Refuse to write a map with fewer than this many opcodes pinned.
+        /// A thin map is worse than none: it would be installed as exact.
+        #[arg(long, default_value = "70")]
+        min_pinned: usize,
+
+        /// Machine-readable report
+        #[arg(long)]
+        json: bool,
+
+        /// Write the map even when files contradicted each other. The
+        /// contradicted bytes are left unpinned either way.
+        #[arg(long)]
+        allow_conflicts: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -199,11 +330,15 @@ fn main() -> Result<()> {
         .init();
 
     let store = store_path(&cli);
+    let db = DbSelection {
+        path: db_path(&cli),
+        entry_id: cli.opmap_db_entry.clone(),
+    };
 
     match cli.command {
         Some(Commands::Decompile { input }) => {
             let data = read_input(input.as_deref())?;
-            let source = decompile_with_store(&data, store.as_ref())?;
+            let source = decompile_with_store(&data, store.as_ref(), &db)?;
             write_output(cli.output.as_deref(), &source)?;
         }
 
@@ -238,16 +373,61 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Watch { folder, out_dir, disasm, interval }) => {
-            run_watch(&folder, out_dir.as_deref(), disasm, interval, store.as_ref())?;
+            run_watch(&folder, out_dir.as_deref(), disasm, interval, store.as_ref(), &db)?;
         }
 
         Some(Commands::Batch { input, out_dir, extensions, disasm }) => {
-            run_batch(&input, out_dir.as_deref(), &extensions, disasm, store.as_ref())?;
+            run_batch(&input, out_dir.as_deref(), &extensions, disasm, store.as_ref(), &db)?;
         }
 
         Some(Commands::Scan { input, extensions }) => {
             run_scan(&input, &extensions, store.as_ref())?;
         }
+
+        Some(Commands::OpmapDb(cmd)) => {
+            let path = db
+                .path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("pass --opmap-db <PATH> (or set LUAU_OPMAP_DB)"))?;
+            match cmd {
+                OpmapDbCmd::List => opmap_db_cmd::run_list(&path)?,
+                OpmapDbCmd::Show { id, json } => opmap_db_cmd::run_show(&path, &id, json)?,
+                OpmapDbCmd::Import {
+                    report,
+                    id,
+                    build,
+                    force,
+                } => opmap_db_cmd::run_import(
+                    &path,
+                    &report,
+                    id.as_deref(),
+                    build.as_deref(),
+                    force,
+                )?,
+                OpmapDbCmd::Match { input } => opmap_db_cmd::run_match(&path, &input)?,
+            }
+        }
+
+        Some(Commands::Probe(cmd)) => match cmd {
+            ProbeCmd::Emit { out, tier } => probe_cmd::run_emit(&out, Some(&tier))?,
+            ProbeCmd::Align {
+                canonical,
+                client,
+                out,
+                id,
+                min_pinned,
+                json,
+                allow_conflicts,
+            } => probe_cmd::run_align(&probe_cmd::AlignOptions {
+                canonical: &canonical,
+                client: &client,
+                out: out.as_deref(),
+                id: id.as_deref(),
+                min_pinned,
+                json,
+                allow_conflicts,
+            })?,
+        },
 
         Some(Commands::Validate { input, builtin, no_color }) => {
             let color = ansi::choose(!no_color);
@@ -281,7 +461,7 @@ fn main() -> Result<()> {
         None => {
             if let Some(ref path) = cli.input {
                 let data = read_input(Some(path.as_path()))?;
-                let source = decompile_with_store(&data, store.as_ref())?;
+                let source = decompile_with_store(&data, store.as_ref(), &db)?;
                 write_output(cli.output.as_deref(), &source)?;
             } else {
                 // No args at all — print help hint
@@ -422,8 +602,80 @@ fn bytecode_files(dir: &Path, extensions: &str) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+// ── Measured-permutation database ──
+
+/// Which database to consult, and whether one entry was named explicitly.
+pub struct DbSelection {
+    pub path: Option<PathBuf>,
+    pub entry_id: Option<String>,
+}
+
+/// Resolve the database path from the flag, falling back to `LUAU_OPMAP_DB`.
+fn db_path(cli: &Cli) -> Option<PathBuf> {
+    cli.opmap_db.clone().or_else(|| {
+        std::env::var_os("LUAU_OPMAP_DB")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// Does a measured entry apply to this file?
+///
+/// Returns `Ok(None)` for every outcome except a verified match, so the caller
+/// falls back to inference unchanged. The one hard error is a `--opmap-db-entry`
+/// that does not fit: the user named it, so a silent fallback would be a lie.
+fn resolve_db_entry(
+    db: &DbSelection,
+    data: &[u8],
+) -> Result<Option<luau_core::parser::opmap_db::DbEntry>> {
+    let Some(ref path) = db.path else {
+        return Ok(None);
+    };
+    let loaded = opmap_db_cmd::load(path)?;
+    let Ok(chunk) = luau_core::parser::parse(data) else {
+        return Ok(None);
+    };
+
+    if let Some(ref id) = db.entry_id {
+        // Verification failure here is fatal by design.
+        loaded.lookup_by_id(&chunk, id)?;
+        return Ok(loaded.get(id).cloned());
+    }
+
+    let result = loaded.lookup(&chunk);
+    match result {
+        luau_core::parser::opmap_db::DbLookup::Hit { ref entry_id, .. } => {
+            log::debug!("opmap database: {}", result.describe());
+            Ok(loaded.get(entry_id).cloned())
+        }
+        other => {
+            log::debug!("opmap database: {}", other.describe());
+            Ok(None)
+        }
+    }
+}
+
 /// Decompile, using and then contributing to the shared store when configured.
-fn decompile_with_store(data: &[u8], store: Option<&PathBuf>) -> Result<String> {
+///
+/// The database is consulted first. A verified entry short-circuits everything
+/// else: no prior is read, and no ballot is cast, because a file decoded from a
+/// measurement has nothing honest to contribute to a tally of guesses.
+fn decompile_with_store(
+    data: &[u8],
+    store: Option<&PathBuf>,
+    db: &DbSelection,
+) -> Result<String> {
+    if let Some(entry) = resolve_db_entry(db, data)? {
+        return luau_core::decompile_with_plan(
+            data,
+            &luau_core::DecodePlan {
+                prior: None,
+                exact: Some(&entry),
+            },
+        )
+        .map(|(src, _)| src);
+    }
+
     let Some(path) = store else {
         return luau_core::decompile(data);
     };
@@ -447,6 +699,7 @@ fn run_watch(
     disasm: bool,
     interval_ms: u64,
     store: Option<&PathBuf>,
+    db: &DbSelection,
 ) -> Result<()> {
     let out = out_dir.unwrap_or(folder);
     fs::create_dir_all(out)?;
@@ -487,7 +740,7 @@ fn run_watch(
                 match fs::read(&path) {
                     Ok(data) if !data.is_empty() => {
                         // Decompile
-                        match decompile_with_store(&data, store) {
+                        match decompile_with_store(&data, store, db) {
                             Ok(source) => {
                                 let p = out.join(format!("{}.lua", stem));
                                 let _ = fs::write(&p, &source);
@@ -519,6 +772,7 @@ fn run_batch(
     extensions: &str,
     disasm: bool,
     store: Option<&PathBuf>,
+    db: &DbSelection,
 ) -> Result<()> {
     let out = out_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| input.join("decompiled"));
     fs::create_dir_all(&out)?;
@@ -547,7 +801,7 @@ fn run_batch(
     for path in files {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
 
-        match fs::read(&path).map(|d| decompile_with_store(&d, store)) {
+        match fs::read(&path).map(|d| decompile_with_store(&d, store, db)) {
             Ok(Ok(source)) => {
                 fs::write(out.join(format!("{}.lua", stem)), &source)?;
                 if disasm {

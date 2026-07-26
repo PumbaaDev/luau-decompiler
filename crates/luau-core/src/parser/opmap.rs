@@ -370,6 +370,54 @@ impl OpmapCoverage {
     }
 }
 
+/// Did a chunk decode cleanly under a candidate map, and if not, where did it
+/// break? Named failures, because "this map does not fit this chunk" is the
+/// single most useful thing a lookup can report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkVerdict {
+    Clean,
+    /// The map has no entry for a byte the chunk actually executes.
+    UnmappedByte { byte: u8, proto: usize, pc: usize },
+    /// AUX skipping stepped past the end of a prototype, so the map disagrees
+    /// with this chunk about which instructions carry an AUX word.
+    OverranProto { proto: usize },
+}
+
+impl WalkVerdict {
+    pub fn is_clean(&self) -> bool {
+        matches!(self, WalkVerdict::Clean)
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            WalkVerdict::Clean => "walks cleanly".to_string(),
+            WalkVerdict::UnmappedByte { byte, proto, pc } => format!(
+                "no mapping for byte 0x{:02X} (proto {}, pc {})",
+                byte, proto, pc
+            ),
+            WalkVerdict::OverranProto { proto } => {
+                format!("AUX skipping overran proto {}", proto)
+            }
+        }
+    }
+}
+
+/// The result of [`OpcodeMap::walk_verify`].
+#[derive(Debug, Clone)]
+pub struct WalkReport {
+    pub verdict: WalkVerdict,
+    /// Bytes seen at a true instruction position before the walk stopped.
+    pub present: [bool; 256],
+    pub insn_words: u32,
+}
+
+impl WalkReport {
+    /// How many distinct bytes the chunk actually executes.
+    pub fn present_bytes(&self) -> usize {
+        self.present.iter().filter(|&&p| p).count()
+    }
+}
+
 /// Walk the instruction stream, counting only true instruction positions.
 ///
 /// AUX words are skipped using `map`'s knowledge of which opcodes carry one.
@@ -443,7 +491,7 @@ impl OpcodeMap {
     /// duplication, three-arg fastcall, jump-eq-constant and integer division).
     /// Each mapping below is by opcode *identity* (same instruction, different
     /// number) and was verified against bytecode produced by `luau-compile`.
-    const fn canonical_luau_to_internal(op: u8) -> u8 {
+    pub(crate) const fn canonical_luau_to_internal(op: u8) -> u8 {
         match op {
             // Identical numbering in both layouts.
             0..=57 => op,
@@ -493,6 +541,32 @@ impl OpcodeMap {
             heuristic_evidence: evidence,
             // A canonical translation is exact by construction: nothing here was
             // completed speculatively, so every mapped byte is fully confident.
+            pre_completion_map: map,
+        }
+    }
+
+    /// Wrap a MEASURED permutation as an [`OpcodeMap`], with nothing invented.
+    ///
+    /// `pre_completion_map` is set to the same table, so `coverage` reports
+    /// every mapping as evidence-backed and none as bijection filler. That is
+    /// not flattery: the map came from aligning two compilations of known
+    /// source, so each entry really was observed. Any byte the measurement did
+    /// not pin stays unmapped and will surface as an unresolved instruction
+    /// rather than being guessed.
+    pub fn from_exact_map(map: [u8; 256]) -> Self {
+        let mapped = map.iter().filter(|&&v| v != 255).count();
+        let mut evidence = [0u16; 256];
+        for (i, &v) in map.iter().enumerate() {
+            if v != 255 {
+                evidence[i] = 3;
+            }
+        }
+        OpcodeMap {
+            shuffled_to_standard: map,
+            mapped_count: mapped,
+            heuristic_map: map,
+            heuristic_count: mapped,
+            heuristic_evidence: evidence,
             pre_completion_map: map,
         }
     }
@@ -589,6 +663,67 @@ impl OpcodeMap {
         Self::detect_with_prior(chunk, &[255u8; 256])
     }
 
+    /// Try to decode `chunk` under `map` and report whether it holds together.
+    ///
+    /// This is the same strict validity walk [`Self::is_canonical_luau`]
+    /// performs against the canonical table, generalised to any map. It is a
+    /// surprisingly sharp instrument: a wrong permutation will usually either
+    /// hit a byte it has no mapping for, or mis-skip an AUX word and step past
+    /// the end of a prototype. Both are caught here.
+    ///
+    /// Also returns which bytes occur at a TRUE instruction position under this
+    /// map, which is the honest denominator for "how much of this chunk does
+    /// the map actually have to explain".
+    pub fn walk_verify(chunk: &Chunk, map: &[u8; 256]) -> WalkReport {
+        let mut present = [false; 256];
+        let mut insn_words = 0u32;
+        if chunk.protos.is_empty() {
+            return WalkReport {
+                verdict: WalkVerdict::Clean,
+                present,
+                insn_words,
+            };
+        }
+        for (pi, proto) in chunk.protos.iter().enumerate() {
+            let code = &proto.code;
+            let mut i = 0usize;
+            while i < code.len() {
+                let byte = insn_op(code[i]);
+                let mapped = map[byte as usize];
+                if mapped == 255 || (mapped as usize) >= LuauOpcode::MAX_OPCODE {
+                    return WalkReport {
+                        verdict: WalkVerdict::UnmappedByte {
+                            byte,
+                            proto: pi,
+                            pc: i,
+                        },
+                        present,
+                        insn_words,
+                    };
+                }
+                present[byte as usize] = true;
+                insn_words += 1;
+                if LuauOpcode::from_u8(mapped).has_aux() {
+                    if i + 2 > code.len() {
+                        return WalkReport {
+                            verdict: WalkVerdict::OverranProto { proto: pi },
+                            present,
+                            insn_words,
+                        };
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        WalkReport {
+            verdict: WalkVerdict::Clean,
+            present,
+            insn_words,
+        }
+    }
+
     /// Detect the opcode shuffle table from bytecode patterns, pre-seeded with
     /// a prior mapping (e.g., a cached opmap from other scripts of the same build).
     ///
@@ -598,15 +733,35 @@ impl OpcodeMap {
     /// other opcodes. This is important for small scripts where per-file detection
     /// lacks enough signal (e.g., a script with no NEWTABLE uses).
     pub fn detect_with_prior(chunk: &Chunk, prior: &[u8; 256]) -> Self {
+        Self::detect_with_prior_and_truth(chunk, prior, get_ground_truth())
+    }
+
+    /// Detect using ONLY the chunk's own structure — no installed ground truth,
+    /// no prior.
+    ///
+    /// Needed because a reading used to *identify* which permutation a chunk
+    /// belongs to must be independent of any permutation already installed.
+    /// Feeding an installed map back into the reading that selects it would
+    /// make the selection self-confirming: whatever was installed first would
+    /// look like the right answer for every subsequent chunk.
+    pub fn detect_structural(chunk: &Chunk) -> Self {
+        Self::detect_with_prior_and_truth(chunk, &[255u8; 256], None)
+    }
+
+    fn detect_with_prior_and_truth(
+        chunk: &Chunk,
+        prior: &[u8; 256],
+        ground_truth: Option<[u8; 256]>,
+    ) -> Self {
         let mut ctx = DetectCtx::new();
         ctx.compute_frequencies(chunk);
 
         // Apply any installed ground truth on top of the caller's prior.
-        // Ground truth comes from direct Roblox-client round-trip observations
-        // (`lift_closure(loadstring(src))` vs `getscriptbytecode(script)`), so
-        // it strictly overrides both the heuristic detectors and cached
-        // consensus. See `set_ground_truth` above for the install path.
-        let effective_prior: [u8; 256] = if let Some(gt) = get_ground_truth() {
+        // Ground truth comes from a direct observation of the client's own
+        // compiler (see `parser::alignment`), so it strictly overrides both the
+        // heuristic detectors and cached consensus. See `set_ground_truth`
+        // above for the install path.
+        let effective_prior: [u8; 256] = if let Some(gt) = ground_truth {
             merge_ground_truth_into_prior(prior, &gt)
         } else {
             *prior

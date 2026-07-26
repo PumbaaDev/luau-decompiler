@@ -1323,8 +1323,10 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against impossible-NOT — `not <function>` is
                 // a strong signal of bad opmap detection. Emit a Comment when
                 // the source register holds a Function literal.
-                if ctx.is_canonical_luau {
-                    // Canonical Luau uses NOT as the real `not` operator.
+                if ctx.unary.not == crate::parser::opmap_db::UnarySem::Operator {
+                    // This build really does use NOT as the `not` operator -
+                    // either canonical Luau, or a client whose own compiler was
+                    // observed emitting this opcode for `not x`.
                     let e = Expr::UnOp {
                         op: UnOp::Not,
                         operand: Box::new(reg_expr(regs, b as usize)),
@@ -1357,8 +1359,8 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against `-<bool>`, `-<string>`, `-<function>`.
                 // Luau coerces strings to numbers in some arithmetic contexts
                 // but never bool/function; either way it's a bad-opmap signal.
-                if ctx.is_canonical_luau {
-                    // Canonical Luau uses MINUS as the real unary `-` operator.
+                if ctx.unary.minus == crate::parser::opmap_db::UnarySem::Operator {
+                    // This build really does use MINUS as unary `-`.
                     let e = Expr::UnOp {
                         op: UnOp::Negate,
                         operand: Box::new(reg_expr(regs, b as usize)),
@@ -1385,9 +1387,11 @@ pub(super) fn lift_instruction_range(
             }
             LuauOpcode::Length => {
                 // Canonical Luau uses LENGTH as the real `#` operator, so build
-                // a genuine UnOp there. The Roblox passthrough below stays the
-                // default and is unchanged: `is_canonical_luau` defaults to
-                // false, so shuffled bytecode never reaches this branch.
+                // a genuine UnOp there. So does any client whose own compiler
+                // was OBSERVED emitting this opcode for `#x` (see
+                // `parser::opmap_db::UnarySemantics`). The Roblox passthrough
+                // below remains the default: `ctx.unary` starts all-passthrough,
+                // so an inferred decode never reaches this branch.
                 //
                 // B0.73: Roblox repurposed standard LENGTH as passthrough
                 // (same pattern as NOT/BNOT/MINUS). Evidence (380 corpus hits):
@@ -1401,8 +1405,8 @@ pub(super) fn lift_instruction_range(
                 // Phase C4: guard against `#<bool>`, `#<number>`, `#<function>` —
                 // all three are runtime errors in Luau and strong signals of a
                 // misidentified LENGTH opcode.
-                if ctx.is_canonical_luau {
-                    // Canonical Luau uses LENGTH as the real `#` operator.
+                if ctx.unary.length == crate::parser::opmap_db::UnarySem::Operator {
+                    // This build really does use LENGTH as the `#` operator.
                     let e = Expr::UnOp {
                         op: UnOp::Length,
                         operand: Box::new(reg_expr(regs, b as usize)),

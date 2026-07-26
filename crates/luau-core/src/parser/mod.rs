@@ -1,8 +1,14 @@
+pub mod alignment;
 pub mod consensus;
+pub mod fingerprint;
 pub mod ground_truth;
 pub mod known_shuffles;
 pub mod opcodes;
 pub mod opmap;
+pub mod opmap_db;
+pub mod probe;
+#[cfg(test)]
+pub mod test_fixtures;
 pub mod types;
 
 use anyhow::{bail, Context, Result};

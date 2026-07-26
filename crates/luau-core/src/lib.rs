@@ -23,6 +23,50 @@ pub fn get_ground_truth_opmap() -> Option<[u8; 256]> {
     parser::opmap::get_ground_truth()
 }
 
+/// Install a ground-truth map for a scope and put back whatever was there when
+/// the guard drops.
+///
+/// The installed map lives in a process-global, which is fine for the intended
+/// use (a caller installs one map and decodes with it) but wrong for a caller
+/// that decodes chunks from several different builds in sequence: without a
+/// restore, the first install would leak into every later decode.
+///
+/// This does NOT make concurrent decodes of different builds safe. Two threads
+/// installing different maps still race, because the global is shared. A server
+/// decoding for multiple builds must serialise, or the map must be threaded
+/// through `detect_with_prior` as a parameter instead of read from a global.
+pub struct GroundTruthGuard(Option<[u8; 256]>);
+
+impl GroundTruthGuard {
+    pub fn install(map: [u8; 256]) -> Self {
+        let previous = parser::opmap::get_ground_truth();
+        parser::opmap::set_ground_truth(Some(map));
+        GroundTruthGuard(previous)
+    }
+}
+
+impl Drop for GroundTruthGuard {
+    fn drop(&mut self) {
+        parser::opmap::set_ground_truth(self.0);
+    }
+}
+
+/// What a decode is allowed to lean on.
+///
+/// The two fields are different KINDS of knowledge, not two sources of the same
+/// kind. `prior` is a pooled tally of guesses from other scripts; `exact` is a
+/// permutation that was measured. When an exact entry applies, the prior is
+/// ignored entirely — averaging a measurement with guesses can only make it
+/// worse.
+#[derive(Default)]
+pub struct DecodePlan<'a> {
+    /// Pooled consensus prior (the `--opmap-cache` path).
+    pub prior: Option<&'a [u8; 256]>,
+    /// A verified database entry for this chunk's build. When present, `prior`
+    /// is not consulted.
+    pub exact: Option<&'a parser::opmap_db::DbEntry>,
+}
+
 /// Parse a JSON blob (shape: `{ "0xNN": "OPCODE_NAME", ... }` or envelope
 /// with `"mappings"` key) into a ground-truth `[u8; 256]` map. Returns
 /// `None` on unparseable JSON. Malformed entries are silently skipped.
@@ -542,7 +586,33 @@ pub fn decompile_with_opmap(
     bytecode: &[u8],
     cached_opmap: Option<&[u8; 256]>,
 ) -> Result<(String, Option<[u8; 256]>)> {
+    decompile_with_plan(
+        bytecode,
+        &DecodePlan {
+            prior: cached_opmap,
+            exact: None,
+        },
+    )
+}
+
+/// Decompile under an explicit [`DecodePlan`].
+///
+/// With `plan.exact == None` this is byte-for-byte the behaviour
+/// [`decompile_with_opmap`] has always had. With an exact entry it takes a
+/// different path entirely: the entry's map is used verbatim, with no detection
+/// and no bijection completion, because completing a measured map would be
+/// filling in facts with guesses.
+pub fn decompile_with_plan(
+    bytecode: &[u8],
+    plan: &DecodePlan<'_>,
+) -> Result<(String, Option<[u8; 256]>)> {
+    let cached_opmap = if plan.exact.is_some() { None } else { plan.prior };
     let mut chunk = parser::parse(bytecode)?;
+
+    // A database-backed decode installs its map as ground truth for the
+    // duration, so anything else in this process that consults the global sees
+    // the same answer, and restores the previous value on the way out.
+    let _gt_guard = plan.exact.map(|e| GroundTruthGuard::install(e.map));
 
     // Canonical (non-Roblox) Luau bytecode needs a handful of opcodes lifted
     // with their real semantics rather than Roblox's passthrough behaviour.
@@ -552,7 +622,28 @@ pub fn decompile_with_opmap(
         && parser::opmap::OpcodeMap::is_canonical_luau(&chunk);
 
     // Auto-detect and apply opcode remapping for Roblox-shuffled bytecode
-    let opmap_info = if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+    let opmap_info = if let Some(entry) = plan.exact.filter(|_| {
+        parser::opmap::OpcodeMap::needs_remapping(&chunk)
+    }) {
+        // Measured permutation. No detectors run, and nothing is completed:
+        // every byte here was read off the client's own compiler, and the
+        // lookup already verified that this chunk walks cleanly under it, so
+        // there is no gap left for completion to fill.
+        let exact = parser::opmap::OpcodeMap::from_exact_map(entry.map);
+        let coverage = exact.coverage(&chunk);
+        let (remap_unknowns, unknown_byte_freq, unknown_byte_sample) = exact.remap_chunk(&mut chunk);
+        // Returns `None` as the cacheable map on purpose: a chunk decoded from
+        // a measurement has no honest contribution to make to a tally of
+        // guesses, and feeding it in would let one entry outvote real readings.
+        Some((
+            entry.pinned(),
+            entry.map,
+            remap_unknowns,
+            unknown_byte_freq,
+            unknown_byte_sample,
+            coverage,
+        ))
+    } else if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
         // Phase B0.31: Self-detect-first. Always try solo detection before applying
         // any prior. If solo detection produces >= SOLO_CONFIDENCE_THRESHOLD opcodes,
         // the script has enough structural evidence to detect its own shuffle
@@ -670,6 +761,15 @@ pub fn decompile_with_opmap(
     let main = &chunk.protos[main_idx];
     let mut ctx = decompiler::DecompileContext::new(&chunk);
     ctx.set_canonical_luau(is_canonical_luau);
+    // A database entry may have OBSERVED that this client's compiler really
+    // emits NOT / MINUS / LENGTH for `not x`, `-x` and `#x`. Only then does the
+    // lifter stop passing them through. Inferred decodes never reach this line,
+    // so their behaviour is unchanged.
+    if let Some(entry) = plan.exact {
+        if !is_canonical_luau {
+            ctx.set_unary_semantics(entry.semantics);
+        }
+    }
     let source = decompiler::decompile_proto(&mut ctx, main, main_idx, 0);
 
     // Safety: if the decompiled source is absurdly large, truncate it
@@ -742,7 +842,32 @@ pub fn decompile_with_opmap(
         // per-byte accuracy at only r=+0.26: a detector can be confidently,
         // structurally, repeatably wrong. What the line does tell you is which
         // part of the map anything downstream may lean on.
-        if let Some(cov) = opmap_coverage {
+        //
+        // A database-backed decode is the one case where that caveat does not
+        // apply, and it says so instead: the map was measured against the
+        // client's own compiler rather than inferred, so no detector and no
+        // completion guess contributed to it.
+        if let Some(entry) = plan.exact {
+            header.push_str(&format!(
+                "-- opmap source: database entry \"{}\" - {} opcodes measured against the \
+                 client's own compiler ({})\n",
+                entry.id,
+                entry.pinned(),
+                entry.provenance.method,
+            ));
+            header.push_str(
+                "-- opmap evidence: not applicable; no detector or bijection completion \
+                 contributed to this decode\n",
+            );
+            if !entry.semantics.all_passthrough() {
+                header.push_str(&format!(
+                    "-- unary semantics: not={} minus={} length={} (observed, not assumed)\n",
+                    entry.semantics.not.as_str(),
+                    entry.semantics.minus.as_str(),
+                    entry.semantics.length.as_str(),
+                ));
+            }
+        } else if let Some(cov) = opmap_coverage {
             header.push_str(&format!(
                 "-- opmap evidence: {}/{} opcode bytes used by this chunk were pinned by \
                  detectors ({}% of instruction words), {} filled by bijection completion, \
@@ -1099,5 +1224,263 @@ mod phase_c1_stability_tests {
         // A subsequent proto should start fresh.
         reset_stmt_budget();
         assert!(!stmt_budget_tripped());
+    }
+}
+
+/// End-to-end tests for the database-backed decode path and the scoping of the
+/// NOT / MINUS / LENGTH passthrough.
+///
+/// The property under test in most of these is a NEGATIVE one: that nothing
+/// about an ordinary decode changed. That is the whole safety argument for this
+/// feature, so it is worth more test surface than the happy path.
+#[cfg(test)]
+mod db_decode_tests {
+    use crate::parser::opmap_db::{DbEntry, Provenance, UnarySem, UnarySemantics};
+    use crate::parser::test_fixtures as fx;
+
+    fn entry(id: &str, perm: fn(u8) -> u8, semantics: UnarySemantics) -> DbEntry {
+        DbEntry {
+            id: id.to_string(),
+            bytecode_version: 6,
+            build_label: None,
+            provenance: Provenance {
+                method: "probe-align".to_string(),
+                producer: Some("test".to_string()),
+                probe_set_version: Some(1),
+                probe_programs: Some(19),
+                notes: None,
+            },
+            semantics,
+            map: fx::exact_map(perm),
+        }
+    }
+
+    /// Every decode in this module takes the ground-truth lock.
+    ///
+    /// `decompile_with_opmap` reads the process-global installed map, and some
+    /// tests here install one, so without serialising them the harness's
+    /// parallelism would let one test's install leak into another's decode.
+    /// Same limitation `GroundTruthGuard` documents for real callers.
+    fn decode(bytes: &[u8], entry: Option<&DbEntry>) -> String {
+        let _lock = fx::ground_truth_lock();
+        crate::decompile_with_plan(
+            bytes,
+            &crate::DecodePlan {
+                prior: None,
+                exact: entry,
+            },
+        )
+        .expect("decode succeeds")
+        .0
+    }
+
+    // ── the inference path must be untouched ──
+
+    /// The single most important test here: with no entry, output is exactly
+    /// what it would have been before any of this existed.
+    #[test]
+    fn no_entry_means_byte_for_byte_the_old_behaviour() {
+        for bytes in [fx::P03_UNARY, fx::M04_MIRROR_FLOW, fx::M02_MIRROR_BRANCH] {
+            let shuffled = fx::permuted_bytes(bytes, fx::perm_a);
+            let via_plan = decode(&shuffled, None);
+            let via_old = {
+                let _lock = fx::ground_truth_lock();
+                crate::decompile_with_opmap(&shuffled, None)
+                    .expect("decode succeeds")
+                    .0
+            };
+            assert_eq!(via_plan, via_old);
+        }
+    }
+
+    #[test]
+    fn an_inferred_decode_never_claims_a_database_source() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let out = decode(&shuffled, None);
+        assert!(!out.contains("opmap source: database entry"));
+        assert!(out.contains("opmap evidence:"));
+    }
+
+    // ── the database path ──
+
+    #[test]
+    fn a_database_backed_decode_says_so_in_the_header() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let out = decode(&shuffled, Some(&e));
+        assert!(
+            out.contains("opmap source: database entry \"build_a\""),
+            "header did not name the entry:\n{}",
+            out.lines().take(8).collect::<Vec<_>>().join("\n")
+        );
+        assert!(out.contains("no detector or bijection completion contributed"));
+    }
+
+    /// An exact map must not be "completed". Completion invents mappings, and
+    /// inventing on top of a measurement is the one thing this path exists to
+    /// avoid.
+    #[test]
+    fn a_database_backed_decode_leaves_unmeasured_bytes_unmapped() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let mut e = entry("build_a", fx::perm_a, UnarySemantics::default());
+        let pinned_before = e.pinned();
+        // Drop a byte the chunk never executes: completion would fill it back
+        // in, an exact decode must not.
+        let unused = (0..=255u8)
+            .find(|&b| {
+                e.map[b as usize] != 255
+                    && crate::parser::opcodes::LuauOpcode::from_u8(e.map[b as usize]).name()
+                        == "COVERAGE"
+            })
+            .or_else(|| (0..=255u8).find(|&b| e.map[b as usize] != 255));
+        if let Some(b) = unused {
+            e.map[b as usize] = 255;
+        }
+        let out = decode(&shuffled, Some(&e));
+        let reported: usize = out
+            .lines()
+            .find(|l| l.contains("opcodes measured against"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|w| w.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        assert!(
+            reported < pinned_before,
+            "an exact decode must report the measured count, not a completed one"
+        );
+    }
+
+    // ── the passthrough, scoped ──
+
+    /// `#x` must NOT become a real length operator on an inferred Roblox decode.
+    /// This is the behaviour the passthrough exists for and it must not move.
+    #[test]
+    fn length_stays_a_passthrough_without_a_database_entry() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let out = decode(&shuffled, None);
+        assert!(
+            !out.contains('#'),
+            "inferred decode emitted a length operator:\n{}",
+            out
+        );
+    }
+
+    /// An entry that does NOT claim the semantics must not change the lifting
+    /// either, even though its map is exact. Knowing which byte is LENGTH is a
+    /// different claim from knowing the client emits it for `#x`.
+    #[test]
+    fn an_exact_map_alone_does_not_enable_the_operators() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::default());
+        let out = decode(&shuffled, Some(&e));
+        assert!(!out.contains('#'), "semantics were not claimed:\n{}", out);
+    }
+
+    /// With the observation recorded, the operators come back.
+    #[test]
+    fn observed_semantics_restore_the_real_operators() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let out = decode(&shuffled, Some(&e));
+        assert!(out.contains("return #"), "length operator missing:\n{}", out);
+        assert!(out.contains("return not "), "not operator missing:\n{}", out);
+        assert!(out.contains("return -"), "minus operator missing:\n{}", out);
+        assert!(out.contains("unary semantics:"), "header should record it");
+    }
+
+    /// The three are independent: claiming one must not enable the others.
+    #[test]
+    fn each_unary_slot_is_scoped_on_its_own() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let only_length = UnarySemantics {
+            not: UnarySem::Passthrough,
+            minus: UnarySem::Passthrough,
+            length: UnarySem::Operator,
+        };
+        let e = entry("build_a", fx::perm_a, only_length);
+        let out = decode(&shuffled, Some(&e));
+        assert!(out.contains("return #"), "length should be an operator:\n{}", out);
+        assert!(
+            !out.contains("return not "),
+            "not should still be a passthrough:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("return -"),
+            "minus should still be a passthrough:\n{}",
+            out
+        );
+    }
+
+    // ── context defaults ──
+
+    #[test]
+    fn a_fresh_context_is_all_passthrough() {
+        let chunk = fx::canonical(fx::P03_UNARY);
+        let ctx = crate::decompiler::DecompileContext::new(&chunk);
+        assert!(ctx.unary.all_passthrough());
+        assert!(!ctx.is_canonical_luau);
+    }
+
+    #[test]
+    fn set_canonical_luau_moves_all_three_together() {
+        let chunk = fx::canonical(fx::P03_UNARY);
+        let mut ctx = crate::decompiler::DecompileContext::new(&chunk);
+        ctx.set_canonical_luau(true);
+        assert_eq!(ctx.unary, UnarySemantics::canonical());
+        ctx.set_canonical_luau(false);
+        assert!(
+            ctx.unary.all_passthrough(),
+            "turning canonical off must restore the Roblox default"
+        );
+    }
+
+    // ── the global install is restored ──
+
+    #[test]
+    fn a_database_decode_does_not_leak_its_map_into_the_process() {
+        // Held across the assert, not just the decode: the whole point is that
+        // no other install can be responsible for what we observe afterwards.
+        let _lock = fx::ground_truth_lock();
+        crate::set_ground_truth_opmap(None);
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let _ = crate::decompile_with_plan(
+            &shuffled,
+            &crate::DecodePlan {
+                prior: None,
+                exact: Some(&e),
+            },
+        )
+        .expect("decode succeeds");
+        assert_eq!(
+            crate::get_ground_truth_opmap(),
+            None,
+            "the installed map must be put back on the way out"
+        );
+    }
+
+    #[test]
+    fn the_guard_restores_a_previous_map_not_just_none() {
+        let _lock = fx::ground_truth_lock();
+        let first = fx::exact_map(fx::perm_b);
+        crate::set_ground_truth_opmap(Some(first));
+        {
+            let _g = crate::GroundTruthGuard::install(fx::exact_map(fx::perm_a));
+            assert_eq!(crate::get_ground_truth_opmap(), Some(fx::exact_map(fx::perm_a)));
+        }
+        assert_eq!(crate::get_ground_truth_opmap(), Some(first));
+        crate::set_ground_truth_opmap(None);
+    }
+
+    // ── canonical bytecode is untouched by any of this ──
+
+    #[test]
+    fn canonical_bytecode_still_lifts_its_operators() {
+        let out = decode(fx::P03_UNARY, None);
+        assert!(out.contains("return #"), "canonical `#` regressed:\n{}", out);
+        assert!(out.contains("return not "), "canonical `not` regressed:\n{}", out);
+        assert!(out.contains("return -"), "canonical unary `-` regressed:\n{}", out);
     }
 }

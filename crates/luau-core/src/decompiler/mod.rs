@@ -210,6 +210,19 @@ pub struct DecompileContext<'a> {
     /// where `#t` must lift to a real `UnOp::Length`. DEFAULTS TO FALSE, so any
     /// caller that does not explicitly opt in keeps the Roblox behaviour.
     pub is_canonical_luau: bool,
+    /// How to lift the three opcodes Roblox is known to repurpose.
+    ///
+    /// DEFAULTS TO ALL-PASSTHROUGH, which is exactly the Roblox behaviour this
+    /// field replaces, so nothing changes for any caller that does not set it.
+    /// `set_canonical_luau(true)` sets all three to `Operator`, reproducing the
+    /// canonical path bit for bit.
+    ///
+    /// Three fields rather than one "the map is exact" flag, because those are
+    /// different claims. An exact map tells you which byte is `LENGTH`; only an
+    /// observation of the client's own compiler tells you that the client emits
+    /// that byte for `#x`. A database entry records the observation; anything
+    /// that has not made it stays on passthrough.
+    pub unary: crate::parser::opmap_db::UnarySemantics,
     /// Temps holding the result of a CALL whose C operand pinned it to exactly
     /// one result (`local x = (f())` in source terms).
     ///
@@ -242,6 +255,7 @@ impl<'a> DecompileContext<'a> {
             current_proto_index: None,
             upval_parent_links: std::collections::HashMap::new(),
             is_canonical_luau: false,
+            unary: crate::parser::opmap_db::UnarySemantics::default(),
             arity_pinned_temps: std::collections::HashSet::new(),
             current_loop_end: None,
         }
@@ -250,6 +264,23 @@ impl<'a> DecompileContext<'a> {
     /// Mark this chunk as canonical (non-Roblox) Luau bytecode.
     pub fn set_canonical_luau(&mut self, canonical: bool) {
         self.is_canonical_luau = canonical;
+        self.unary = if canonical {
+            crate::parser::opmap_db::UnarySemantics::canonical()
+        } else {
+            crate::parser::opmap_db::UnarySemantics::default()
+        };
+    }
+
+    /// Adopt the unary semantics a database entry OBSERVED for this build.
+    ///
+    /// Only ever called for a decode backed by a verified database entry. On
+    /// the inference path nothing calls this, so the passthrough default stands
+    /// and Roblox output is unchanged - which matters, because the passthrough
+    /// exists to suppress thousands of spurious `not vN` and `#vN` that a
+    /// misdetected map produces. A verified entry removes the misdetection;
+    /// an inferred map does not.
+    pub fn set_unary_semantics(&mut self, unary: crate::parser::opmap_db::UnarySemantics) {
+        self.unary = unary;
     }
 
     /// Initialize naming context for a proto with register hints from pre-pass.
