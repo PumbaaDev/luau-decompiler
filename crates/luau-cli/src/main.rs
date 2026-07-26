@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
                      luau-decompiler script.bin         # decompile a file\n  \
                      luau-decompiler watch ./dir        # auto-decompile folder\n  \
                      luau-decompiler batch ./dir        # batch process a folder\n  \
+                     luau-decompiler scan ./dir         # pool opcode-shuffle evidence\n  \
                      luau-decompiler validate out.lua   # syntax-check a Luau file\n  \
                      luau-decompiler compare a.lua b.lua  # diff + similarity\n\n\
                    Use --help on any subcommand for more detail."
@@ -119,6 +120,27 @@ enum Commands {
         /// Also produce .disasm files
         #[arg(long)]
         disasm: bool,
+    },
+
+    /// Contribute readings of the opcode shuffle to a store, decoding nothing
+    ///
+    /// Only useful with `--opmap-cache`. Every script from one Roblox client
+    /// version shares one opcode permutation, but a single script exercises
+    /// only a fraction of it, so a decompile is far more accurate once the
+    /// whole set has been pooled than it is on the first arrival.
+    ///
+    /// `batch` already pools its own folder before decoding any of it, so it
+    /// needs no help. This exists for the case `batch` cannot serve: scripts
+    /// arriving one at a time, where the decision to decode is made before the
+    /// rest of the set exists. Scanning the set first, then decompiling it,
+    /// gives a streaming caller the same pooled evidence a batch gets.
+    Scan {
+        /// Bytecode file, or a folder of them
+        input: PathBuf,
+
+        /// File extensions to read when INPUT is a folder (comma-separated)
+        #[arg(long, default_value = "bin,luac,bytecode,out")]
+        extensions: String,
     },
 
     /// Validate Luau source — syntax-check a .lua/.luau file
@@ -221,6 +243,10 @@ fn main() -> Result<()> {
 
         Some(Commands::Batch { input, out_dir, extensions, disasm }) => {
             run_batch(&input, out_dir.as_deref(), &extensions, disasm, store.as_ref())?;
+        }
+
+        Some(Commands::Scan { input, extensions }) => {
+            run_scan(&input, &extensions, store.as_ref())?;
         }
 
         Some(Commands::Validate { input, builtin, no_color }) => {
@@ -364,6 +390,38 @@ fn consult_store(
     }
 }
 
+/// Contribute one reading per file to the store, decoding nothing.
+///
+/// Returns how many files actually had a reading to give — canonical Luau
+/// carries no Roblox shuffle, so it neither votes nor is an error. Unreadable
+/// files are skipped for the same reason a failed decompile does not abort a
+/// batch: collecting evidence is best-effort.
+fn cast_ballots(store: &Path, files: &[PathBuf]) -> usize {
+    let mut cast = 0usize;
+    for f in files {
+        if let Ok(data) = fs::read(f) {
+            if let Some(b) = luau_core::observe_ballot(&data) {
+                cast_ballot(store, &b);
+                cast += 1;
+            }
+        }
+    }
+    cast
+}
+
+/// Bytecode files in a folder, in a stable order.
+fn bytecode_files(dir: &Path, extensions: &str) -> Result<Vec<PathBuf>> {
+    let exts: Vec<&str> = extensions.split(',').map(|s| s.trim()).collect();
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| exts.contains(&p.extension().and_then(|e| e.to_str()).unwrap_or("")))
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 /// Decompile, using and then contributing to the shared store when configured.
 fn decompile_with_store(data: &[u8], store: Option<&PathBuf>) -> Result<String> {
     let Some(path) = store else {
@@ -465,20 +523,13 @@ fn run_batch(
     let out = out_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| input.join("decompiled"));
     fs::create_dir_all(&out)?;
 
-    let exts: Vec<&str> = extensions.split(',').map(|s| s.trim()).collect();
     let mut ok = 0u32;
     let mut fail = 0u32;
     let start = std::time::Instant::now();
 
     eprintln!("Batch: {} → {}", input.display(), out.display());
 
-    let mut files: Vec<PathBuf> = fs::read_dir(input)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| exts.contains(&p.extension().and_then(|e| e.to_str()).unwrap_or("")))
-        .collect();
-    files.sort();
+    let files = bytecode_files(input, extensions)?;
 
     // Pre-pass: pool every script's reading of the opcode shuffle BEFORE
     // decoding any of them.
@@ -490,13 +541,7 @@ fn run_batch(
     // stream, knows its own boundary, so there is no reason to make the early
     // files pay for arriving early.
     if let Some(path) = store {
-        for f in &files {
-            if let Ok(data) = fs::read(f) {
-                if let Some(b) = luau_core::observe_ballot(&data) {
-                    cast_ballot(path, &b);
-                }
-            }
-        }
+        cast_ballots(path, &files);
     }
 
     for path in files {
@@ -520,6 +565,41 @@ fn run_batch(
 
     let elapsed = start.elapsed();
     eprintln!("Done: {} ok, {} failed ({:.1}s)", ok, fail, elapsed.as_secs_f64());
+    Ok(())
+}
+
+// ── Scan ──
+
+/// Pool readings of the opcode shuffle without decoding anything.
+///
+/// The pre-pass inside `run_batch` is the same operation, but a batch can only
+/// pool the folder it was handed. A caller that receives scripts one at a time
+/// has no folder to hand over at the moment it must decide, and decoding in
+/// arrival order makes every early script pay for the evidence it has not
+/// collected yet — measured at 0 of 47 corpus files recovered in arrival order
+/// against 6-10 once the whole set has voted first. Exposing the pre-pass on
+/// its own lets such a caller scan first and decompile second.
+fn run_scan(input: &Path, extensions: &str, store: Option<&PathBuf>) -> Result<()> {
+    let Some(path) = store else {
+        anyhow::bail!(
+            "scan has nowhere to record what it reads — pass --opmap-cache <PATH> \
+             (or set LUAU_OPMAP_CACHE)"
+        );
+    };
+
+    let files = if input.is_dir() {
+        bytecode_files(input, extensions)?
+    } else {
+        vec![input.to_path_buf()]
+    };
+
+    let cast = cast_ballots(path, &files);
+    eprintln!(
+        "Scanned {} file(s) → {} contributed a reading of the opcode shuffle to {}",
+        files.len(),
+        cast,
+        path.display()
+    );
     Ok(())
 }
 
@@ -562,4 +642,92 @@ fn format_info(info: &luau_core::BytecodeInfo) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch folder under the OS temp dir, removed when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "luau-cli-test-{}-{}-{:?}",
+                tag,
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn bytecode_files_filters_by_extension_and_sorts() {
+        let d = TempDir::new("exts");
+        for name in ["b.luac", "a.bin", "notes.txt", "c.bytecode"] {
+            fs::write(d.join(name), b"x").unwrap();
+        }
+        fs::create_dir_all(d.join("sub.bin")).unwrap(); // a DIRECTORY named like a file
+
+        let found = bytecode_files(&d.0, "bin,luac,bytecode,out").unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.bin", "b.luac", "c.bytecode"],
+            "must keep only bytecode extensions, only files, in sorted order");
+    }
+
+    #[test]
+    fn bytecode_files_tolerates_spaces_in_the_extension_list() {
+        let d = TempDir::new("spaces");
+        fs::write(d.join("a.bin"), b"x").unwrap();
+        fs::write(d.join("b.luac"), b"x").unwrap();
+        assert_eq!(bytecode_files(&d.0, " bin , luac ").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bytecode_files_reports_a_missing_folder() {
+        let d = TempDir::new("missing");
+        assert!(bytecode_files(&d.join("nope"), "bin").is_err());
+    }
+
+    #[test]
+    fn cast_ballots_ignores_files_with_nothing_to_say() {
+        // Neither an unreadable path nor a non-bytecode blob carries a reading
+        // of a Roblox opcode shuffle, and neither may abort the pass or invent
+        // a vote. An empty store is the correct outcome, not an error.
+        let d = TempDir::new("ballots");
+        let store = d.join("store.jsonl");
+        fs::write(d.join("junk.bin"), b"not bytecode at all").unwrap();
+
+        let cast = cast_ballots(&store, &[d.join("junk.bin"), d.join("absent.bin")]);
+        assert_eq!(cast, 0, "nothing observable must mean no ballots");
+        assert!(!store.exists(), "an empty pass must not create a store");
+    }
+
+    #[test]
+    fn scan_without_a_store_is_an_error_not_a_silent_no_op() {
+        // `scan` exists only to record evidence. With nowhere to record it the
+        // command would do nothing at all, and a caller that scanned a whole
+        // folder before decompiling would silently get the un-pooled result.
+        let d = TempDir::new("nostore");
+        fs::write(d.join("a.bin"), b"x").unwrap();
+        assert!(run_scan(&d.join("a.bin"), "bin", None).is_err());
+    }
 }

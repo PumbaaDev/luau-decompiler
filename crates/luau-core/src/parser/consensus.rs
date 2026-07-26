@@ -118,8 +118,31 @@ impl Default for ConsensusConfig {
     /// make withholding actually mean "leave unresolved", and because a future
     /// completion tier that declined to guess would change this trade. Do not
     /// turn them on again without re-measuring.
+    ///
+    /// `min_ballots` is the one gate that IS worth paying for, and 3 was too
+    /// low. Measured end to end — pool the first K ballots in smallest-file-
+    /// first arrival order, then score the map every file actually decodes with
+    /// against ground truth, 800 present byte-slots per seed:
+    ///
+    /// ```text
+    ///   K     seed 42  seed 1337  seed 424242  seed 55555   mean   vs solo
+    ///   solo   55.88     56.62       57.00        58.38     56.97      —
+    ///   3      50.00     54.50       56.88        60.25     55.41    -1.56
+    ///   4      49.62     55.12       52.00        57.88     53.66    -3.31
+    ///   5      58.75     61.88       60.88        63.62     61.28    +4.31
+    ///   6      59.00     63.88       62.75        65.62     62.81    +5.84
+    ///   7      60.50     65.38       65.12        68.00     64.75    +7.78
+    /// ```
+    ///
+    /// Three or four ballots is not yet a consensus — it is a couple of tiny
+    /// files' guesses, and publishing them LOCKS those guesses as a prior, which
+    /// is strictly worse than letting each file detect for itself. From five
+    /// ballots on, pooling wins on every seed and never looks back. Raising the
+    /// floor further was considered and rejected: K = 5, 6, 7 are worth +4.3,
+    /// +5.8 and +7.8 points, so a floor of 10 would throw away real evidence to
+    /// avoid a cold zone that ends at four.
     fn default() -> Self {
-        Self { min_ballots: 3, min_votes: 1, min_share_pct: 0, min_margin_pct: 0 }
+        Self { min_ballots: 5, min_votes: 1, min_share_pct: 0, min_margin_pct: 0 }
     }
 }
 
@@ -620,6 +643,22 @@ mod tests {
         let r = resolve(&bs, &cfg);
         assert!(r.is_empty(), "must publish nothing below the ballot floor");
         assert_eq!(r.published(), 0);
+    }
+
+    #[test]
+    fn default_ballot_floor_clears_the_measured_cold_zone() {
+        // Not a style preference — 3 and 4 ballots were MEASURED to decode
+        // worse than no store at all (-1.6 and -3.3 points of byte accuracy
+        // across four permutation seeds), because publishing a two-or-three
+        // file majority locks those files' guesses in as a prior. Five is the
+        // first count that wins on every seed. Lowering this back below five
+        // reintroduces a known regression.
+        let cfg = ConsensusConfig::default();
+        assert!(cfg.min_ballots >= 5, "cold-start floor must clear K = 4");
+        let four: Vec<Ballot> = (0..4u64).map(|i| ballot(i, &[(0x35, 4)])).collect();
+        assert!(resolve(&four, &cfg).is_empty(), "four ballots must publish nothing");
+        let five: Vec<Ballot> = (0..5u64).map(|i| ballot(i, &[(0x35, 4)])).collect();
+        assert_eq!(resolve(&five, &cfg).map[0x35], 4, "five ballots must publish");
     }
 
     #[test]

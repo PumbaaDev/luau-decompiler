@@ -3838,6 +3838,25 @@ fn detect_comparison_jumps_aux(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut candidates: HashMap<u8, usize> = HashMap::new();
     // Boolean-materialisation sites per candidate byte — see the T/F split below.
     let mut bool_mat: HashMap<u8, usize> = HashMap::new();
+    // Sites where A == AUX, i.e. the instruction compares a register with
+    // itself. Counted separately and NOT credited as candidate evidence: in
+    // JumpXEqKN the AUX word is a CONSTANT index, so it lands on the value of A
+    // by coincidence often enough to hand a JumpXEqK byte a comparison-jump
+    // score it has not earned.
+    //
+    // Do not escalate this into a rejection rule. Dropping any byte that has a
+    // single A == AUX site scores +18 byte-slots across seven corpus seeds and
+    // is WRONG: `if x ~= x then` — the standard NaN test — compiles to exactly
+    // `JUMPIFEQ Rn Rn` (verified against luau-compile v6), so one NaN guard
+    // anywhere in a module would discard a genuine comparison byte along with
+    // every real site on it. All of that +18 comes from disqualifying bytes
+    // that also carry genuine non-self sites, which is precisely the case a
+    // real NaN guard produces. Discounting the sites keeps the sound part of
+    // the signal (+4 slots, four of seven seeds, none worse) and none of the
+    // hazard. Neither corpus nor the real Roblox module contains a NaN guard,
+    // so neither can measure this — hence the compiler check rather than a
+    // score.
+    let mut self_cmp: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         let ms = proto.max_stack_size as u32;
         // Walk TRUE instruction positions, skipping AUX words of already-mapped
@@ -3871,7 +3890,11 @@ fn detect_comparison_jumps_aux(chunk: &Chunk, ctx: &mut DetectCtx) {
                 && target_pc >= 0 && (target_pc as usize) < proto.code.len()
                 && aux < ms  // full word < max_stack → upper bits zero AND value is a register
             {
-                *candidates.entry(op).or_insert(0) += 1;
+                if aux == a as u32 {
+                    *self_cmp.entry(op).or_insert(0) += 1;
+                } else {
+                    *candidates.entry(op).or_insert(0) += 1;
+                }
                 // Boolean materialisation: `local x = a < b` compiles to a jump
                 // over `LOADB dst,false,+1` onto `LOADB dst,true`.
                 //
@@ -3895,6 +3918,38 @@ fn detect_comparison_jumps_aux(chunk: &Chunk, ctx: &mut DetectCtx) {
                         && insn_a(w2) == insn_a(w3)
                         && insn_b(w2) == 0 && insn_c(w2) == 1
                         && insn_b(w3) == 1 && insn_c(w3) == 0
+                    {
+                        *bool_mat.entry(op).or_insert(0) += 1;
+                    }
+                }
+                // `repeat ... until cond` puts a second jump-if-TRUE form on
+                // record. The guard LEAVES the loop when the condition holds,
+                // so it jumps forward over the backward jump that closes the
+                // loop — the same "true means take the branch" polarity the
+                // boolean-materialisation site above detects, reached by a
+                // different shape:
+                //
+                //   i  : CMP A, D=2 ; AUX = right register
+                //   i+2: JUMPBACK    (D < 0, to the top of the body)
+                //   i+3: loop exit
+                //
+                // Recognised MAP-FREE: the word at i+2 must be AD-format with A
+                // unused and a negative D landing inside this proto, which no
+                // ABC instruction with a live A register can imitate.
+                //
+                // Worth +5 correct byte-slots across seven permutation seeds
+                // (three seeds better, none worse). The one shape that could
+                // fool it is `while cond do end` with a genuinely empty body,
+                // which compiles to the same three words and IS a NOT form;
+                // nothing in the corpus or the real Roblox module writes that.
+                if d == 2 && i + 3 < proto.code.len() {
+                    let w2 = proto.code[i + 2];
+                    let back = insn_d(w2) as i32;
+                    let back_target = (i + 2) as i32 + back + 1;
+                    if insn_a(w2) == 0
+                        && back < 0
+                        && back_target >= 0
+                        && (back_target as usize) < proto.code.len()
                     {
                         *bool_mat.entry(op).or_insert(0) += 1;
                     }
@@ -4761,9 +4816,31 @@ fn detect_arithmetic(chunk: &Chunk, ctx: &mut DetectCtx) {
 fn detect_arithmetic_k(chunk: &Chunk, ctx: &mut DetectCtx) {
     let mut candidates: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
-        for &insn in &proto.code {
+        let code = &proto.code;
+        // Walk TRUE instruction positions, skipping the AUX word of an
+        // already-mapped AUX-bearing opcode. An AUX word is arbitrary data —
+        // a constant index, a register, an import path — so its low byte is
+        // some unrelated value, and reading it as an instruction credits
+        // whatever byte that happens to be with an arithmetic-K sighting.
+        // The shape being matched here is weak enough for that to matter: the
+        // test is only "A and B look like registers and C indexes a number",
+        // which random data passes often. Mirrors the walk in
+        // detect_comparison_jumps_aux and detect_closeupvals.
+        //
+        // Worth +2 correct byte-slots across seven permutation seeds (two seeds
+        // better, none worse) and, more usefully, it stops this detector
+        // manufacturing votes for bytes a file does not contain — the ballots
+        // in parser::consensus are only as good as the evidence behind them.
+        // The real Roblox module's opcode map is unchanged by it.
+        let mut i = 0usize;
+        while i < code.len() {
+            let insn = code[i];
             let op = insn_op(insn);
-            if ctx.is_mapped(op) { continue; }
+            if ctx.is_mapped(op) {
+                let std_op = LuauOpcode::from_u8(ctx.map[op as usize]);
+                if std_op.has_aux() && i + 1 < code.len() { i += 2; } else { i += 1; }
+                continue;
+            }
             let a = insn_a(insn);
             let b = insn_b(insn);
             let c = insn_c(insn) as usize;
@@ -4773,6 +4850,7 @@ fn detect_arithmetic_k(chunk: &Chunk, ctx: &mut DetectCtx) {
                     *candidates.entry(op).or_insert(0) += 1;
                 }
             }
+            i += 1;
         }
     }
     // ArithK ops are individually uncommon — cap at 10% of total instructions
@@ -13316,6 +13394,127 @@ mod tests {
             ctx.map[fake_byte as usize], 255,
             "detect_arithmetic_k wrongly claimed 0x{:02X} with String constant", fake_byte
         );
+    }
+
+    #[test]
+    fn comparing_a_register_with_itself_is_not_evidence_of_a_comparison_jump() {
+        // 0xD2 outnumbers 0xD1 four sites to three, but every one of its sites
+        // compares a register with ITSELF — the shape JumpXEqKN produces for
+        // free whenever its constant index happens to equal A. Counting those
+        // lets it outrank the byte that has real evidence and take the slot.
+        //
+        // The sites are discounted, not the byte: a byte keeps every genuine
+        // site it has. See the note on `self_cmp` for why disqualifying the
+        // whole byte is wrong.
+        let real: u8 = 0xD1;
+        let selfcmp: u8 = 0xD2;
+        let filler = insn_abc(0xEE, 200, 0, 0); // A >= max_stack: never a candidate
+
+        let mut code: Vec<u32> = Vec::new();
+        for _ in 0..3 {
+            code.push(insn_ad(real, 0, 3)); // A = R0 ...
+            code.push(1); // ... AUX = R1, a genuine two-register comparison
+        }
+        for _ in 0..4 {
+            code.push(insn_ad(selfcmp, 2, 3)); // A = R2 ...
+            code.push(2); // ... AUX = R2, the same register
+        }
+        code.resize(20, filler);
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_comparison_jumps_aux(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[real as usize], LuauOpcode::JumpIfNotLT as u8,
+            "the byte with genuine two-register sites must take the slot"
+        );
+        assert_eq!(
+            ctx.map[selfcmp as usize], 255,
+            "self-comparison sites alone are not evidence and must claim nothing"
+        );
+    }
+
+    #[test]
+    fn repeat_until_guard_is_read_as_a_jump_if_true_form() {
+        // Two comparison-jump bytes, identical in every respect the encoding can
+        // show, separated only by the shape they sit in:
+        //
+        //   0xC1  `repeat ... until a < b`  — jumps FORWARD over the backward
+        //                                     jump, so TRUE takes the branch
+        //   0xC2  a plain `if` guard        — TRUE falls through, so it is a
+        //                                     NOT form
+        //
+        // Without the repeat-until site both land in the NOT bucket and 0xC1 is
+        // mislabelled JumpIfNotLT.
+        let cmp_true: u8 = 0xC1;
+        let cmp_not: u8 = 0xC2;
+        let jumpback: u8 = 0xC3;
+        let filler = insn_abc(0xEE, 200, 0, 0); // A >= max_stack: never a candidate
+
+        let mut code: Vec<u32> = vec![
+            insn_ad(cmp_true, 0, 2), // 0: exits the loop when the test holds
+            1,                       // 1: AUX = right register
+            insn_ad(jumpback, 0, -3),// 2: closes the loop
+            insn_ad(cmp_not, 0, 4),  // 3: ordinary forward guard
+            1,                       // 4: AUX = right register
+        ];
+        code.resize(10, filler);
+        let chunk = chunk_from_code(code, 4);
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_comparison_jumps_aux(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[cmp_true as usize], LuauOpcode::JumpIfLT as u8,
+            "a byte used to leave a repeat-until loop is a jump-if-TRUE form"
+        );
+        assert_eq!(
+            ctx.map[cmp_not as usize], LuauOpcode::JumpIfNotLT as u8,
+            "a byte with no true-form site must stay in the NOT bucket"
+        );
+    }
+
+    #[test]
+    fn detect_arithmetic_k_does_not_read_aux_words_as_instructions() {
+        // The AUX word of an already-mapped AUX-bearing opcode is DATA — here a
+        // GETIMPORT path constant. Its low byte is whatever that datum happens
+        // to be, and treating it as an instruction credits that byte with
+        // arithmetic-K sightings it never had.
+        //
+        // The chunk below contains no arithmetic-K at all: three GETIMPORTs
+        // whose AUX words are crafted so that reading them as instructions
+        // yields (op = 0xC7, A = 0, B = 1, C = 0), which passes the detector's
+        // "A and B are registers, C indexes a number constant" test. Under an
+        // every-word walk 0xC7 collects three sightings and is handed AddK.
+        let aux_byte: u8 = 0xC7;
+        let getimport: u8 = 0x2A;
+        let aux_word = insn_abc(aux_byte, 0, 1, 0);
+
+        let mut code: Vec<u32> = Vec::new();
+        for _ in 0..3 {
+            code.push(insn_abc(getimport, 0, 0, 0));
+            code.push(aux_word);
+        }
+        let mut chunk = chunk_from_code(code, 8);
+        chunk.protos[0].constants = vec![Constant::Number(1.0)];
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        // GetImport carries an AUX word, so the walk must step over it.
+        ctx.try_assign(getimport, LuauOpcode::GetImport as u8);
+        assert!(LuauOpcode::from_u8(LuauOpcode::GetImport as u8).has_aux());
+
+        detect_arithmetic_k(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[aux_byte as usize], 255,
+            "0x{:02X} occurs only as AUX data and must not be claimed as arithmetic-K",
+            aux_byte
+        );
+        assert!(!ctx.assigned[LuauOpcode::AddK as usize]);
     }
 
     /// ---- detect_move -------------------------------------------------------
