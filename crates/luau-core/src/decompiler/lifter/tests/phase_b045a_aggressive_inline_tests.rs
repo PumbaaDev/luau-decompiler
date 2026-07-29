@@ -24,7 +24,7 @@
 
 use super::super::{inline_single_use_temps, is_pure_expr, expr_contains_call,
     stmt_has_observable_side_effect};
-use crate::ast::{BinOp, Expr, Stat, TableField};
+use crate::ast::{BinOp, Expr, Stat};
 
 fn name(s: &str) -> Expr { Expr::Name(s.to_string()) }
 fn num(n: f64) -> Expr { Expr::Number(n) }

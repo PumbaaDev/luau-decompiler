@@ -9969,7 +9969,7 @@ mod tests {
             code_b.push(0x00000001);                          // SETTABLEKS AUX
         }
         code_b.push(insn_abc(0xCC, 0, 0, 0));
-        let mut proto_b = Proto {
+        let proto_b = Proto {
             max_stack_size: 8,
             num_params: 0,
             num_upvalues: 0,
@@ -11012,7 +11012,7 @@ mod tests {
         let settablen_byte = cache.iter().position(|&v| v == LuauOpcode::SetTableN as u8).map(|i| i as u8);
 
         let mut parsed_count = 0usize;
-        for (fname, data) in &files {
+        for (_fname, data) in &files {
             let chunk = match crate::parser::parse(data) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -11034,7 +11034,7 @@ mod tests {
                     }
                     // Unmapped byte at a true instruction position — probe for shapes
                     let a = insn_a(insn);
-                    let b = insn_b(insn);
+                    let _b = insn_b(insn);
                     let c = insn_c(insn);
                     let d = insn_d(insn) as i32;
                     let entry = per_byte.entry(op).or_default();
@@ -12465,7 +12465,7 @@ mod tests {
         let snap = |ctx: &DetectCtx| ctx.map[0x8C];
         let mut last = snap(&ctx);
 
-        let mut check = |ctx: &DetectCtx, phase: &'static str, last: &mut u8, log: &mut Vec<(&'static str, u8)>| {
+        let check = |ctx: &DetectCtx, phase: &'static str, last: &mut u8, log: &mut Vec<(&'static str, u8)>| {
             let cur = snap(ctx);
             if cur != *last {
                 eprintln!(">>> 0x8C FIRST ASSIGNED in {} -> std={} ({:?})",
@@ -13023,7 +13023,7 @@ mod tests {
         let loadk_byte: u8 = 0x6F;
         let impure_byte: u8 = 0xA7; // will have mixed D values → not pure → not LoadKX
         let real_kx_byte: u8 = 0xB3; // pure D=0 → real LoadKX
-        let mut constants: Vec<Constant> = (0..200).map(|_| Constant::Nil).collect();
+        let constants: Vec<Constant> = (0..200).map(|_| Constant::Nil).collect();
         let mut code: Vec<u32> = Vec::new();
         // Seed LOADK
         for _ in 0..5 { code.push(loadk_byte as u32); }
@@ -13073,7 +13073,7 @@ mod tests {
         let loadk_byte: u8 = 0x6F;
         let candidate_byte: u8 = 0xA7;
         // Proto with 100 constants; candidate byte has D=0 but AUX = 200 (>= 100 = out of range)
-        let mut constants: Vec<Constant> = (0..100).map(|_| Constant::Nil).collect();
+        let constants: Vec<Constant> = (0..100).map(|_| Constant::Nil).collect();
         let mut code: Vec<u32> = Vec::new();
         for _ in 0..5 { code.push(loadk_byte as u32); }
         for _ in 0..5 {
@@ -13120,7 +13120,7 @@ mod tests {
         let loadkx_byte: u8 = 0xC1;  // LoadKX shuffled byte (the target we want to detect)
 
         let const_count = 300usize;
-        let mut constants: Vec<Constant> = (0..const_count).map(|_| Constant::Nil).collect();
+        let constants: Vec<Constant> = (0..const_count).map(|_| Constant::Nil).collect();
         let mut code: Vec<u32> = Vec::new();
 
         // Seed LOADK (required prereq for detect_loadkx)

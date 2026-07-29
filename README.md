@@ -124,6 +124,13 @@ and the pass rate is treated as the project's real quality metric.
 
 **Current: 47 of 47 programs decompile to semantically equivalent source.**
 
+This figure is measured out of tree: the round trip needs a Luau interpreter binary to
+execute both the original and the recovered source, and neither that binary nor the corpus
+ships in this repository, so a fresh clone cannot reproduce the number directly. What CI and
+`cargo test` do exercise is the in-repo suite (parser, lifter, disassembler and obfuscator
+unit tests, 900+ of them); the interpreter round-trip test skips cleanly when the binary is
+absent.
+
 A known limitation: when the operands of a nested short-circuit are themselves function
 calls, the value-join reconstruction declines to fold them. Doing so would risk emitting a
 call twice, which would change behaviour silently rather than visibly, so the analysis
@@ -147,11 +154,18 @@ are far larger and give the inference considerably more structural evidence to w
 this is a worst case rather than a typical one, but it is not currently a measured claim
 either way.
 
-**The important caveat is that a poor inference does not announce itself.** Unmapped opcodes
-are currently filled in to complete the permutation, so a substantially wrong map still
-produces clean, well-formed, plausible output. Absence of errors in the output is therefore
-not evidence that the mapping was correct. Treat results on shuffled input as unverified,
-and prefer checking recovered behaviour over reading the recovered source.
+**A poor inference is dangerous precisely because the output still looks clean.** Bytes the
+detectors cannot pin are completed by bijection to finish the permutation, so a substantially
+wrong map can still produce well-formed, plausible source. To make that visible rather than
+silent, every remapped decode now carries an evidence header: how many opcode bytes this
+chunk uses were pinned by detectors, how many were filled by completion, how many were left
+unmapped, and a list of any unresolved instructions. That header reports **provenance, not
+correctness** — measured against ground truth, the detector-backed share predicts per-byte
+accuracy only weakly (r ≈ 0.26), so even a high pinned share can be confidently wrong. Read it
+as a map of what the output leans on, not a guarantee. Treat results on shuffled input as
+unverified and prefer checking recovered behaviour over reading the recovered source. The one
+path that carries no such caveat is a database-backed decode, where the map was measured
+against the client's own compiler rather than inferred; the header says so when that applies.
 
 ## Project layout
 

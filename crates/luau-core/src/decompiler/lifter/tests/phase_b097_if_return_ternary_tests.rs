@@ -3,7 +3,7 @@
 //! Pattern A: `if cond then return a else return b end` → `return if cond then a else b`
 //! Pattern B: `if cond then return a end; return b` → `return if cond then a else b`
 
-use crate::ast::{BinOp, Expr, Stat, UnOp};
+use crate::ast::{BinOp, Expr, Stat};
 use super::super::post_passes::collapse_if_return_ternary;
 
 fn name(s: &str) -> Expr { Expr::Name(s.to_string()) }
