@@ -388,9 +388,15 @@ impl<'a> BytecodeReader<'a> {
             bail!("bytecode contains compilation error: {}", error_msg);
         }
 
-        if !(3..=8).contains(&version) {
+        // v9 is a same-container version bump: header and proto layout are
+        // byte-identical to v8, verified by decoding real captured v9 samples
+        // from a live Roblox client. The type-info blob is read below as an
+        // opaque size-prefixed blob, so types_version 3 needs no special case.
+        // Roblox shipped v9 to production clients, so rejecting it here failed
+        // every script on the current build.
+        if !(3..=9).contains(&version) {
             bail!(
-                "unsupported bytecode version {} (expected 3-8)",
+                "unsupported bytecode version {} (expected 3-9)",
                 version
             );
         }

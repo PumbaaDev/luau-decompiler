@@ -6910,6 +6910,36 @@ fn detect_fastcall3(chunk: &Chunk, ctx: &mut DetectCtx) {
 ///
 /// Requires all 6 standard arithmetic ops to be mapped first (same ABC format).
 fn detect_bitwise_ops(chunk: &Chunk, ctx: &mut DetectCtx) {
+    // DISABLED — this pass invents opcodes that are not in the bytecode.
+    //
+    // Luau source has no bitwise operators. `bit32.band`/`bor`/`bxor` are plain
+    // library functions and compile to ordinary calls, so the stock Roblox
+    // compiler does not emit opcodes 84-91 at all. Detection here rests only on
+    // operand SHAPE (C==0, C within the constant range, ...) — properties every
+    // ABC-format instruction also satisfies — so it reliably mislabels real
+    // opcodes as bitwise ones.
+    //
+    // Measured on a 1286-script corpus from a live client: once all six
+    // arithmetic ops were pinned from measured ground truth, the guard below
+    // started passing and this pass then assigned BAND/BOR/BNOT/SHL/SHR/BANDK
+    // across 262 files. It emitted `bit32.band(x, nil)`, `bit32.band(0.5, ...)`
+    // and `bit32.band(self.Position, self.Position)` — bitwise operations on
+    // nil, on floats and on a Vector3, none of which can occur. One case
+    // reduced to `atan2(band(X,Z) - band(Z,X), band(X,X) + band(Z,Z))` where the
+    // source plainly computed `X*Z - Z*X`: the byte was MUL. Every emission was
+    // wrong. Disabling it took files containing bit32 artifacts from 243 to 1,
+    // and that last one is genuine library use in a hash function.
+    //
+    // Note the failure mode is the one this crate is built to avoid: the output
+    // looked plausible and was fiction. An unresolved marker is honest; a
+    // fabricated `bit32.band` silently corrupts otherwise-correct output.
+    //
+    // If a future client genuinely emits these, re-enable behind measured
+    // evidence from `probe align`, never shape heuristics.
+    let _ = (chunk, ctx);
+    #[allow(unreachable_code)]
+    return;
+
     // Require all 6 standard arithmetic ops mapped first — they share the same ABC format.
     // Without this guard, detect_bitwise_ops can steal arith bytes that look like bitwise.
     let all_arith_mapped = [
@@ -14142,56 +14172,46 @@ mod tests {
             "detect_bitwise_ops must bail when arithmetic ops are unmapped"
         );
     }
-
     #[test]
-    fn detect_bitwise_ops_classifies_unary_and_binary() {
-        // Pre-seed the 6 arithmetic ops so the detector runs.
-        // Provide two candidate bytes:
-        //   byte_u: unary-shaped (C=0 always, pos_hits>=2)  → Bnot
-        //   byte_b: binary-shaped (C is a register, varies) → Band
+    fn detect_bitwise_ops_is_disabled_and_assigns_nothing() {
+        // detect_bitwise_ops is disabled: Luau source has no bitwise operators,
+        // so the stock compiler never emits opcodes 84-91, and shape-based
+        // detection reliably mislabels real opcodes as bitwise ones. Measured
+        // on a 1286-script corpus it fabricated BAND/BOR/BNOT/SHL/SHR/BANDK in
+        // 262 files, including bitwise ops on nil, floats and a Vector3.
+        //
+        // This asserts the contract that replaced the old classification tests:
+        // even with every prerequisite satisfied, the pass must assign NOTHING.
         let byte_u: u8 = 0x30;
-        let byte_b: u8 = 0x31;
         let code = vec![
-            // Unary-shaped candidate
             insn_abc(byte_u, 1, 0, 0),
             insn_abc(byte_u, 2, 0, 0),
             insn_abc(byte_u, 3, 1, 0),
-            // Binary-shaped candidate — C>0, C<stack, varying registers
-            insn_abc(byte_b, 0, 1, 2),
-            insn_abc(byte_b, 1, 2, 3),
-            insn_abc(byte_b, 2, 0, 1),
             insn_abc(0xDD, 0, 0, 0),
         ];
         let chunk = chunk_from_code(code, 8);
 
         let mut ctx = DetectCtx::new();
         ctx.compute_frequencies(&chunk);
-        // Pre-seed all 6 standard arith ops onto arbitrary fake bytes.
-        let arith_seed: [(u8, LuauOpcode); 6] = [
-            (0xA0, LuauOpcode::Add),
-            (0xA1, LuauOpcode::Sub),
-            (0xA2, LuauOpcode::Mul),
-            (0xA3, LuauOpcode::Div),
-            (0xA4, LuauOpcode::Mod),
-            (0xA5, LuauOpcode::Pow),
-        ];
-        for (sh, std) in arith_seed.iter() {
+        // Satisfy the old prerequisite gate so we prove the disable, not the gate.
+        for (sh, std) in [
+            (0xA0u8, LuauOpcode::Add), (0xA1, LuauOpcode::Sub), (0xA2, LuauOpcode::Mul),
+            (0xA3, LuauOpcode::Div),   (0xA4, LuauOpcode::Mod), (0xA5, LuauOpcode::Pow),
+        ].iter() {
             ctx.map[*sh as usize] = *std as u8;
             ctx.assigned[*std as usize] = true;
         }
+        let before = ctx.map;
 
         detect_bitwise_ops(&chunk, &mut ctx);
 
-        assert_eq!(
-            ctx.map[byte_u as usize],
-            LuauOpcode::Bnot as u8,
-            "detect_bitwise_ops should classify C=0 byte 0x{:02X} as Bnot", byte_u
-        );
-        assert_eq!(
-            ctx.map[byte_b as usize],
-            LuauOpcode::Band as u8,
-            "detect_bitwise_ops should classify varying-C-register byte 0x{:02X} as Band", byte_b
-        );
+        assert_eq!(ctx.map, before, "disabled pass must not modify the map");
+        for op in [LuauOpcode::Band, LuauOpcode::Bor, LuauOpcode::Bxor,
+                   LuauOpcode::Bnot, LuauOpcode::Shl, LuauOpcode::Shr,
+                   LuauOpcode::Bandk, LuauOpcode::Bork] {
+            assert!(!ctx.assigned[op as usize],
+                "{:?} must never be assigned by the disabled pass", op);
+        }
     }
 
     /// ---- detect_unary_not_minus -------------------------------------------
@@ -14546,80 +14566,7 @@ mod tests {
 
     /// ---- detect_bitwise_ops additional coverage ----------------------------
 
-    #[test]
-    fn detect_bitwise_ops_assigns_k_group_for_const_c() {
-        // With all 6 arith ops mapped, a byte whose C points to a Number
-        // constant on every instance falls into the K-group → maps to Bandk.
-        let bandk_byte: u8 = 0x91;
-        let mut code = vec![
-            // 4 hits: A=0, B=1, C=0 where const[0] = Number → c_const_number
-            insn_abc(bandk_byte, 0, 1, 0),
-            insn_abc(bandk_byte, 0, 1, 0),
-            insn_abc(bandk_byte, 0, 1, 0),
-            insn_abc(bandk_byte, 0, 1, 0),
-            insn_abc(0xDD, 0, 0, 0),
-        ];
-        // Pad so total_insns gets compute_frequencies a respectable count.
-        for _ in 0..20 { code.push(insn_abc(0xDE, 0, 0, 0)); }
-        let mut chunk = chunk_from_code(code, 4);
-        chunk.protos[0].constants = vec![Constant::Number(0xFFu32 as f64)];
 
-        let mut ctx = DetectCtx::new();
-        ctx.compute_frequencies(&chunk);
-        // Pre-seed all 6 arith ops (prerequisite gate)
-        ctx.map[0xE0] = LuauOpcode::Add as u8; ctx.assigned[LuauOpcode::Add as usize] = true;
-        ctx.map[0xE1] = LuauOpcode::Sub as u8; ctx.assigned[LuauOpcode::Sub as usize] = true;
-        ctx.map[0xE2] = LuauOpcode::Mul as u8; ctx.assigned[LuauOpcode::Mul as usize] = true;
-        ctx.map[0xE3] = LuauOpcode::Div as u8; ctx.assigned[LuauOpcode::Div as usize] = true;
-        ctx.map[0xE4] = LuauOpcode::Mod as u8; ctx.assigned[LuauOpcode::Mod as usize] = true;
-        ctx.map[0xE5] = LuauOpcode::Pow as u8; ctx.assigned[LuauOpcode::Pow as usize] = true;
-
-        detect_bitwise_ops(&chunk, &mut ctx);
-
-        // The byte (4 hits, all c=0 with const[0]=Number) → c_zero_pct=100, c_reg_nonzero=0
-        // → unary group → assigned to one of the unary targets (Bnot/Shl/Shr).
-        // Note: c_zero_pct >= 85 AND c_reg_nonzero == 0 takes precedence over const check.
-        // Other unmapped C=0 fillers may compete and take Bnot first by frequency, so
-        // we just verify the byte landed in the unary target set.
-        let mapped = ctx.map[bandk_byte as usize];
-        assert!(
-            mapped == LuauOpcode::Bnot as u8
-                || mapped == LuauOpcode::Shl as u8
-                || mapped == LuauOpcode::Shr as u8,
-            "C=0 always with no nonzero-reg C should classify into unary group; got {}", mapped
-        );
-    }
-
-    #[test]
-    fn detect_bitwise_ops_classifies_binary_reg_byte() {
-        // Byte with C always a valid non-zero register (and not a Number const)
-        // → binary-group → maps to Band (first binary target).
-        let band_byte: u8 = 0x92;
-        let mut code: Vec<u32> = Vec::new();
-        for _ in 0..5 {
-            code.push(insn_abc(band_byte, 0, 1, 2)); // C=2 valid reg
-        }
-        for _ in 0..20 { code.push(insn_abc(0xDE, 0, 0, 0)); }
-        let chunk = chunk_from_code(code, 4);
-        // No Number constants → C=2 won't count as c_const_number.
-
-        let mut ctx = DetectCtx::new();
-        ctx.compute_frequencies(&chunk);
-        ctx.map[0xE0] = LuauOpcode::Add as u8; ctx.assigned[LuauOpcode::Add as usize] = true;
-        ctx.map[0xE1] = LuauOpcode::Sub as u8; ctx.assigned[LuauOpcode::Sub as usize] = true;
-        ctx.map[0xE2] = LuauOpcode::Mul as u8; ctx.assigned[LuauOpcode::Mul as usize] = true;
-        ctx.map[0xE3] = LuauOpcode::Div as u8; ctx.assigned[LuauOpcode::Div as usize] = true;
-        ctx.map[0xE4] = LuauOpcode::Mod as u8; ctx.assigned[LuauOpcode::Mod as usize] = true;
-        ctx.map[0xE5] = LuauOpcode::Pow as u8; ctx.assigned[LuauOpcode::Pow as usize] = true;
-
-        detect_bitwise_ops(&chunk, &mut ctx);
-
-        assert_eq!(
-            ctx.map[band_byte as usize],
-            LuauOpcode::Band as u8,
-            "C=valid-nonzero-reg should classify into binary group → Band"
-        );
-    }
 
     /// ---- detect_unary_not_minus additional coverage -------------------------
 
