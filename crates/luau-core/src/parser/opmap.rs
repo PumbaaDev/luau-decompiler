@@ -295,8 +295,70 @@ impl DetectCtx {
         true
     }
 
+    /// Claim a byte even if a weaker detector already holds it.
+    ///
+    /// ── WHY THIS EXISTS ─────────────────────────────────────────────────
+    /// Detectors run in a fixed order and `try_assign`/`try_assign_force`
+    /// both refuse a byte that is already mapped. So the FIRST detector to
+    /// guess wins permanently, regardless of how weak its evidence was —
+    /// several force-assign on a threshold of 1.
+    ///
+    /// Measured consequence: in CameraModule, `detect_closure_capture`
+    /// (invoked at line 790, threshold `count >= 1`) claimed 0x9F for
+    /// CAPTURE. CALL was then never assigned at all, because `detect_call`
+    /// runs at line 827 and skips already-mapped bytes. Every call in the
+    /// chunk decoded as a no-op, and a 32-proto module produced `return {}`.
+    ///
+    /// Tightening the CAPTURE detector did NOT fix it — `detect_duptable`
+    /// (line 792) simply took the byte instead, and that change regressed a
+    /// previously-passing chunk. Ordering is the fault, not any one detector,
+    /// so the fix is to let strong evidence displace weak evidence rather
+    /// than to reshuffle who guesses first.
+    ///
+    /// `min_evidence_to_beat` is the evidence level at or below which the
+    /// incumbent is considered a guess worth overriding. A detector should
+    /// only call this when its own discriminant is genuinely stronger than a
+    /// structural coincidence — CALL's C-distribution test qualifies; a
+    /// "these bytes look similar" heuristic does not.
+    fn try_assign_override(&mut self, shuffled: u8, standard: u8, min_evidence_to_beat: u16) -> bool {
+        let current = self.map[shuffled as usize];
+        if current == standard {
+            self.evidence[shuffled as usize] =
+                self.evidence[shuffled as usize].saturating_add(2);
+            return true;
+        }
+        if current != 255 {
+            // Never displace an externally-seeded entry: those come from a
+            // consensus across many scripts and outrank any single-file test.
+            if self.locked[shuffled as usize] {
+                return false;
+            }
+            if self.evidence[shuffled as usize] > min_evidence_to_beat {
+                return false;
+            }
+            // Release the standard opcode the incumbent held, or it stays
+            // marked assigned and can never be detected on another byte.
+            self.assigned[current as usize] = false;
+            self.map[shuffled as usize] = 255;
+            self.evidence[shuffled as usize] = 0;
+        }
+        if self.assigned[standard as usize] {
+            return false;
+        }
+        self.map[shuffled as usize] = standard;
+        self.assigned[standard as usize] = true;
+        self.evidence[shuffled as usize] = 3;
+        true
+    }
+
     fn is_mapped(&self, shuffled: u8) -> bool {
         self.map[shuffled as usize] != 255
+    }
+
+    /// How much evidence backs the current mapping of `shuffled`.
+    /// 0 = unmapped, 1 = try_assign, 2 = force-assign, 3+ = corroborated.
+    fn evidence_for(&self, shuffled: u8) -> u16 {
+        self.evidence[shuffled as usize]
     }
 
     fn find_shuffled(&self, standard: u8) -> Option<u8> {
@@ -2480,7 +2542,21 @@ fn detect_call(chunk: &Chunk, ctx: &mut DetectCtx) {
     for proto in &chunk.protos {
         for &insn in &proto.code {
             let op = insn_op(insn);
-            if ctx.is_mapped(op) { continue; }
+            // Consider bytes another detector already claimed, PROVIDED that
+            // claim is weak (evidence <= 2, i.e. a plain try_assign or a
+            // single-match force-assign).
+            //
+            // Skipping every mapped byte is what let CALL be lost entirely:
+            // detect_closure_capture (line 790) and detect_duptable (line 792)
+            // both run before this and both force-claim on thin evidence, so
+            // whichever guessed first held CALL's byte permanently and this
+            // detector — the only one with a real statistical discriminant —
+            // never even evaluated it. Measured on CameraModule: CALL never
+            // assigned, every call decoded as a no-op, 32 protos -> `return {}`.
+            //
+            // Strongly-held bytes are still skipped, so this cannot disturb a
+            // mapping that several passes agree on.
+            if ctx.is_mapped(op) && ctx.evidence_for(op) > 2 { continue; }
             let a = insn_a(insn);
             let b = insn_b(insn);
             let c = insn_c(insn);
@@ -2548,8 +2624,17 @@ fn detect_call(chunk: &Chunk, ctx: &mut DetectCtx) {
     });
 
     if let Some((op, _)) = pick {
-        // Force — CALL detection via ABC pattern + C-distribution is reliable
-        ctx.try_assign_force(op, LuauOpcode::Call as u8);
+        // A byte reaching the STRICT filter has >= 10 instances, >= 60% with
+        // C <= 2, and >= 15% with C > 0 — a statistical signature far stronger
+        // than the structural coincidences that produce weak claims. That
+        // earns the right to displace an incumbent holding the byte on
+        // evidence <= 2. The loose fallback below does NOT get that right.
+        let from_strict = strict.first().map(|&(o, _)| o) == Some(op);
+        if from_strict {
+            ctx.try_assign_override(op, LuauOpcode::Call as u8, 2);
+        } else {
+            ctx.try_assign_force(op, LuauOpcode::Call as u8);
+        }
     }
 }
 
