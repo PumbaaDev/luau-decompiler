@@ -1715,8 +1715,33 @@ fn detect_dupclosure(chunk: &Chunk, ctx: &mut DetectCtx) {
     if let Some((&op, &count)) = candidates.iter()
         .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
     {
-        // Pointing to a Closure constant is a very specific pattern.
-        if count >= 1 { ctx.try_assign(op, LuauOpcode::DupClosure as u8); }
+        // The discriminant above is STRONG: D must index an entry that really is
+        // a Constant::Closure in this proto's own constant table. That is a hard
+        // structural fact about the chunk, not a shape heuristic — unlike
+        // detect_closure_capture's "A <= 2 and every capture shares one byte",
+        // which ordinary instructions satisfy by coincidence.
+        //
+        // But detect_closure_capture runs FIRST (opmap.rs:852 vs 853) and
+        // force-assigns on a threshold of 1, and a plain try_assign silently
+        // fails on an already-mapped byte. So DUPCLOSURE routinely lost its byte
+        // and was never assigned at all.
+        //
+        // Measured on a 628-script corpus extracted from a live client:
+        //   * 63 chunks assigned the SAME unbound register to 3+ table fields
+        //     (Badges: 25 fields all = v12; DigitalBeeQuests: 21 all = v4)
+        //   * RefCounter's 7 methods were all `= v1`, with nothing ever
+        //     assigning v1 — the module exported nothing callable
+        // The SETTABLEKS instructions were present and correct throughout; only
+        // the closure load was missing, because its opcode had been taken.
+        //
+        // Two occurrences is the bar for displacing an incumbent: one constant
+        // slot could coincidentally hold a closure, two independent instructions
+        // pointing at closure constants could not.
+        if count >= 2 {
+            ctx.try_assign_override(op, LuauOpcode::DupClosure as u8, 2);
+        } else if count >= 1 {
+            ctx.try_assign(op, LuauOpcode::DupClosure as u8);
+        }
     }
 }
 
