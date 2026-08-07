@@ -10,6 +10,20 @@ use anyhow::Result;
 /// Decompiler version string, injected from Cargo.toml
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Attribution emitted at the top of every decompiled file.
+///
+/// Every output path routes through here rather than formatting its own
+/// header, so attribution cannot be lost by adding a new entry point and
+/// forgetting to include it. Recovered source is derived work produced by
+/// this tool, and output that travels without provenance ends up with none.
+pub const ATTRIBUTION: &str =
+    "PumbaDecompiler | PumbaHub | PumbaDev — github.com/PumbaaDev/luau-decompiler";
+
+/// The standard two-line banner: attribution followed by version.
+pub fn banner() -> String {
+    format!("-- {}\n-- Luau Decompiler v{}\n", ATTRIBUTION, VERSION)
+}
+
 /// Install a ground-truth opmap (canonical shuffled-byte → opcode table)
 /// obtained from an external source such as the an executor probe script. Ground
 /// truth is applied with top priority in every subsequent `detect` call.
@@ -825,8 +839,8 @@ pub fn decompile_with_plan(
     // Add header with remap info
     if let Some(mapped) = mapped_count {
         let mut header = format!(
-            "-- Luau Decompiler v{}\n-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
-            VERSION, mapped, chunk.protos.len(), chunk.main_proto
+            "{}-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
+            banner(), mapped, chunk.protos.len(), chunk.main_proto
         );
         // Evidence line. Deliberately unconditional: the failure mode this
         // guards against is a wholly mis-detected shuffle producing output that
@@ -936,7 +950,7 @@ pub fn decompile_with_plan(
         header.push_str(&source);
         Ok((header, returned_opmap))
     } else {
-        let versioned = format!("-- Luau Decompiler v{}\n{}", VERSION, source);
+        let versioned = format!("{}{}", banner(), source);
         Ok((versioned, None))
     }
 }

@@ -534,6 +534,35 @@ impl LuauOpcode {
                 // Roblox extension: RBX_EXT_101 is observed to have an AUX word
                 // (confirmed via debug-disasm: UNKNOWN 0x00000800 always follows it).
                 | Self::RbxExt101
+                // Its EVEN-numbered siblings carry one too, and missing them
+                // desynced the instruction stream.
+                //
+                // Same evidence as RbxExt101: in CameraModule's main proto every
+                // one of these is immediately followed by a word the decoder
+                // cannot classify --
+                //     325: RBX_EXT_94   -> 326: UNKNOWN 0x005F1B00
+                //     328: RBX_EXT_96   -> 329: UNKNOWN 0x00611B00
+                //     331: RBX_EXT_98   -> 332: UNKNOWN 0x00631B00
+                //     335: RBX_EXT_100  -> 336: UNKNOWN 0x00651B00
+                //     338: RBX_EXT_102  -> 339: UNKNOWN 0x00671B00
+                // -- with no exceptions across the corpus.
+                //
+                // Each unconsumed AUX word shifts every following instruction by
+                // one. That is why CameraModule's tail decoded as nonsense
+                // (repeating ORK/RBX_EXT/UNKNOWN triples) and why its ~20
+                // DUPCLOSURE + SETTABLEKS method attachments never became
+                // function declarations: they were still in the bytecode, but the
+                // decoder had lost alignment before reaching them.
+                //
+                // This is why the module emitted `return {}` from 32 protos. The
+                // declaration path was never broken; it was never reached.
+                | Self::RbxExt92
+                | Self::RbxExt94
+                | Self::RbxExt96
+                | Self::RbxExt98
+                | Self::RbxExt100
+                | Self::RbxExt102
+                | Self::RbxExt104
         )
     }
 }
