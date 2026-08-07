@@ -394,6 +394,12 @@ impl<'a> BytecodeReader<'a> {
         // opaque size-prefixed blob, so types_version 3 needs no special case.
         // Roblox shipped v9 to production clients, so rejecting it here failed
         // every script on the current build.
+        // v10/v11 are NOT same-container bumps: tested 2026-08-03 by widening
+        // this gate to 11 and decoding a v11 chunk from the bundled
+        // luau-compile — it failed with "unexpected end of bytecode at offset
+        // 376" while reading proto 2, so the proto layout changed after v9.
+        // Widening the gate again without implementing the new layout only
+        // converts a clear version error into a confusing truncation error.
         if !(3..=9).contains(&version) {
             bail!(
                 "unsupported bytecode version {} (expected 3-9)",
