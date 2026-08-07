@@ -3245,6 +3245,36 @@ pub(super) fn lift_instruction_range(
             LuauOpcode::GetVarargs => {
                 // GETVARARGS A B: store B-1 vararg values into R(A)..R(A+B-2)
                 // B=0 means store all varargs starting at A
+                //
+                // LEGALITY GUARD — a non-vararg proto cannot have varargs.
+                //
+                // `proto.is_vararg` is read from the bytecode header
+                // (parser/mod.rs:239), so it is authoritative: it comes from the
+                // file rather than from opcode inference. If a proto whose flag
+                // is false appears to execute GETVARARGS, the DECODE is wrong —
+                // most often a byte assigned by bijection completion rather than
+                // pinned by a detector.
+                //
+                // Emitting `...` anyway turns a recoverable mis-decode into
+                // source that cannot compile at all:
+                //
+                //     local function HasCapacity()            -- params=0, not vararg
+                //         local service = game:GetService(...)
+                //     SyntaxError: Cannot use '...' outside of a vararg function
+                //
+                // Measured on a 628-chunk corpus: 53 chunks emitted illegal `...`,
+                // SpiritBearInit alone 570 times, and that single class was 40 of
+                // the 66 files that failed to compile.
+                //
+                // Marking the register Unknown keeps the mis-decode visible to the
+                // semantic checks instead of laundering it into valid-looking
+                // syntax. That is deliberate: a defect the tooling can see beats
+                // one it cannot.
+                if !proto.is_vararg {
+                    regs[a] = RegVal::Unknown;
+                    pc += 1;
+                    continue;
+                }
                 let count = if b == 0 { 1 } else { b.saturating_sub(1).max(1) };
                 if count == 1 {
                     regs[a] = RegVal::Expr(Expr::Varargs);
@@ -3379,6 +3409,16 @@ pub(super) fn lift_instruction_range(
             // A=target register, B=count+1 (0=all), exactly matching standard GETVARARGS.
             // Proto is vararg=true and there is no standard GETVARARGS in the instruction stream.
             LuauOpcode::RbxExt97 => {
+                // Same legality guard as GETVARARGS — see that handler for the
+                // full reasoning. Note the comment directly above ASSERTS "Proto
+                // is vararg=true" as part of the evidence for this decode, but
+                // nothing ever checked it. When the assumption does not hold, the
+                // decode is wrong and `...` here cannot compile.
+                if !proto.is_vararg {
+                    regs[a] = RegVal::Unknown;
+                    pc += 1;
+                    continue;
+                }
                 // Reuse exact logic from LuauOpcode::GetVarargs handler.
                 let count = if b == 0 { 1 } else { b.saturating_sub(1).max(1) };
                 if count == 1 {
