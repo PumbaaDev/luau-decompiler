@@ -3,6 +3,7 @@ mod compare;
 mod ansi;
 mod probe_cmd;
 mod opmap_db_cmd;
+mod run_manifest;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -774,12 +775,19 @@ fn run_batch(
     store: Option<&PathBuf>,
     db: &DbSelection,
 ) -> Result<()> {
-    let out = out_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| input.join("decompiled"));
-    fs::create_dir_all(&out)?;
+    // Each run gets its own timestamped folder. Writing into a directory that
+    // already holds output from a different binary silently mixes generations,
+    // and any percentage taken from a mixed folder is meaningless because
+    // nothing records which build produced which file. `keep = 3` retains the
+    // last few runs for comparison and removes older ones — and only ever
+    // touches `run_*` folders this tool created.
+    let base = out_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| input.join("decompiled"));
+    let out = run_manifest::prepare_run_dir(&base, 3)?;
 
     let mut ok = 0u32;
     let mut fail = 0u32;
     let start = std::time::Instant::now();
+    let started_at = run_manifest::run_timestamp_human();
 
     eprintln!("Batch: {} → {}", input.display(), out.display());
 
@@ -819,7 +827,124 @@ fn run_batch(
 
     let elapsed = start.elapsed();
     eprintln!("Done: {} ok, {} failed ({:.1}s)", ok, fail, elapsed.as_secs_f64());
+
+    // Check what we just produced, and record it. A folder of .lua files with
+    // no provenance cannot be compared against anything.
+    let semantic = summarise_semantics(&out);
+    if let Some(s) = &semantic {
+        let pct = if s.files_checked > 0 {
+            100.0 * s.files_clean as f64 / s.files_checked as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "Semantic: {}/{} clean ({:.1}%), {} defects",
+            s.files_clean, s.files_checked, pct, s.total_defects
+        );
+    }
+
+    let (version, commit, dirty) = run_manifest::collect_build_info();
+    let info = run_manifest::RunInfo {
+        input: input.to_path_buf(),
+        out_dir: out.clone(),
+        started: started_at,
+        decompiler_version: version,
+        git_commit: commit,
+        git_dirty: dirty,
+        opmap_source: describe_opmap_source(store, db),
+        total_inputs: (ok + fail) as usize,
+        ok,
+        failed: fail,
+        elapsed_secs: elapsed.as_secs_f64(),
+        semantic,
+    };
+    let manifest = run_manifest::write_manifest(&info)?;
+    eprintln!("Manifest: {}", manifest.display());
     Ok(())
+}
+
+/// Run the semantic checker over every .lua file just written.
+fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
+    use luau_core::decompiler::semantic_check::{check, Severity};
+    use std::collections::BTreeMap;
+
+    let entries: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "lua"))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut clean = 0usize;
+    let mut total = 0usize;
+    let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+
+    for p in &entries {
+        let Ok(src) = fs::read_to_string(p) else { continue };
+        let protos = src.lines().take(20).find_map(|l| {
+            l.trim()
+                .strip_prefix("-- Protos:")?
+                .trim()
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        });
+        let wrong: Vec<_> = check(&src, protos)
+            .into_iter()
+            .filter(|f| f.severity == Severity::Wrong)
+            .collect();
+        if wrong.is_empty() {
+            clean += 1;
+            continue;
+        }
+        total += wrong.len();
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for f in &wrong {
+            *seen.entry(f.check).or_insert(0) += 1;
+        }
+        for (k, n) in seen {
+            let e = counts.entry(k.to_string()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += n;
+        }
+    }
+
+    let mut by_check: Vec<(String, usize, usize)> =
+        counts.into_iter().map(|(k, (f, n))| (k, f, n)).collect();
+    by_check.sort_by(|a, b| b.2.cmp(&a.2));
+
+    Some(run_manifest::SemanticSummary {
+        files_checked: entries.len(),
+        files_clean: clean,
+        total_defects: total,
+        by_check,
+    })
+}
+
+/// Describe where the opcode map came from — it changes the output enough
+/// that a result is not interpretable without it.
+fn describe_opmap_source(store: Option<&PathBuf>, db: &DbSelection) -> String {
+    if let Some(dbp) = &db.path {
+        match &db.entry_id {
+            Some(id) => format!(
+                "exact entry `{}` from opmap database `{}` (no detection, no completion)",
+                id,
+                dbp.display()
+            ),
+            None => format!(
+                "opmap database `{}`, entry matched per file where applicable",
+                dbp.display()
+            ),
+        }
+    } else if let Some(p) = store {
+        format!("pooled cache at `{}` plus per-chunk detection", p.display())
+    } else {
+        "per-chunk detection only (no cache, no database)".to_string()
+    }
 }
 
 // ── Scan ──

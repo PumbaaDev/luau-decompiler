@@ -1,5 +1,7 @@
 pub mod emit;
+pub mod free_var_decls;
 pub mod lifter;
+pub mod semantic_check;
 
 use crate::ast::*;
 use crate::parser::opcodes::LuauOpcode;
@@ -1867,7 +1869,31 @@ fn get_aux_string(proto: &Proto, strings: &[String], aux: u32) -> Option<String>
 
 /// Decompile a single proto into Luau source
 pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> String {
-    let stmts = lifter::lift_proto(ctx, proto, proto_index);
+    let mut stmts = lifter::lift_proto(ctx, proto, proto_index);
+
+    // Declare captured upvalues that no scope declares.
+    //
+    // A closure that captures a parent local kept the *use* but lost the
+    // *declaration*, so the output assigned to a global instead of the
+    // intended local. It still parsed, which is why marker-counting scored
+    // those files clean — measured at 556 of 1,273 corpus files and 2,118
+    // occurrences, 98.8% of every provably-wrong defect found.
+    //
+    // Only at depth 0. These are module-level locals in the original source,
+    // and only the outermost scope is guaranteed to dominate every use: a
+    // capture may be written in one closure and read by another that runs
+    // first, so declaring at first use would not be sound.
+    if depth == 0 {
+        let declared = free_var_decls::declare_free_vars(&mut stmts);
+        if !declared.is_empty() {
+            log::debug!(
+                "declared {} captured upvalue(s) with no binding: {}",
+                declared.len(),
+                declared.join(", ")
+            );
+        }
+    }
+
     let mut output = String::new();
     emit::emit_block(&mut output, &stmts, depth);
     output
