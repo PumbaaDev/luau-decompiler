@@ -167,6 +167,65 @@ unverified and prefer checking recovered behaviour over reading the recovered so
 path that carries no such caveat is a database-backed decode, where the map was measured
 against the client's own compiler rather than inferred; the header says so when that applies.
 
+### Semantic checking — a second measurement, for input we cannot round-trip
+
+Round-tripping needs the original source to compare against. For real-world
+bytecode there is none, so quality there used to be judged by counting marker
+strings in the output — how many files contained `upval_N`, a bare `return nil`,
+and so on.
+
+**That measure is close to worthless, and it produced a confidently wrong report.**
+Three Roblox modules scored "0 defects in 3 of 4 categories" by marker count.
+Reading them showed:
+
+| module | what marker counting missed |
+|---|---|
+| `CameraModule` | 32 protos in, `return {}` out — the whole body gone |
+| `ClickToMoveController` | `game[1] = v8`, `Players.LocalPlayer = Enum.KeyCode.Down`, undefined `v9`–`v27` throughout |
+| `Events` | every `tbl.X` function carried a *different* function's body |
+
+None contained a single marker string. The `Events` case is the dangerous one:
+correct-looking names on correct-looking bodies, wired to each other wrongly, so
+calling `Events.Create` actually ran `ServerCall`. A marker count can only find
+defects someone already thought to name.
+
+`decompiler::semantic_check` asserts **properties of meaning** instead:
+
+| check | catches |
+|---|---|
+| `name_body_mismatch` | a body that identifies itself as a sibling function |
+| `undefined_local` | a name read or written but never bound |
+| `bodies_dropped` | proto count far exceeding emitted functions |
+| `discarded_table_write` | a table built in a loop and never read |
+| `property_called_as_method` | `script:Parent()`, which errors at runtime |
+
+Every check is *sound*: it fires only when the output really is wrong. A check
+that produces false positives trains people to ignore the report, which is worse
+than having no check.
+
+### Measured state on real shuffled bytecode
+
+Seven Roblox client modules, decompiled and checked:
+
+**3 of 7 fully clean, 4 remaining defects, 0 undefined locals.**
+
+Recent fixes, each verified by that harness rather than by eye:
+
+- **Captured upvalues were never declared** — a closure capturing a parent local
+  kept the use and lost the declaration, so output assigned to a global instead.
+  It still parsed, which is why markers never saw it. `undefined_local`: 48 → 0.
+- **Opcode bytes were claimed by the first detector to guess.** Detectors ran in
+  a fixed order and would not take a byte already mapped, so a single coincidental
+  match could permanently claim one. `CALL` lost its byte to `CAPTURE` this way and
+  was then never assigned at all — every call in the chunk decoded as a no-op.
+  Strong evidence can now displace weak evidence. `CameraModule`: 1 → 34 call sites.
+
+**Known open defect: `bodies_dropped`.** `CameraModule` still emits 0 function
+declarations from 32 protos. The instruction stream now decodes correctly; the
+remaining fault is in the `DUPCLOSURE` → `SETTABLEKS` → declaration path, which
+attaches methods to a module table. The test for this is committed and
+deliberately failing — it documents a real defect and stays red until fixed.
+
 ## Project layout
 
 | Crate | What it is |
