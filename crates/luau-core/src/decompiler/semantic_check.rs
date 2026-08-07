@@ -72,6 +72,7 @@ pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     let mut out = Vec::new();
     check_name_body_agreement(source, &mut out);
     check_undefined_locals(source, &mut out);
+    check_declared_but_never_assigned(source, &mut out);
     check_body_recovered(source, proto_count, &mut out);
     check_discarded_table_writes(source, &mut out);
     check_property_called_as_method(source, &mut out);
@@ -309,6 +310,148 @@ fn is_generated_name(tok: &str) -> bool {
         return rest.len() >= 1 && rest.chars().all(|c| c.is_ascii_digit());
     }
     false
+}
+
+// ── Check 2b: a bare `local x` that is read but never assigned ─────────────
+//
+// This check exists because a FIX in this project disarmed check 2.
+//
+// `free_var_decls` was added to repair captured upvalues that kept their USE
+// and lost their DECLARATION. It works by declaring every unbound name at
+// chunk top. That took `undefined_local` from 48 to 0 — but the reported win
+// conflated two different situations:
+//
+//   * a real captured upvalue that was genuinely missing a declaration
+//     -> declaring it is correct
+//   * a value the lifter dropped on the floor
+//     -> declaring it converts "undefined variable" into "variable that is
+//        permanently nil", which parses cleanly and is still wrong
+//
+// The second case is worse than the first was, because it is SILENT.
+//
+// Found in `ReplicatedStorage.Badges`: a helper is inlined at 25 call sites
+// with only its receiver substituted --
+//
+//     if Honey.Count then
+//         Honey.Count = v12      -- v12 declared at chunk top, never assigned
+//     end
+//
+// -- so 25 badge counts are set to nil. `undefined_local` sees the top-level
+// `local ... v12 ...` and considers it bound, so it passes.
+//
+// SOUNDNESS: a name introduced by a bare `local` (no initialiser), never
+// appearing on the left of any assignment, and read at least once, is nil at
+// every one of those reads. There is no program for which that is intentional
+// and also correct — if nil were wanted, the read would be of a literal nil.
+// Declared-and-never-read is dead code, not a defect, so it is not flagged.
+fn check_declared_but_never_assigned(source: &str, out: &mut Vec<Finding>) {
+    let lines: Vec<&str> = source.lines().collect();
+
+    // 1. names introduced by a bare `local a, b, c` with no `=`
+    let mut bare: Vec<(String, usize)> = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        if t.starts_with("--") {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("local ") else { continue };
+        if rest.contains('=') || rest.starts_with("function ") {
+            continue;
+        }
+        for n in rest.split(',') {
+            let n = n.trim();
+            if !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                bare.push((n.to_string(), i + 1));
+            }
+        }
+    }
+    if bare.is_empty() {
+        return;
+    }
+
+    // 2. every name that is ever written to
+    let mut assigned: HashSet<String> = HashSet::new();
+    for raw in &lines {
+        let t = raw.trim();
+        if t.starts_with("--") {
+            continue;
+        }
+        // `a = ...`, `a, b = ...`, `local a = ...`, and compound `a += ...`
+        let stripped = t.strip_prefix("local ").unwrap_or(t);
+        let Some(eq) = stripped.find('=') else { continue };
+        // skip comparisons: ==, ~=, <=, >=
+        let bytes = stripped.as_bytes();
+        if stripped[eq..].starts_with("==")
+            || (eq > 0 && matches!(bytes[eq - 1], b'~' | b'<' | b'>' | b'='))
+        {
+            continue;
+        }
+        let lhs = &stripped[..eq];
+        for part in lhs.split(',') {
+            let mut name = part.trim();
+            // compound assignment: `x +=` leaves a trailing operator
+            name = name.trim_end_matches(['+', '-', '*', '/', '.', '%']);
+            let name = name.trim();
+            // field or index writes bind the base, not the name itself
+            if name.is_empty() || name.contains('.') || name.contains('[') || name.contains(':') {
+                continue;
+            }
+            if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                assigned.insert(name.to_string());
+            }
+        }
+    }
+
+    // 3. and every name that is read
+    let mut read: HashSet<String> = HashSet::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        if t.starts_with("--") || t.starts_with("local ") && !t.contains('=') {
+            continue; // the bare declaration itself is not a read
+        }
+        let _ = i;
+        for tok in t.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if !tok.is_empty() {
+                read.insert(tok.to_string());
+            }
+        }
+    }
+
+    let mut reported = 0usize;
+    for (name, line) in &bare {
+        if assigned.contains(name) || !read.contains(name) {
+            continue;
+        }
+        reported += 1;
+        if reported > 6 {
+            continue;
+        }
+        let uses = lines
+            .iter()
+            .filter(|l| {
+                !l.trim_start().starts_with("--")
+                    && l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|tok| tok == name)
+            })
+            .count()
+            .saturating_sub(1); // minus the declaration
+        out.push(Finding::wrong(
+            "declared_never_assigned",
+            Some(*line),
+            format!(
+                "`{}` is declared but never assigned, yet read {} time(s) — \
+                 every use evaluates to nil, so a value the bytecode carried was dropped",
+                name, uses
+            ),
+        ));
+    }
+    if reported > 6 {
+        out.push(Finding::wrong(
+            "declared_never_assigned",
+            None,
+            format!("... and {} further names that are always nil", reported - 6),
+        ));
+    }
 }
 
 // ── Check 3: a chunk with many protos must produce many functions ──────────

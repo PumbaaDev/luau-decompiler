@@ -107,6 +107,20 @@ struct Scan {
     /// Read but never written. Only actionable for generated names — see
     /// [`is_generated_name`].
     read: BTreeSet<String>,
+    /// Read at least once OUTSIDE any closure body.
+    ///
+    /// This is the discriminant that separates a genuine captured upvalue from
+    /// a value the lifter dropped. A capture, by definition, is a reference
+    /// from inside a nested function to a name in an enclosing scope — so a
+    /// real capture is read INSIDE a closure. A name read at chunk top level
+    /// that nothing ever assigns is not a capture; it is a hole.
+    ///
+    /// Declaring a hole is worse than leaving it undeclared, because it makes
+    /// the output parse while every use evaluates to nil. See the admission
+    /// rules in [`declare_free_vars`].
+    read_outside_closure: BTreeSet<String>,
+    /// Closure nesting depth during the walk. 0 == chunk top level.
+    closure_depth: usize,
 }
 
 /// Insert declarations for captured upvalues that nothing declares.
@@ -138,10 +152,52 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
         .cloned()
         .collect();
 
+    // Read-only names: declare ONLY if the reads are consistent with a capture.
+    //
+    // ── WHY THIS GUARD EXISTS ───────────────────────────────────────────
+    // The earlier version declared every generated read-only name. It took
+    // `undefined_local` from 48 to 0 and that was reported as a fix. It was
+    // not: the win conflated two different situations.
+    //
+    //   * a genuine captured upvalue missing its declaration -> declaring is right
+    //   * a value the lifter dropped                          -> declaring is WRONG
+    //
+    // The second case is worse than the defect it replaces, because it is
+    // silent. `undefined_local` cannot see it — the name IS declared — so the
+    // output parses while every use evaluates to nil.
+    //
+    // Measured cost of getting this wrong: on a 628-script corpus a check that
+    // free_var_decls could not hide from (`declared_never_assigned`) put the
+    // clean rate at 13.7%, not the 94.9% reported while the masking was in
+    // place. 532 of 628 files carried silently-nil values.
+    //
+    // Concretely, `ReplicatedStorage.Badges` inlines a helper at 25 call sites
+    // with only its receiver substituted:
+    //
+    //     if Honey.Count then
+    //         Honey.Count = v12      -- declared at chunk top, never assigned
+    //     end
+    //
+    // — so 25 badge counts silently became nil.
+    //
+    // ── THE DISCRIMINANT ────────────────────────────────────────────────
+    // A capture is BY DEFINITION a reference from inside a nested function to a
+    // name in an enclosing scope. So a real capture is read INSIDE a closure.
+    // A generated name read at chunk top level that nothing ever assigns is not
+    // a capture — it is a hole where the lifter dropped a value.
+    //
+    // Declaring holes hides them. Leaving them undeclared keeps them visible to
+    // `undefined_local`, which is the honest outcome: still broken, but broken
+    // in a way the tooling reports.
     for n in &scan.read {
-        if !scan.bound.contains(n) && !is_known_global(n) && is_generated_name(n) {
+        if scan.bound.contains(n) || is_known_global(n) || !is_generated_name(n) {
+            continue;
+        }
+        // Read only from inside closures -> consistent with a capture.
+        if !scan.read_outside_closure.contains(n) {
             free.insert(n.clone());
         }
+        // Otherwise: leave undeclared on purpose, so the defect stays visible.
     }
 
     let free: Vec<String> = free.into_iter().collect();
@@ -259,6 +315,9 @@ fn scan_expr(expr: &Expr, out: &mut Scan) {
         // rules in `declare_free_vars`.
         Expr::Name(n) => {
             out.read.insert(n.clone());
+            if out.closure_depth == 0 {
+                out.read_outside_closure.insert(n.clone());
+            }
         }
         Expr::Field { object, .. } => scan_expr(object, out),
         Expr::Index { object, key } => {
@@ -290,7 +349,11 @@ fn scan_expr(expr: &Expr, out: &mut Scan) {
             for p in params {
                 out.bound.insert(p.clone());
             }
+            // Track nesting so reads can be attributed to inside-a-closure
+            // (a possible capture) or chunk top level (never a capture).
+            out.closure_depth += 1;
             scan_stats(body, out);
+            out.closure_depth -= 1;
         }
         Expr::Table { fields } => {
             for f in fields {
