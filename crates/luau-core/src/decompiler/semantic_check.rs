@@ -407,7 +407,26 @@ const ROBLOX_PROPERTIES: &[&str] = &[
     "Text", "Visible", "Enabled", "Health", "WalkSpeed", "PlaceId", "JobId",
 ];
 
+/// Receivers that are unambiguously Roblox Instances. Anything else may be a
+/// user object whose methods legitimately share a name with a property.
+const INSTANCE_RECEIVERS: &[&str] = &["script", "game", "workspace", "Workspace"];
+
 fn check_property_called_as_method(source: &str, out: &mut Vec<Finding>) {
+    // SOUNDNESS: an earlier version flagged `:Text(`, `:Name(`, `:Value(` etc.
+    // on ANY receiver. On a full-machine scan that produced 1,890 findings, and
+    // the largest were all false positives of the same shape:
+    //
+    //     local builder = ChangelogBuilder.new(...)
+    //     builder:Section("...", function(p) p:Text("...") end)
+    //
+    // `:Text()` there is a real method on a user builder object. Nothing is
+    // wrong with that code. Flagging it violates the rule this module is built
+    // on -- a check that cries wolf gets the whole report ignored -- so the
+    // receiver must now be provably an Instance.
+    //
+    // This deliberately trades recall for soundness. `someInstance:Parent()` on
+    // a local will no longer be caught; `script:Parent()`, the form actually
+    // observed coming out of the lifter, still is.
     for (i, raw) in source.lines().enumerate() {
         let line = raw.trim();
         if line.starts_with("--") {
@@ -415,17 +434,29 @@ fn check_property_called_as_method(source: &str, out: &mut Vec<Finding>) {
         }
         for prop in ROBLOX_PROPERTIES {
             let pat = format!(":{}(", prop);
-            if line.contains(&pat) {
-                out.push(Finding::wrong(
-                    "property_called_as_method",
-                    Some(i + 1),
-                    format!(
-                        "`:{}()` calls a property as a method — this would error at runtime; \
-                         a property read was emitted as a method call",
-                        prop
-                    ),
-                ));
+            let Some(at) = line.find(&pat) else { continue };
+            // Identify the receiver: the identifier immediately before the ':'.
+            let before = &line[..at];
+            let recv: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !INSTANCE_RECEIVERS.contains(&recv.as_str()) {
+                continue;
             }
+            out.push(Finding::wrong(
+                "property_called_as_method",
+                Some(i + 1),
+                format!(
+                    "`{}:{}()` calls a property as a method — this would error at runtime; \
+                     a property read was emitted as a method call",
+                    recv, prop
+                ),
+            ));
         }
     }
 }
