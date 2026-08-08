@@ -69,3 +69,7 @@ mod phase_c10r_empty_fn_drop_tests;
 mod phase_c10s_stdlib_lvalue_drop_tests;
 #[cfg(test)]
 mod phase_c10v_generic_prefix_drop_tests;
+#[cfg(test)]
+mod merge_regs_scope_probe_tests;
+#[cfg(test)]
+mod getupval_retarget_tests;

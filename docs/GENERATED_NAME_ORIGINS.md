@@ -204,11 +204,10 @@ that reports `ok` in ~0.03s has skipped, and has done so twice in this project.
 - **Why** a register is `Unknown` on a fully-mapped chunk. The call site is
   known; the cause is not.
 - Whether the 330 share one cause or several.
-- **Which opcode the reproducer's constant-loads are actually being decoded as.**
-  The absence of any constant-load in a 541-constant module is established; the
-  byte responsible is not, and cannot be identified from an unmapped
-  disassembly (see the withdrawn claims above). A measured permutation with
-  provenance settles it; nothing else available here does.
+- ~~**Which opcode the reproducer's constant-loads are actually being decoded
+  as.**~~ RESOLVED — see "The reproducer decodes LOADK as JUMPIFNOT" below. It
+  did not need a measured permutation: the corpus majority (one client build)
+  plus the instruction structure name the byte and the opcode outright.
 
 ## The structuring diagnosis, and one fix measured and rejected
 
@@ -282,11 +281,99 @@ thread the arm's block *set* through instead of collapsing it to a PC range.
 The mechanism is well established; only this particular implementation of it is
 refuted.
 
-## Next step
+## The reproducer decodes LOADK as JUMPIFNOT, and silent mis-mapping is rare
 
-Run `probe align` against the live Roblox client to obtain a permutation with
-recorded provenance, import it with `opmap-db import`, and re-decode the
-reproducer. If its constant-loads reappear, silent mis-mapping is confirmed as
-the cause of the 330 and the fix is in byte assignment. If they do not, the
-lifter hypothesis survives its first real test. Either outcome is decisive, and
-no cheaper experiment distinguishes them.
+The open question above — which opcode the reproducer's constant-loads are decoded
+as — is settled, and without a measured permutation. Two independent facts that
+cannot lie converge on the same answer.
+
+**Corpus majority.** All 628 files are one client build, so one true permutation
+governs them, and the majority of the independent per-file maps IS that
+permutation. Measured across the corpus (`opmap_structural_audit`,
+`loadk_jumpifnot_confusion_across_the_corpus`):
+
+```
+shuffled byte -> LOADK        0x6F in 622 files   (0x01 in 3, two others 1 each)
+shuffled byte -> JUMPIFNOT    0x0E in 623 files   (0x6F in 2, 0x52 in 1)
+```
+
+The truth is `0x6F -> LOADK` and `0x0E -> JUMPIFNOT`. The reproducer is one of
+only TWO files that assign `0x6F -> JUMPIFNOT` instead. LOADK and JUMPIFNOT are
+both AD-form, single-word, no AUX, so swapping them desyncs nothing: plausible
+instructions, "0 left unmapped", full coverage reported. That is precisely the
+silent mis-map this document predicted, now caught in the act.
+
+**Structure, map-free.** In the reproducer, `0x6F` decodes as 313 "JUMPIFNOT"
+instructions arranged in runs on strictly incrementing registers R6, R7, R8, …
+whose values are then read by `SETLIST`. JUMPIFNOT writes no register; an
+instruction whose result SETLIST consumes must be a load. And the D field those
+"jumps" carry is the constant index a LOADK would carry: at pc 36–43 it reads
++42,+43,…,+49, and K42..K49 are consecutive Sun Bear dialogue lines. Both
+readings say LOADK, and they do not need the map to be trusted — one is a
+data-flow fact, the other is the constant table.
+
+So the reproducer's generated names are genuine silent mis-mapping: the vanished
+LOADKs leave R6.. unwritten, every read is `RegVal::Unknown`, and `reg_expr`
+mints a readonly `vN`. It is the 944-name site with, for this file, a named cause.
+
+### But it is rare, and "a full third" does not survive the corpus
+
+The reproducer is a pathological outlier, not a representative of the 330.
+Measured over 628 files / 6086 protos:
+
+```
+Import  const present & 0 GETIMPORT decoded : 0 protos
+Closure const present & 0 DUPCLOSURE decoded: 0 protos
+Table   const present & 0 DUPTABLE  decoded : 0 protos
+>=8 loadable consts   & 0 constant-consuming opcode of ANY kind : 0 protos
+load-as-branch run signature (>=5 cond-jumps on incrementing reg): 1 proto, 1 file
+files assigning 0x6F -> JUMPIFNOT: 2  (113_..._JumpPower, 258_..._SunBear2Init)
+```
+
+Where an opcode is type-locked to a single consumer, the map is correct in every
+one of the 6086 protos. No proto is disconnected from its constant table. The
+visible corruption is one file.
+
+This also retires the "541 constants that load nothing is impossible" premise. It
+is not impossible: 315 of the reproducer's instructions consume constants — 166
+`DUPTABLE` templates, which in bytecode v7+ **bake** their scalar values, plus 134
+`SETTABLEKS` keys and 15 `NAMECALL`. 88 protos corpus-wide share the reproducer's
+"many constants, zero LOADK/LOADN/LOADB/GETIMPORT" shape; exactly one is
+mis-mapped and the other 87 are legitimate baked-template data modules for which
+zero LOADK is correct. The reproducer looked impossible only because it was the
+one genuinely broken member of an 88-strong family of innocents.
+
+The 330 generated names on zero-unmapped chunks are therefore **not**
+predominantly silent mis-mapping. Silent mis-mapping is confirmed real and worth
+~2 files; the bulk is more consistent with the lifter mechanism recorded above
+(if/else arms that delete their loops, leaving loop variables `Unknown`), which
+needs no mis-map at all.
+
+### Mechanism, and why no fix is shipped
+
+The reproducer exercises only 10 of ~84 opcodes. Its own reading is too thin to
+tell LOADK from JUMPIFNOT, and that reading is the probe that selects which pooled
+consensus applies to it (`load_prior`: "the script's own reading is the probe
+used to pick its peers"). It self-selects a consensus already carrying
+`0x6F -> JUMPIFNOT`. This is not `merge_cache_first`'s override exception, which
+only lets a ForGLoop-pair beat a JumpXEq byte; the wrong byte is in the resolved
+prior before the merge.
+
+No fix is shipped. The defect is 2–3 files, and all of them still pass the compile
+gate (none is among the 7 failures), so the result is valid-looking wrong output,
+not a crash. A repair lives in consensus peer-selection — the exact class of
+change this project has twice watched trade compile-gate files for cleaner
+semantics. Buying 1–2 files there at any risk to the other 626 is the wrong
+trade. The measurement is the deliverable; a fix, if attempted, must clear all
+four gates first.
+
+Reproduce (private corpus of one client build):
+
+```bash
+AUDIT_CORPUS=<corpus-of-.bin> \
+  cargo test -p luau-core --release --test opmap_structural_audit -- --nocapture
+```
+
+The probe path (`probe align` against the live client, `opmap-db import`) remains
+available and would be a third independent confirmation, but it is no longer the
+only thing that can settle the reproducer: the corpus majority already did.

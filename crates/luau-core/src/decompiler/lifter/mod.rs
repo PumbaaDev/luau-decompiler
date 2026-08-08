@@ -1762,7 +1762,7 @@ fn lift_region(
             // reset to Unknown where they diverge. This is conservative
             // but correct — after an if/else, only values that are the
             // same on both paths are guaranteed to hold.
-            merge_regs(regs, &regs_after_then);
+            merge_regs(regs, &regs_after_then, &regs_before);
 
             // B0.116: Import-guard MethodCall propagation.
             // Roblox bytecode uses GETIMPORT + guard + NAMECALL + CALL for
@@ -2900,7 +2900,7 @@ fn table_fields_equal(a: &crate::ast::TableField, b: &crate::ast::TableField) ->
     }
 }
 
-fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal]) {
+fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) {
     for (i, slot) in regs.iter_mut().enumerate() {
         if i >= other.len() {
             // Stay with current slot — caller's side may have a valid Name
@@ -2937,25 +2937,62 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal]) {
         }
         // Both sides hold a simple Name and they merely DIFFER. B0.56 handled
         // the asymmetric cases directly above but not this one, so it fell
-        // through to the reset below — which the comment there called safe
-        // while describing a different situation entirely. It is the opposite
-        // of safe: it is the second largest producer of hoisted-and-never-
-        // assigned locals, 75 names across 60 files.
+        // through to the reset below, producing hoisted-and-never-assigned
+        // `local vN` (75 names across 60 files at the time of c77dcd1).
         //
         // It arises when a write inside a branch shadows an already-declared
         // register (naming.rs classify_write returns Shadow once BOTH the old
         // and new names are semantic). The two paths then reach the merge
-        // holding different names for one register, and resetting to Unknown
-        // discards both — so the next read falls through to the `v{idx}` arm
-        // in reg_expr and is emitted as a chunk-top `local vN` nothing ever
-        // assigns.
+        // holding different names for one register.
         //
-        // Keeping the fall-through path's name applies exactly the reasoning
-        // B0.56 already used one branch up: a declared local is valid on
-        // whichever path declared it, and a name that is right on one path
-        // beats Unknown, which is useful on neither.
+        // c77dcd1 kept the fall-through (self/else) name unconditionally.
+        // That was measurably better on the gates but structurally unsound:
+        // a Shadow write emits its `Stat::Local` INSIDE the branch block, and
+        // B0.57's hoist only rescues inits that `is_safe_hoist_init` accepts
+        // (literals, pre-branch names, safe tables). A closure or call init
+        // stays branch-local, so a post-merge read of the kept name referenced
+        // a declaration that is lexically out of scope — it compiles clean
+        // (bare global read), `free_var_decls` is scope-blind to it, and at
+        // runtime it resolves to nil. CONFIRMED by construction in
+        // `merge_regs_scope_probe_tests` (see docs/MERGE_REGS_SCOPE_RISK.md).
+        //
+        // The sound subset: keep a differing name ONLY when it matches the
+        // PRE-BRANCH binding of this register. That binding's `local` was
+        // emitted before the `if` statement, so it is still lexically live
+        // after the merge. A name minted inside a branch on BOTH sides has no
+        // in-scope declaration at the join — reset to Unknown so the read
+        // falls back to a VISIBLE `v{idx}` instead of a plausible wrong name.
         if self_name && other_name {
-            continue;
+            let pre_name: Option<&str> = regs_before.get(i).and_then(|v| match v {
+                RegVal::Expr(Expr::Name(n)) => Some(n.as_str()),
+                RegVal::LoopVar(n) => Some(n.as_str()),
+                _ => None,
+            });
+            let self_n = match &slot {
+                RegVal::Expr(Expr::Name(n)) => n.clone(),
+                _ => unreachable!("self_name checked above"),
+            };
+            let other_n = match &other[i] {
+                RegVal::Expr(Expr::Name(n)) => n.as_str(),
+                _ => unreachable!("other_name checked above"),
+            };
+            match pre_name {
+                Some(p) if self_n == p => {
+                    // Self side still holds the pre-branch binding — keep it.
+                    continue;
+                }
+                Some(p) if other_n == p => {
+                    // Other side holds the pre-branch binding — adopt it.
+                    *slot = other[i].clone();
+                    continue;
+                }
+                _ => {
+                    // Both names were minted inside the arms; neither
+                    // declaration survives the join lexically.
+                    *slot = RegVal::Unknown;
+                    continue;
+                }
+            }
         }
         // Genuinely neither side is a simple Name — both compound, or one is
         // Unknown with no Name counterpart. Now the reset really is safe.

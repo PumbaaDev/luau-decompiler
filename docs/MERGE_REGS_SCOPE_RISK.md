@@ -1,88 +1,108 @@
-# `merge_regs` may be trading a visible defect for an invisible one
+# `merge_regs` was trading a visible defect for an invisible one — CONFIRMED, fixed
 
-**Status: unresolved. Applies to `c77dcd1`, which is currently on the branch.**
-Raised by review, reasoned from code, **not** confirmed by measurement.
+**Status: SETTLED (confirmed structurally, fix applied on top of `c77dcd1`).**
+Raised by review, reasoned from code, then **confirmed by direct construction**
+in `crates/luau-core/src/decompiler/lifter/tests/merge_regs_scope_probe_tests.rs`.
 
-## The claim
+## The claim (now confirmed)
 
 `c77dcd1` changed `merge_regs` so that when both predecessors of a join hold a
-simple `Expr::Name`, the slot keeps its value instead of resetting to `Unknown`.
-When the two names *differ*, `continue` keeps whichever the caller's `self`
-holds — the else-path state (`lifter/mod.rs:1765`).
+simple `Expr::Name` and the names *differ*, the slot kept the fall-through
+(else-path) name instead of resetting to `Unknown`.
 
-The problem is scope. The very case the commit was written for — a `Shadow`
-write via `classify_write` — emits `Stat::Local { name }` **inside the branch
-block** (`opcode_handlers.rs:1485-1490`, `2118-2123`). So the surviving name's
-declaration is branch-local, and a read after the merge emits it outside its
-lexical scope.
+The problem is scope. The case the commit was written for — a `Shadow` write
+via `classify_write` — emits `Stat::Local { name }` **inside the branch
+block** (NEWTABLE handler and NEWCLOSURE handler in `opcode_handlers.rs`, plus
+`emit_local_or_assign`/`store_complex`). The B0.57 pair-fix
+(`hoist_escaping_locals`) hoists such declarations out of the branch, **but
+only when `is_safe_hoist_init` accepts the init** — literals, pre-branch
+names, and tables of safe values. A closure (`Expr::Function`) or call-result
+init is NOT safe to hoist, so the declaration stays branch-local while the
+merged register still names it.
 
-`free_var_decls` cannot catch this: it scans with flat, scope-blind sets
-(`free_var_decls.rs:106-121`), so a name declared anywhere counts as bound. It
-is therefore not hoisted and not reported by `declared_never_assigned`.
+## The construction that settled it
 
-At runtime that read resolves to a global (`nil`) or a stale outer binding. It
-**compiles clean**, so the compile gate cannot see it either.
+`probe_shadow_diff_names_read_after_merge_structure` builds a six-instruction
+diamond: `NEWCLOSURE R1` ("alpha") pre-branch, `JUMPIFNOT`, `NEWCLOSURE R1`
+("beta") in the then-arm, `NEWCLOSURE R1` ("gamma") in the else-arm, `RETURN
+R1` after the join. Debug locals supply the semantic names. Under `c77dcd1`
+alone the emitted source was:
 
-## Why this matters more than the numbers say
+```lua
+local function alpha() return ... end
+if cond then
+    local function beta() return ... end
+else
+    local function gamma() return ... end
+end
+return gamma        -- gamma's `local` is INSIDE the else block
+```
+
+Exactly as claimed: the post-merge read references a name whose declaration is
+branch-local. It **compiles clean** (bare `gamma` at top level is a legal
+global read), `free_var_decls` counts the name as bound because its sets are
+scope-blind, and at runtime the read resolves to a global — nil. Both gates
+blind, silently wrong. A companion probe shows the same shape through a CALL
+consumer (`gamma()`).
 
 This is structurally the reverted `free_var_decls` masking bug: a name that IS
-declared, so the check passes, while every use evaluates to nil. That one was
-worse than the defect it replaced precisely because it was silent.
+declared, so the check passes, while the use evaluates to nil. The commit's
+measured −41 defects were partly this class becoming **uncountable** rather
+than fixed.
 
-The commit measured −41 defects. If the review is right, that is the same class
-of defect becoming **uncountable** rather than fixed. Both gates are blind to
-it: the semantic checks by scope-blindness, the compile gate because the output
-is valid Luau. A green board is not evidence here.
+## The fix applied
 
-Note also that the two changes were measured **together**, not independently:
-the GETUPVAL widening (`9995ed2`) acts on registers that this change stops
-setting to `Unknown`, so their attributed gains are not separable as recorded.
+`merge_regs` now takes `regs_before` (the caller already had it in scope).
+When both sides are simple `Name`s and they differ, the surviving name must
+match the **pre-branch** binding of that register — the one whose `local` is
+emitted before the `if` and is therefore still lexically live after the merge:
 
-## Suggested fix direction (not applied)
+* self (else-path) name == pre-branch name → keep self;
+* then-path name == pre-branch name → adopt the then-path value;
+* **neither matches** (both names minted inside the arms) → reset to
+  `Unknown`, so the read falls back to a *visible* `v{idx}` instead of a
+  plausible wrong name.
 
-`regs_before` is already in scope at the call site (`lifter/mod.rs:1743`). When
-both sides are `Name` and they differ, keep the name only if it matches the
-**pre-branch** name — that is the binding still lexically live after the merge —
-and reset to `Unknown` otherwise.
+This retains the half of `c77dcd1` that was right: in the common single-arm
+case the fall-through side IS `regs_before`, so the kept name is the
+pre-branch binding and the read stays valid
+(`probe_single_arm_shadow_keeps_prebranch_name` pins this).
 
-## How to settle it
+The probes are polarity-safe as regression tests: they assert "any branch name
+surviving to a post-merge read has a top-level declaration", so a future
+change that keeps the name AND hoists its declaration would still pass.
 
-Do not settle it on the gates alone; by the argument above they cannot see it.
-Construct the case directly: a chunk where a register is `Shadow`-written to
-different names in the two arms of an if/else and read after the merge. Check
-whether the emitted read references a name whose `local` sits inside a branch
-block. That is a structural property of the AST and needs no corpus.
+## Residual, known and accepted
 
-If confirmed, either apply the pre-branch-match fix or revert `c77dcd1`. A
-revert is cheap and returns to a state whose failure mode is visible `vN`
-names — which this project has repeatedly found preferable to plausible-looking
-wrong ones.
+* **The asymmetric B0.56 cases carry the same hazard** (one side `Name`, other
+  side Unknown/compound → the Name is kept without a pre-branch check). That
+  behavior predates this session by ~80 phases, is load-bearing for
+  BaseCamera-style modules (where the init is a hoist-safe `{}` and B0.57
+  makes the result correct), and was NOT changed here. The unsound subset is
+  the same as above — non-hoistable init — but narrowing it was out of scope
+  for settling `c77dcd1` and needs its own measured pass.
+* The underlying coupling remains: `merge_regs` cannot see whether B0.57 will
+  be able to hoist a name's declaration (init-safety lives in the emitted
+  statement, not the register lattice). The pre-branch-match rule sidesteps
+  this by only keeping names whose declaration provably precedes the branch.
+* Keeping the pre-branch name is *lexically* sound but can still be
+  *value*-wrong on the path that rewrote the register (the register holds the
+  arm's value, the name denotes the pre-branch one). That failure predates
+  `c77dcd1`, cannot be reached from honest compiler output of valid source
+  (a live-across-join variable is not register-reused inside the arms), and
+  the alternative — Unknown — is the visible-vN trade this project makes
+  deliberately. Recorded here so the next reader knows it was seen.
 
-## Also raised, lower severity
+## Also raised in the same review, unchanged by this fix
 
-* **`9995ed2` GETUPVAL widening.** `RegVal::Unknown` does not only mean "holds
-  nothing" — `merge_regs` sets it on compound divergence and failed GETGLOBAL
-  resolution. For an opcode *misidentified* as GETUPVAL (the exact case the
-  B0.52 guard exists for), a declared local can be live-but-`Unknown`, and the
-  widened guard now overwrites it with an upval alias. Later reads then emit a
-  plausible wrong name instead of a flaggable `vN`. The commit's defence
-  measured only the flagged class, which by construction cannot see a wrong-name
-  substitution.
-* **`7d69bbb` NAMECALL veto is all-or-nothing.** The scan walks every code word
-  including AUX data of two-word instructions. A single false occurrence — an
-  AUX word whose low byte matches, passing the register/string filters but with
-  no matching CALL at `pc+2` — vetoes the true byte chunk-wide. It fails in the
-  *visible* direction and the corpus showed zero exceptions, but it is
-  data-dependent where the old scorer degraded gracefully.
-* **`mint_trace` confirmed behaviour-neutral when unset** — every write and
-  `eprintln!` is behind the cached `enabled()` check and the `format!`
-  allocations predate the commit. Two caveats in *enabled* mode only:
-  `env::var(...).is_ok()` means `LUAU_MINT_TRACE=0` still enables it, and the
-  thread-local map plus stderr `FILE` markers break per-file attribution under
-  any multi-threaded decompile. Measurement integrity, not correctness.
-* The `None` arm of the GETUPVAL guard is **dead code**, not a mask: `insn_a`
-  returns `u8` and the register file is at least 256 entries, so `regs.get(a)`
-  is never `None` there.
-
-No memory-safety, panic, unwrap, or loop-termination issues were found in any of
-the four commits. 894/894 lib tests pass on `9fcf0b1`.
+* **`9995ed2` GETUPVAL widening** — `Unknown` does not only mean "holds
+  nothing"; for an opcode misidentified as GETUPVAL the widened guard can
+  overwrite a live-but-Unknown local with an upval alias. Lower severity,
+  unmeasured, still open.
+* **`7d69bbb` NAMECALL veto is all-or-nothing** — a single false byte match in
+  AUX data vetoes the true byte chunk-wide. Fails in the visible direction;
+  corpus showed zero exceptions.
+* `mint_trace` is behaviour-neutral when unset; two measurement-integrity
+  caveats in enabled mode (`LUAU_MINT_TRACE=0` still enables; thread-local map
+  breaks per-file attribution under multi-threaded decompile).
+* The `None` arm of the GETUPVAL guard is dead code, not a mask.

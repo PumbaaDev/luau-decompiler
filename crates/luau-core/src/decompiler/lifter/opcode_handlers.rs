@@ -732,67 +732,51 @@ pub(super) fn lift_instruction_range(
 
             LuauOpcode::GetUpval => {
                 let name = ctx.upval_name(proto, proto_index, b as u8);
-                // Phase B0.52: if R[a] is already a DECLARED LOCAL (e.g., a
-                // B0.51-seeded module table) and the bytecode attempts to
-                // overwrite it with an upval reference, the subsequent
-                // SETTABLEKS/RETURN reads clearly still refer to the local.
-                // This can happen when opcode shuffle detection misidentifies
-                // another opcode as GETUPVAL, or when the bytecode really IS
-                // overwriting but our upval inference produced a stale name
-                // (e.g., "game") that breaks downstream table operations.
-                // Keep the local binding; don't clobber regs[a] with the upval
-                // name. If the upval was genuinely needed, the downstream
-                // misalignment will surface as a separate test failure to fix.
+                // The store is UNCONDITIONAL. It was guarded from Phase B0.52
+                // until the compile gate proved the guard wrong (7/628
+                // failures, 6 sharing one signature).
                 //
-                // The guard must not be tripped by this handler's OWN
-                // `pre_declare` below. A proto that reads two different
-                // upvalues through one scratch register —
-                // `GETUPVAL R2 U0 … GETUPVAL R2 U1` — would otherwise keep the
-                // first alias forever, and `reads = reads + 1` lifted as
-                // `reads = n + 1`, silently reading the wrong upvalue. A
-                // register whose current binding is itself an upvalue alias is
-                // scratch, never the seeded module-table local guarded here.
-                let holds_upval_alias = match locals.current_name(a) {
-                    Some(cur) => (0..proto.num_upvalues)
-                        .any(|u| ctx.upval_name(proto, proto_index, u) == cur),
-                    None => false,
-                };
-                // Third disjunct: the register is DECLARED but currently holds
-                // nothing. The guard above protects a live binding from being
-                // clobbered — but it never asked whether the binding still has
-                // a value. It usually does not: CALL clears every slot from its
-                // frame base upwards (see the SETLIST/CALL handler below), so
-                // the common shape
-                //     GETTABLEKS R2 …  /  CALL R2  /  GETUPVAL R2 U0
-                // hits this handler with R2 declared and empty. Skipping the
-                // store there guards a binding that no longer exists, the
-                // upvalue read produces nothing, and the next read of R2 falls
-                // through to the `v{idx}` arm in reg_expr — which is emitted as
-                // a chunk-top `local v2` that is never assigned.
+                // The guard skipped the store when R[a] was a declared,
+                // non-empty local that was not itself an upvalue alias,
+                // reasoning that a misdecoded GETUPVAL must not clobber a
+                // B0.51-seeded module-table binding. But registers are
+                // function-scoped and reuse is routine: a REAL GetUpval into a
+                // previously-declared scratch register is everyday bytecode,
+                // and skipping the store leaves the register's STALE expression
+                // to be read by whatever consumes it next. RootCamera proto 16:
                 //
-                // Measured over 628 files: this single case accounts for 606 of
-                // 1807 hoisted-and-never-assigned names (33.5%) across 218 of
-                // the 403 affected files, the largest cause by a wide margin.
+                //     14: SETUPVAL R0 U2      ; isPortrait = X < Y
+                //     15: GETUPVAL R0 U3      ; R0 = callback   ← was dropped
+                //     16: GETUPVAL R1 U2      ; R1 = isPortrait ← was dropped
+                //     17: CALL     R0 args=1  ; callback(isPortrait)
                 //
-                // Widening only on EMPTY cannot reintroduce the B0.52 clobber
-                // this guard was added for. The diagnosis split the guard's
-                // misses into reg-was-empty and reg-had-value; the had-value
-                // half produced zero flagged names and zero fallback events. So
-                // the guard is right exactly when it has something to protect,
-                // and wrong exactly when it does not.
-                let reg_is_empty = matches!(regs.get(a), None | Some(RegVal::Unknown));
-                if !locals.declared.contains(&a) || holds_upval_alias || reg_is_empty {
-                    regs[a] = RegVal::Expr(Expr::Name(name.clone()));
-                    // The register is now an ALIAS of an existing binding (the
-                    // upvalue), not a fresh slot. Without recording that, the
-                    // read-modify-write `GETUPVAL / ADDK / SETUPVAL` lowered its
-                    // middle step through `needs_local` and emitted
-                    // `local hits = hits + 1` — a shadow that made the following
-                    // `hits = hits` a self-assign, which dead-store elimination
-                    // deleted, silently dropping the upvalue write entirely.
-                    locals.pre_declare(a);
-                    locals.record_name(a, &name);
-                }
+                // lifted as `(X < Y)(X)` — a statement beginning with `(`,
+                // which the Luau compiler rejects outright ("ambiguous
+                // syntax"). Same signature in five more corpus files, with
+                // bases like `(new74 + new74)`, `("Sticker")` and `(0)` on
+                // calls and namecalls. When the stale value happened to be a
+                // plain name the result still compiled and was silently wrong —
+                // the worse outcome.
+                //
+                // The guard's own history already pointed here: the
+                // `holds_upval_alias` disjunct (scratch registers reading two
+                // upvalues in a row) and the `reg_is_empty` disjunct (measured:
+                // 606 of 1807 hoisted-never-assigned names) each widened the
+                // store because the drop was found doing damage. Storing
+                // unconditionally completes that arc. If a misdecoded GetUpval
+                // ever does clobber a live module-table binding, the damage is
+                // a VISIBLE wrong name at the table's use sites — strictly
+                // better than an invisible stale expression at the call site.
+                regs[a] = RegVal::Expr(Expr::Name(name.clone()));
+                // The register is now an ALIAS of an existing binding (the
+                // upvalue), not a fresh slot. Without recording that, the
+                // read-modify-write `GETUPVAL / ADDK / SETUPVAL` lowered its
+                // middle step through `needs_local` and emitted
+                // `local hits = hits + 1` — a shadow that made the following
+                // `hits = hits` a self-assign, which dead-store elimination
+                // deleted, silently dropping the upvalue write entirely.
+                locals.pre_declare(a);
+                locals.record_name(a, &name);
             }
             LuauOpcode::SetUpval => {
                 // Phase C2 pass #1 — SETUPVAL upval backscan.
