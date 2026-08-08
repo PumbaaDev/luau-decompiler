@@ -107,13 +107,83 @@ comes out backwards:
 
 The mint rate **rises** with opcode coverage — 13% of the weakest-evidence
 chunks against 85% of the strongest. If weak evidence were the cause the
-gradient would run the other way. It tracks program complexity instead, which
-points at the lifter losing a register it was handed, not at the map handing it
-the wrong one.
+gradient would run the other way. It tracks program complexity instead.
 
-**This is the first time this defect class has been separated from the opcode
-family.** Every fix in this project so far has been an opcode-mapping fix. A
-third of the remaining generated names will not yield to another one.
+### ⚠ What that does NOT license concluding
+
+An earlier revision of this document read that gradient as "the lifter, not the
+map", i.e. a defect class finally separated from the opcode family. **That
+conclusion was not supported and has been withdrawn.**
+
+"Zero unmapped" means every byte the chunk executes was *assigned* an opcode. It
+does not mean it was assigned the *right* one. A byte mapped wrongly is silent:
+it produces no unresolved-instruction count, decodes to a plausible instruction,
+and the header reports full coverage.
+
+The reproducer is direct evidence of exactly that. Disassembled with the map
+applied, `258_ReplicatedStorage_NPCs_SunBear2Init` — 2 protos, 541 constants,
+166 `DUPTABLE`, "0 left unmapped" — contains:
+
+```
+343  JUMPIFNOT      <- in a data module with no control flow
+166  DUPTABLE
+128  SETTABLEKS
+ 74  SETLIST
+ 72  NEWTABLE
+  0  LOADK / LOADN / LOADB / GETIMPORT
+```
+
+**A module with 541 constants that executes no constant-load opcode is
+impossible.** Something that should load a constant is decoding as `JUMPIFNOT`,
+on a chunk reporting full opcode coverage. That is a mapping failure, not a
+lifter failure.
+
+So the honest split is **visible mis-mapping (unmapped bytes) versus silent
+mis-mapping (wrong byte, full coverage reported)** — not map versus lifter. The
+lifter hypothesis is neither established nor excluded; the coverage gradient is
+consistent with both, because more complex chunks execute more distinct bytes
+and so have more opportunities to be handed a wrong one.
+
+## Two claims withdrawn, and why
+
+Both were made in this document and both came from reading bytes off a view that
+could not support them.
+
+**1. "The disassembler disagrees with the decompiler."** It does not.
+`disassemble` applies the opcode map only when `--opmap` is passed;
+`--opmap-cache` alone takes the raw path and silently produces an unmapped view.
+Passing `--opmap --opmap-cache` on the reproducer gives **zero `UNKNOWN`** and a
+coherent `DUPTABLE`/`SETLIST`/`SETTABLEKS` stream. The prior claim of
+`R2557922`-style garbage was operator error, not a tool defect. The two paths
+agree.
+
+**2. "Raw byte `0x6F` is `LOADK` and is being stolen by `JUMPIFNOT`."**
+Withdrawn. It came from reading byte values off an *unmapped* disassembly.
+Without a map the disassembler cannot compute instruction lengths, so it
+mis-steps through AUX words and prints operand bytes as opcodes — 192 distinct
+"opcodes" over 40 files, against a Luau instruction set of ~84, is the tell. Raw
+byte positions from an unmapped view are not evidence.
+
+The same reasoning invalidates the obvious next test: you cannot collect the set
+of genuinely-executed opcode bytes without already holding a correct map.
+
+## The measured permutation is not usable as it stands
+
+`target/release/opmap_ground_truth.json` holds a 76-entry `{hex: NAME}` map, and
+`opmap-db` will import a bare map of that shape. It refuses this one:
+
+```
+Error: entry has no provenance.method
+       every entry must say how it was produced
+```
+
+That guard is correct and should not be worked around. The file sits in a build
+output directory with no record of whether it came from `probe align` against
+Jep's client, a test fixture, or an older client build — and a permutation
+adopted on faith would launder every downstream measurement. Establishing its
+provenance (or re-running `probe align` against the live client) is the
+prerequisite, and would also settle the reproducer outright: a measured map is
+the one source that can say which opcode that chunk's constant-loads really are.
 
 ## Verified behaviour-neutral
 
@@ -134,13 +204,17 @@ that reports `ok` in ~0.03s has skipped, and has done so twice in this project.
 - **Why** a register is `Unknown` on a fully-mapped chunk. The call site is
   known; the cause is not.
 - Whether the 330 share one cause or several.
-- `258_ReplicatedStorage_NPCs_SunBear2Init` is the cleanest reproducer — 2
-  protos, zero unmapped, 20 mints, and a visible pattern where consecutive
-  entries of one table constructor (`Say[4]` … `Say[10]`) degrade to `vN` while
-  their neighbours lift as full nested literals. It has **not** been traced to a
-  cause, and the disassembler cannot do it: run against this chunk with the same
-  pooled `--opmap-cache` the batch used, it still prints `UNKNOWN` for dozens of
-  instructions and operands like `R2557922` on a proto with `stack=22`, while
-  the decompile header for the same chunk reports zero unmapped. **The two paths
-  still disagree.** Reconciling them is a prerequisite for diagnosing this, and
-  is itself worth doing — it has now misled three separate investigations.
+- **Which opcode the reproducer's constant-loads are actually being decoded as.**
+  The absence of any constant-load in a 541-constant module is established; the
+  byte responsible is not, and cannot be identified from an unmapped
+  disassembly (see the withdrawn claims above). A measured permutation with
+  provenance settles it; nothing else available here does.
+
+## Next step
+
+Run `probe align` against the live Roblox client to obtain a permutation with
+recorded provenance, import it with `opmap-db import`, and re-decode the
+reproducer. If its constant-loads reappear, silent mis-mapping is confirmed as
+the cause of the 330 and the fix is in byte assignment. If they do not, the
+lifter hypothesis survives its first real test. Either outcome is decisive, and
+no cheaper experiment distinguishes them.
