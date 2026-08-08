@@ -433,11 +433,54 @@ mod tests {
         assert!(declared.is_empty(), "read-only name declared: {:?}", declared);
     }
 
-    /// A GENERATED name that is only read IS declared. This is the majority
-    /// case — the first version of the pass skipped it and left 48 of 53
-    /// real defects standing.
+    // ── Read-only generated names: WHERE the read happens decides ─────────
+    //
+    // These two tests differ in exactly one thing — whether the read sits
+    // inside a closure — and they must disagree about the outcome. That
+    // difference IS the pass's central judgement, so it is pinned from both
+    // sides.
+    //
+    // An earlier version declared every generated read-only name. It took
+    // `undefined_local` from 48 to 0 and was reported as a fix; it was
+    // masking. The check that free_var_decls cannot hide from
+    // (`declared_never_assigned`) later put the corpus clean rate at 13.7%,
+    // not the 94.9% claimed while the masking was in place — 532 of 628 files
+    // carried values that were declared and then never assigned.
+
+    /// A generated name read ONLY from inside a closure is a captured upvalue
+    /// whose declaration was lost. Declaring it at chunk top is the fix this
+    /// pass exists for.
     #[test]
-    fn generated_read_only_name_is_declared() {
+    fn generated_name_read_only_inside_a_closure_is_declared() {
+        let mut body = vec![Stat::LocalFunction {
+            name: "f".into(),
+            func: Expr::Function {
+                params: vec![],
+                is_vararg: false,
+                body: vec![Stat::ExprStat(Expr::Call {
+                    func: Box::new(name("print")),
+                    args: vec![name("v30")],
+                })],
+            },
+        }];
+        let declared = declare_free_vars(&mut body);
+        assert_eq!(
+            declared,
+            vec!["v30".to_string()],
+            "a name referenced from inside a nested function, and bound by no \
+             scope, is a capture — declaring it is the whole point of the pass"
+        );
+    }
+
+    /// The same name read at chunk top level is NOT a capture — a capture is by
+    /// definition a reference from inside a nested function. It is a hole where
+    /// the lifter dropped a value, and it must stay undeclared so
+    /// `undefined_local` keeps reporting it.
+    ///
+    /// Declaring it would be worse than the defect it replaces, because the
+    /// output would parse while every use evaluated to nil — silently.
+    #[test]
+    fn generated_name_read_at_top_level_stays_undeclared() {
         let mut body = vec![Stat::Local {
             names: vec!["x".into()],
             values: vec![Expr::BinOp {
@@ -446,9 +489,13 @@ mod tests {
                 right: Box::new(name("v29")),
             }],
         }];
-        let mut declared = declare_free_vars(&mut body);
-        declared.sort();
-        assert_eq!(declared, vec!["v29".to_string(), "v30".to_string()]);
+        let declared = declare_free_vars(&mut body);
+        assert!(
+            declared.is_empty(),
+            "declared {:?} — a top-level read-only name is a dropped value, not \
+             a capture. Declaring it hides the defect instead of fixing it.",
+            declared
+        );
     }
 
     /// The generated-name test must be tight: real identifiers that merely
