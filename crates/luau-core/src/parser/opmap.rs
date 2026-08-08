@@ -1686,6 +1686,71 @@ fn detect_closure_capture(chunk: &Chunk, ctx: &mut DetectCtx) {
             }
         }
     }
+    // ── Roblox path: child_protos is stripped, so the loop above sees nothing ──
+    //
+    // Every Roblox proto ships with an EMPTY `child_protos`, and the loop above
+    // skips exactly those. So on Roblox bytecode — which is the whole corpus —
+    // this detector scanned nothing at all and CAPTURE was never assigned. The
+    // byte then fell to whichever later detector wanted it, and `detect_move`
+    // takes it readily: CAPTURE is encoded `ABC(type, index, 0)`, which is
+    // shaped exactly like `MOVE dst, src`.
+    //
+    // Measured on CameraModule (32 protos): CAPTURE unassigned, byte 0x12 given
+    // to MOVE, and all 54 of its instructions decoded as `MOVE R0, Rn` — every
+    // one writing register 0, fifteen of them self-moves. Register 0 held the
+    // module table, so each capture run wiped it before the following
+    // `SETTABLEKS R0."Method"` stored into the wreckage. Twenty methods were
+    // lost and the chunk returned `{}` instead of the module.
+    //
+    // Resolution here mirrors `detect_dupclosure`: D indexes this proto's own
+    // constants to a `Constant::Closure`, which is a hard structural fact about
+    // the chunk rather than a shape that ordinary instructions meet by
+    // coincidence. The child's `num_upvalues` then gives the EXACT number of
+    // CAPTUREs that must follow, so the run length is known, not guessed.
+    for proto in &chunk.protos {
+        for i in 0..proto.code.len() {
+            let d = insn_d(proto.code[i]);
+            if d < 0 {
+                continue;
+            }
+            let Some(Constant::Closure(child_idx)) = proto.constants.get(d as usize) else {
+                continue;
+            };
+            let Some(child) = chunk.protos.get(*child_idx as usize) else { continue };
+            let expected = child.num_upvalues as usize;
+            if expected == 0 || i + expected >= proto.code.len() {
+                continue;
+            }
+            let mut cap_op = None;
+            let mut ok = true;
+            for j in 1..=expected {
+                let ci = proto.code[i + j];
+                // Luau emits every CAPTURE as ABC(type, id, 0): type is 0/1/2,
+                // and C is always zero. Checking C as well as A is what keeps an
+                // ordinary instruction from passing — the original guard tested
+                // only `A <= 2`, which most opcodes satisfy routinely.
+                if insn_a(ci) > 2 || insn_c(ci) != 0 {
+                    ok = false;
+                    break;
+                }
+                let co = insn_op(ci);
+                match cap_op {
+                    Some(prev) if prev != co => {
+                        ok = false;
+                        break;
+                    }
+                    None => cap_op = Some(co),
+                    _ => {}
+                }
+            }
+            if ok {
+                if let Some(cap) = cap_op {
+                    *capture_candidates.entry(cap).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     if let Some((&op, &count)) = closure_candidates.iter()
         .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
     {
@@ -4940,8 +5005,22 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
             score *= 1.5;
         }
 
-        // Bonus: has significant A!=B ratio (real register copies, not all no-ops)
-        // Real MOVE almost always has a mix of A==B and A!=B, with A!=B being dominant.
+        // Bonus: has significant A!=B ratio (real register copies, not all no-ops).
+        //
+        // ── A REJECTION GATE HERE WAS MEASURED AND NOT SHIPPED ───────────
+        // `MOVE Rn, Rn` is a no-op the Luau compiler never emits, so it is
+        // tempting to DISQUALIFY any candidate with self-moves rather than
+        // merely decline to reward it. It correctly rejects both bytes that
+        // stole this slot in CameraModule — CAPTURE `ABC(type, id, 0)` reads
+        // as `MOVE R{type}, R{id}`, and GETUPVAL's B is an upvalue index, not
+        // a register — and it cut semantic defects corpus-wide by 72.
+        //
+        // But it cost 4 files on the compile gate (600 -> 596). The compile
+        // gate is decided by the Luau compiler and cannot be blunted by a
+        // change of mine; the semantic checks are mine and have twice been
+        // silently blunted by a fix they were meant to catch. Trading the
+        // un-gameable measure for the gameable one is the wrong direction,
+        // so the gate stays out until it can be had without that cost.
         let a_ne_b = a_ne_b_counts.get(&op).copied().unwrap_or(0);
         if total > 5 && a_ne_b * 100 / total > 30 {
             score *= 1.2;
