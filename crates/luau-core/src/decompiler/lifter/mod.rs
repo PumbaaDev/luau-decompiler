@@ -2933,8 +2933,30 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal]) {
             *slot = other[i].clone();
             continue;
         }
-        // Neither side is a simple Name (both compound or one side is
-        // Unknown without a Name counterpart) — safe to reset.
+        // Both sides hold a simple Name and they merely DIFFER. B0.56 handled
+        // the asymmetric cases directly above but not this one, so it fell
+        // through to the reset below — which the comment there called safe
+        // while describing a different situation entirely. It is the opposite
+        // of safe: it is the second largest producer of hoisted-and-never-
+        // assigned locals, 75 names across 60 files.
+        //
+        // It arises when a write inside a branch shadows an already-declared
+        // register (naming.rs classify_write returns Shadow once BOTH the old
+        // and new names are semantic). The two paths then reach the merge
+        // holding different names for one register, and resetting to Unknown
+        // discards both — so the next read falls through to the `v{idx}` arm
+        // in reg_expr and is emitted as a chunk-top `local vN` nothing ever
+        // assigns.
+        //
+        // Keeping the fall-through path's name applies exactly the reasoning
+        // B0.56 already used one branch up: a declared local is valid on
+        // whichever path declared it, and a name that is right on one path
+        // beats Unknown, which is useful on neither.
+        if self_name && other_name {
+            continue;
+        }
+        // Genuinely neither side is a simple Name — both compound, or one is
+        // Unknown with no Name counterpart. Now the reset really is safe.
         *slot = RegVal::Unknown;
     }
 }
