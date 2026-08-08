@@ -1,5 +1,6 @@
 pub mod emit;
 pub mod free_var_decls;
+pub mod mint_trace;
 pub mod lifter;
 pub mod semantic_check;
 
@@ -571,7 +572,9 @@ impl<'a> DecompileContext<'a> {
                 // No hint -- fall back to register-based name.
                 // Use "v" prefix with per-proto scoping for cleaner output.
                 let p = format!("v{}", reg);
-                return self.gen_scoped_name(&p);
+                let n = self.gen_scoped_name(&p);
+                crate::decompiler::mint_trace::note("GEN_VAR_NOHINT", &n);
+                return n;
             }
         };
 
@@ -892,9 +895,13 @@ impl<'a> DecompileContext<'a> {
         // upvalues. Emit a distinct prefix so the quality classifier does
         // not lump these into the upval_ bucket with real unnamed captures.
         if (idx as usize) >= proto.num_upvalues as usize {
-            return format!("cap_{}", idx);
+            let n = format!("cap_{}", idx);
+            crate::decompiler::mint_trace::note("UPVAL_NAME_CAP", &n);
+            return n;
         }
-        format!("upval_{}", idx)
+        let n = format!("upval_{}", idx);
+        crate::decompiler::mint_trace::note("UPVAL_NAME", &n);
+        n
     }
 }
 

@@ -202,6 +202,24 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
 
     let free: Vec<String> = free.into_iter().collect();
 
+    // Emitted here rather than at each mint site because this is the only point
+    // that knows which branch hoisted the name -- ASSIGNED names are written
+    // somewhere in the body and are defensible, READONLY ones evaluate to nil.
+    if crate::decompiler::mint_trace::enabled() {
+        for n in &free {
+            let branch = if scan.assigned.contains(n) { "ASSIGNED" } else { "READONLY" };
+            let in_closure = scan.read.contains(n) && !scan.read_outside_closure.contains(n);
+            eprintln!(
+                "MINT\t{}\t{}\tinclosure={}\tsites={}",
+                branch,
+                n,
+                in_closure,
+                crate::decompiler::mint_trace::sites_for(n)
+            );
+        }
+        crate::decompiler::mint_trace::clear();
+    }
+
     if free.is_empty() {
         return free;
     }

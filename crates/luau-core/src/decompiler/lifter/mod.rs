@@ -2386,7 +2386,9 @@ fn lift_region(
                     // Mask off bit 31 (inext flag) before reading variable count
                     let nresults = (loop_aux & 0x7FFFFFFF).clamp(1, 5) as usize;
                     for extra in 2..nresults {
-                        var_names.push(ctx.gen_var(&format!("v{}", extra)));
+                        let n = ctx.gen_var(&format!("v{}", extra));
+                        crate::decompiler::mint_trace::note("FORGLOOP_EXTRA_VAR", &n);
+                        var_names.push(n);
                     }
                 }
             }
@@ -5778,7 +5780,9 @@ fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Ve
             // Phase B0.119: generator register can hold a leaked NAMECALL
             // method-name string (e.g. Expr::String) which produces invalid
             // `for k, v in "MethodName" do`.  Fall back to a register name.
-            Expr::Name(format!("v{}", a))
+            let n = format!("v{}", a);
+            crate::decompiler::mint_trace::note("FORGPREP_GEN_REJECT", &n);
+            Expr::Name(n)
         }
     };
     let second = regs.get(a + 1).and_then(|r| match r {
@@ -5877,7 +5881,17 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
     match regs.get(idx) {
         Some(RegVal::Expr(e)) => e.clone(),
         Some(RegVal::LoopVar(s)) => Expr::Name(s.clone()),
-        _ => Expr::Name(format!("v{}", idx)),
+        other => {
+            let n = format!("v{}", idx);
+            crate::decompiler::mint_trace::note(
+                match other {
+                    None => "REG_EXPR_OUT_OF_RANGE",
+                    _ => "REG_EXPR_UNKNOWN",
+                },
+                &n,
+            );
+            Expr::Name(n)
+        }
     }
 }
 
@@ -5899,7 +5913,12 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
 pub(super) fn table_expr(regs: &[RegVal], idx: usize) -> Expr {
     let e = reg_expr(regs, idx);
     if is_impossible_as_table(&e) {
-        return Expr::Name(format!("v{}", idx));
+        let n = format!("v{}", idx);
+        crate::decompiler::mint_trace::note("TABLE_EXPR_REJECT", &n);
+        if crate::decompiler::mint_trace::enabled() {
+            eprintln!("REJECT\tTABLE_EXPR\t{}\tdiscarded={:?}", n, e);
+        }
+        return Expr::Name(n);
     }
     e
 }
@@ -5928,7 +5947,12 @@ pub(super) fn method_receiver_expr(regs: &[RegVal], idx: usize) -> Expr {
         _ => false,
     };
     if impossible {
-        return Expr::Name(format!("v{}", idx));
+        let n = format!("v{}", idx);
+        crate::decompiler::mint_trace::note("METHOD_RECV_REJECT", &n);
+        if crate::decompiler::mint_trace::enabled() {
+            eprintln!("REJECT\tMETHOD_RECV\t{}\tdiscarded={:?}", n, e);
+        }
+        return Expr::Name(n);
     }
     e
 }
@@ -6022,7 +6046,9 @@ pub(super) fn mk_binop(regs: &[RegVal], left: usize, right: usize, op: BinOp) ->
         let right_leaked = is_ident_string(&right_expr);
         if left_leaked && right_leaked {
             // Both are leaked strings — return left register name.
-            return Expr::Name(format!("v{}", left));
+            let n = format!("v{}", left);
+            crate::decompiler::mint_trace::note("BINOP_ANDOR_LEAK", &n);
+            return Expr::Name(n);
         }
         if right_leaked {
             // Right is leaked — return left (the meaningful operand).
@@ -6085,7 +6111,9 @@ pub(super) fn mk_binop_k(proto: &Proto, strings: &[String], regs: &[RegVal], lef
         let left_leaked = is_ident_string(&left_expr);
         let right_leaked = is_ident_string(&right_expr);
         if left_leaked && right_leaked {
-            return Expr::Name(format!("v{}", left));
+            let n = format!("v{}", left);
+            crate::decompiler::mint_trace::note("BINOPK_ANDOR_LEAK", &n);
+            return Expr::Name(n);
         }
         if right_leaked {
             return left_expr;

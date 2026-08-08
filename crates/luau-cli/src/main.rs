@@ -828,6 +828,11 @@ fn run_batch(
 
     for path in files {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        // Marks the chunk boundary in the trace, so MINT lines can be
+        // attributed to the file that produced them.
+        if luau_core::decompiler::mint_trace::enabled() {
+            eprintln!("FILE\t{}", stem);
+        }
 
         match fs::read(&path).map(|d| decompile_with_store(&d, store, db)) {
             Ok(Ok(source)) => {
