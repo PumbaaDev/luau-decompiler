@@ -793,6 +793,26 @@ fn run_batch(
 
     let files = bytecode_files(input, extensions)?;
 
+    // Pool by default. Every script in a batch comes from ONE client build and
+    // so shares ONE opcode permutation, but each exercises only a fraction of
+    // it, so a single file's detectors see a partial, guess-heavy map. Pooling
+    // every file's independent reading into a corpus-wide majority is simply
+    // using more of the evidence that is already present, and it is decisive:
+    // measured over a 628-file dump it takes the compile gate from 600 to 613
+    // and semantically-clean files from 88 to 224, because the
+    // {GETTABLEKS, SETTABLEKS, NAMECALL} trio — three opcodes with an identical
+    // instruction shape, which single-file detection routinely confuses and
+    // which was the cause of the `return {}` export-table losses — is resolved
+    // by the majority once every file has voted.
+    //
+    // When the caller named a shared store we honour it (it may pool across
+    // several runs). Otherwise we pool into a fresh run-local file inside the
+    // output folder. Fresh-per-run is deliberate: a stale pool from an earlier
+    // binary would silently mix opcode maps across builds, exactly the trap the
+    // timestamped output dir exists to prevent.
+    let local_pool = out.join(".opmap_pool.jsonl");
+    let store: Option<&PathBuf> = store.or(Some(&local_pool));
+
     // Pre-pass: pool every script's reading of the opcode shuffle BEFORE
     // decoding any of them.
     //
