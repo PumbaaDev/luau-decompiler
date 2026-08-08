@@ -306,6 +306,44 @@ impl<'a> DecompileContext<'a> {
         self.proto_naming.insert(proto_index, naming);
     }
 
+    /// Let every function in this proto claim its own name before lifting.
+    ///
+    /// A register is reused across a proto's lifetime, so the slot that will
+    /// hold a closure often holds something unrelated first. Names are handed
+    /// out first-come-first-served by `gen_scoped_name`, so whichever site the
+    /// lifter reached first won the name and the other was bumped to `name2`.
+    /// When the loser was the function, the name recorded in the bytecode for
+    /// it was lost: RbxCharacterSounds emitted `local map = "UserFixCharSounds…"`
+    /// for a string constant and `local function map2(...)` for the function
+    /// actually called `map` in the published source.
+    ///
+    /// Claiming here, in program order, before anything else is named, makes a
+    /// function's own `debug_name` win by construction. The `assigned` cache is
+    /// keyed by `(reg, pc)` and consulted by `reg_name` ahead of synthesis, so
+    /// the closure site later resolves to exactly this name. Nothing is
+    /// refused: a temporary sharing the register still gets a name, it just
+    /// takes the `2` suffix instead of handing one to the function.
+    ///
+    /// This deliberately does NOT filter hints — a closure's own declaration is
+    /// frequently named at a pc EARLIER than its NEWCLOSURE (hoisting), so it
+    /// is indistinguishable at hint level from a temporary borrowing the name.
+    pub fn preallocate_closure_names(&mut self, sites: &[(u8, usize, String)]) {
+        let Some(pi) = self.current_proto_index else { return };
+        for (reg, pc, name) in sites {
+            if self
+                .proto_naming
+                .get(&pi)
+                .is_some_and(|n| n.assigned.contains_key(&(*reg, *pc)))
+            {
+                continue;
+            }
+            let allocated = self.gen_scoped_name(name);
+            if let Some(naming) = self.proto_naming.get_mut(&pi) {
+                naming.assigned.insert((*reg, *pc), allocated);
+            }
+        }
+    }
+
     pub fn gen_var(&mut self, prefix: &str) -> String {
         // Use per-proto naming when available for cleaner scoped names
         if let Some(pi) = self.current_proto_index {
@@ -871,7 +909,8 @@ impl<'a> DecompileContext<'a> {
 ///   3. first Param/SelfParam hint
 ///
 /// When no hint is in scope (e.g., read before any recorded write), fall back
-/// to the full hint set using the same priorities.
+/// to the full hint set using the same priorities — EXCEPT `Named`, see the
+/// comment on the fallback itself.
 fn select_hint(hints: &[(usize, RegisterHint)], pc: usize) -> Option<RegisterHint> {
     fn pick(hs: impl Iterator<Item = (usize, RegisterHint)> + Clone) -> Option<RegisterHint> {
         // Collect once so we can iterate in reverse multiple times.
@@ -898,6 +937,13 @@ fn select_hint(hints: &[(usize, RegisterHint)], pc: usize) -> Option<RegisterHin
         return chosen;
     }
     // Read-before-write fallback: consider all hints.
+    //
+    // Note this path also names a closure's OWN declaration when the lifter
+    // asks at a pc earlier than the NEWCLOSURE (hoisting). Filtering hints here
+    // therefore cannot separate "a temporary borrowing a function's name" from
+    // "the function itself" — both arrive identically. Attempting it stripped
+    // 11 of 13 function names from `Collectors_LocalCollect`. The collision is
+    // resolved by allocation ORDER instead; see `preallocate_closure_names`.
     pick(hints.iter().cloned())
 }
 
@@ -998,6 +1044,84 @@ pub fn is_import_path_identifier(s: &str) -> bool {
 /// NEWCLOSURE/DUPCLOSURE can resolve the child proto's `debug_name` and install
 /// a `Named(debug_name)` hint so user-defined functions render with their real
 /// names instead of `fn`, `fn2`, etc.
+/// The usable `debug_name` of the child proto a NEWCLOSURE/DUPCLOSURE at `d`
+/// instantiates, if it has one.
+///
+/// Single source of truth for two readers that MUST agree: the hint installer
+/// below, and `closure_debug_names`, which collects the same names so
+/// `select_hint` can tell a function's real name apart from an ordinary alias.
+/// Were these to drift, `select_hint` would protect a name no closure claims
+/// (or fail to protect one that is claimed) — a silent, hard-to-see defect.
+///
+/// Resolution mirrors the lifter: for NEWCLOSURE, D indexes
+/// `proto.child_protos` → chunk-global proto index (with the Roblox fallback of
+/// D-as-direct-global-index). For DUPCLOSURE, D indexes `proto.constants` to a
+/// `Constant::Closure(child_idx)` holding a GLOBAL index, with the same
+/// fallbacks.
+fn closure_debug_name_at<'a>(
+    proto: &Proto,
+    all_protos: &'a [Proto],
+    op: LuauOpcode,
+    d: i16,
+) -> Option<&'a str> {
+    let d_unsigned = d as u16 as usize;
+    let resolved_idx: Option<usize> = if op == LuauOpcode::NewClosure {
+        proto.child_protos.get(d_unsigned).map(|&i| i as usize)
+            .or_else(|| {
+                if d_unsigned < all_protos.len() { Some(d_unsigned) } else { None }
+            })
+    } else {
+        // Constant::Closure holds a GLOBAL proto index; try it first
+        // (mirrors the DupClosure resolution in opcode_handlers.rs).
+        let from_const = match proto.constants.get(d_unsigned) {
+            Some(Constant::Closure(child_idx)) => {
+                let g = *child_idx as usize;
+                if g < all_protos.len() {
+                    Some(g)
+                } else {
+                    proto.child_protos.get(g).map(|&i| i as usize)
+                }
+            }
+            _ => None,
+        };
+        from_const
+            .or_else(|| proto.child_protos.get(d_unsigned).map(|&i| i as usize))
+            .or_else(|| {
+                if d_unsigned < all_protos.len() { Some(d_unsigned) } else { None }
+            })
+    };
+    let child = all_protos.get(resolved_idx?)?;
+    let name = child.debug_name.as_deref()?;
+    if name.is_empty() || !is_valid_luau_identifier(name) || is_stdlib_shadow_name(name) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Every `(register, pc, name)` at which this proto instantiates a closure that
+/// carries a `debug_name`, in program order.
+///
+/// These names are ground truth from the bytecode about what the source called
+/// those functions, unlike a field or global hint, which is only a plausible
+/// label. `preallocate_closure_names` uses them to let each function claim its
+/// own name before any temporary can.
+pub fn closure_debug_names(proto: &Proto, all_protos: &[Proto]) -> Vec<(u8, usize, String)> {
+    let mut sites = Vec::new();
+    let code = &proto.code;
+    let mut pc = 0;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if matches!(op, LuauOpcode::NewClosure | LuauOpcode::DupClosure) {
+            if let Some(name) = closure_debug_name_at(proto, all_protos, op, insn_d(insn)) {
+                sites.push((insn_a(insn), pc, name.to_string()));
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    sites
+}
+
 pub fn analyze_register_usage(
     proto: &Proto,
     strings: &[String],
@@ -1039,45 +1163,10 @@ pub fn analyze_register_usage(
                 // with the same Roblox fallback.
                 let mut named_installed = false;
                 if let Some(all_protos) = chunk_protos {
-                    let d_unsigned = d as u16 as usize;
-                    let resolved_idx: Option<usize> = if op == LuauOpcode::NewClosure {
-                        proto.child_protos.get(d_unsigned).map(|&i| i as usize)
-                            .or_else(|| {
-                                if d_unsigned < all_protos.len() { Some(d_unsigned) } else { None }
-                            })
-                    } else {
-                        // Constant::Closure holds a GLOBAL proto index; try it first
-                        // (mirrors the DupClosure resolution in opcode_handlers.rs).
-                        let from_const = match proto.constants.get(d_unsigned) {
-                            Some(Constant::Closure(child_idx)) => {
-                                let g = *child_idx as usize;
-                                if g < all_protos.len() {
-                                    Some(g)
-                                } else {
-                                    proto.child_protos.get(g).map(|&i| i as usize)
-                                }
-                            }
-                            _ => None,
-                        };
-                        from_const
-                            .or_else(|| proto.child_protos.get(d_unsigned).map(|&i| i as usize))
-                            .or_else(|| {
-                                if d_unsigned < all_protos.len() { Some(d_unsigned) } else { None }
-                            })
-                    };
-                    if let Some(idx) = resolved_idx {
-                        if let Some(child) = all_protos.get(idx) {
-                            if let Some(name) = child.debug_name.as_deref() {
-                                if !name.is_empty()
-                                    && is_valid_luau_identifier(name)
-                                    && !is_stdlib_shadow_name(name)
-                                {
-                                    hints.entry(a).or_default()
-                                        .push((pc, RegisterHint::Named(name.to_string())));
-                                    named_installed = true;
-                                }
-                            }
-                        }
+                    if let Some(name) = closure_debug_name_at(proto, all_protos, op, d) {
+                        hints.entry(a).or_default()
+                            .push((pc, RegisterHint::Named(name.to_string())));
+                        named_installed = true;
                     }
                 }
                 if !named_installed {
@@ -2008,8 +2097,8 @@ mod hint_path_tests {
     //! [[Phase B0.38 CALL Destination Naming]], and the Phase B0.39 REJECTED
     //! entry in [[Phase History]].
     use super::{
-        analyze_register_usage, is_stdlib_shadow_name, is_valid_luau_identifier,
-        RegisterHint,
+        analyze_register_usage, closure_debug_names, is_stdlib_shadow_name,
+        is_valid_luau_identifier, RegisterHint,
     };
     use crate::parser::types::{Constant, Proto};
 
@@ -2439,6 +2528,42 @@ mod hint_path_tests {
         // installed too (it would confuse select_hint preference ordering).
         let any_closure = r0.iter().any(|(_, h)| matches!(h, RegisterHint::Closure));
         assert!(!any_closure, "Named hint must replace, not duplicate, Closure");
+    }
+
+    // ── A function's own recorded name outranks a temporary's claim ───────
+    //
+    // Registers are reused, so the slot that ends up holding a closure often
+    // holds something unrelated first. Names were handed out first-come, so
+    // the earlier temporary took the function's name and the function itself
+    // was bumped to `name2`. RbxCharacterSounds shipped `local map = "UserFix…"`
+    // for a string constant while the function the published source calls
+    // `map` came out as `map2`.
+    //
+    // A `debug_name` is bytecode ground truth about that function; a hint
+    // borrowed by a temporary is a guess. Ground truth claims first.
+
+    #[test]
+    fn closure_debug_names_reports_each_closure_site() {
+        let (parent, protos) = make_closure_pair(Some("map"));
+        let sites = closure_debug_names(&parent, &protos);
+        assert_eq!(
+            sites,
+            vec![(0u8, 0usize, "map".to_string())],
+            "the NEWCLOSURE at pc 0 writing R0 must be reported with its debug_name"
+        );
+    }
+
+    #[test]
+    fn closure_debug_names_skips_closures_without_a_usable_name() {
+        for unusable in [None, Some(""), Some("function"), Some("pcall")] {
+            let (parent, protos) = make_closure_pair(unusable);
+            assert!(
+                closure_debug_names(&parent, &protos).is_empty(),
+                "must not claim a name for debug_name {:?} — empty, a keyword, \
+                 and a stdlib shadow are all unusable as identifiers",
+                unusable
+            );
+        }
     }
 
     #[test]
@@ -3394,8 +3519,105 @@ mod hint_path_tests {
 #[cfg(test)]
 mod b0106_reserved_word_guard_tests {
     use super::{is_valid_luau_identifier, DecompileContext, RegisterHint};
-    use crate::parser::types::Chunk;
+    use crate::parser::types::{Chunk, Proto};
     use std::collections::HashMap;
+
+    /// A proto with no debug info, so `reg_name` falls through to the
+    /// `assigned` cache and synthesis — the paths under test here.
+    fn bare_proto() -> Proto {
+        Proto {
+            max_stack_size: 2,
+            num_params: 0,
+            num_upvalues: 0,
+            is_vararg: false,
+            flags: 0,
+            typeinfo: None,
+            code: Vec::new(),
+            constants: Vec::new(),
+            child_protos: Vec::new(),
+            line_defined: 1,
+            debug_name: None,
+            line_info: None,
+            debug_info: None,
+        }
+    }
+
+    // ── A function's own recorded name outranks a temporary's claim ───────
+    //
+    // Registers are reused, so the slot that ends up holding a closure often
+    // holds something unrelated first. Names were handed out first-come, so an
+    // earlier temporary took the function's name and the function itself was
+    // bumped to `name2`. RbxCharacterSounds shipped `local map = "UserFix…"`
+    // for a string constant while the function the published source calls
+    // `map` came out as `map2`.
+    //
+    // A `debug_name` is bytecode ground truth about that function; a name a
+    // temporary borrowed from a future hint is a guess. Ground truth claims
+    // first.
+
+    /// The regression itself: the function keeps `map`, and the temporary
+    /// sharing its register takes the suffix instead of handing one over.
+    #[test]
+    fn preallocated_closure_name_outranks_a_temporary_sharing_the_register() {
+        let chunk = test_chunk();
+        // R0 carries Named("map") recorded at the NEWCLOSURE (pc 4). Reads
+        // BEFORE that pc still reach it, through the read-before-write
+        // fallback in `select_hint` — exactly how the string constant in
+        // RbxCharacterSounds got hold of the name.
+        let mut ctx = make_ctx_with_hint(&chunk, 0, 4, RegisterHint::Named("map".to_string()));
+        let proto = bare_proto();
+
+        ctx.preallocate_closure_names(&[(0, 4, "map".to_string())]);
+
+        // The temporary asks first in lifting order, but the claim already
+        // happened, so it is the one that gets bumped.
+        let temporary = ctx.reg_name(&proto, 0, 1);
+        let function = ctx.reg_name(&proto, 0, 4);
+
+        assert_eq!(
+            function, "map",
+            "the function must keep the name the bytecode records for it"
+        );
+        assert_ne!(
+            temporary, "map",
+            "a temporary sharing the register must not hold the function's \
+             name — that is the defect this guards"
+        );
+    }
+
+    /// Claiming must not fight the `(reg, pc)` cache: asking twice returns the
+    /// same name rather than bumping the function to `map2` itself.
+    #[test]
+    fn preallocating_twice_does_not_bump_the_closure_name() {
+        let chunk = test_chunk();
+        let mut ctx = make_ctx_with_hint(&chunk, 0, 4, RegisterHint::Named("map".to_string()));
+        let proto = bare_proto();
+
+        ctx.preallocate_closure_names(&[(0, 4, "map".to_string())]);
+        ctx.preallocate_closure_names(&[(0, 4, "map".to_string())]);
+
+        assert_eq!(ctx.reg_name(&proto, 0, 4), "map");
+    }
+
+    /// Two distinct functions the source genuinely gave one name still get
+    /// distinct identifiers — claiming reorders who wins, it must not merge
+    /// two bindings into one.
+    #[test]
+    fn two_closures_with_one_name_still_get_distinct_identifiers() {
+        let chunk = test_chunk();
+        let mut ctx = make_ctx(&chunk);
+        let proto = bare_proto();
+
+        ctx.preallocate_closure_names(&[(0, 1, "map".to_string()), (1, 3, "map".to_string())]);
+
+        let first = ctx.reg_name(&proto, 0, 1);
+        let second = ctx.reg_name(&proto, 1, 3);
+        assert_eq!(first, "map");
+        assert_ne!(
+            first, second,
+            "distinct closures must not collapse onto one identifier"
+        );
+    }
 
     fn test_chunk() -> Chunk {
         Chunk {

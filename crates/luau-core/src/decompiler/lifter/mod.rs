@@ -892,6 +892,11 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
     );
     let prev_proto = ctx.current_proto_index;
     ctx.current_proto_index = Some(proto_index);
+    // Let each function claim its own recorded name before any temporary
+    // sharing its register can take it. Must run with `current_proto_index`
+    // already switched, and before any other naming happens in this proto.
+    let closure_sites = crate::decompiler::closure_debug_names(proto, &ctx.chunk.protos);
+    ctx.preallocate_closure_names(&closure_sites);
     // B0.134b: push this proto onto the decompilation stack so child
     // NEWCLOSURE instructions can detect (and prevent) recursion into
     // any ancestor proto. Previously proto_stack was only maintained
