@@ -210,6 +210,78 @@ that reports `ok` in ~0.03s has skipped, and has done so twice in this project.
   disassembly (see the withdrawn claims above). A measured permutation with
   provenance settles it; nothing else available here does.
 
+## The structuring diagnosis, and one fix measured and rejected
+
+A five-agent workflow attacked the same population independently and found a
+mechanism the mint trace could not see, because it explains *why* a register is
+`Unknown` rather than where the name is minted.
+
+**If/else arms are never recursively structured.** `structure_control_flow`
+matches an if/else, marks the arm blocks `handled`, and stores them as plain
+block-id lists — never re-examining them. So a `FORGPREP` inside an arm is
+already `handled` when the RPO walk reaches it, `try_match_for_loop` is never
+called on it, and the linear dispatcher's match arm for the for-loop opcodes is
+an empty block (`{}` — "handled at the region level"). **The loop is emitted as
+nothing at all.** What survives is the iterator `CALL` as a bare 3-value local
+followed by the unguarded body; the loop variables are written only by the
+discarded `FORGLOOP`, so every read finds `Unknown`.
+
+The contrast is the proof, and it is internal to the codebase:
+
+```
+FORGPREP instructions corpus-wide              1094
+  lifted as Region::GenericFor                  464
+  skipped, marked handled by IF/ELSE arms       607   <- never lifted
+  skipped, marked handled by FOR-BODY blocks     55   <- STILL lifted
+  never reached dispatch (not in RPO)            13
+  match returned None (true decode failure)       2
+FORGPREP->FORGLOOP link decodes correctly   1084/1094
+every FORGPREP is a CFG block start          1094/1094
+```
+
+Identical `handled`-marking on both paths; the for-body path recurses and its
+loops survive, the if/else path does not and its loops vanish. Visible in
+output as 466 flattened `local a, b, c = ipairs(...)` headers against 549 real
+`for ... in` loops — roughly 46% of generic-for loops in the corpus are gone.
+Decode is ruled out as the cause: 1084/1094 links decode correctly.
+
+### The fix I tried, and why it was reverted
+
+Added `then_body`/`else_body: Vec<Region>` to `Region::IfThenElse`, populated by
+running each arm's PC extent through `structure_numeric_for_body` — the same
+recursion the for-body path uses — with the lifter preferring the nested regions
+when present. It builds, and on my own checks it is a large win:
+
+| | before | after |
+|---|---:|---:|
+| semantic clean | 266/628 | **290/628** (+24) |
+| semantic defects | 1272 | **1088** (−184) |
+| CoreScript ground truth | 9/9 | 9/9 |
+| lib tests | 894 | 894 |
+| **compile gate** | **621/628** | **598/628 (−23)** |
+
+**Reverted.** −23 on the gate the Luau compiler decides, for +24 on the checks I
+wrote, is the trade this project has already rejected twice — once for the
+self-move MOVE filter (−4 gate for −72 defects) and once for the semicolon
+experiment. The semantic checks have been blunted by my own fixes twice; the
+compile gate cannot be. Buying the gameable measure with the un-gameable one is
+the wrong direction regardless of how good the ratio looks.
+
+Backup tag `backup/pre-ifelse-recursion` marks the pre-attempt state.
+
+### Why it probably regressed, for the next attempt
+
+Arm blocks are not guaranteed contiguous in PC order, and I passed
+`min(start)..max(end)` as the range. Where an arm's blocks are disjoint that
+extent spans intervening blocks belonging to other regions, which are then
+lifted twice or in the wrong scope — consistent with 23 files becoming
+syntactically invalid while the mechanism itself is real.
+
+The next attempt should structure only **contiguous runs** of arm blocks, or
+thread the arm's block *set* through instead of collapsing it to a PC range.
+The mechanism is well established; only this particular implementation of it is
+refuted.
+
 ## Next step
 
 Run `probe align` against the live Roblox client to obtain a permutation with
