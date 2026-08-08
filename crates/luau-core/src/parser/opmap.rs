@@ -2728,10 +2728,51 @@ fn detect_call(chunk: &Chunk, ctx: &mut DetectCtx) {
     }
 }
 
+/// NAMECALL, GETTABLEKS and SETTABLEKS are the same instruction SHAPE: A and B
+/// are registers, C is unused by the decoder, and AUX is a string-constant
+/// index. Nothing in a single instruction word tells them apart, so a detector
+/// that scores on that shape alone is really just ranking by frequency — and
+/// GETTABLEKS/SETTABLEKS are far more frequent than NAMECALL. Measured over the
+/// 628-chunk corpus, the old shape-only branch picked GETTABLEKS's byte for
+/// NAMECALL in 439 chunks and SETTABLEKS's in 167, against only 13 correct.
+/// Because `detect_table_ops` skips bytes that are already mapped, and every
+/// later pass carries the same filter, there is no recovery path: the stolen
+/// byte stays stolen and the table op is lost for the rest of the run.
+///
+/// The separator is not in the instruction, it is in the one AFTER it. Luau's
+/// VM does not implement NAMECALL as a standalone operation — the NAMECALL
+/// handler resolves the method and falls straight through into the CALL
+/// handler, so the compiler must emit a CALL immediately after every NAMECALL.
+/// NAMECALL occupies two words (instruction + AUX), which puts that CALL at
+/// pc+2. NAMECALL writes the method into R(A) and the receiver into R(A+1), and
+/// CALL takes the function's register as its own A, so the two A fields are
+/// equal.
+///
+/// That gives a property no table op can fake, and it must hold at EVERY
+/// occurrence rather than merely at some — which makes it a VETO, not a score.
+/// Measured over the corpus, restricted to the same population this function
+/// scans (A and B valid registers, AUX a string constant):
+///
+///   byte  occurrences  share followed at pc+2 by one fixed byte with equal A
+///   0xBC        7 165  100.00%   <- the true NAMECALL, exactly zero exceptions
+///   0x4D       28 641   20.54%   <- GETTABLEKS
+///   0x30       23 144   18.07%   <- SETTABLEKS
+///
+/// Discriminants measured and DISCARDED:
+///   * C == 0. C is not unused in the encoding — it is Luau's inline-cache slot
+///     hint for the string key, so it is almost never zero: C==0 held for only
+///     0.10% of NAMECALL, 0.34% of GETTABLEKS and 0.25% of SETTABLEKS words.
+///   * B == 0 ("store shape"). No separation: 25.9% / 21.3% / 16.0%.
+///   * A == B. Strong, but it separates the wrong pair — 52.6% for NAMECALL and
+///     48.4% for GETTABLEKS against 0.16% for SETTABLEKS. It would stop
+///     NAMECALL stealing SETTABLEKS while leaving GETTABLEKS wide open.
 fn detect_namecall(chunk: &Chunk, ctx: &mut DetectCtx) {
     let call_op = ctx.find_shuffled(LuauOpcode::Call as u8);
 
+    // Per candidate byte: every occurrence, and how those occurrences are
+    // distributed over the opcode byte sitting at pc+2 with a matching A.
     let mut candidates: HashMap<u8, usize> = HashMap::new();
+    let mut successors: HashMap<u8, HashMap<u8, usize>> = HashMap::new();
     for proto in &chunk.protos {
         for i in 0..proto.code.len().saturating_sub(2) {
             let insn = proto.code[i];
@@ -2754,34 +2795,39 @@ fn detect_namecall(chunk: &Chunk, ctx: &mut DetectCtx) {
 
                 if !aux_is_string { continue; }
 
-                // If we have CALL mapped, verify pc+2 is CALL with same A
-                if let Some(call) = call_op {
-                    let next_insn = proto.code[i + 2];
-                    if insn_op(next_insn) == call && insn_a(next_insn) == a {
-                        *candidates.entry(op).or_insert(0) += 1;
-                    }
-                } else {
-                    // Without CALL, just check the AUX pattern:
-                    // NAMECALL always uses AUX, so pc+1 is AUX data, pc+2 should be
-                    // a different instruction. The key identifier is that AUX is a valid
-                    // string constant index and A,B are valid registers.
-                    *candidates.entry(op).or_insert(0) += 1;
+                *candidates.entry(op).or_insert(0) += 1;
+                let next_insn = proto.code[i + 2];
+                if insn_a(next_insn) == a {
+                    *successors.entry(op).or_default().entry(insn_op(next_insn)).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    // NAMECALL should be one of the most frequent AUX-using opcodes
-    // Filter: at least 50% of AUX values must point to string constants.
-    // Previously required `count >= 3` which dropped single-use cases in small
-    // scripts (e.g., a module that only has one `game:GetService(...)` call).
-    // With CALL mapped, the `pc+2 == CALL` check makes single hits highly
-    // reliable; without CALL, require count >= 2 to reduce noise.
+    // With CALL named, a lone occurrence still has to clear the veto, so one hit
+    // is enough. Without it, two occurrences are the minimum that can establish
+    // "the same successor byte every time" at all.
     let require_count = if call_op.is_some() { 1 } else { 2 };
     // Deterministic: collect viable, sort by count desc then byte asc.
     let mut viable: Vec<(u8, usize)> = Vec::new();
     for (&op, &count) in &candidates {
         if count < require_count { continue; }
+
+        // THE VETO. A single successor byte must account for EVERY occurrence
+        // of this byte, with a matching A each time. One exception is enough to
+        // prove the byte is not NAMECALL.
+        let Some(by_successor) = successors.get(&op) else { continue };
+        let Some((&successor, &hits)) = by_successor
+            .iter()
+            .max_by(|x, y| x.1.cmp(y.1).then_with(|| y.0.cmp(x.0)))
+        else { continue };
+        if hits != count { continue; }
+        // When CALL is already named, the successor must BE it. When it is not,
+        // the byte is still whatever CALL turns out to be — we cannot name it,
+        // but we can and do require that it never varies.
+        if let Some(call) = call_op {
+            if successor != call { continue; }
+        }
 
         // Verify string AUX ratio
         let mut string_aux = 0u32;
@@ -14579,14 +14625,22 @@ mod tests {
     fn detect_namecall_without_call_requires_two_hits() {
         // Without CALL pre-seeded, the detector requires count >= 2 AND >= 50%
         // string-AUX ratio. Two valid NAMECALLs (each AUX → string) must map.
+        //
+        // "Without CALL" means ctx has not yet NAMED the CALL byte — not that
+        // the code lacks one. Luau's VM falls out of the NAMECALL handler into
+        // the CALL handler, so a NAMECALL with anything other than CALL two
+        // words later is bytecode the compiler cannot emit. This fixture
+        // originally used unrelated filler there, which made it assert on an
+        // impossible program; 0xAA now stands in for the not-yet-identified
+        // CALL, reusing each NAMECALL's A register as a real CALL would.
         let nc_byte: u8 = 0xE5;
         let code = vec![
-            insn_abc(nc_byte, 2, 1, 0), // 0: NAMECALL
+            insn_abc(nc_byte, 2, 1, 0), // 0: NAMECALL → R2, self R1
             0x00000000,                  // 1: AUX → const 0 (string)
-            insn_abc(0xAA, 0, 0, 0),    // 2: filler (so we don't need CALL)
-            insn_abc(nc_byte, 3, 2, 0), // 3: NAMECALL
+            insn_abc(0xAA, 2, 1, 1),    // 2: the CALL, base R2 — byte not yet named
+            insn_abc(nc_byte, 3, 2, 0), // 3: NAMECALL → R3, self R2
             0x00000000,                  // 4: AUX → const 0 (string)
-            insn_abc(0xBB, 0, 0, 0),    // 5: filler
+            insn_abc(0xAA, 3, 1, 1),    // 5: the CALL, base R3 — same byte
             insn_abc(0xDD, 0, 0, 0),    // 6: filler
         ];
         let mut chunk = chunk_from_code(code, 8);
