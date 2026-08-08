@@ -757,7 +757,31 @@ pub(super) fn lift_instruction_range(
                         .any(|u| ctx.upval_name(proto, proto_index, u) == cur),
                     None => false,
                 };
-                if !locals.declared.contains(&a) || holds_upval_alias {
+                // Third disjunct: the register is DECLARED but currently holds
+                // nothing. The guard above protects a live binding from being
+                // clobbered — but it never asked whether the binding still has
+                // a value. It usually does not: CALL clears every slot from its
+                // frame base upwards (see the SETLIST/CALL handler below), so
+                // the common shape
+                //     GETTABLEKS R2 …  /  CALL R2  /  GETUPVAL R2 U0
+                // hits this handler with R2 declared and empty. Skipping the
+                // store there guards a binding that no longer exists, the
+                // upvalue read produces nothing, and the next read of R2 falls
+                // through to the `v{idx}` arm in reg_expr — which is emitted as
+                // a chunk-top `local v2` that is never assigned.
+                //
+                // Measured over 628 files: this single case accounts for 606 of
+                // 1807 hoisted-and-never-assigned names (33.5%) across 218 of
+                // the 403 affected files, the largest cause by a wide margin.
+                //
+                // Widening only on EMPTY cannot reintroduce the B0.52 clobber
+                // this guard was added for. The diagnosis split the guard's
+                // misses into reg-was-empty and reg-had-value; the had-value
+                // half produced zero flagged names and zero fallback events. So
+                // the guard is right exactly when it has something to protect,
+                // and wrong exactly when it does not.
+                let reg_is_empty = matches!(regs.get(a), None | Some(RegVal::Unknown));
+                if !locals.declared.contains(&a) || holds_upval_alias || reg_is_empty {
                     regs[a] = RegVal::Expr(Expr::Name(name.clone()));
                     // The register is now an ALIAS of an existing binding (the
                     // upvalue), not a fresh slot. Without recording that, the
