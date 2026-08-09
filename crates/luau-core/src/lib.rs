@@ -679,13 +679,41 @@ pub fn decompile_with_plan(
         //       idx 35 still at solo=80 → remains below threshold → uses prior (no regression).
         const SOLO_CONFIDENCE_THRESHOLD: usize = 83;
         let solo_detected = parser::opmap::OpcodeMap::detect(&chunk);
-        let solo_is_authoritative = solo_detected.mapped_count >= SOLO_CONFIDENCE_THRESHOLD;
+
+        // A large script self-detects enough of the shuffle to stand on its own,
+        // and the original rule then IGNORED the prior entirely for such files.
+        // But "self-detects a lot" is not "self-detects correctly": a script can
+        // map 83 bytes and still have its own detectors mis-assign a confusable
+        // one — e.g. detect_arithmetic greedily claiming the true GETGLOBAL byte
+        // for MUL, which is exactly what left 282_Animate emitting `(v0*v172)()`
+        // and failing to compile. Discarding the prior threw away the one piece
+        // of evidence that had that byte right.
+        //
+        // The rule the gate was really reaching for is CROSS-SHUFFLE protection:
+        // the measured Animate collapse came from seeding a large script with a
+        // cache read off a DIFFERENT client permutation. So gate on that directly
+        // — keep solo authoritative only when the prior looks like a different
+        // shuffle (fewer than MIN_ANCHOR_AGREE anchors land on the same byte). A
+        // prior that IS this shuffle is strictly better evidence than one file's
+        // solo guess and must be folded in; `detect_with_prior` locks its entries
+        // and still runs every solo detector on top, so nothing self-detected is
+        // lost. `same_shuffle` is the same anchor predicate `resolve_for` already
+        // uses to admit ballots, so this trusts exactly the priors the consensus
+        // layer trusts.
+        let prior_is_same_shuffle = cached_opmap.is_some_and(|c| {
+            parser::consensus::same_shuffle(&solo_detected.heuristic_map, c)
+        });
+        let solo_is_authoritative = solo_detected.mapped_count >= SOLO_CONFIDENCE_THRESHOLD
+            && !prior_is_same_shuffle;
 
         let detected_opmap = if solo_is_authoritative {
-            // Large script self-detects reliably. Ignore the prior entirely.
+            // Large script, and the prior is a different (or unrecognisable)
+            // shuffle — self-detect and ignore the prior, as before.
             solo_detected
         } else if let Some(cached) = cached_opmap {
-            // Small script: use prior to help detection.
+            // Either a small script, or a large one whose prior is the SAME
+            // shuffle: fold the prior in so its high-confidence entries correct
+            // the confusable bytes the solo detectors got wrong.
             parser::opmap::OpcodeMap::detect_with_prior(&chunk, cached)
         } else {
             solo_detected
