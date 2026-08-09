@@ -611,13 +611,44 @@ pub struct DbSelection {
     pub entry_id: Option<String>,
 }
 
-/// Resolve the database path from the flag, falling back to `LUAU_OPMAP_DB`.
+/// Resolve the database path from the flag, falling back to `LUAU_OPMAP_DB`,
+/// then to a repo-bundled measured database if one is present.
+///
+/// The bundled fallback is existence-guarded and read-only, and the database
+/// itself only ever installs an entry that ANCHOR-MATCHES the chunk (a miss is a
+/// no-op — see `opmap_db`), so shipping a verified entry can only make matching
+/// files decode from a measurement instead of a guess; it can never corrupt a
+/// chunk from a different client build. This is what turns the measured
+/// permutation into the DEFAULT decode path for the client build it describes,
+/// rather than something every invocation must opt into by flag.
 fn db_path(cli: &Cli) -> Option<PathBuf> {
-    cli.opmap_db.clone().or_else(|| {
-        std::env::var_os("LUAU_OPMAP_DB")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    })
+    cli.opmap_db
+        .clone()
+        .or_else(|| {
+            std::env::var_os("LUAU_OPMAP_DB")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(bundled_db_path)
+}
+
+/// A measured-permutation database bundled with the repository, if present.
+///
+/// Checked relative to the current directory (how `batch` is normally run) and
+/// relative to the executable, so it is found whether the tool runs from the
+/// repo root or from an installed location. Returns `None` when no bundled
+/// database exists, which restores the exact prior behaviour.
+fn bundled_db_path() -> Option<PathBuf> {
+    const REL: &str = "opmap_db/roblox_v9_live.json";
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(REL)];
+    if let Ok(exe) = std::env::current_exe() {
+        // exe lives at target/<profile>/luau-decompiler.exe; the repo root is
+        // two directories up.
+        if let Some(root) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            candidates.push(root.join(REL));
+        }
+    }
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Does a measured entry apply to this file?
