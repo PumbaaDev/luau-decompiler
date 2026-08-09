@@ -1939,10 +1939,18 @@ fn lift_region(
             // to feed, and the write scan walks the arm's ACTUAL block ranges
             // (never `min..max` of a disjoint arm — the double-lift lesson).
             if let Some(mpc) = merge_pc {
-                let arm_ranges: Vec<(usize, usize)> = then_region
+                let then_ranges: Vec<(usize, usize)> = then_region
                     .iter()
-                    .chain(else_region.iter())
                     .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
+                let else_ranges: Vec<(usize, usize)> = else_region
+                    .iter()
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
+                let arm_ranges: Vec<(usize, usize)> = then_ranges
+                    .iter()
+                    .chain(else_ranges.iter())
+                    .copied()
                     .collect();
                 let after_start = cfg.blocks.get(mpc).map(|b| b.start).unwrap_or(*mpc);
                 premateralize_branch_escapes_spans(
@@ -1952,6 +1960,7 @@ fn lift_region(
                     locals,
                     stmts,
                     &arm_ranges,
+                    Some((&then_ranges, &else_ranges)),
                     after_start,
                     proto.code.len(),
                     find_branch_pc(proto, block.end),
@@ -3700,7 +3709,19 @@ pub(super) fn store_complex(
             // `ctx.reg_name` is idempotent at the same (reg, pc); calling
             // it here caches the synthesized name for downstream lookups
             // at the same PC.
-            let do_peek = !carried_is_loopvar;
+            //
+            // Round 4: a PINNED register never peeks. The pin's contract is
+            // one stable identity across its span (a loop body, a branch
+            // arm, a capture span); a semantic hint inside the span is a
+            // hint about the VALUE passing through the slot, not about the
+            // binding — honoring it shadow-demotes the arm write into a
+            // fresh local and the join annihilates it. That is the
+            // "pre-branch NAME-seeded registers still shadow-demote inside
+            // arms" residual 26f939b documented, and the reason the round-4
+            // unknown-seed pass could not hold without this gate
+            // (16_StickerPlacer: the arm CALL's "GetLocalPlayerCanvasSet"
+            // hint out-ranked the seeded identity).
+            let do_peek = !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc);
             let rebind_name: Option<String> = if do_peek {
                 let fresh = ctx.reg_name(proto, reg as u8, pc);
                 if fresh != name && is_semantic_local_name(&fresh) {
@@ -5737,8 +5758,12 @@ fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool
 /// Pinning over the branch range routes the in-body write through
 /// `store_complex`'s pinned-register path so it is emitted rather than folded.
 ///
-/// Narrow by construction: only registers that (a) the branch writes, (b)
-/// currently hold a parked LITERAL, and (c) are read after the branch.
+/// Narrow by construction: only registers that (a) the branch writes and (c)
+/// later code reads, AND (b) currently hold a parked pure expression — a
+/// literal or a larger side-effect-free expr such as `self.Amount` or
+/// `self.Amount .. " Pair"`. Registers already bound to a declared local are
+/// left alone (see `premateralize_branch_escapes_spans` for why pinning them
+/// regressed clean files).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn premateralize_branch_escapes(
     ctx: &mut DecompileContext,
@@ -5762,10 +5787,68 @@ pub(super) fn premateralize_branch_escapes(
         locals,
         stmts,
         &[(branch_start, branch_end)],
+        None,
         after_start,
         after_end,
         pc,
     );
+}
+
+/// Split-arm variant for the INLINE if/else diamonds (`detect_else_skip`
+/// shapes in `lift_instruction_range`). Passes the then/else spans separately
+/// so the round-4 unknown-seed case can require a write in BOTH arms — the
+/// gate that makes a bare seeded declaration bit-exact against the bytecode.
+///
+/// The parked-pure scan is unchanged: its write-scan domain is the union of
+/// the two spans, and the only gap between them is the else-skip JUMP, which
+/// writes nothing — so this is span-for-span the behavior the single-range
+/// wrapper had for these callers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn premateralize_branch_escapes_split(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    then_range: (usize, usize),
+    else_range: Option<(usize, usize)>,
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    match else_range {
+        Some(er) => {
+            let then_ranges = [then_range];
+            let else_ranges = [er];
+            let arm_ranges = [then_range, er];
+            premateralize_branch_escapes_spans(
+                ctx,
+                proto,
+                regs,
+                locals,
+                stmts,
+                &arm_ranges,
+                Some((&then_ranges, &else_ranges)),
+                after_start,
+                after_end,
+                pc,
+            );
+        }
+        None => {
+            premateralize_branch_escapes(
+                ctx,
+                proto,
+                regs,
+                locals,
+                stmts,
+                then_range.0,
+                then_range.1,
+                after_start,
+                after_end,
+                pc,
+            );
+        }
+    }
 }
 
 /// Multi-span core of `premateralize_branch_escapes`, for the region-level
@@ -5776,14 +5859,25 @@ pub(super) fn premateralize_branch_escapes(
 /// actual block ranges and touch nothing in the gaps.
 ///
 /// Per register the logic is unchanged from the single-span version: a
-/// register that (a) some arm writes, (b) currently holds a parked literal,
-/// and (c) later code reads, is materialized from its pre-branch value BEFORE
-/// the caller snapshots the register file, and pinned across every arm range
-/// so `store_complex` emits the arm writes as reassignments to that one name
-/// instead of parking them (region merges collapse disagreeing parks to
-/// `Unknown`; the inline paths hard-restore the snapshot — either way an
-/// unpinned arm write is annihilated at the join and every later read of the
-/// register becomes a permanently-nil hoisted `vN`).
+/// register that (a) some arm writes, (b) currently holds a parked PURE
+/// expression (a literal, or a larger side-effect-free expr — the widening
+/// over 26f939b's literal-only gate), and (c) later code reads, is
+/// materialized from its pre-branch value BEFORE the caller snapshots the
+/// register file, and pinned across every arm range so `store_complex` emits
+/// the arm writes as reassignments to that one name instead of parking them
+/// (region merges collapse disagreeing parks to `Unknown`; the inline paths
+/// hard-restore the snapshot — either way an unpinned arm write is
+/// annihilated at the join and every later read of the register becomes a
+/// permanently-nil hoisted `vN`, or a silent read of the stale pre-branch
+/// value).
+///
+/// A register already bound to a DECLARED local is deliberately excluded. It
+/// needs no declaration, so pinning would only route its arm writes through
+/// the reassignment path — but a declared local's register is routinely reused
+/// as a compare/scratch operand, and pinning one name across the arms orphaned
+/// a later reader on the corpus (476_BadgeMenu, clean bytecode). The
+/// name-seeded arm-rebind is a genuine residual; pin-only threading is not its
+/// cure.
 #[allow(clippy::too_many_arguments)]
 fn premateralize_branch_escapes_spans(
     ctx: &mut DecompileContext,
@@ -5792,6 +5886,7 @@ fn premateralize_branch_escapes_spans(
     locals: &mut LocalTracker,
     stmts: &mut Vec<Stat>,
     arm_ranges: &[(usize, usize)],
+    split_arms: Option<(&[(usize, usize)], &[(usize, usize)])>,
     after_start: usize,
     after_end: usize,
     pc: usize,
@@ -5811,16 +5906,90 @@ fn premateralize_branch_escapes_spans(
         if reg >= regs.len() {
             continue;
         }
-        let parked_literal = matches!(
-            regs.get(reg),
-            Some(RegVal::Expr(
-                Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_)
-            ))
-        );
-        if !parked_literal {
+        if !reg_used_in_range(&proto.code, after_start, after_end, reg) {
             continue;
         }
-        if !reg_used_in_range(&proto.code, after_start, after_end, reg) {
+        // Round 4 — the UNKNOWN-seed case, the residual this file's parked-pure
+        // gate left open (16_StickerPlacer proto 15, 162_Badges proto 10, both
+        // traced to raw operand fields): a register with NO pre-branch binding
+        // at all, written by BOTH arms of a real two-arm diamond, and read at
+        // the merge. The parked-pure gate below can never fire for it (there
+        // is nothing to materialize), so the fallthrough arm's write parked
+        // and was annihilated by `merge_regs`, the other arm's write
+        // shadow-demoted into an arm-local, and the merge read minted an
+        // unbound `vN` — `declared_never_assigned`, the largest class of the
+        // round-4 census (35 of 69 bc defects).
+        //
+        // Seed a BARE `local <name>` before the branch and pin both arm spans
+        // so every arm write is emitted against that one identity.
+        //
+        // Soundness gates, each necessary:
+        //   * `RegVal::Unknown` + `is_undeclared_non_param` — never touch a
+        //     declared local or parameter slot (the 476_BadgeMenu lesson:
+        //     threading one name over a reused slot orphans later readers);
+        //   * BOTH split arms must write the register — then the merge read
+        //     provably never observes the unknown pre-branch value, so the
+        //     bare declaration is bit-exact against the bytecode. A one-arm
+        //     write would make the seed assert `nil` for a path whose true
+        //     value we lost — that shape stays unfixed and FLAGGED;
+        //   * the merge must READ the register before any redefinition
+        //     (`reg_dead_on_entry` false) — otherwise the arm writes are dead
+        //     and the seed is pure noise;
+        //   * the minted name must be NON-generic — `pinned_write_consumed`
+        //     refuses `vN` bindings because chunk-wide `vN` folding conflates
+        //     unrelated variables (the 551_Shop compile failure).
+        if let Some((then_ranges, else_ranges)) = split_arms {
+            let unknown_seed = matches!(regs.get(reg), Some(RegVal::Unknown))
+                && locals.is_undeclared_non_param(reg)
+                && !then_ranges.is_empty()
+                && !else_ranges.is_empty()
+                && ranges_write_reg(&proto.code, then_ranges, reg)
+                && ranges_write_reg(&proto.code, else_ranges, reg)
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+            if unknown_seed {
+                let mut name = ctx.reg_name(proto, reg as u8, pc);
+                if opcode_handlers::is_generic_placeholder(&name) {
+                    name = format!("sel{}", reg);
+                }
+                let (kind, final_name) = locals.classify_write(reg, &name);
+                // `is_undeclared_non_param` guarantees FirstDecl; anything
+                // else means tracker state moved under us — bail rather than
+                // thread a name we do not own.
+                if kind == WriteKind::FirstDecl {
+                    stmts.push(Stat::Local { names: vec![final_name.clone()], values: Vec::new() });
+                    regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
+                    for &(s, e) in arm_ranges {
+                        if e > s {
+                            ctx.pin_reg_name(reg as u8, &final_name, s, e);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        // Widen the seed gate from LITERAL-only (the residual 26f939b left) to
+        // ANY parked pure expression. `self.Amount` (a Field) and
+        // `self.Amount .. " Pair"` (a BinOp) are parked exactly like a literal
+        // and were lost at the join exactly like one — census exhibits
+        // 110_Collect_Tokens and 148_Match_Pairs, both bytecode-traced. Purity
+        // is the park contract (`store_complex` parks only inlinable exprs), so
+        // evaluating the seed early cannot duplicate or reorder a side effect.
+        //
+        // A register ALREADY bound to a declared local (`RegVal::Name` matching
+        // the tracker) is deliberately NOT handled here: pinning that name
+        // across the arms threads it over reused compare/scratch operands and
+        // orphaned a later reader on the corpus (measured: it minted a fresh
+        // unbound `vN` in 476_BadgeMenu — CLEAN bytecode — and 111_Mechsquitos,
+        // for +4 clean but −2 previously-clean files per corpus). That
+        // name-seeded rebind is a real residual, but pin-only threading is the
+        // wrong cure; left for a pass that can distinguish a carried identity
+        // from a repurposed register.
+        let parked_pure = matches!(
+            regs.get(reg),
+            Some(RegVal::Expr(e)) if expr_is_inlinable(e)
+                && !matches!(e, Expr::Name(_))
+        );
+        if !parked_pure {
             continue;
         }
         let value = reg_expr(regs, reg);
@@ -5834,6 +6003,211 @@ fn premateralize_branch_escapes_spans(
             }
         }
     }
+}
+
+/// Does ANY span in `ranges` contain an instruction writing `reg`?
+/// Same opcode write-set as `collect_body_writes` — kept in terms of it so the
+/// two can never disagree about what counts as a write.
+fn ranges_write_reg(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool {
+    ranges
+        .iter()
+        .filter(|(s, e)| e > s)
+        .any(|&(s, e)| collect_body_writes(code, s, e).contains(&reg))
+}
+
+/// Is the FIRST post-merge touch of `reg` a genuine READ?
+///
+/// `reg_dead_on_entry` cannot answer this: its pure-definition list omits
+/// every table read, arith op and call, so a `GETTABLEKS R6 = ...`
+/// REDEFINITION of a scratch register counts as "live" there. Seeding on that
+/// answer declared `local Parent` / `local fromRGB` / `local Score` for
+/// call-setup scratch that nothing ever assigns (137_TradableGrid,
+/// 191_BuffTile, 317_GroupQuestListenerOld — the three regressions the first
+/// cut of round 4 introduced, all reverted by this classifier).
+///
+/// Per-opcode operand roles, walked instruction-aligned. Anything not
+/// explicitly classified stops the scan with `false` — an unrecognised
+/// opcode suppresses the seed, never invents one, so the failure mode is
+/// "defect stays flagged", not "bare declaration nothing assigns".
+fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    use LuauOpcode as Op;
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = Op::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        let aux = if op.has_aux() { code.get(i + 1).copied().unwrap_or(0) } else { 0 };
+
+        let mut reads: Vec<usize> = Vec::new();
+        let mut writes: Vec<usize> = Vec::new();
+        let mut classified = true;
+        match op {
+            // Pure definitions — write A, read nothing.
+            Op::LoadNil | Op::LoadB | Op::LoadN | Op::LoadK | Op::LoadKX
+            | Op::GetGlobal | Op::GetImport | Op::GetUpval | Op::NewTable
+            | Op::DupTable | Op::NewClosure | Op::DupClosure | Op::GetVarargs => {
+                writes.push(a);
+            }
+            Op::Move => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::Not | Op::Minus | Op::Length => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::IDiv
+            | Op::And | Op::Or | Op::Band | Op::Bor | Op::Bxor | Op::Shl | Op::Shr => {
+                reads.push(b);
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::AddK | Op::SubK | Op::MulK | Op::DivK | Op::ModK | Op::PowK
+            | Op::IDivK | Op::AndK | Op::OrK | Op::Bandk | Op::Bork | Op::Bnot => {
+                reads.push(b);
+                writes.push(a);
+            }
+            // SUBRK/DIVRK: A = K(B) op R(C).
+            Op::SubRK | Op::DivRK => {
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::Concat => {
+                for r in b..=c.max(b) {
+                    reads.push(r);
+                }
+                writes.push(a);
+            }
+            Op::GetTable => {
+                reads.push(b);
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::GetTableKS | Op::GetTableN => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::SetTable => {
+                reads.push(a);
+                reads.push(b);
+                reads.push(c);
+            }
+            Op::SetTableKS | Op::SetTableN => {
+                reads.push(a);
+                reads.push(b);
+            }
+            Op::SetGlobal | Op::SetUpval => {
+                reads.push(a);
+            }
+            Op::SetList => {
+                // Table A, values B.. — everything involved is a read of state
+                // built earlier; A is mutated in place, not redefined.
+                reads.push(a);
+                reads.push(b);
+            }
+            Op::NameCall => {
+                reads.push(b);
+                writes.push(a);
+                writes.push(a + 1);
+            }
+            Op::Call => {
+                // Reads function + args FIRST, then writes results.
+                if b == 0 {
+                    if reg >= a {
+                        return true;
+                    }
+                } else {
+                    for r in a..a + b {
+                        reads.push(r);
+                    }
+                }
+                if c == 0 {
+                    // Writes A..top — unknowable; stop conservatively unless
+                    // the read set already claimed it.
+                    if reads.contains(&reg) {
+                        return true;
+                    }
+                    return false;
+                }
+                for r in a..(a + c).saturating_sub(1) {
+                    writes.push(r);
+                }
+            }
+            Op::Return => {
+                if b == 0 {
+                    if reg >= a {
+                        return true;
+                    }
+                } else {
+                    for r in a..(a + b).saturating_sub(1) {
+                        reads.push(r);
+                    }
+                }
+            }
+            Op::JumpIf | Op::JumpIfNot => {
+                reads.push(a);
+            }
+            Op::JumpIfEq | Op::JumpIfNotEq | Op::JumpIfLE | Op::JumpIfNotLE
+            | Op::JumpIfLT | Op::JumpIfNotLT => {
+                reads.push(a);
+                reads.push((aux & 0xFF) as usize);
+            }
+            Op::JumpXEqKNil | Op::JumpXEqKB | Op::JumpXEqKN | Op::JumpXEqKS => {
+                reads.push(a);
+            }
+            Op::ForNPrep | Op::ForNLoop => {
+                reads.push(a);
+                reads.push(a + 1);
+                reads.push(a + 2);
+                writes.push(a + 3);
+            }
+            Op::ForGPrep | Op::ForGPrepNext | Op::ForGPrepINext | Op::ForGLoop => {
+                reads.push(a);
+                reads.push(a + 1);
+                reads.push(a + 2);
+                // Loop vars A+3.. are writes; the exact arity lives in AUX —
+                // treat any higher touch as a write.
+                if reg > a + 2 {
+                    writes.push(reg);
+                }
+            }
+            Op::Capture => {
+                // Types VAL(0)/REF(1) read parent register B.
+                if a <= 1 {
+                    reads.push(b);
+                }
+            }
+            // Control flow that touches no registers.
+            Op::Nop | Op::Break | Op::Jump | Op::JumpBack | Op::JumpX
+            | Op::CloseUpvals | Op::Coverage | Op::PrepVarargs => {}
+            // FASTCALL variants are speculative mirrors of the CALL that
+            // follows; the CALL decides. They touch nothing here.
+            Op::FastCall | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K
+            | Op::FastCall3 => {}
+            _ => {
+                classified = false;
+            }
+        }
+
+        if !classified {
+            // Unknown opcode — cannot trust roles. Suppress the seed.
+            if a == reg || b == reg || c == reg {
+                return false;
+            }
+        } else {
+            if reads.contains(&reg) {
+                return true;
+            }
+            if writes.contains(&reg) {
+                return false;
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec<usize> {
@@ -6332,8 +6706,18 @@ pub(super) fn is_impossible_as_table(e: &Expr) -> bool {
         ),
         Expr::BinOp { op, .. } => matches!(
             op,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
-            | BinOp::Mod | BinOp::Pow | BinOp::IDiv | BinOp::Concat
+            // Add/Sub/Mul/Div are NOT rejected. B0.59 assumed "arith → number",
+            // which is false in Roblox Luau: Vector3/Vector2/CFrame/UDim2 all
+            // overload exactly these four operators and their results are
+            // indexed constantly — `(a - b).magnitude` is the idiomatic
+            // distance. The round-3 defect census measured every value this
+            // guard discarded across the 111-defect corpus: Sub x92 / Add x12 /
+            // Mul x11 / Div x3 and NOTHING else, each one the exact expression
+            // the bytecode then indexes (473_DragManager pc31 SUB → pc39/47
+            // GETTABLEKS .X/.Y; 511_TriangleMaker pc21 SUB → pc22 GETTABLEKS
+            // .magnitude — raw-field traces under the measured v9 map).
+            // Rejecting them converted correct values into unbound `vN` nils.
+            BinOp::Mod | BinOp::Pow | BinOp::IDiv | BinOp::Concat
             | BinOp::Eq | BinOp::NotEq
             | BinOp::LT | BinOp::LE | BinOp::GT | BinOp::GE
             | BinOp::BAnd | BinOp::BOr | BinOp::BXor

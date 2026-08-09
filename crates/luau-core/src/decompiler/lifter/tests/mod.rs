@@ -76,3 +76,13 @@ mod getupval_retarget_tests;
 #[cfg(test)]
 mod branch_arm_for_recovery_tests;
 mod branch_merge_reg_tests;
+#[cfg(test)]
+mod ref_capture_write_pin_tests;
+#[cfg(test)]
+mod branch_seed_shape_tests;
+#[cfg(test)]
+mod pinned_arm_write_tests;
+
+mod arith_table_base_tests;
+#[cfg(test)]
+mod branch_unknown_seed_tests;

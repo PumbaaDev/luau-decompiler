@@ -52,7 +52,7 @@ use super::{
     reg_expr,
     sanitize_leaked_global_string,
     simplify_expr,
-    premateralize_branch_escapes,
+    premateralize_branch_escapes_split,
     store_complex,
     table_expr,
     // Recursive closure lifting — called on every `NewClosure` opcode.
@@ -97,7 +97,11 @@ fn maybe_emit_self_arith_guard(
 /// be used to promote a CALL arg from another generic (lateral swap)?
 /// Matches `v12`, `fn3`, `call7`, `arg4`, `upval_2`. Rejects real names
 /// that happen to share a prefix (`value`, `vec3`, `argon`, `calling`).
-fn is_generic_placeholder(name: &str) -> bool {
+/// `pub(super)` since round 4: the branch-seed pass in `mod.rs` must mint
+/// names OUTSIDE this family (a `vN` seed is folded chunk-wide by
+/// `free_var_decls` and treated as disposable by cleanup passes — the
+/// 551_Shop compile failure).
+pub(super) fn is_generic_placeholder(name: &str) -> bool {
     let rest = name.strip_prefix("upval_")
         .or_else(|| name.strip_prefix("call"))
         .or_else(|| name.strip_prefix("arg"))
@@ -222,6 +226,93 @@ fn reg_is_open_ref_capture(code: &[u32], upto_pc: usize, a: usize) -> bool {
         i += if op.has_aux() { 2 } else { 1 };
     }
     open
+}
+
+/// Forward-looking twin of [`reg_is_open_ref_capture`]: the pc of the first
+/// `CLOSEUPVALS` at or after `from_pc` whose A operand closes `reg`
+/// (`A <= reg`), or `code.len()` when the capture stays open to the end of
+/// the proto.
+///
+/// That pc is exactly where Luau is again free to rebind the slot; up to it,
+/// every write to `reg` is by construction an assignment to the SAME captured
+/// variable, never the declaration of a new one.
+fn ref_capture_close_pc(code: &[u32], from_pc: usize, reg: usize) -> usize {
+    let mut i = from_pc;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::CloseUpvals && (insn_a(insn) as usize) <= reg {
+            return i;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    code.len()
+}
+
+/// A write to a register the premateralizer PINNED must be EMITTED as an
+/// assignment to the pinned binding — the pin's whole contract is that the
+/// register's value is observable through another route (a post-join read, a
+/// closure's upvalue, a loop back-edge), so a register-file-only park is
+/// annihilated before that observer sees it (`merge_regs` collapses
+/// disagreeing parks to `Unknown`; the inline paths hard-restore the
+/// snapshot).
+///
+/// `store_complex` and the MOVE handler already honor the pin. This helper
+/// gives the DIRECT-PARK handlers (GETUPVAL / LOADNIL / GETGLOBAL — writers
+/// that never route through `store_complex`) the same path. Measured shape
+/// (538_RingPulse child "OnUpdate"): six nil-seeded locals, both diamond arms
+/// filling them purely via GETUPVAL — every arm write was parked, annihilated
+/// at the join, and the post-join reads minted six permanently-nil names.
+///
+/// Returns `true` when it consumed the write. Gates:
+///  * the register is pinned AT THIS PC — outside a pin span, parking is the
+///    correct, deliberate inlining behavior;
+///  * the register currently holds its own bound local (`regs` name ==
+///    tracker name) — a pin whose seed never materialized has no binding to
+///    assign to, and a stale alias must not become an assignment target;
+///  * a self-assign (`n = n`) emits nothing but still counts as consumed, so
+///    the caller does not re-park an alias over the binding.
+fn pinned_write_consumed(
+    ctx: &DecompileContext,
+    regs: &mut [RegVal],
+    locals: &LocalTracker,
+    stmts: &mut Vec<Stat>,
+    a: usize,
+    pc: usize,
+    value: Expr,
+) -> bool {
+    if !ctx.is_pinned_reg(a as u8, pc) {
+        return false;
+    }
+    let bound = match regs.get(a) {
+        Some(RegVal::Expr(Expr::Name(n))) if locals.current_name(a) == Some(n.as_str()) => {
+            n.clone()
+        }
+        _ => return false,
+    };
+    // A generic `vN` binding is NOT a safe assignment target. Those names are
+    // minted per-register (`reg_expr`'s v{idx} family) with no chunk-wide
+    // uniqueness, `free_var_decls` folds every same-named orphan into ONE
+    // chunk-top `local vN`, and the artifact-cleanup passes deliberately
+    // treat `v\d+` locals as disposable (C10j drops, literal propagation).
+    // Routing real dataflow through such a name conflates unrelated
+    // variables: on 551_Shop the seed "v16" collided with an upvalue and two
+    // other protos' mints, a cleanup pass const-propagated a stale `0` into
+    // the new reads, and the output gained `(0):TweenPosition(...)` — a
+    // compile failure. Falling through keeps the old alias-park behavior for
+    // exactly the generic-named minority.
+    if is_generic_placeholder(&bound) {
+        return false;
+    }
+    if matches!(&value, Expr::Name(s) if *s == bound) {
+        return true;
+    }
+    stmts.push(Stat::Assign {
+        targets: vec![Expr::Name(bound.clone())],
+        values: vec![value],
+    });
+    regs[a] = RegVal::Expr(Expr::Name(bound));
+    true
 }
 
 /// Does this opcode define (write) register R(A)?
@@ -564,11 +655,18 @@ pub(super) fn lift_instruction_range(
             | LuauOpcode::PrepVarargs | LuauOpcode::Capture => {}
 
             LuauOpcode::LoadNil => {
-                // Just store nil in register for inlining — don't emit `local vN = nil`.
-                // Downstream code that uses this register will inline the nil.
-                // This matches LOADK's store_complex behavior (nil is "simple").
-                regs[a] = RegVal::Expr(Expr::Nil);
-                explicit_nil_regs.insert(a);
+                // A pinned register's nil write is as much a write as any
+                // other: emit `<bound> = nil` (and do NOT mark the register
+                // as an explicit-nil park — it still holds its binding).
+                if pinned_write_consumed(ctx, regs, locals, stmts, a, pc, Expr::Nil) {
+                    // consumed
+                } else {
+                    // Just store nil in register for inlining — don't emit `local vN = nil`.
+                    // Downstream code that uses this register will inline the nil.
+                    // This matches LOADK's store_complex behavior (nil is "simple").
+                    regs[a] = RegVal::Expr(Expr::Nil);
+                    explicit_nil_regs.insert(a);
+                }
             }
             LuauOpcode::LoadB => {
                 if c != 0 {
@@ -715,7 +813,11 @@ pub(super) fn lift_instruction_range(
                 // When all resolution fails, the instruction is likely a misaligned
                 // data word — absorb silently instead of emitting garbage.
                 if let Some(name) = resolve_global_name(proto, &ctx.chunk.strings, d, aux) {
-                    regs[a] = RegVal::Expr(Expr::Name(name));
+                    // A global read into a pinned register is a write like any
+                    // other — emit it, or the join annihilates it.
+                    if !pinned_write_consumed(ctx, regs, locals, stmts, a, pc, Expr::Name(name.clone())) {
+                        regs[a] = RegVal::Expr(Expr::Name(name));
+                    }
                 } else {
                     regs[a] = RegVal::Unknown;
                 }
@@ -732,6 +834,16 @@ pub(super) fn lift_instruction_range(
 
             LuauOpcode::GetUpval => {
                 let name = ctx.upval_name(proto, proto_index, b as u8);
+                // A pinned destination register (premateralized branch seed,
+                // loop-carried accumulator, or open ref-capture span) must
+                // have this write EMITTED: the alias park below never reaches
+                // the AST, and inside an arm span the join annihilates it —
+                // the RingPulse shape (six GETUPVAL-only arm writes, all
+                // lost, six permanently-nil post-join reads).
+                if pinned_write_consumed(ctx, regs, locals, stmts, a, pc, Expr::Name(name.clone())) {
+                    pc += 1;
+                    continue;
+                }
                 // The store is UNCONDITIONAL. It was guarded from Phase B0.52
                 // until the compile gate proved the guard wrong (7/628
                 // failures, 6 sharing one signature).
@@ -2009,6 +2121,59 @@ pub(super) fn lift_instruction_range(
                                 name
                             };
 
+                            // A register captured by REFERENCE stays the SAME
+                            // variable for every write between this CAPTURE and
+                            // the CLOSEUPVALS that releases it — the allocator
+                            // cannot rebind the slot while the upvalue is open.
+                            // The one site that knew this
+                            // (`reg_is_open_ref_capture`, guarding closure
+                            // stores) left every OTHER write path free to split
+                            // the binding: JellyBeanToss's `MOVE R12 R16`
+                            // copy-propagated the `RenderStepped:Connect(...)`
+                            // result straight past the declared `local result3`
+                            // that the child closure Disconnects, leaving the
+                            // child reading a never-assigned name (census class
+                            // declared_never_assigned, mechanism 1b).
+                            //
+                            // Pin the register to its bound name for exactly
+                            // that span, riding the same machinery
+                            // `premateralize_loop_carried` uses for loop-carried
+                            // accumulators. The invariant is identical: the
+                            // register's value is observable through another
+                            // route (here the closure's upvalue), so every
+                            // write must be EMITTED as an assignment to one
+                            // stable name — never parked in the register file,
+                            // never shadow-declared under a fresh name. The pin
+                            // pre-seeds `reg_name` across the span, so the CALL
+                            // / store_complex / classify_write paths all
+                            // resolve to the pinned name and classify their
+                            // writes as Reassign; the MOVE handler's
+                            // `pinned_dest` arm materializes copy-propagated
+                            // stores outright.
+                            //
+                            // Gates: a REAL remapped CAPTURE only (a structural
+                            // guess must not pin); REF kind only (a VAL capture
+                            // copies, so a later write to the register is the
+                            // allocator reusing a dead slot for a NEW variable,
+                            // which a pin would wrongly redirect into the old
+                            // one); and the register must currently hold its
+                            // bound local (`regs` name == tracker name) — a
+                            // register that never got a binding here is the
+                            // census's 1a family, not this one.
+                            if cap_op == LuauOpcode::Capture && cap_type == 1 {
+                                if let Some(RegVal::Expr(Expr::Name(n))) =
+                                    regs.get(cap_idx as usize)
+                                {
+                                    if locals.current_name(cap_idx as usize)
+                                        == Some(n.as_str())
+                                    {
+                                        let close =
+                                            ref_capture_close_pc(code, cap_pc, cap_idx as usize);
+                                        ctx.pin_reg_name(cap_idx, n, cap_pc + 1, close);
+                                    }
+                                }
+                            }
+
                             inferred_upval_names.push(name);
                             cap_pc += 1;
                         } else {
@@ -2601,6 +2766,18 @@ pub(super) fn lift_instruction_range(
                             // producing nested MethodCall expressions instead of
                             // intermediate local variables.
                             regs[a] = RegVal::Expr(call_expr);
+                        } else if pinned_write_consumed(
+                            ctx, regs, locals, stmts, a, pc, call_expr.clone(),
+                        ) {
+                            // Round 4: a call result landing in a PINNED
+                            // register is an arm/loop write like any other —
+                            // it must be emitted as an assignment to the
+                            // pinned identity, not classified into a fresh
+                            // arm-local that the join annihilates
+                            // (16_StickerPlacer: `R2 = tbl.GetLocalPlayer
+                            // CanvasSet()` inside the else arm became `local
+                            // GetLocalPlayerCanvasSet3 = ...` and the merge
+                            // read minted `v2`).
                         } else {
                             // Phase B0.49: classify_write for shadow-on-rename.
                             let (kind, name) = locals.classify_write(a, &new_name);
@@ -2951,11 +3128,15 @@ pub(super) fn lift_instruction_range(
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join
                     // silently reads the stale pre-branch literal. Mirrors the
-                    // JumpIfEq-family arm.
+                    // JumpIfEq-family arm. Split arms (round 4) so a register
+                    // with NO pre-branch binding written by BOTH arms gets a
+                    // seeded identity instead of a minted `vN` at the join —
+                    // 162_Badges proto 10, whose diamond sits INSIDE the outer
+                    // `if arg2.Badges` arm and lifts through this inline path.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
-                    premateralize_branch_escapes(
+                    premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        jump_next, construct_end, construct_end, end, pc,
+                        (jump_next, then_end), else_range, construct_end, end, pc,
                     );
 
                     // Lift the guarded block with isolated register state so
@@ -3082,11 +3263,12 @@ pub(super) fn lift_instruction_range(
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join silently
-                    // reads the stale pre-branch literal.
+                    // reads the stale pre-branch literal. Split arms (round 4):
+                    // see the JumpIf arm.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
-                    premateralize_branch_escapes(
+                    premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        jump_next, construct_end, construct_end, end, pc,
+                        (jump_next, then_end), else_range, construct_end, end, pc,
                     );
 
                     // Isolate register state so then-body doesn't corrupt fall-through.
@@ -3192,11 +3374,12 @@ pub(super) fn lift_instruction_range(
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join
                     // silently reads the stale pre-branch literal. Mirrors the
-                    // JumpIfEq-family arm.
+                    // JumpIfEq-family arm. Split arms (round 4): see the
+                    // JumpIf arm.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
-                    premateralize_branch_escapes(
+                    premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        jump_next, construct_end, construct_end, end, pc,
+                        (jump_next, then_end), else_range, construct_end, end, pc,
                     );
 
                     // Isolate register state so then-body doesn't corrupt fall-through.
