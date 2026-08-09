@@ -2941,15 +2941,27 @@ pub(super) fn lift_instruction_range(
                     } else {
                         Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) } // JumpIf: skip when true
                     };
-                    // Lift the guarded block with isolated register state so
-                    // assignments inside the then-body don't corrupt the
-                    // fall-through path's register view.
-                    let regs_snapshot = regs.clone();
                     let jump_next = pc + 1 + if op.has_aux() { 1 } else { 0 };
 
                     // If/else diamond: see the JumpXEqK* arm below.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end);
+
+                    // Name any parked literal this branch overwrites and later
+                    // code reads, BEFORE snapshotting — otherwise the restore
+                    // below annihilates the branch's result and the join
+                    // silently reads the stale pre-branch literal. Mirrors the
+                    // JumpIfEq-family arm.
+                    let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    premateralize_branch_escapes(
+                        ctx, proto, regs, locals, stmts,
+                        jump_next, construct_end, construct_end, end, pc,
+                    );
+
+                    // Lift the guarded block with isolated register state so
+                    // assignments inside the then-body don't corrupt the
+                    // fall-through path's register view.
+                    let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
@@ -3164,8 +3176,6 @@ pub(super) fn lift_instruction_range(
                 let exits_loop = ctx.current_loop_end.map_or(false, |le| target >= le);
                 if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
-                    // Isolate register state so then-body doesn't corrupt fall-through.
-                    let regs_snapshot = regs.clone();
                     let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
                     let jump_next = pc + 2; // these have AUX word
 
@@ -3177,6 +3187,20 @@ pub(super) fn lift_instruction_range(
                     // the else body is lifted as if it were unconditional.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end);
+
+                    // Name any parked literal this branch overwrites and later
+                    // code reads, BEFORE snapshotting — otherwise the restore
+                    // below annihilates the branch's result and the join
+                    // silently reads the stale pre-branch literal. Mirrors the
+                    // JumpIfEq-family arm.
+                    let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    premateralize_branch_escapes(
+                        ctx, proto, regs, locals, stmts,
+                        jump_next, construct_end, construct_end, end, pc,
+                    );
+
+                    // Isolate register state so then-body doesn't corrupt fall-through.
+                    let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);

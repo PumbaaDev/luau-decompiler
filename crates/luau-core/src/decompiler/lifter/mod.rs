@@ -1922,6 +1922,42 @@ fn lift_region(
             // Extract the condition expression from the branch instruction
             let condition = extract_branch_condition(ctx, proto, find_branch_pc(proto, block.end), regs);
 
+            // Name any parked literal the arms overwrite and later code reads,
+            // BEFORE snapshotting. Without this the arm writes stay parked in
+            // the register file, `merge_regs` collapses the disagreeing parks
+            // to `Unknown` at the join, `is_empty_if` then deletes the (still
+            // statement-free) arms, and every post-merge read of the register
+            // becomes a permanently-nil hoisted `vN`. The measured shape
+            // (95_TaskTypes GetStat): `LOADNIL R2`, a three-way ORK diamond
+            // writing R2, `SUB R2 ...` after the merge — the whole diamond
+            // vanished and the read arrived as `v2`. Pinning routes each arm
+            // write through `store_complex`'s pinned path, so the arms emit
+            // `v2 = ...` reassignments against ONE pre-declared identity and
+            // the diamond survives as an if/else.
+            //
+            // Only when a merge exists: arms that return/diverge have no join
+            // to feed, and the write scan walks the arm's ACTUAL block ranges
+            // (never `min..max` of a disjoint arm — the double-lift lesson).
+            if let Some(mpc) = merge_pc {
+                let arm_ranges: Vec<(usize, usize)> = then_region
+                    .iter()
+                    .chain(else_region.iter())
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
+                let after_start = cfg.blocks.get(mpc).map(|b| b.start).unwrap_or(*mpc);
+                premateralize_branch_escapes_spans(
+                    ctx,
+                    proto,
+                    regs,
+                    locals,
+                    stmts,
+                    &arm_ranges,
+                    after_start,
+                    proto.code.len(),
+                    find_branch_pc(proto, block.end),
+                );
+            }
+
             // Snapshot register state before branches so then/else don't
             // corrupt each other's view of the registers.
             let regs_before = regs.clone();
@@ -5716,10 +5752,59 @@ pub(super) fn premateralize_branch_escapes(
     after_end: usize,
     pc: usize,
 ) {
-    if branch_end <= branch_start || after_end <= after_start {
+    if branch_end <= branch_start {
         return;
     }
-    let mut writes = collect_body_writes(&proto.code, branch_start, branch_end);
+    premateralize_branch_escapes_spans(
+        ctx,
+        proto,
+        regs,
+        locals,
+        stmts,
+        &[(branch_start, branch_end)],
+        after_start,
+        after_end,
+        pc,
+    );
+}
+
+/// Multi-span core of `premateralize_branch_escapes`, for the region-level
+/// if/else lift whose arms are NON-CONTIGUOUS CFG block lists. Collapsing a
+/// disjoint arm to `min(start)..max(end)` is exactly the mistake that
+/// double-lifted foreign blocks in the first arm-loop fix (see
+/// `lift_branch_region`), so the write scan and the pin both walk the arm's
+/// actual block ranges and touch nothing in the gaps.
+///
+/// Per register the logic is unchanged from the single-span version: a
+/// register that (a) some arm writes, (b) currently holds a parked literal,
+/// and (c) later code reads, is materialized from its pre-branch value BEFORE
+/// the caller snapshots the register file, and pinned across every arm range
+/// so `store_complex` emits the arm writes as reassignments to that one name
+/// instead of parking them (region merges collapse disagreeing parks to
+/// `Unknown`; the inline paths hard-restore the snapshot — either way an
+/// unpinned arm write is annihilated at the join and every later read of the
+/// register becomes a permanently-nil hoisted `vN`).
+#[allow(clippy::too_many_arguments)]
+fn premateralize_branch_escapes_spans(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    arm_ranges: &[(usize, usize)],
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    if after_end <= after_start {
+        return;
+    }
+    let mut writes: Vec<usize> = Vec::new();
+    for &(s, e) in arm_ranges {
+        if e > s {
+            writes.extend(collect_body_writes(&proto.code, s, e));
+        }
+    }
     writes.sort_unstable();
     writes.dedup();
     for reg in writes {
@@ -5742,7 +5827,11 @@ pub(super) fn premateralize_branch_escapes(
         emit_local_or_assign(ctx, proto, regs, locals, stmts, reg, pc, value);
         if let RegVal::Expr(Expr::Name(n)) = &regs[reg] {
             let name = n.clone();
-            ctx.pin_reg_name(reg as u8, &name, branch_start, branch_end);
+            for &(s, e) in arm_ranges {
+                if e > s {
+                    ctx.pin_reg_name(reg as u8, &name, s, e);
+                }
+            }
         }
     }
 }
