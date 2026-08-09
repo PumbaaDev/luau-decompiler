@@ -73,3 +73,5 @@ mod phase_c10v_generic_prefix_drop_tests;
 mod merge_regs_scope_probe_tests;
 #[cfg(test)]
 mod getupval_retarget_tests;
+#[cfg(test)]
+mod branch_arm_for_recovery_tests;

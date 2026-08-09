@@ -1203,40 +1203,233 @@ fn lift_branch_region(
         .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
         .collect();
 
-    let contiguous = !ranges.is_empty()
-        && ranges.windows(2).all(|w| w[0].1 == w[1].0);
+    // Split the arm into maximal CONTIGUOUS runs of adjacent block ranges. A
+    // gap between two arm blocks is exactly where another region's blocks live
+    // (a merge block, an already-claimed inner region, ...), so a lift must
+    // never span one: structuring `min(start)..max(end)` of a disjoint arm is
+    // what double-lifted foreign blocks and broke 23 compile-gate files in the
+    // previous attempt at the dropped-loop fix.
+    let runs = split_contiguous_runs(&ranges);
 
-    if contiguous {
-        let start = ranges[0].0;
-        let end = ranges[ranges.len() - 1].1;
-        // A loop body or branch arm is lifted as one raw span, so a value join
-        // inside it never reaches the region structurer. Splice the ones that
-        // are there back in; when there are none this is exactly the single
-        // `lift_instruction_range` call it replaces.
-        let joins = collect_value_joins_in_span(cfg, proto, start, end);
-        if joins.is_empty() {
-            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+    for &(lo, hi) in &runs {
+        let start = ranges[lo].0;
+        let end = ranges[hi].1;
+
+        // A branch arm is normally lifted as a raw linear span, and the linear
+        // dispatcher's match arm for FORNPREP/FORGPREP/FOR*LOOP is EMPTY
+        // ("handled at the region level" — which for arm-interior loops never
+        // happens: `structure_control_flow` marked these blocks `handled` when
+        // it matched the enclosing if/else, so `try_match_for_loop` never saw
+        // them). The loop was emitted as nothing: iterator call flattened to a
+        // bare 3-value local, body unguarded, loop variables permanently nil.
+        //
+        // When a run provably contains a complete prep→loop pair, structure it
+        // with the same scan that for-loop bodies already use (that path
+        // recurses and its loops DO survive), and lift the resulting regions.
+        // Runs without a complete for-pair keep the exact pre-existing
+        // behavior below.
+        if crate::analysis::structuring::range_contains_nested_for(&proto.code, start, end) {
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, start, end, regs, locals, out, in_loop,
+            );
+            continue;
+        }
+
+        if runs.len() == 1 {
+            // A loop body or branch arm is lifted as one raw span, so a value join
+            // inside it never reaches the region structurer. Splice the ones that
+            // are there back in; when there are none this is exactly the single
+            // `lift_instruction_range` call it replaces.
+            let joins = collect_value_joins_in_span(cfg, proto, start, end);
+            if joins.is_empty() {
+                lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+            } else {
+                let mut cursor = start;
+                for (entry, arms, join, join_start) in joins {
+                    let entry_start = cfg.blocks.get(&entry).map(|b| b.start).unwrap_or(cursor);
+                    if entry_start < cursor {
+                        continue;
+                    }
+                    if cursor < entry_start {
+                        lift_instruction_range(ctx, proto, proto_index, depth, cursor, entry_start, regs, locals, out, in_loop);
+                    }
+                    lift_value_join(ctx, proto, proto_index, cfg, entry, &arms, join, regs, locals, depth, out, in_loop);
+                    cursor = join_start;
+                }
+                if cursor < end {
+                    lift_instruction_range(ctx, proto, proto_index, depth, cursor, end, regs, locals, out, in_loop);
+                }
+            }
         } else {
-            let mut cursor = start;
-            for (entry, arms, join, join_start) in joins {
-                let entry_start = cfg.blocks.get(&entry).map(|b| b.start).unwrap_or(cursor);
-                if entry_start < cursor {
-                    continue;
-                }
-                if cursor < entry_start {
-                    lift_instruction_range(ctx, proto, proto_index, depth, cursor, entry_start, regs, locals, out, in_loop);
-                }
-                lift_value_join(ctx, proto, proto_index, cfg, entry, &arms, join, regs, locals, depth, out, in_loop);
-                cursor = join_start;
-            }
-            if cursor < end {
-                lift_instruction_range(ctx, proto, proto_index, depth, cursor, end, regs, locals, out, in_loop);
+            // Disjoint arm, run without a for-pair: keep the historical
+            // per-block lift for exactly these blocks.
+            for &(s, e) in &ranges[lo..=hi] {
+                lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, out, in_loop);
             }
         }
-    } else {
-        for &(start, end) in &ranges {
-            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+    }
+}
+
+/// Split sorted block ranges into maximal runs of PC-adjacent ranges.
+///
+/// Returns inclusive index pairs `(lo, hi)` into `ranges`; each run's PC span
+/// is `ranges[lo].0 .. ranges[hi].1` and contains no instruction outside the
+/// listed blocks. Runs partition the input: every index appears in exactly one
+/// run, in order.
+fn split_contiguous_runs(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < ranges.len() {
+        let mut j = i;
+        while j + 1 < ranges.len() && ranges[j].1 == ranges[j + 1].0 {
+            j += 1;
         }
+        runs.push((i, j));
+        i = j + 1;
+    }
+    runs
+}
+
+/// Lift one contiguous PC span `[start, end)` of a branch arm (or while-body
+/// block list) that is known to contain at least one complete for-loop
+/// prep→loop pair, by structuring it with `structure_numeric_for_body` and
+/// lifting the resulting regions in PC order.
+///
+/// Every region the scan produces lies inside `[start, end)` by construction
+/// (the scan walks only that range), so nothing outside the run — hence
+/// nothing owned by another region — can be lifted here. The debug assertion
+/// pins that invariant: its violation is the double-lift failure mode that
+/// sank the previous attempt at this fix.
+#[allow(clippy::too_many_arguments)]
+fn lift_structured_run(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    start: usize,
+    end: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    // Loop headers protect `find_value_join` from claiming a nested loop's
+    // header as a value-join entry. Same set `structure_control_flow` builds;
+    // only computed when a run actually needs structuring, so the dominator
+    // walk is not paid on the common (for-free) arm.
+    let loop_headers: std::collections::BTreeSet<usize> =
+        cfg.find_loops().iter().map(|l| l.header).collect();
+    let regions = crate::analysis::structuring::structure_numeric_for_body(
+        &proto.code, start, end, cfg, &loop_headers,
+    );
+    debug_assert!(
+        regions.iter().all(|r| region_pc_extent_within(r, start, end)),
+        "structured arm run [{start}, {end}) produced a region outside its span"
+    );
+    lift_structured_regions(
+        ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
+    );
+}
+
+/// Lift a `structure_numeric_for_body` region list in caller context.
+///
+/// Mirrors the nested-body iteration in `Region::GenericFor` /
+/// `Region::InlineIfThenInLoop`, with one load-bearing difference: those sites
+/// sit inside a real loop and hardcode `in_loop: true` for Linear children,
+/// while this helper also runs inside non-loop branch arms — where a hardcoded
+/// `true` would translate arm-exit jumps into `break`/`continue` statements
+/// outside any loop, a guaranteed compile failure. The caller's `in_loop` is
+/// threaded through Linear, ValueJoin, and InlineIfThenInLoop children
+/// instead. Self-contained loop regions (NumericFor / GenericFor /
+/// InlineLoopInLoop) establish their own loop context and go through
+/// `lift_region` unchanged.
+#[allow(clippy::too_many_arguments)]
+fn lift_structured_regions(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    regions: &[Region],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    for sub in regions {
+        match sub {
+            Region::Linear { start, end } => {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth, *start, *end, regs, locals, out, in_loop,
+                );
+            }
+            Region::ValueJoin { entry, arms, join } => {
+                lift_value_join(
+                    ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, out,
+                    in_loop,
+                );
+            }
+            Region::InlineIfThenInLoop { cond_pc, body } => {
+                let condition = extract_branch_condition(ctx, proto, *cond_pc, regs);
+                let mut then_stmts = Vec::new();
+                lift_structured_regions(
+                    ctx, proto, proto_index, cfg, depth, body, regs, locals, &mut then_stmts,
+                    in_loop,
+                );
+                if matches!(&condition, Expr::Bool(true)) {
+                    out.extend(then_stmts);
+                } else {
+                    out.push(Stat::If {
+                        condition,
+                        then_body: then_stmts,
+                        elseif_clauses: vec![],
+                        else_body: None,
+                    });
+                }
+            }
+            _ => {
+                lift_region(
+                    ctx, proto, proto_index, cfg, sub, regs, locals, depth + 1, out,
+                );
+            }
+        }
+    }
+}
+
+/// Is every PC this region names inside `[start, end)`?
+///
+/// Backs the `debug_assert!` in `lift_structured_run`: structuring a
+/// contiguous arm run must not claim instructions owned by another region —
+/// the double-lift that broke the previous attempt at recovering
+/// arm-interior for-loops.
+fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
+    let within = |pc: usize| pc >= start && pc < end;
+    match region {
+        Region::Linear { start: s, end: e } => *s >= start && *e <= end,
+        Region::ValueJoin { entry, arms, join } => {
+            // `join` is a boundary, not a member: it may sit AT the run end.
+            within(*entry) && arms.iter().all(|&a| within(a)) && *join <= end
+        }
+        Region::NumericFor { prep_pc, loop_pc, body, .. }
+        | Region::GenericFor { prep_pc, loop_pc, body, .. } => {
+            within(*prep_pc)
+                && within(*loop_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::InlineLoopInLoop { header_start, latch_pc, body, .. } => {
+            within(*header_start)
+                && within(*latch_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::InlineIfThenInLoop { cond_pc, body } => {
+            within(*cond_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::IfThenElse { .. }
+        | Region::WhileTrue { .. }
+        | Region::WhileDo { .. }
+        | Region::RepeatUntil { .. } => false,
     }
 }
 

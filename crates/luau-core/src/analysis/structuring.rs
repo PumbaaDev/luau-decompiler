@@ -618,7 +618,7 @@ fn is_real_loop(
 /// the nested body may itself contain further nested for-loops), and for
 /// InlineIfThenInLoop bodies (where the if-arm may contain one or more
 /// nested for-loops).
-fn structure_numeric_for_body(
+pub(crate) fn structure_numeric_for_body(
     code: &[u32],
     body_start: usize,
     body_end: usize,
@@ -959,7 +959,7 @@ fn forward_conditional_jump(op: LuauOpcode, pc: usize, insn: u32) -> Option<(usi
 /// trigger the wrap — cases without any nested for-loop continue to lift
 /// via the Linear segment and the lifter's in-line if-then handling in
 /// `lift_instruction_range`.
-fn range_contains_nested_for(code: &[u32], start: usize, end: usize) -> bool {
+pub(crate) fn range_contains_nested_for(code: &[u32], start: usize, end: usize) -> bool {
     if end <= start || end > code.len() {
         return false;
     }
