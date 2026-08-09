@@ -2240,9 +2240,47 @@ fn lift_region(
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
                 .max();
-            for &block_id in &sorted_body {
-                if let Some(b) = cfg.blocks.get(&block_id) {
-                    lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
+            // A for-loop nested in the body spans several of these blocks, and
+            // block-at-a-time lifting drops it: the linear dispatcher's
+            // FORNPREP/FOR*LOOP arm is empty ("handled at the region level",
+            // which never happens for blocks this loop already claimed), so the
+            // loop flattened into its own body statements and its jumps to the
+            // FORNLOOP latch were minted as bare `continue` mid-block — for
+            // 511_TriangleMaker that `continue` was not last in its block, and
+            // the emitted chunk failed the Luau parser outright. Structure any
+            // contiguous run that provably contains a complete prep→loop pair
+            // (same scan as if/else arms since f7cc859); runs without one keep
+            // the per-block lift byte-for-byte.
+            let ranges: Vec<(usize, usize)> = sorted_body
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                .collect();
+            // The loop's own latch (highest start pc — same assumption as the
+            // `continue` minting above) must stay OUT of any structured span:
+            // its JUMPBACK targets the span's first pc, which the scan reads as
+            // an inner loop of the span, double-lifting the tail and swallowing
+            // the loop exit. The latch is lifted per-block after the span, just
+            // as it always was.
+            let last_idx = ranges.len().saturating_sub(1);
+            for &(lo, hi) in &split_contiguous_runs(&ranges) {
+                let run_has_latch = hi == last_idx && ranges.len() > 1;
+                let run_start = ranges[lo].0;
+                let span_end = if run_has_latch { ranges[hi].0 } else { ranges[hi].1 };
+                if run_start < span_end
+                    && crate::analysis::structuring::range_contains_nested_for(&proto.code, run_start, span_end)
+                {
+                    lift_structured_run(
+                        ctx, proto, proto_index, cfg, depth, run_start, span_end, regs, locals,
+                        &mut body_stmts, true,
+                    );
+                    if run_has_latch {
+                        let (s, e) = ranges[hi];
+                        lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                    }
+                } else {
+                    for &(s, e) in &ranges[lo..=hi] {
+                        lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                    }
                 }
             }
             ctx.current_loop_end = prev_loop_end;
