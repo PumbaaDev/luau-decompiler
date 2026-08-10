@@ -1917,10 +1917,11 @@ fn lift_region(
         } => {
             // Lift the condition block up to (not including) the branch
             let block = &cfg.blocks[cond_pc];
-            lift_instruction_range(ctx, proto, proto_index, depth, block.start, find_branch_pc(proto, block.end), regs, locals, stmts, false);
+            let branch_pc = block_branch_pc(block);
+            lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, stmts, false);
 
             // Extract the condition expression from the branch instruction
-            let condition = extract_branch_condition(ctx, proto, find_branch_pc(proto, block.end), regs);
+            let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
 
             // Name any parked literal the arms overwrite and later code reads,
             // BEFORE snapshotting. Without this the arm writes stay parked in
@@ -1963,7 +1964,7 @@ fn lift_region(
                     Some((&then_ranges, &else_ranges)),
                     after_start,
                     proto.code.len(),
-                    find_branch_pc(proto, block.end),
+                    branch_pc,
                 );
             }
 
@@ -2155,7 +2156,7 @@ fn lift_region(
 
         Region::WhileDo { header, body_blocks } => {
             let block = &cfg.blocks[header];
-            let branch_pc = find_branch_pc(proto, block.end);
+            let branch_pc = block_branch_pc(block);
 
             // Lift the header block's pre-branch instructions (e.g., GETTABLEKS,
             // NAMECALL+CALL, etc.) so registers are populated before we extract
@@ -2360,7 +2361,7 @@ fn lift_region(
                     }
                 }
                 if let Some(cb) = cfg.blocks.get(cond_pc) {
-                    let cbranch = find_branch_pc(proto, cb.end);
+                    let cbranch = block_branch_pc(cb);
                     writes.extend(collect_body_writes(&proto.code, cb.start, cbranch));
                     loop_start = loop_start.min(cb.start);
                     loop_end = loop_end.max(cb.end);
@@ -2400,7 +2401,7 @@ fn lift_region(
             // the cond block may contain GETTABLEKS or CALL instructions
             // that produce the value compared by the branch instruction.
             let cond_block = &cfg.blocks[cond_pc];
-            let cond_branch_pc = find_branch_pc(proto, cond_block.end);
+            let cond_branch_pc = block_branch_pc(cond_block);
             if cond_block.start < cond_branch_pc {
                 lift_instruction_range(ctx, proto, proto_index, depth, cond_block.start, cond_branch_pc, regs, locals, &mut body_stmts, true);
             }
@@ -3369,25 +3370,38 @@ fn extract_branch_condition(
     }
 }
 
-/// Find the PC of the branch instruction at the end of a block.
-/// `block_end` is exclusive — the first PC NOT in the block.
-/// If the last real instruction has an AUX word, block_end-1 is the AUX
-/// and block_end-2 is the branch. Otherwise block_end-1 is the branch.
-fn find_branch_pc(proto: &Proto, block_end: usize) -> usize {
-    if block_end < 2 || block_end > proto.code.len() + 1 {
-        return block_end.saturating_sub(1);
-    }
-    // Check if the instruction at block_end-2 has AUX (making block_end-1 the AUX word)
-    let candidate = block_end - 2;
-    if candidate < proto.code.len() {
-        let insn = proto.code[candidate];
-        let op = LuauOpcode::from_u8(insn_op(insn));
-        if op.has_aux() {
-            return candidate; // branch is at end-2, AUX at end-1
+/// The PC of the branch instruction ending a block, as computed once by the
+/// CFG's forward, instruction-aligned walk.
+///
+/// This replaces a local `find_branch_pc` that stepped BACKWARD from `end` and
+/// asked whether the word at `end - 2` carried an AUX. That question is not
+/// decidable in reverse: the word may itself be an AUX payload whose value
+/// happens to decode as an aux-carrying opcode. A block ending
+/// `GETTABLEKS <aux=31> JUMPIFNOT` was read as ending in opcode 31
+/// (`JumpIfNotLE`), and the real JUMPIFNOT word was then consumed as that
+/// phantom instruction's operand, so `extract_branch_condition` synthesized a
+/// comparison out of two registers that were never operands of anything. The
+/// visible result was output like `if arg1 <= v26 then` in place of a plain
+/// truthy test, with both names invented.
+///
+/// `cfg.rs` had already diagnosed this and switched to a forward walk for its
+/// own successor edges, then discarded the value. The bug survived because the
+/// fix landed in one of the two places that needed it.
+fn block_branch_pc(block: &crate::analysis::cfg::BasicBlock) -> usize {
+    match block.branch_pc {
+        Some(pc) => pc,
+        None => {
+            // Never expected for a block that ends in a branch. Logged rather
+            // than silent: a quiet fallback reinstates the old wrong answer for
+            // some subset of sites and makes the measurement uninterpretable.
+            log::warn!(
+                "BRANCH_PC FALLBACK: block [{}, {}) carries no branch_pc; using end-1",
+                block.start,
+                block.end
+            );
+            block.end.saturating_sub(1)
         }
     }
-    // No AUX — branch is the last word
-    block_end - 1
 }
 
 fn remove_trailing_jump(stmts: &mut Vec<Stat>) {

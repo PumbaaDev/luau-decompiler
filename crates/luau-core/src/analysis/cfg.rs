@@ -12,6 +12,15 @@ pub struct BasicBlock {
     pub end: usize,
     pub successors: Vec<usize>,
     pub predecessors: Vec<usize>,
+    /// PC of this block's last real instruction, found by the forward,
+    /// instruction-aligned walk in [`ControlFlowGraph::build`].
+    ///
+    /// This is the block's branch instruction when the block ends in one. It is
+    /// stored rather than recomputed because the same value cannot be derived
+    /// by stepping backward from `end`: see the comment at the walk itself.
+    /// `None` only for a block whose walk produced nothing (empty or malformed
+    /// range), never for a block that ends in a branch.
+    pub branch_pc: Option<usize>,
 }
 
 /// Complete control flow graph for a function
@@ -150,6 +159,7 @@ impl ControlFlowGraph {
                 end,
                 successors: Vec::new(),
                 predecessors: Vec::new(),
+                branch_pc: None,
             };
             for p in start..end {
                 pc_to_block.insert(p, start);
@@ -187,6 +197,16 @@ impl ControlFlowGraph {
                 } else {
                     1
                 };
+            }
+
+            // Publish it. The lifter used to re-derive this by stepping backward
+            // from `end`, which is the exact mistake the comment above describes,
+            // so it read an AUX payload as a comparison instruction and then
+            // consumed the real branch word as that phantom instruction's
+            // operand. Computing it once, forward, and storing it removes the
+            // second, wrong derivation entirely.
+            if let Some(b) = blocks.get_mut(&start) {
+                b.branch_pc = Some(last_pc);
             }
 
             // Bounds-checked — malformed `block_end` could exceed code length.
