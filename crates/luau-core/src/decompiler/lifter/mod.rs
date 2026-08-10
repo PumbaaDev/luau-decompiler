@@ -7326,8 +7326,34 @@ pub(super) fn resolve_global_name(proto: &Proto, strings: &[String], d: i16, aux
     None
 }
 
+/// The canonical AUX resolution: `proto.constants[aux]` read as a string, which
+/// is exactly what the Luau VM does for GETTABLEKS/SETTABLEKS (`VM_KV(aux)`).
+///
+/// This tier is deliberately NOT filtered by [`is_plausible_field_name`]. That
+/// guard exists to reject garbage produced by the *speculative* tiers (masked
+/// indices, hash reverse-lookup), and applying it here rejected legitimate keys.
+/// `pprint`'s escape table is keyed by control characters — `"\7"`, `"\9"` and
+/// friends — and every one of them was thrown away and replaced by a fabricated
+/// `field_N`, so the table it built could never match the characters it was
+/// meant to escape.
+///
+/// Matches `Constant::String` directly rather than going through
+/// `const_to_string`, which also stringifies `Constant::Import` by joining its
+/// parts. An Import is not a field key, and admitting one here unfiltered would
+/// be a new way to emit a wrong name.
+fn resolve_aux_string_canonical(proto: &Proto, aux: u32) -> Option<String> {
+    match proto.constants.get(aux as usize) {
+        Some(Constant::String(s)) if !s.is_empty() && s.len() <= 200 => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Get a string from AUX value for GETTABLEKS/SETTABLEKS.
 pub(super) fn get_table_string_from_aux(proto: &Proto, strings: &[String], aux: u32) -> String {
+    // Canonical tier first, unfiltered: if the VM would read this constant, so do we.
+    if let Some(s) = resolve_aux_string_canonical(proto, aux) {
+        return s;
+    }
     resolve_aux_string(proto, strings, aux)
         .filter(|s| is_plausible_field_name(s))
         .unwrap_or_else(|| {
