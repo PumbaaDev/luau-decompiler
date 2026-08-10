@@ -6,8 +6,37 @@ const INDENT: &str = "    ";
 
 /// Emit a block of statements
 pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
-    for stmt in stmts {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let before = out.len();
         emit_stat(out, stmt, depth);
+
+        // A statement that begins with '(' fuses with the line above it. Lua's
+        // grammar does not treat a newline as a separator, so
+        //
+        //     local Size = Parent.Size
+        //     (function() ... end)()
+        //
+        // parses as `local Size = Parent.Size(function() ... end)()` -- the
+        // preceding expression is called with the closure as its argument. That
+        // is not a formatting nit: it is a different program, and here it also
+        // failed the compile gate as "Ambiguous syntax".
+        //
+        // A leading ';' is the standard disambiguator and is valid Lua wherever
+        // a statement may appear. Applied only from the second statement on,
+        // because the first in a block has nothing above it to fuse with, which
+        // keeps this from rewriting files that were never ambiguous.
+        if i > 0 {
+            let insert_at = {
+                let emitted = &out[before..];
+                emitted
+                    .find(|c: char| !c.is_whitespace())
+                    .filter(|&p| emitted.as_bytes()[p] == b'(')
+                    .map(|p| before + p)
+            };
+            if let Some(at) = insert_at {
+                out.insert(at, ';');
+            }
+        }
     }
 }
 

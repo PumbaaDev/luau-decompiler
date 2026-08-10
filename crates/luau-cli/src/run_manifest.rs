@@ -33,6 +33,12 @@ pub struct RunInfo {
     pub total_inputs: usize,
     pub ok: u32,
     pub failed: u32,
+    /// Inputs that are not programs: Luau writes a leading 0 byte followed by a
+    /// compiler diagnostic when the SOURCE failed to compile, and ships that in
+    /// place of bytecode. There is nothing to decompile. Counted apart from
+    /// `failed`, because folding the two together reads as our defect when it
+    /// is the game's broken script.
+    pub not_a_program: u32,
     pub elapsed_secs: f64,
     /// Filled in when the semantic checker ran over the output.
     pub semantic: Option<SemanticSummary>,
@@ -186,8 +192,30 @@ pub fn write_manifest(info: &RunInfo) -> Result<PathBuf> {
     m.push_str("| | |\n|---|---|\n");
     m.push_str(&format!("| decompiled | {} |\n", info.ok));
     m.push_str(&format!("| failed | {} |\n", info.failed));
+    if info.not_a_program > 0 {
+        m.push_str(&format!(
+            "| not a program | {} |\n",
+            info.not_a_program
+        ));
+    }
     m.push_str(&format!("| elapsed | {:.1}s |\n", info.elapsed_secs));
+    let decodable = info.ok + info.failed;
+    if decodable > 0 {
+        m.push_str(&format!(
+            "| **decompiled / decodable** | **{}/{}** |\n",
+            info.ok, decodable
+        ));
+    }
     m.push('\n');
+
+    if info.not_a_program > 0 {
+        m.push_str(
+            "> A *not a program* input carries a leading 0 byte and a compiler diagnostic \
+             instead of bytecode: the game's own source failed to compile and Roblox shipped \
+             the error. It is excluded from the ratio above because there is no program in it \
+             to recover.\n\n",
+        );
+    }
 
     if let Some(s) = &info.semantic {
         let pct = if s.files_checked > 0 {

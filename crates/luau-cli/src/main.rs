@@ -817,6 +817,7 @@ fn run_batch(
 
     let mut ok = 0u32;
     let mut fail = 0u32;
+    let mut not_a_program = 0u32;
     let start = std::time::Instant::now();
     let started_at = run_manifest::run_timestamp_human();
 
@@ -865,24 +866,50 @@ fn run_batch(
             eprintln!("FILE\t{}", stem);
         }
 
-        match fs::read(&path).map(|d| decompile_with_store(&d, store, db)) {
-            Ok(Ok(source)) => {
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => { fail += 1; continue; }
+        };
+
+        // A leading 0 byte is not a version. Luau writes it, followed by a
+        // compiler diagnostic, when the SOURCE failed to compile, and Roblox
+        // ships that blob in place of bytecode. There is no program in it.
+        //
+        // Counting it as a decompile failure blames us for the game's broken
+        // script. 134_ReplicatedStorage_BuilderGui is 61 bytes and reads
+        // ":16: Expected identifier when parsing method name, got 'end'".
+        if data.first() == Some(&0) {
+            not_a_program += 1;
+            let diag = String::from_utf8_lossy(&data[1..])
+                .trim_matches(|c: char| c.is_control() || c == '\u{0}')
+                .to_string();
+            eprintln!("  not a program: {} -- source failed to compile in-game: {}", stem, diag);
+            continue;
+        }
+
+        match decompile_with_store(&data, store, db) {
+            Ok(source) => {
                 fs::write(out.join(format!("{}.lua", stem)), &source)?;
                 if disasm {
-                    if let Ok(data) = fs::read(&path) {
-                        if let Ok(text) = luau_core::disassemble(&data, true) {
-                            let _ = fs::write(out.join(format!("{}.disasm", stem)), &text);
-                        }
+                    if let Ok(text) = luau_core::disassemble(&data, true) {
+                        let _ = fs::write(out.join(format!("{}.disasm", stem)), &text);
                     }
                 }
                 ok += 1;
             }
-            _ => { fail += 1; }
+            Err(_) => { fail += 1; }
         }
     }
 
     let elapsed = start.elapsed();
-    eprintln!("Done: {} ok, {} failed ({:.1}s)", ok, fail, elapsed.as_secs_f64());
+    if not_a_program > 0 {
+        eprintln!(
+            "Done: {} ok, {} failed, {} not a program ({:.1}s)  [{}/{} decodable]",
+            ok, fail, not_a_program, elapsed.as_secs_f64(), ok, ok + fail
+        );
+    } else {
+        eprintln!("Done: {} ok, {} failed ({:.1}s)", ok, fail, elapsed.as_secs_f64());
+    }
 
     // Check what we just produced, and record it. A folder of .lua files with
     // no provenance cannot be compared against anything.
@@ -908,9 +935,10 @@ fn run_batch(
         git_commit: commit,
         git_dirty: dirty,
         opmap_source: describe_opmap_source(store, db),
-        total_inputs: (ok + fail) as usize,
+        total_inputs: (ok + fail + not_a_program) as usize,
         ok,
         failed: fail,
+        not_a_program,
         elapsed_secs: elapsed.as_secs_f64(),
         semantic,
     };
