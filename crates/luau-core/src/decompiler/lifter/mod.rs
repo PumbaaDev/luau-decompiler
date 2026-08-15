@@ -2219,6 +2219,24 @@ fn lift_region(
                         };
                         let raw = ctx.reg_name(proto, i as u8, *mpc);
                         let (kind, name) = locals.classify_write(i, &raw);
+                        // FirstDecl only. Admitting `Reassign` looks obviously
+                        // safe -- the binding already exists and already holds
+                        // the pre-branch value, so no declaration is needed --
+                        // and it is NOT. TESTED AND REJECTED: it reintroduces
+                        // the scope defect in docs/MERGE_REGS_SCOPE_RISK.md,
+                        // where the name a later read resolves is bound only
+                        // inside an arm. All three purpose-built probes fire:
+                        // `merge_redefinition_stays_unseeded` ("a merge-redefined
+                        // register must not grow a seeded declaration") and both
+                        // `probe_shadow_diff_names_*_after_merge_structure`
+                        // ("top-level use with no top-level declaration").
+                        //
+                        // The seductive part is the score: CoreGui went 220 ->
+                        // 122 defects and BSS 378 -> 260. That is the semantic
+                        // checker being satisfied while the output gets WORSE --
+                        // a top-level name with a branch-local binding compiles
+                        // clean and reads nil at runtime, which is precisely
+                        // what those probes exist to catch.
                         if kind != WriteKind::FirstDecl {
                             continue;
                         }
