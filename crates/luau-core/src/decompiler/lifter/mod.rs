@@ -2030,7 +2030,9 @@ fn lift_region(
             // Lift else-body (sorted by start PC for correct instruction order)
             let mut else_sorted = else_region.clone();
             else_sorted.sort_unstable();
-            let else_body = if !else_sorted.is_empty() {
+            // `mut` because the phi reconstruction below may append an
+            // assignment into each arm.
+            let mut else_body = if !else_sorted.is_empty() {
                 let mut else_stmts = Vec::new();
                 lift_branch_region(ctx, proto, proto_index, cfg, depth, &else_sorted, regs, locals, &mut else_stmts, false);
                 Some(else_stmts)
@@ -2155,6 +2157,72 @@ fn lift_region(
                                 ctx, proto, regs, locals, &mut hoisted_phis, i, *mpc, phi,
                             );
                         }
+                    }
+                }
+
+                // Statement form, for the diamonds the ternary path above turns
+                // away: arms that emit statements, or values too large for
+                // `expr_is_leaf`.
+                //
+                // The leaf cap bounds expression growth because a ternary
+                // inlines BOTH trees at every use site. Declaring the name and
+                // assigning inside each arm does not duplicate anything -- each
+                // expression stays in the arm that computed it, evaluated once,
+                // and the condition is not re-evaluated either. So neither gate
+                // the ternary needs applies here.
+                //
+                // Without this the register is left Unknown by `merge_regs`'
+                // terminal reset and the post-join read mints a name nothing
+                // assigns. Measured on CorePackages: of 225 defect names whose
+                // register was last cleared there, 202 have BOTH arms holding an
+                // Expr -- 193 of them blocked purely by `expr_is_leaf`.
+                //
+                // BOTH arms must hold a value. When one side is Unknown this
+                // must NOT fire: assigning on a single path is exactly the
+                // declaration-only hoist that was measured and rejected
+                // (1699/303 -> 1674/335). Declaring more names does not make
+                // more of them assigned on every path.
+                // Runs for ANY register the ternary pass left Unknown -- it sets
+                // `regs[i]` for the ones it handled, so the Unknown test below
+                // is what separates the two paths. Gating this on
+                // `!arms_are_pure_value` would skip the largest group by far:
+                // 193 of the 202 candidates are pure-value arms rejected purely
+                // by `expr_is_leaf`.
+                {
+                    let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                    for i in 0..n {
+                        if !matches!(regs[i], RegVal::Unknown) {
+                            continue;
+                        }
+                        let (t, e) = match (&regs_after_then[i], &regs_after_else[i]) {
+                            (RegVal::Expr(t), RegVal::Expr(e)) => (t.clone(), e.clone()),
+                            _ => continue,
+                        };
+                        if exprs_structurally_equal(&t, &e) {
+                            continue;
+                        }
+                        // An else arm is required: with no else there is no
+                        // second assignment and the name is unassigned whenever
+                        // the condition is false.
+                        let Some(else_stmts) = else_body.as_mut() else { continue };
+                        let raw = ctx.reg_name(proto, i as u8, *mpc);
+                        let (kind, name) = locals.classify_write(i, &raw);
+                        if kind != WriteKind::FirstDecl {
+                            continue;
+                        }
+                        hoisted_phis.push(Stat::Local {
+                            names: vec![name.clone()],
+                            values: vec![],
+                        });
+                        then_stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(name.clone())],
+                            values: vec![t],
+                        });
+                        else_stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(name.clone())],
+                            values: vec![e],
+                        });
+                        regs[i] = RegVal::Expr(Expr::Name(name));
                     }
                 }
             }
