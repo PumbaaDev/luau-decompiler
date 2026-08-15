@@ -76,7 +76,22 @@ impl ChunkFingerprint {
     /// Returns `None` for bytecode that carries no Roblox shuffle: canonical
     /// Luau has no permutation to identify, and keying it would be meaningless.
     pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
-        if !OpcodeMap::needs_remapping(chunk) {
+        // Gate on what this is actually asking -- "is this upstream Luau, which
+        // has no permutation to identify" -- rather than on `needs_remapping`.
+        //
+        // `needs_remapping` is a frequency heuristic (`high_count * 100 / total
+        // > 20`, and `total` counts AUX words as though they were opcodes). A
+        // small or unusual chunk can fall under that bar while still being
+        // shuffled, and returning None here makes the database report
+        // NotShuffled, so the chunk is decoded as raw bytes with no map at all.
+        // Measured on CorePackages: ~5% of 24160 files decode by identity that
+        // way, carrying 430 undefined_local and every one of the 366 `cap_0`
+        // names -- a shape whose own minting site calls it decode corruption.
+        //
+        // This only lets the chunk be FINGERPRINTED. Tier-A anchor conflicts,
+        // the anchor-agreement floor and `walk_verify` all still run in
+        // `OpcodeDb::lookup` before any entry is returned.
+        if OpcodeMap::is_canonical_luau(chunk) {
             return None;
         }
         // Structural only. An installed ground truth must never influence the

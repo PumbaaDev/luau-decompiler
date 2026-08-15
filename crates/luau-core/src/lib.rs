@@ -636,9 +636,12 @@ pub fn decompile_with_plan(
         && parser::opmap::OpcodeMap::is_canonical_luau(&chunk);
 
     // Auto-detect and apply opcode remapping for Roblox-shuffled bytecode
-    let opmap_info = if let Some(entry) = plan.exact.filter(|_| {
-        parser::opmap::OpcodeMap::needs_remapping(&chunk)
-    }) {
+    // No `needs_remapping` filter here. `OpcodeDb::lookup` has already
+    // walk-verified this entry against this chunk, and a frequency heuristic
+    // must not overrule a verified measured map -- the previous filter discarded
+    // one even when `--opmap-db-entry` named it explicitly. Genuine upstream
+    // Luau is excluded by `is_canonical_luau` above, which is the real question.
+    let opmap_info = if let Some(entry) = plan.exact {
         // Measured permutation. No detectors run, and nothing is completed:
         // every byte here was read off the client's own compiler, and the
         // lookup already verified that this chunk walks cleanly under it, so

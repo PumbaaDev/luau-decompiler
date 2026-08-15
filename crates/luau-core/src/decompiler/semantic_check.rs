@@ -68,11 +68,121 @@ impl Finding {
 ///
 /// `proto_count` is the number of protos in the chunk, used by the
 /// body-recovery check. Pass `None` if unknown.
+/// Blank the CONTENTS of string literals and comments, preserving length and
+/// line structure so offsets and line numbers still line up.
+///
+/// The identifier scans tokenise anything name-shaped, and decompiled Roblox
+/// code is full of API version strings and URL paths -- `"v1"`,
+/// `"modals-api/v1/prompts"`, `"%s/v2/universes/%d/configuration"`. Those match
+/// the generated-name shape `vN` and were reported as undefined locals; the
+/// literal `"v1"` alone occurs 173 times in the CorePackages output.
+///
+/// COMMENTS MUST BE SKIPPED, and getting that wrong is not hypothetical. A
+/// first version handled only quotes, and this decompiler's own header ends
+/// `...measured against the client'` -- an apostrophe, present in 1815 of 1880
+/// CoreGui files. Treated as an opening quote it swallowed the rest of each
+/// file, leaving no identifiers to check: CoreGui "improved" from 240 defects
+/// to 5 while an independent scan still found 100 stranded locals in the very
+/// same output. A checker that reports nothing is not a clean corpus.
+///
+/// Deliberately NOT applied to `check_name_body_agreement`, which reads string
+/// contents on purpose -- a function naming itself in its own error message is
+/// exactly the evidence that check depends on.
+fn blank_noncode(source: &str) -> String {
+    let b = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+
+    // Long-bracket opener at `i`: returns (level, first_byte_after_opener).
+    let long_open = |i: usize| -> Option<(usize, usize)> {
+        if b.get(i) != Some(&b'[') {
+            return None;
+        }
+        let mut eq = 0;
+        let mut j = i + 1;
+        while b.get(j) == Some(&b'=') {
+            eq += 1;
+            j += 1;
+        }
+        if b.get(j) == Some(&b'[') { Some((eq, j + 1)) } else { None }
+    };
+    let blank_to = |out: &mut String, from: usize, to: usize| {
+        for k in from..to {
+            out.push(if b[k] == b'\n' { '\n' } else { ' ' });
+        }
+    };
+
+    while i < b.len() {
+        // Comment first: `--`, optionally a long bracket, else to end of line.
+        if b[i] == b'-' && b.get(i + 1) == Some(&b'-') {
+            out.push_str("--");
+            let after = i + 2;
+            if let Some((eq, body)) = long_open(after) {
+                let close: String = format!("]{}]", "=".repeat(eq));
+                out.push_str(&source[after..body]);
+                let end = source[body..].find(&close).map(|p| body + p).unwrap_or(b.len());
+                blank_to(&mut out, body, end);
+                if end < b.len() {
+                    out.push_str(&close);
+                    i = end + close.len();
+                } else {
+                    i = end;
+                }
+            } else {
+                let end = source[after..].find('\n').map(|p| after + p).unwrap_or(b.len());
+                blank_to(&mut out, after, end);
+                i = end;
+            }
+            continue;
+        }
+        // Long string.
+        if let Some((eq, body)) = long_open(i) {
+            let close: String = format!("]{}]", "=".repeat(eq));
+            out.push_str(&source[i..body]);
+            let end = source[body..].find(&close).map(|p| body + p).unwrap_or(b.len());
+            blank_to(&mut out, body, end);
+            if end < b.len() {
+                out.push_str(&close);
+                i = end + close.len();
+            } else {
+                i = end;
+            }
+            continue;
+        }
+        // Quoted string. Unterminated by end of LINE is treated as closed, so a
+        // stray apostrophe cannot consume the rest of the file.
+        if b[i] == b'"' || b[i] == b'\'' {
+            let quote = b[i];
+            out.push(quote as char);
+            i += 1;
+            while i < b.len() && b[i] != quote && b[i] != b'\n' {
+                if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] != b'\n' {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            if i < b.len() && b[i] == quote {
+                out.push(quote as char);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     let mut out = Vec::new();
+    // Reads string contents on purpose — must see the ORIGINAL source.
     check_name_body_agreement(source, &mut out);
-    check_undefined_locals(source, &mut out);
-    check_declared_but_never_assigned(source, &mut out);
+    let code = blank_noncode(source);
+    check_undefined_locals(&code, &mut out);
+    check_declared_but_never_assigned(&code, &mut out);
     check_body_recovered(source, proto_count, &mut out);
     check_discarded_table_writes(source, &mut out);
     check_property_called_as_method(source, &mut out);
