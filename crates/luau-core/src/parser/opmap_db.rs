@@ -550,9 +550,27 @@ impl OpmapDb {
             };
         }
 
+        // Both size floors below exist to DISCRIMINATE between candidates. When
+        // exactly one measured entry has already walked the chunk cleanly there
+        // is nothing left to discriminate, and refusing it does not avoid a
+        // guess -- it forces one, because the chunk then falls back to a
+        // detector map or to raw identity bytes.
+        //
+        // Measured: forcing the entry on all 1517 defect-carrying CorePackages
+        // files gave 435 better and 0 worse, with the 1082 files that already
+        // matched byte-identical -- which is what shows this is a no-op wherever
+        // the entry applied anyway. 426 files were being refused by Gate 3 for
+        // "too little evidence" alone, carrying 450 undefined_local.
+        //
+        // The floors stay in force whenever two or more entries survive, which
+        // is the only case where a size floor can separate anything. The
+        // database holds one entry today; this is written for the multi-entry
+        // future rather than deleted.
+        let sole_measured = fitted.len() == 1 && fitted[0].0.provenance.is_measured();
+
         // Gate 3: enough of the chunk to be worth being exact about.
         let present = fitted.iter().map(|(_, p)| *p).max().unwrap_or(0);
-        if present < DB_MIN_PRESENT_BYTES {
+        if !sole_measured && present < DB_MIN_PRESENT_BYTES {
             return DbLookup::TooLittleEvidence {
                 present_bytes: present,
             };
@@ -571,7 +589,10 @@ impl OpmapDb {
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.id.cmp(&b.0.id)));
 
         let (best, best_score, best_agree) = scored[0];
-        if best_agree < DB_MIN_CORROBORATION {
+        // Same reasoning as Gate 3: corroboration ranks rival entries, and a
+        // sole measured entry that already walks cleanly has no rival to be
+        // ranked against. A small chunk simply cannot corroborate much.
+        if !sole_measured && best_agree < DB_MIN_CORROBORATION {
             return DbLookup::LowConfidence {
                 best_id: best.id.clone(),
                 agreements: best_agree,
