@@ -1607,7 +1607,15 @@ pub(super) fn lift_instruction_range(
                 } else {
                     Expr::Table { fields: vec![] }
                 };
-                regs[a] = RegVal::Expr(expr);
+                // Honour a pinned destination, as LoadNil / GetUpval / GetGlobal
+                // all do. Parking unconditionally ignores a pin that was set
+                // before the branch, so both arms reach the merge holding
+                // structurally different pending tables, neither is a Name, and
+                // `merge_regs` takes its terminal reset -- discarding the table
+                // and every SETTABLEKS that mutated it in place.
+                if !pinned_write_consumed(ctx, regs, locals, stmts, a, pc, expr.clone()) {
+                    regs[a] = RegVal::Expr(expr);
+                }
             }
             LuauOpcode::SetList => {
                 // SETLIST A B C AUX: bulk-set sequential table entries in R(A)
