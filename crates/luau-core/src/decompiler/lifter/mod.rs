@@ -3048,6 +3048,18 @@ fn hoist_escaping_locals(
             continue;
         }
         if !is_safe_hoist_init(&init, &pre_names) {
+            // TESTED AND REJECTED. The safe path below hoists `local x = init`
+            // AND re-assigns inside the arm, evaluating `init` twice -- fine for
+            // a literal or pre-branch name, which is what `is_safe_hoist_init`
+            // restricts it to, and impossible for a call or closure init.
+            //
+            // Hoisting the DECLARATION alone (`local x`, leaving `x = init` in
+            // the arm) evaluates once, needs no safety test, and would make the
+            // binding lexically live at the join -- exactly what `merge_regs`
+            // looks for before resetting a register to Unknown. Sound in
+            // principle; measured on CoreGui it went 1699/303 -> 1674/335, so
+            // it costs 25 clean files. Declaring more names does not make more
+            // of them assigned on every path.
             continue;
         }
         hoisted_out.push(Stat::Local {
