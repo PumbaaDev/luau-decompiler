@@ -6603,6 +6603,16 @@ fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Ve
                 | Expr::Call { .. }
                 | Expr::MethodCall { .. }
                 | Expr::Varargs
+                // Luau has generalized iteration, so `for k, v in {..} do` is
+                // valid and is what the bytecode built with NEWTABLE+SETLIST or
+                // DUPTABLE. Rejecting it minted a `vN` that free_var_decls then
+                // declared at chunk top with nothing to assign it.
+                //
+                // The Function / UnOp / BinOp rejections stay: the failure this
+                // guard was built for was an unresolved NEWCLOSURE rendering a
+                // multi-line body inside the `in` clause, and a leaked NAMECALL
+                // method-name string. Neither is a table.
+                | Expr::Table { .. }
         )
     }
 

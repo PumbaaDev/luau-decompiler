@@ -1594,7 +1594,17 @@ pub(super) fn lift_instruction_range(
                     }
                     regs[a] = RegVal::Expr(Expr::Name(name));
                 } else {
-                    regs[a] = RegVal::Expr(Expr::Table { fields: vec![] });
+                    // Honour a pinned destination, exactly as DupTable now does
+                    // (df419e1). NewTable was the last direct-park writer that
+                    // ignored the pin -- LoadNil, GetGlobal, GetUpval, DupTable
+                    // and Call all honour it -- so a table built in a branch
+                    // reached the merge as a pending expression, matched
+                    // nothing, and went out with merge_regs' terminal reset
+                    // along with every SETTABLEKS that had mutated it in place.
+                    let empty = Expr::Table { fields: vec![] };
+                    if !pinned_write_consumed(ctx, regs, locals, stmts, a, pc, empty.clone()) {
+                        regs[a] = RegVal::Expr(empty);
+                    }
                 }
             }
             LuauOpcode::DupTable => {
