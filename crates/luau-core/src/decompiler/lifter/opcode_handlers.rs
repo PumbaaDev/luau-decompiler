@@ -820,6 +820,7 @@ pub(super) fn lift_instruction_range(
                     }
                 } else {
                     regs[a] = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_GETGLOBAL_UNRESOLVED", a);
                 }
             }
             LuauOpcode::SetGlobal => {
@@ -2902,8 +2903,30 @@ pub(super) fn lift_instruction_range(
                 // For statement calls (nresults==1), reg `a` is NOT written back,
                 // so clear from `a` onward.
                 let clear_start = if nresults == 1 { a } else { result_end };
+                // `nresults == 0` is MULTRET: the results run from `a` to the
+                // top of stack and how many there are is decided by whatever
+                // consumes them (SETLIST, a following CALL, RETURN). The arm
+                // above assumes exactly one "by convention", so everything from
+                // a+1 upward is wiped -- including real result registers when
+                // the call returned more than one. A later read of one of those
+                // then finds Unknown and mints a name nothing assigns.
+                //
+                // Clearing on an unknown count is a guess in the destructive
+                // direction; leaving them alone is a guess in the recoverable
+                // one. MEASURED, and it does not pay: skipping the clear for
+                // MULTRET moved CoreGui from 1699/303 to 1700/305 -- one more
+                // file clean, two more defects, i.e. noise -- while leaving
+                // stale values in registers the VM considers dead. Kept as the
+                // clear it was; the note stands so the next reader does not
+                // re-run the experiment.
                 for r in clear_start..regs.len() {
                     regs[r] = RegVal::Unknown;
+                    // CORRECT by construction: a call leaves everything above
+                    // its results genuinely holding nothing. Tagged so this can
+                    // be counted APART from the give-up paths -- suppressing a
+                    // declaration whose register was cleared here would replace
+                    // a visible defect with a silent wrong value.
+                    crate::decompiler::mint_trace::note_unknown("UNK_CALL_CLEAR", r);
                     explicit_nil_regs.remove(&r);
                 }
             }
@@ -3487,6 +3510,7 @@ pub(super) fn lift_instruction_range(
                 // one it cannot.
                 if !proto.is_vararg {
                     regs[a] = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_VARARG_ILLEGAL", a);
                     pc += 1;
                     continue;
                 }
@@ -3631,6 +3655,7 @@ pub(super) fn lift_instruction_range(
                 // decode is wrong and `...` here cannot compile.
                 if !proto.is_vararg {
                     regs[a] = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_RBXEXT97_ILLEGAL", a);
                     pc += 1;
                     continue;
                 }
@@ -3802,6 +3827,7 @@ pub(super) fn lift_instruction_range(
                 // consumers get "nil" rather than "_unk_XX_PC" garbage.
                 if a < regs.len() {
                     regs[a] = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_OPCODE_UNKNOWN", a);
                 }
 
                 // Heuristic: skip likely AUX words following this unknown opcode.

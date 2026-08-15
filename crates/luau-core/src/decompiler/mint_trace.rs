@@ -44,6 +44,49 @@ pub fn sites_for(name: &str) -> String {
     })
 }
 
+thread_local! {
+    /// Register index -> the site that last set it to `RegVal::Unknown`.
+    static UNKNOWN_ORIGIN: RefCell<BTreeMap<usize, &'static str>> =
+        RefCell::new(BTreeMap::new());
+}
+
+/// Record WHY a register went `Unknown`.
+///
+/// `note` is keyed by name, so it can say a generated name came from
+/// `reg_expr`'s Unknown fallback but not which of the producers emptied that
+/// register. That distinction is the whole question: the fallback is one call
+/// site with several upstream causes, and some of them are CORRECT -- the
+/// registers above a call's result are genuinely cleared and genuinely hold
+/// nothing. Suppressing the declaration for those would trade a visible defect
+/// for a silent wrong value.
+///
+/// Keyed by register rather than by name because the name does not exist yet at
+/// the moment the register is cleared.
+pub fn note_unknown(site: &'static str, reg: usize) {
+    if !enabled() {
+        return;
+    }
+    UNKNOWN_ORIGIN.with(|m| {
+        m.borrow_mut().insert(reg, site);
+    });
+}
+
+/// The site that last cleared `reg`, or `UNK_ORIGIN_NONE` if nothing did --
+/// which means the register was never written in this proto at all.
+pub fn unknown_origin(reg: usize) -> &'static str {
+    UNKNOWN_ORIGIN.with(|m| m.borrow().get(&reg).copied().unwrap_or("UNK_ORIGIN_NONE"))
+}
+
+/// Register indices are per-proto, so provenance must be dropped when a new
+/// proto's register file is created or entries leak across protos.
+pub fn clear_unknown_origins() {
+    if !enabled() {
+        return;
+    }
+    UNKNOWN_ORIGIN.with(|m| m.borrow_mut().clear());
+}
+
 pub fn clear() {
     MINTS.with(|m| m.borrow_mut().clear());
+    UNKNOWN_ORIGIN.with(|m| m.borrow_mut().clear());
 }

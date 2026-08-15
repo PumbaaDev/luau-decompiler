@@ -908,6 +908,11 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
     // Use a generous register count — max_stack_size can be too small for some operands
     let reg_count = (proto.max_stack_size as usize).max(256);
     let mut regs = vec![RegVal::Unknown; reg_count];
+    // Register indices are per-proto, so provenance from the previous proto
+    // must not leak in. After this, a register with no recorded origin was
+    // never written in THIS proto at all -- a distinct cause worth counting
+    // separately from the ones that clear a register deliberately.
+    crate::decompiler::mint_trace::clear_unknown_origins();
     let mut locals = LocalTracker::new(proto.num_params as usize);
 
     // Initialize parameters
@@ -1821,6 +1826,7 @@ fn lift_value_join(
         // back to the conservative merge result for that register.
         if paths.iter().any(|p| matches!(p.regs[i], RegVal::Unknown)) {
             regs[i] = RegVal::Unknown;
+            crate::decompiler::mint_trace::note_unknown("UNK_JOIN_ANY_PATH", i);
             continue;
         }
         divergent.push(i);
@@ -3267,6 +3273,7 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) 
                     // Both names were minted inside the arms; neither
                     // declaration survives the join lexically.
                     *slot = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_MERGE_ARM_NAMES", i);
                     continue;
                 }
             }
@@ -3274,6 +3281,7 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) 
         // Genuinely neither side is a simple Name — both compound, or one is
         // Unknown with no Name counterpart. Now the reset really is safe.
         *slot = RegVal::Unknown;
+        crate::decompiler::mint_trace::note_unknown("UNK_MERGE_COMPOUND", i);
     }
 }
 
@@ -6635,6 +6643,17 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
                 },
                 &n,
             );
+            // This arm is one call site with several upstream causes, and they
+            // do not all deserve the same treatment -- a register cleared above
+            // a call result genuinely holds nothing, while one the lifter gave
+            // up on is a dropped value. Attribute it so the two can be counted
+            // apart before either is "fixed".
+            if matches!(other, Some(_)) {
+                crate::decompiler::mint_trace::note(
+                    crate::decompiler::mint_trace::unknown_origin(idx),
+                    &n,
+                );
+            }
             Expr::Name(n)
         }
     }
