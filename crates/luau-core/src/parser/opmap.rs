@@ -849,6 +849,13 @@ impl OpcodeMap {
 
         // TIER 2: AUX/pattern matching
         detect_getimport(chunk, &mut ctx);
+        // Runs first: the census pins CAPTURE from metadata alone, so
+        // detect_closure_capture cannot propagate a wrong NEWCLOSURE guess into
+        // the capture byte.
+        detect_capture_by_upvalue_census(chunk, &mut ctx);
+        // Must precede detect_move, which force-claims on frequency and will
+        // otherwise take GETUPVAL's byte for MOVE.
+        detect_getupval_by_upvalue_bound(chunk, &mut ctx);
         detect_closure_capture(chunk, &mut ctx);
         detect_dupclosure(chunk, &mut ctx);
         detect_duptable(chunk, &mut ctx);
@@ -1030,7 +1037,14 @@ impl OpcodeMap {
             detect_getimport(chunk, &mut ctx);
         }
         if ctx.find_shuffled(LuauOpcode::NewClosure as u8).is_none() {
-            detect_closure_capture(chunk, &mut ctx);
+            // Runs first: the census pins CAPTURE from metadata alone, so
+        // detect_closure_capture cannot propagate a wrong NEWCLOSURE guess into
+        // the capture byte.
+        detect_capture_by_upvalue_census(chunk, &mut ctx);
+        // Must precede detect_move, which force-claims on frequency and will
+        // otherwise take GETUPVAL's byte for MOVE.
+        detect_getupval_by_upvalue_bound(chunk, &mut ctx);
+        detect_closure_capture(chunk, &mut ctx);
         }
         if ctx.find_shuffled(LuauOpcode::LoadK as u8).is_none() {
             detect_loadk(chunk, &mut ctx);
@@ -1064,6 +1078,13 @@ impl OpcodeMap {
         detect_return(chunk, &mut ctx);
         detect_prepvarargs(chunk, &mut ctx);
         detect_getimport(chunk, &mut ctx);
+        // Runs first: the census pins CAPTURE from metadata alone, so
+        // detect_closure_capture cannot propagate a wrong NEWCLOSURE guess into
+        // the capture byte.
+        detect_capture_by_upvalue_census(chunk, &mut ctx);
+        // Must precede detect_move, which force-claims on frequency and will
+        // otherwise take GETUPVAL's byte for MOVE.
+        detect_getupval_by_upvalue_bound(chunk, &mut ctx);
         detect_closure_capture(chunk, &mut ctx);
         detect_dupclosure(chunk, &mut ctx);
         detect_duptable(chunk, &mut ctx);
@@ -1645,6 +1666,209 @@ fn detect_getimport(chunk: &Chunk, ctx: &mut DetectCtx) {
             ctx.try_assign_force(op, LuauOpcode::GetImport as u8);
         }
     }
+}
+
+/// TIER 1 — pin GETUPVAL from the upvalue-index bound.
+///
+/// `GETUPVAL R(a) U(b)` indexes the UPVALUE table, so `b < proto.num_upvalues`
+/// on every occurrence, and a proto declaring zero upvalues cannot contain one
+/// at all. `MOVE R(a) R(b)` indexes registers and obeys neither rule. The two
+/// are otherwise indistinguishable here — same ABC shape, same one-word width —
+/// which is why a swap between them survives every width-based check: the
+/// instruction walk still lands exactly on RETURN while the decode is
+/// semantically wrong throughout.
+///
+/// `detect_move` already documents this exact distinction, but applies it as a
+/// 1.5x scoring bonus rather than a requirement, so the highest-frequency byte
+/// wins even when it never once appears in an upvalue-free proto. Measured on
+/// the 1880-file v7 CoreGui set: byte 0xFB satisfies `b < num_upvalues` in
+/// 12127 of 12127 occurrences and appears in zero upvalue-free protos, yet was
+/// assigned MOVE; the byte holding GETUPVAL appeared 695 times inside protos
+/// declaring no upvalues, which that opcode cannot do.
+///
+/// The cost of the swap is the corpus's dominant defect: every upvalue read
+/// becomes a copy from a register nothing ever wrote, so the closure body
+/// references a name with no assignment and `free_var_decls` hoists it as a
+/// bare `local vN`.
+fn detect_getupval_by_upvalue_bound(chunk: &Chunk, ctx: &mut DetectCtx) {
+    if ctx.assigned[LuauOpcode::GetUpval as usize] {
+        return;
+    }
+    // Absence from upvalue-free protos is only evidence when there is enough
+    // upvalue-free code for a genuine MOVE to have shown up in it.
+    let zero_upval_insns: usize = chunk
+        .protos
+        .iter()
+        .filter(|p| p.num_upvalues == 0)
+        .map(|p| p.code.len())
+        .sum();
+    // Kept low deliberately. A batch pools a per-chunk reading from every file
+    // and decodes on the majority, so a detector that only fires on the largest
+    // chunks is outvoted by the many small ones and never reaches the pool --
+    // measured: gated at 300 this fired on a minority and the pooled map still
+    // read 0xFB as MOVE. The strict fit tests below, not the volume, are what
+    // make the reading safe.
+    if zero_upval_insns < 300 {
+        return;
+    }
+
+    let mut within: HashMap<u8, usize> = HashMap::new();
+    let mut outside: HashMap<u8, usize> = HashMap::new();
+    let mut in_zero: HashMap<u8, usize> = HashMap::new();
+    for proto in &chunk.protos {
+        for &insn in &proto.code {
+            let op = insn_op(insn);
+            if ctx.is_mapped(op) {
+                continue;
+            }
+            // C is unused by GETUPVAL; a nonzero C rules the occurrence out.
+            if insn_c(insn) != 0 {
+                *outside.entry(op).or_insert(0) += 1;
+                continue;
+            }
+            if (insn_b(insn) as usize) < proto.num_upvalues as usize {
+                *within.entry(op).or_insert(0) += 1;
+            } else {
+                *outside.entry(op).or_insert(0) += 1;
+            }
+            if proto.num_upvalues == 0 {
+                *in_zero.entry(op).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut best: Option<(u8, usize)> = None;
+    for (&op, &w) in within.iter() {
+        // Volume gate: this force-assigns, so a handful of coincidences must not
+        // be able to claim the byte. Low, because the fit tests carry the weight
+        // and the reading has to reach the pooled majority to be worth anything.
+        if w < 50 {
+            continue;
+        }
+        let out = outside.get(&op).copied().unwrap_or(0);
+        let zero = in_zero.get(&op).copied().unwrap_or(0);
+        // 2% slack on both tests. These counts include AUX words -- operand data
+        // that can carry any byte value -- because instruction widths are not
+        // known this early. MOVE fails both tests by a wide margin regardless:
+        // its B is a register index, so it lands outside the upvalue range
+        // constantly and appears freely in upvalue-free protos.
+        if out * 100 > (w + out) {
+            continue;
+        }
+        if zero * 100 > (w + out) {
+            continue;
+        }
+        if best.map_or(true, |(_, bw)| w > bw) {
+            best = Some((op, w));
+        }
+    }
+
+    if let Some((op, w)) = best {
+        let out = outside.get(&op).copied().unwrap_or(0);
+        eprintln!(
+            "  GETUPVAL bound: pinning 0x{:02X} ({}/{} occurrences have B < num_upvalues, {} in upvalue-free protos)",
+            op,
+            w,
+            w + out,
+            in_zero.get(&op).copied().unwrap_or(0)
+        );
+        ctx.try_assign_force(op, LuauOpcode::GetUpval as u8);
+    }
+}
+
+/// TIER 1 — pin CAPTURE from the proto upvalue census.
+///
+/// `detect_closure_capture` finds captures by looking at the words that follow
+/// a NEWCLOSURE, so it can only be as right as NEWCLOSURE was. When NEWCLOSURE
+/// is guessed wrong the capture byte is wrong too, and nothing downstream can
+/// recover: the child's upvalues never bind to the parent's registers, the
+/// closure body reads names nothing assigns, and `free_var_decls` hoists them
+/// as bare `local vN`.
+///
+/// This detector is not circular. Every closure creation is followed by exactly
+/// `child.num_upvalues` CAPTURE words, so for any proto:
+///
+///     count(CAPTURE byte in proto.code) == sum(child.num_upvalues)
+///
+/// Both sides come from length-prefixed metadata, so the test runs without
+/// knowing a single opcode's meaning. Measured on the 1880-file v7 CoreGui set,
+/// where no measured permutation applies and the detectors must infer: the true
+/// byte fits 64% of protos and every rival byte fits ~10% — a 6x separation.
+/// That corpus had CAPTURE assigned to the wrong byte entirely, and the real
+/// one (0x12) was being handed to LENGTH by `detect_length_rescue`.
+fn detect_capture_by_upvalue_census(chunk: &Chunk, ctx: &mut DetectCtx) {
+    if ctx.assigned[LuauOpcode::Capture as usize] {
+        return;
+    }
+    let mut fit: HashMap<u8, usize> = HashMap::new();
+    let mut viol: HashMap<u8, usize> = HashMap::new();
+    for proto in &chunk.protos {
+        let expected: usize = proto
+            .child_protos
+            .iter()
+            .filter_map(|&ci| chunk.protos.get(ci as usize))
+            .map(|c| c.num_upvalues as usize)
+            .sum();
+        // `expected == 0` fits every byte that does not occur, so it carries no
+        // signal and would drown the ranking in noise.
+        if expected == 0 {
+            continue;
+        }
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for &insn in &proto.code {
+            *counts.entry(insn_op(insn)).or_insert(0) += 1;
+        }
+        for (&byte, &c) in counts.iter() {
+            if c == expected {
+                *fit.entry(byte).or_insert(0) += 1;
+            } else {
+                *viol.entry(byte).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut ranked: Vec<(u8, usize)> = fit.into_iter().collect();
+    // Highest fit count wins; ties broken by byte value so the result is
+    // deterministic across runs.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let Some(&(best, best_fit)) = ranked.first() else {
+        return;
+    };
+    // Thin evidence is worse than none: a chunk with one or two closures can
+    // put an unrelated byte on top by chance.
+    if best_fit < 3 {
+        return;
+    }
+    // Demand clear separation from the runner-up. On the measured corpus the
+    // true byte leads by roughly 6x; 2x is a deliberately loose floor.
+    let runner_up = ranked.get(1).map(|&(_, n)| n).unwrap_or(0);
+    if best_fit < runner_up.saturating_mul(2).max(3) {
+        return;
+    }
+    // Corroborate with CAPTURE's own encoding: A is the capture kind
+    // (VAL / REF / UPVAL) and C is unused. A byte that wins the census but does
+    // not look like a capture is a coincidence, not the opcode.
+    let (mut shape_ok, mut shape_total) = (0usize, 0usize);
+    for proto in &chunk.protos {
+        for &insn in &proto.code {
+            if insn_op(insn) == best {
+                shape_total += 1;
+                if insn_c(insn) == 0 && insn_a(insn) <= 2 {
+                    shape_ok += 1;
+                }
+            }
+        }
+    }
+    if shape_total == 0 || shape_ok * 10 < shape_total * 8 {
+        return;
+    }
+
+    let violations = viol.get(&best).copied().unwrap_or(0);
+    eprintln!(
+        "  CAPTURE census: pinning 0x{:02X} ({} protos fit, {} violate, {}/{} shape-conform)",
+        best, best_fit, violations, shape_ok, shape_total
+    );
+    ctx.try_assign_force(best, LuauOpcode::Capture as u8);
 }
 
 fn detect_closure_capture(chunk: &Chunk, ctx: &mut DetectCtx) {
@@ -4973,6 +5197,14 @@ fn detect_loadnil(chunk: &Chunk, ctx: &mut DetectCtx) {
 /// Key distinction from unary ops (NOT/MINUS/LENGTH): MOVE allows A==B, unaries always have A!=B.
 /// MOVE is also far more frequent than any unary op.
 fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
+    // How much upvalue-free code exists. Absence of a byte from these protos
+    // only disproves MOVE when there is enough of it to have contained one.
+    let zero_upval_insns: usize = chunk
+        .protos
+        .iter()
+        .filter(|p| p.num_upvalues == 0)
+        .map(|p| p.code.len())
+        .sum();
     // Collect per-candidate stats for refined scoring
     let mut totals: HashMap<u8, usize> = HashMap::new();
     let mut a_ne_b_counts: HashMap<u8, usize> = HashMap::new();
@@ -5047,6 +5279,29 @@ fn detect_move(chunk: &Chunk, ctx: &mut DetectCtx) {
 
         // Bonus: appears in protos with NO upvalues (rules out GETUPVAL/SETUPVAL)
         let no_upval_count = in_no_upval.get(&op).copied().unwrap_or(0);
+
+        // ...and when there is ample upvalue-free code, that is a REQUIREMENT
+        // rather than a bonus. The doc comment above names this as the key
+        // distinction from GETUPVAL, but a 1.5x multiplier does not enforce it:
+        // MOVE is the highest-frequency instruction, so the raw `total` term
+        // lets a byte win outright while never once appearing in an
+        // upvalue-free proto — which is precisely what GETUPVAL cannot avoid
+        // and MOVE cannot do.
+        //
+        // Measured on the v7 CoreGui set (1880 files, no measured permutation
+        // available so the detectors must infer): byte 0xFB took this slot with
+        // 12127 occurrences, 0 of them in an upvalue-free proto and all 12127
+        // satisfying B < num_upvalues. It is GETUPVAL. The swap is invisible to
+        // every width-based check because both opcodes are one word, so the
+        // instruction walk still lands exactly on RETURN.
+        //
+        // Gated on there being enough upvalue-free code for absence to mean
+        // something; on a chunk whose protos all capture, MOVE legitimately
+        // never appears in one, and this must not fire.
+        if zero_upval_insns >= 300 && no_upval_count == 0 {
+            continue;
+        }
+
         if no_upval_count > 0 {
             score *= 1.5;
         }
@@ -6012,6 +6267,38 @@ fn detect_unary_ops(chunk: &Chunk, ctx: &mut DetectCtx) {
     }
 }
 
+/// Word positions holding `CAPTURE`: the run that immediately follows every
+/// `NEWCLOSURE` / `DUPCLOSURE`.
+///
+/// The run is walked by shape rather than by the child proto's declared
+/// upvalue count, because that count needs the constant table resolved and
+/// this runs during opcode detection, before the map is trusted. Every CAPTURE
+/// has `C == 0` and `A` in `0..=2` (VAL / REF / UPVAL); the first word that
+/// fails either test ends the run.
+///
+/// `closure_bytes` are the already-mapped shuffled bytes for NEWCLOSURE and
+/// DUPCLOSURE. When neither is mapped yet the zone is empty and callers scan
+/// unchanged.
+fn capture_run_positions(code: &[u32], closure_bytes: &[u8]) -> std::collections::HashSet<usize> {
+    let mut zone = std::collections::HashSet::new();
+    if closure_bytes.is_empty() {
+        return zone;
+    }
+    for i in 0..code.len() {
+        if !closure_bytes.contains(&insn_op(code[i])) {
+            continue;
+        }
+        for j in (i + 1)..code.len() {
+            let w = code[j];
+            if insn_c(w) != 0 || insn_a(w) > 2 {
+                break;
+            }
+            zone.insert(j);
+        }
+    }
+    zone
+}
+
 /// Phase B0.78: Post-augmenter LENGTH rescue detector.
 ///
 /// When LENGTH (52) isn't detected by the normal pipeline, it blocks the
@@ -6064,11 +6351,37 @@ fn detect_length_rescue(chunk: &Chunk, ctx: &mut DetectCtx) {
         return;
     }
 
+    // CAPTURE words are shaped EXACTLY like the unary candidate this scan is
+    // looking for -- C == 0, A is the capture kind (VAL/REF/UPVAL), B is a
+    // register index -- and the captured register is almost always read within
+    // the consumer window. With the thresholds below (one instance, one hit) a
+    // single closure capture in a chunk that never uses `#` is enough to hand
+    // CAPTURE's byte to LENGTH.
+    //
+    // Measured on the CoreGui corpus: the rescue fires on 21% of files, and
+    // when it takes CAPTURE the child closure's upvalue never binds to the
+    // parent register. The closure then emits an unbound generated name that
+    // nothing assigns, which `free_var_decls` hoists as a bare `local vN` --
+    // the `declared_never_assigned` defect, 4,616 of them.
+    // `getTranslator` is the minimal case: `CAPTURE VAL R1` at pc 17 decoded
+    // as `LENGTH R0 #R1`, so `return RobloxTranslator` came out `return v0`.
+    //
+    // CAPTURE can only appear in the run immediately following NEWCLOSURE /
+    // DUPCLOSURE, so those positions are excluded structurally rather than by
+    // tightening a threshold. Over-marking only costs the rescue a candidate
+    // position; taking CAPTURE corrupts every closure in the chunk.
+    let closure_bytes: Vec<u8> = [LuauOpcode::NewClosure, LuauOpcode::DupClosure]
+        .iter()
+        .filter_map(|o| ctx.find_shuffled(*o as u8))
+        .collect();
+
     // Scan for unary-shaped (C=0, A!=B) unmapped bytes with consumer context.
     let mut candidates: HashMap<u8, (usize, usize)> = HashMap::new();
     for proto in &chunk.protos {
         let code = &proto.code;
+        let capture_zone = capture_run_positions(code, &closure_bytes);
         for i in 0..code.len() {
+            if capture_zone.contains(&i) { continue; }
             let insn = code[i];
             let op = insn_op(insn);
             if ctx.is_mapped(op) { continue; }

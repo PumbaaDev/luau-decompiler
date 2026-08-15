@@ -487,7 +487,28 @@ impl OpmapDb {
         let mut best_anchor_agree = 0u32;
         let mut candidates: Vec<&DbEntry> = Vec::new();
         for e in &self.entries {
-            if e.bytecode_version != chunk.version {
+            // An opcode permutation is a property of the CLIENT BUILD. The
+            // bytecode version is a property of the COMPILER that emitted the
+            // chunk. They are orthogonal, and one client ships both: the live
+            // compiler emits v9 while the precompiled CoreScripts are v7, all
+            // under one shuffle.
+            //
+            // An equality test here conflates them. `roblox_v9_live` takes its
+            // `bytecode_version` from the build label ("live v9"), not from the
+            // version of the chunks it was probed against, so equality rejected
+            // it on all 1880 v7 CoreGui files and every one fell back to
+            // per-file heuristic detection: 23.9% clean, 6449 defects. The same
+            // entry admitted decodes them at 90.4% clean, 303 defects.
+            //
+            // Luau opcode numbering is append-only, so an entry measured at a
+            // NEWER version is a superset of an older chunk's opcode set and is
+            // safe to try. The reverse is not: an older entry against newer
+            // chunks leaves the added opcodes unmapped, so that stays rejected.
+            //
+            // This only admits the entry as a CANDIDATE. Tier-A anchor
+            // conflicts, the anchor-agreement floor and `walk_verify` all still
+            // run below and reject a map that does not fit.
+            if e.bytecode_version < chunk.version {
                 continue;
             }
             if fp.tier_a_conflicts(&e.map) > 0 {
@@ -583,9 +604,13 @@ impl OpmapDb {
         let entry = self
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no database entry with id \"{}\"", id))?;
-        if entry.bytecode_version != chunk.version {
+        // Same asymmetry as `lookup`: opcode numbering is append-only, so an
+        // entry measured at a newer bytecode version covers an older chunk's
+        // opcode set. `walk_verify` below is the real gate and still runs.
+        if entry.bytecode_version < chunk.version {
             anyhow::bail!(
-                "entry \"{}\" is for bytecode v{}, this chunk is v{}",
+                "entry \"{}\" was measured at bytecode v{}, older than this chunk's v{}, \
+                 so opcodes added since are unmapped",
                 id,
                 entry.bytecode_version,
                 chunk.version
