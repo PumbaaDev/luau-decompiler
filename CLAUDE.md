@@ -33,7 +33,11 @@ Windows, or the link step fails on a locked file.
 - **Force a clean decompiler run when measuring quality.** Empty the output dir
   first and confirm `resumed=0`. Otherwise the numbers mix old-opmap files and
   are meaningless.
-- **`disassemble` needs `--opmap`** or its output is wrong.
+- **`disassemble` needs `--opmap` AND `--opmap-db`** or its output is wrong.
+  `--opmap` alone runs the detectors and prints a map the decompile never used;
+  it misassigns the AUX-carrying opcodes, so the listing eats AUX words as
+  instructions and desynchronises. It looks plausible and is not. Fixed in
+  4ca4286, but pass both flags — the DB is what makes it exact.
 - **Never read operands off the disassembler's printer** — it invents names like
   `R{a+1}`. Go to the bytecode.
 - Tag a backup (`git tag backup/pre-<phase>`) before lifter/opmap/emitter edits.
