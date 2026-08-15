@@ -2201,10 +2201,22 @@ fn lift_region(
                         if exprs_structurally_equal(&t, &e) {
                             continue;
                         }
-                        // An else arm is required: with no else there is no
-                        // second assignment and the name is unassigned whenever
-                        // the condition is false.
-                        let Some(else_stmts) = else_body.as_mut() else { continue };
+                        // Every path must assign, or this becomes the rejected
+                        // declaration-only hoist. With an else arm both arms
+                        // assign. WITHOUT one, the false path leaves the
+                        // register at its PRE-BRANCH value, so seeding the
+                        // declaration with that value covers it -- and only then
+                        // is it sound.
+                        let seed = match else_body {
+                            Some(_) => None,
+                            None => match regs_before.get(i) {
+                                Some(RegVal::Expr(p)) => Some(p.clone()),
+                                Some(RegVal::LoopVar(nm)) => Some(Expr::Name(nm.clone())),
+                                // Pre-branch value unknown and no else arm:
+                                // nothing assigns on the false path. Skip.
+                                _ => continue,
+                            },
+                        };
                         let raw = ctx.reg_name(proto, i as u8, *mpc);
                         let (kind, name) = locals.classify_write(i, &raw);
                         if kind != WriteKind::FirstDecl {
@@ -2212,16 +2224,18 @@ fn lift_region(
                         }
                         hoisted_phis.push(Stat::Local {
                             names: vec![name.clone()],
-                            values: vec![],
+                            values: seed.map(|s| vec![s]).unwrap_or_default(),
                         });
                         then_stmts.push(Stat::Assign {
                             targets: vec![Expr::Name(name.clone())],
                             values: vec![t],
                         });
-                        else_stmts.push(Stat::Assign {
-                            targets: vec![Expr::Name(name.clone())],
-                            values: vec![e],
-                        });
+                        if let Some(else_stmts) = else_body.as_mut() {
+                            else_stmts.push(Stat::Assign {
+                                targets: vec![Expr::Name(name.clone())],
+                                values: vec![e],
+                            });
+                        }
                         regs[i] = RegVal::Expr(Expr::Name(name));
                     }
                 }
