@@ -468,11 +468,33 @@ fn check_body_recovered(source: &str, proto_count: Option<usize>, out: &mut Vec<
     if protos < 4 {
         return;
     }
+    // Count the `function` KEYWORD, not the three line shapes a declaration can
+    // take. A body passed inline as a call argument -- `sig:Connect(function(a, b)`
+    // -- or returned directly is a real emitted body, and the shape test saw
+    // none of them.
+    //
+    // Loosening a check that exists to catch dropped bodies is exactly how a
+    // genuine drop could start scoring clean, so this was verified against the
+    // three CoreGui files that fire it rather than assumed:
+    //
+    //   24875  10 protos, shape test 2, keyword count  9, 81 lines  -> bodies present
+    //   25948  12 protos, shape test 2, keyword count 11, 188 lines -> bodies present
+    //   26253  12 protos, shape test 1, keyword count  1, 8 lines   -> genuinely dropped
+    //
+    // The keyword count separates them; the shape test called all three broken.
+    // 26253 still fires, which is the point -- it collapses 12 protos into an
+    // empty function body and `cap_0[cap_0]`.
     let emitted = source
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            t.starts_with("function ") || t.starts_with("local function ") || t.contains("= function(")
+        .match_indices("function")
+        .filter(|(i, _)| {
+            let before_ok = *i == 0
+                || !source.as_bytes()[i - 1].is_ascii_alphanumeric()
+                    && source.as_bytes()[i - 1] != b'_';
+            let after = i + "function".len();
+            let after_ok = after >= source.len()
+                || !source.as_bytes()[after].is_ascii_alphanumeric()
+                    && source.as_bytes()[after] != b'_';
+            before_ok && after_ok
         })
         .count();
     // main proto is not itself emitted as a declaration
