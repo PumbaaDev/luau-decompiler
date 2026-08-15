@@ -1125,6 +1125,55 @@ pub fn disassemble_with_opmap(
     Ok(format!("{}{}", header, body))
 }
 
+/// Disassemble under a decode plan, so the diagnostic view matches what the
+/// DECOMPILE would actually use.
+///
+/// `disassemble_with_opmap` takes only a pooled prior, so when a measured
+/// database entry applies the disassembly still ran the detectors and printed a
+/// map the decompile never used. That makes the tool's own diagnostic view
+/// disagree with its output on exactly the chunks where a measured permutation
+/// exists -- the case where the disassembly is most likely to be trusted. It
+/// cost several investigations real time, one of which concluded a chunk was
+/// mis-decoded from a listing produced by a map the decompiler had not used.
+pub fn disassemble_with_plan(bytecode: &[u8], plan: &DecodePlan<'_>) -> Result<String> {
+    let Some(entry) = plan.exact else {
+        return disassemble_with_opmap(bytecode, plan.prior);
+    };
+    let mut chunk = parser::parse(bytecode)?;
+    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        return disassemble_with_opmap(bytecode, plan.prior);
+    }
+
+    // Same ground-truth installation the decompile path performs, so anything
+    // consulting the global sees the measured answer.
+    let _gt_guard = GroundTruthGuard::install(entry.map);
+    let exact = parser::opmap::OpcodeMap::from_exact_map(entry.map);
+
+    let mut header = format!(
+        "; Luau bytecode v{} — measured map \"{}\" ({} opcodes, no detectors run)\n",
+        chunk.version,
+        entry.id,
+        exact.mapped_count
+    );
+    header.push_str("; SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
+    let mut mappings: Vec<(u8, u8)> = exact
+        .shuffled_to_standard
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v != 255)
+        .map(|(i, &v)| (i as u8, v))
+        .collect();
+    mappings.sort_by_key(|&(_, std)| std);
+    for (shuffled, standard) in &mappings {
+        let name = parser::opcodes::LuauOpcode::from_u8(*standard).name();
+        header.push_str(&format!(";   0x{:02X} -> {:2} {}\n", shuffled, standard, name));
+    }
+    header.push('\n');
+
+    let (_unknowns, _, _) = exact.remap_chunk(&mut chunk);
+    Ok(format!("{}{}", header, disasm::disassemble(&chunk, true)))
+}
+
 /// High-level API: parse and return structured info about the bytecode
 pub fn info(bytecode: &[u8]) -> Result<BytecodeInfo> {
     let chunk = parser::parse(bytecode)?;

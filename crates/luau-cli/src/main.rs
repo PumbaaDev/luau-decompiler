@@ -349,13 +349,26 @@ fn main() -> Result<()> {
                 // Diagnostic view of what the lifter actually processes, so it
                 // must apply the same map the lifter would — including the
                 // shared store, or it would show a map the decompile never used.
-                let consulted = store.as_ref().map(|p| consult_store(p, &data));
-                let prior = consulted.as_ref().and_then(|(m, _)| *m);
-                let text = luau_core::disassemble_with_opmap(&data, prior.as_ref())?;
-                if let (Some(p), Some((_, Some(b)))) = (store.as_ref(), consulted.as_ref()) {
-                    cast_ballot(p, b);
+                //
+                // The DATABASE has to be resolved here too, with the same
+                // DB-first precedence as `decompile_with_store`. It was not,
+                // so on any chunk a measured entry covers this printed a
+                // detector map the decompile never touched — the case where
+                // the listing is most likely to be believed.
+                if let Some(entry) = resolve_db_entry(&db, &data)? {
+                    luau_core::disassemble_with_plan(
+                        &data,
+                        &luau_core::DecodePlan { prior: None, exact: Some(&entry) },
+                    )?
+                } else {
+                    let consulted = store.as_ref().map(|p| consult_store(p, &data));
+                    let prior = consulted.as_ref().and_then(|(m, _)| *m);
+                    let text = luau_core::disassemble_with_opmap(&data, prior.as_ref())?;
+                    if let (Some(p), Some((_, Some(b)))) = (store.as_ref(), consulted.as_ref()) {
+                        cast_ballot(p, b);
+                    }
+                    text
                 }
-                text
             } else {
                 luau_core::disassemble(&data, debug_info)?
             };
