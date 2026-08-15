@@ -23,9 +23,11 @@
 //! output assigns to globals instead of the intended locals. It still parses,
 //! which is exactly why marker-counting scored these files clean.
 //!
-//! Note this is a different problem from `capture_chain.rs`, which works out
-//! what an upvalue should be *called*. A perfect name is still broken output
-//! if nothing declares it.
+//! Note this is a different problem from working out what an upvalue should be
+//! *called*. A perfect name is still broken output if nothing declares it.
+//! (An unwired `capture_chain.rs` used to attempt the naming half; it was never
+//! declared as a module, and wiring it in was measured byte-identical on 400
+//! corpus files, so it was deleted rather than finished.)
 //!
 //! ── THE FIX ─────────────────────────────────────────────────────────────
 //! After lifting, walk the chunk and collect every name that is **assigned**
