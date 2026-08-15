@@ -2237,6 +2237,20 @@ fn lift_region(
                         // a top-level name with a branch-local binding compiles
                         // clean and reads nil at runtime, which is precisely
                         // what those probes exist to catch.
+                        //
+                        // AND THE SOUND SUBSET IS EMPTY. The correct admission
+                        // test is the one `merge_regs` already uses: allow a
+                        // Reassign only when the binding it targets is the
+                        // PRE-BRANCH one, whose declaration precedes the `if`
+                        // and is therefore live at the join. Implemented and
+                        // measured: all three probes pass, the full suite is
+                        // 928/928 -- and the corpora do not move at all, CoreGui
+                        // 220 and BSS 378, unchanged to the defect.
+                        //
+                        // So every case that appeared to help was one where the
+                        // binding was NOT live. The 45% drop was entirely the
+                        // scope defect. There is nothing here to recover
+                        // soundly; do not try a third time.
                         if kind != WriteKind::FirstDecl {
                             continue;
                         }
