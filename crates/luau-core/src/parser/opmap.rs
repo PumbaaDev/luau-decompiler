@@ -1758,7 +1758,11 @@ fn detect_getupval_by_upvalue_bound(chunk: &Chunk, ctx: &mut DetectCtx) {
         if zero * 100 > (w + out) {
             continue;
         }
-        if best.map_or(true, |(_, bw)| w > bw) {
+        // Tie-break on byte value. `within` is a HashMap, so iteration order
+        // varies between runs; picking "first seen wins" on an equal count made
+        // the whole detector nondeterministic and surfaced as an unrelated
+        // opmap test failing roughly one run in three.
+        if best.map_or(true, |(bo, bw)| w > bw || (w == bw && op < bo)) {
             best = Some((op, w));
         }
     }

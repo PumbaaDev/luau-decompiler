@@ -1798,6 +1798,44 @@ fn lift_value_join(
         // Not a pure value selection after all. Fall back to the linear lift of
         // the whole span, which is exactly what a `Region::Linear` would do.
         _ => {
+            // Seed the registers that escape this diamond BEFORE the fallback
+            // lift, exactly as the `Region::IfThenElse` caller does.
+            //
+            // Without this the fallback lifts `branch_pc..join_start`, so the
+            // nested inline-if handler forwards an after-window of
+            // `join_start..join_start` -- zero width -- and
+            // `premateralize_branch_escapes_spans` returns at its
+            // `after_end <= after_start` guard before evaluating a single gate.
+            // The handler then hard-restores the pre-branch snapshot, which
+            // annihilates BOTH arm writes silently, and the post-join read
+            // mints a name nothing ever assigns.
+            //
+            // The real after-window is the join onward, not the empty span
+            // between the branch and the join.
+            if arms.len() == 2 {
+                let range_of = |id: &usize| cfg.blocks.get(id).map(|b| (b.start, b.end));
+                let then_ranges: Vec<(usize, usize)> = range_of(&arms[0]).into_iter().collect();
+                let else_ranges: Vec<(usize, usize)> = range_of(&arms[1]).into_iter().collect();
+                if !then_ranges.is_empty() && !else_ranges.is_empty() {
+                    let arm_ranges: Vec<(usize, usize)> = then_ranges
+                        .iter()
+                        .chain(else_ranges.iter())
+                        .copied()
+                        .collect();
+                    premateralize_branch_escapes_spans(
+                        ctx,
+                        proto,
+                        regs,
+                        locals,
+                        stmts,
+                        &arm_ranges,
+                        Some((&then_ranges, &else_ranges)),
+                        join_start,
+                        proto.code.len(),
+                        branch_pc,
+                    );
+                }
+            }
             lift_instruction_range(
                 ctx, proto, proto_index, depth, branch_pc, join_start, regs, locals, stmts, in_loop,
             );
@@ -5765,6 +5803,37 @@ fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool
             || insn_c(insn) as usize == reg
         {
             return true;
+        }
+        // CALL and RETURN read a WINDOW of registers that no operand field
+        // names: `CALL A B C` takes its arguments from A+1..A+B-1 and `RETURN A
+        // B` its values from A..A+B-1, where B is a COUNT, not a register. The
+        // A/B/C scan above therefore cannot see them, and this function's own
+        // contract says a false negative loses a value.
+        //
+        // That is not hypothetical. `merge_first_touch_is_read` models these
+        // windows and this function does not, so the two disagree about the
+        // same instruction while this, the cruder one, runs first as a
+        // pre-filter above every seed gate. A register whose only post-join
+        // consumer is a call argument was reported unused and its value
+        // dropped.
+        //
+        // B == 0 means "to the top of the stack" -- the count is decided at
+        // runtime -- so every register above the base is potentially read.
+        // Over-approximating there is the safe direction per the contract.
+        match op {
+            LuauOpcode::Call | LuauOpcode::Return => {
+                let base = insn_a(insn) as usize;
+                let count = insn_b(insn) as usize;
+                let first = if op == LuauOpcode::Call { base + 1 } else { base };
+                if count == 0 {
+                    if reg >= first {
+                        return true;
+                    }
+                } else if reg >= first && reg < base + count {
+                    return true;
+                }
+            }
+            _ => {}
         }
         i += if op.has_aux() { 2 } else { 1 };
     }
