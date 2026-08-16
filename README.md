@@ -205,9 +205,34 @@ than having no check.
 
 ### Measured state on real shuffled bytecode
 
-Seven Roblox client modules, decompiled and checked:
+A whole Roblox game, not a sample: **1,310 bytecode files pulled from a live
+client** (Bee Swarm Simulator, `PlaceId 1537690962`), decompiled in one clean
+batch run.
 
-**3 of 7 fully clean, 4 remaining defects, 0 undefined locals.**
+| | |
+|---|---|
+| Decoded | **1,309 / 1,309** (the 1 exclusion ships a compiler error, not a program) |
+| Parses as valid Luau | **1,309 / 1,309 (100%)** |
+| Semantically clean | **1,255 / 1,309 (95.9%)**, 115 defects |
+
+Syntax validity is cross-checked against the real `luau-compile`, not just our
+own checker — see below for why that mattered.
+
+The 115 remaining defects are not spread evenly. They are almost one thing:
+
+| check | files | defects |
+|---|---:|---:|
+| `declared_never_assigned` | 52 | **113** |
+| `undefined_local` | 1 | 1 |
+| `name_body_mismatch` | 1 | 1 |
+
+**98% of what is left is a single mechanism.** A value the bytecode computes
+inside a branch is parked in the register file rather than emitted as a
+statement; the merge then discards it, the hoisted declaration survives, and
+every later read is `nil`. Traced end to end in `BeeStats.GetGatherAmounts`,
+where `MUL R10 R10 * R14` behind a `JUMPXEQKNIL` guard produces a `v10` that is
+declared once and never assigned. Fixing it means binding the pre-branch value
+*and* emitting the in-branch write — not one of the two.
 
 Recent fixes, each verified by that harness rather than by eye:
 
@@ -225,6 +250,27 @@ declarations from 32 protos. The instruction stream now decodes correctly; the
 remaining fault is in the `DUPCLOSURE` → `SETTABLEKS` → declaration path, which
 attaches methods to a module table. The test for this is committed and
 deliberately failing — it documents a real defect and stays red until fixed.
+
+### A tool that lies is worse than no tool
+
+`validate` used to reject **106 of those 1,309 files**, reporting a `function`
+left unclosed hundreds of lines from anything wrong.
+
+Every one of them was valid. `tools/luau/luau-compile` — the real Luau compiler
+— accepted all 106. The bug was ours: the block tracker pushed an entry for
+every `then` token, including the one after `elseif`, but `if/elseif/else`
+closes with a single `end`. Each `elseif` leaked one entry, and because the
+stack is LIFO the survivor reported at EOF was the outermost opener.
+
+The correlation was exact — 106 files contain `elseif` and 106 failed; the
+1,203 without `elseif` all passed, with no exception either way.
+
+Two things are worth taking from that. A false failure costs more than a missed
+one, because it sends you hunting a bug that does not exist — this nearly
+became a hunt for an emitter fault across 100 files. And **when a checker and a
+reference implementation disagree, find out which is wrong before believing
+either.** `luau-compile` ships in this repo precisely so that question is one
+command away.
 
 ## Project layout
 
