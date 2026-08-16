@@ -312,8 +312,26 @@ pub fn run_builtin(src: &str) -> ValidationResult {
                     }
                     _ => errors.push(format!("line {}: unexpected `until`", line)),
                 },
-                "elseif" | "else" => {
-                    // Fine inside `then` block.
+                "elseif" => {
+                    // `if a then … elseif b then … end` closes with ONE `end`, but the
+                    // `then` arm below pushes for EVERY `then` token — including the one
+                    // that follows `elseif`. Left alone that leaks one stack entry per
+                    // `elseif`, and because the stack is LIFO the survivor reported at
+                    // EOF is the OUTERMOST opener, so the message blamed a `function`
+                    // hundreds of lines away. It marked all 106 elseif-containing files
+                    // in the game corpus as unparseable while real `luau-compile`
+                    // accepted every one of them.
+                    //
+                    // Pop the arm this `elseif` closes; the following `then` re-pushes.
+                    match blocks.last() {
+                        Some(("then", _)) => {
+                            blocks.pop();
+                        }
+                        _ => errors.push(format!("line {}: unexpected `elseif`", line)),
+                    }
+                }
+                "else" => {
+                    // `else` continues the same arm — no push, no pop.
                 }
                 _ => {}
             }
