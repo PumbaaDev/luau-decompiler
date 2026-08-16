@@ -103,7 +103,7 @@
         "producer": "python differential aligner (canonical luau-compile --text vs client dumpbytecode)"
       },
       "semantics": {
-        "unary_length": "passthrough",
+        "unary_length": "operator",
         "unary_minus": "passthrough",
         "unary_not": "passthrough"
       }
