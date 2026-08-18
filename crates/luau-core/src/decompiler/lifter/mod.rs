@@ -4051,33 +4051,83 @@ fn hoist_loop_locals(
         return;
     }
 
-    // Collect names from Local statements in the body that correspond to
-    // newly-declared registers and rewrite them to Assign.
+    // ONLY THE NAMES THAT ARE ACTUALLY NEW IN THIS LOOP.
+    //
+    // This collected every `Stat::Local` name in the body. `new_regs` was
+    // computed, tested for emptiness, and then never used again - so a name
+    // already live BEFORE the loop was hoisted too, and the bare `local` we
+    // emit below re-declared it, shadowing the existing binding with nil:
+    //
+    //     local result4 = task.wait(...)        -- assigned
+    //     local random49, random50, result4     -- hoist re-declares it
+    //     while result4 do                      -- reads nil, never runs
+    //
+    // That is 250_GlitchEffect, where the periodic effect could never fire
+    // once. The same shape shadows `self` and `arg2` inside a method in
+    // 879_BigNum, so `self.len` indexes nil. On the 18 Aug 1,143-file corpus
+    // `declared_never_assigned` was 100 of the 102 remaining defects.
+    //
+    // The doc comment above already described the correct rule; this makes the
+    // code do it. A register in `new_regs` was first declared inside the loop,
+    // so hoisting its name is sound. A name bound to any other register was
+    // live on the way in and must be assigned, never re-declared.
+    let new_names: HashSet<String> = new_regs
+        .iter()
+        .filter_map(|&r| locals.current_name(r).map(|s| s.to_string()))
+        .collect();
+
     let mut hoisted_names: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // A name already live on the way in still has to become an ASSIGNMENT.
+    //
+    // Not hoisting it is only half the job. The body re-binds the same
+    // register each time round, and if that stays a `local` it shadows the
+    // outer binding inside the loop, so the condition never sees the new
+    // value:
+    //
+    //     local result4 = task.wait(...)
+    //     while result4 do
+    //         glitchEffect(arg1)
+    //         local result4 = task.wait(...)   -- shadows; outer never updates
+    //     end
+    //
+    // Registers are function-scoped, so a body write to a register that was
+    // live before the loop IS the same variable - rewriting it to an assign is
+    // what the bytecode actually said.
+    let mut rebind_names: Vec<String> = Vec::new();
     for stat in body.iter() {
         if let Stat::Local { names, .. } = stat {
             for name in names {
-                if seen.insert(name.clone()) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if new_names.contains(name) {
                     hoisted_names.push(name.clone());
+                } else {
+                    rebind_names.push(name.clone());
                 }
             }
         }
     }
 
-    if hoisted_names.is_empty() {
+    if hoisted_names.is_empty() && rebind_names.is_empty() {
         return;
     }
 
-    // Emit a single hoisted `local` declaration before the loop
-    stmts.push(Stat::Local {
-        names: hoisted_names.clone(),
-        values: vec![],
-    });
+    // Only the genuinely new names get a declaration; the rest were already
+    // declared outside and re-declaring them is the shadowing bug above.
+    if !hoisted_names.is_empty() {
+        stmts.push(Stat::Local {
+            names: hoisted_names.clone(),
+            values: vec![],
+        });
+    }
 
-    // Rewrite matching Local nodes in the body to plain Assign
-    let rewrite_set: HashSet<String> = hoisted_names.into_iter().collect();
+    // Rewrite matching Local nodes in the body to plain Assign - both the
+    // hoisted ones and the ones that were live all along.
+    let mut rewrite_set: HashSet<String> = hoisted_names.into_iter().collect();
+    rewrite_set.extend(rebind_names);
     rewrite_locals_to_assigns(body, &rewrite_set);
 }
 
