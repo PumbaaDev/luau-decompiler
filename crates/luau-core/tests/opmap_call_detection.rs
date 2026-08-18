@@ -43,6 +43,34 @@ use std::path::{Path, PathBuf};
 
 const BYTECODE_DIR: &str = r"C:\Users\jep\AppData\Local\Potassium\workspace\decompiler";
 
+/// Decompile with the measured opmap database when it covers this chunk,
+/// exactly as `luau-cli` does. Falls back to detector inference only when the
+/// database has no entry, which is the same order of precedence the CLI uses.
+fn decompile_like_product(bytes: &[u8]) -> Option<String> {
+    let db_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../opmap_db/roblox_v9_live.json");
+    if let Ok((db, _warnings)) = luau_core::parser::opmap_db::OpmapDb::load(&db_path) {
+        if let Ok(chunk) = luau_core::parser::parse(bytes) {
+            if let Some(entry_id) = match db.lookup(&chunk) {
+                luau_core::parser::opmap_db::DbLookup::Hit { ref entry_id, .. } => {
+                    Some(entry_id.clone())
+                }
+                _ => None,
+            } {
+                if let Some(entry) = db.get(&entry_id).cloned() {
+                    if let Ok((src, _)) = luau_core::decompile_with_plan(
+                        bytes,
+                        &luau_core::DecodePlan { prior: None, exact: Some(&entry) },
+                    ) {
+                        return Some(src);
+                    }
+                }
+            }
+        }
+    }
+    luau_core::decompile(bytes).ok()
+}
+
 fn bytecode_files() -> Vec<PathBuf> {
     let dir = Path::new(BYTECODE_DIR);
     if !dir.exists() {
@@ -80,7 +108,23 @@ fn call_is_assigned_for_every_shuffled_chunk() {
     let mut missing = Vec::new();
     for path in &files {
         let Ok(bytes) = std::fs::read(path) else { continue };
-        let Ok(src) = luau_core::decompile(&bytes) else { continue };
+        // DECODE THE WAY THE PRODUCT DOES. This called `luau_core::decompile`,
+        // which runs detector-only opmap inference. On CameraModule that pins
+        // 33 of the 40 opcode bytes the chunk uses, fills 4 by bijection and
+        // leaves 3 UNMAPPED, and the header it emits says so outright: "treat
+        // the mapping as provisional". Three unresolved opcodes mis-decode the
+        // stream, and the output collapses from 577 lines and 25 functions to
+        // 93 lines and 0 -- which is precisely the "module bodies were lost"
+        // this test then reported.
+        //
+        // The loss was in the harness, not the emitter: every real invocation
+        // resolves the measured database entry first (luau-cli/src/main.rs:358,
+        // :718). Decoding here without it tested a path the decompiler never
+        // takes and blamed the result on the emitter.
+        let src = match decompile_like_product(&bytes) {
+            Some(s) => s,
+            None => continue,
+        };
         // Only chunks that actually reported a shuffle map are in scope.
         if !src.lines().any(|l| l.contains("SHUFFLE MAP")) {
             continue;
@@ -119,7 +163,12 @@ fn large_modules_emit_calls_not_empty_tables() {
     let mut broken = Vec::new();
     for path in &files {
         let Ok(bytes) = std::fs::read(path) else { continue };
-        let Ok(src) = luau_core::decompile(&bytes) else { continue };
+        // Same reason as the call site above: decode with the measured DB,
+        // which is what every real invocation does.
+        let src = match decompile_like_product(&bytes) {
+            Some(s) => s,
+            None => continue,
+        };
         let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
 
         let protos: usize = src
