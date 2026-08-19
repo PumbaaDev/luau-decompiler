@@ -3990,8 +3990,38 @@ pub(super) fn store_complex(
             // deliberately the same predicate `check_branch_local_discarded`
             // uses to recognise the family - the checker and the fix agree on
             // what the defect is.
-            let self_mutation =
+            let mut self_mutation =
                 matches!(&value, Expr::BinOp { .. }) && expr_references_name(&value, &name);
+
+            // ACCUMULATE THROUGH AN ALIAS.
+            //
+            // Luau's CONCAT needs its operands in consecutive registers, so
+            // `desc = desc .. x .. " "` first MOVEs the accumulator into the
+            // start of a scratch range. The arm then reads as
+            //
+            //     Pool = Name2                        -- the MOVE
+            //     local Name3 = (Pool .. self.Pool) .. " "
+            //
+            // and the extension references the SCRATCH name, not the carried
+            // one, so the guard above cannot see that this is still an
+            // accumulate onto `Name2`. 819_StatReqs_Completed_Quests loses the
+            // pool name from its description this way, and the same shape
+            // appears in 165_QuestListener and 263_BeeTypeStatsBox.
+            //
+            // Only ONE level, and only when the MOVE is the statement
+            // immediately before: a longer chain is not evidence of anything,
+            // and matching loosely here is how rotations 25 and 27 broke files.
+            if !self_mutation && matches!(&value, Expr::BinOp { .. }) {
+                if let Some(Stat::Assign { targets, values }) = stmts.last() {
+                    if let (Some(Expr::Name(alias)), Some(Expr::Name(src))) =
+                        (targets.first(), values.first())
+                    {
+                        if src == &name && expr_references_name(&value, alias) {
+                            self_mutation = true;
+                        }
+                    }
+                }
+            }
             let do_peek =
                 !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc) && !self_mutation;
             let rebind_name: Option<String> = if do_peek {

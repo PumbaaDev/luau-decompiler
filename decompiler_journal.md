@@ -2011,3 +2011,62 @@ SEMANTIC: 1,115/1,142 (97.6%), 35 defects - of which 3 are now proven checker
   A2 PARKED (2). B PARKED (1). C PARKED (2). J PARKED (0).
   K PART-ADJUDICATED: 3 confirmed FP, 5 candidates, 12 real (they are J).
 SWEEP: still running against run_r27.
+
+
+## Rotation 31 - mechanism J CLOSED: accumulating through a MOVE alias
+
+### The answer to J's question
+Luau's CONCAT needs its operands in CONSECUTIVE registers, so
+`desc = desc .. x .. " "` first MOVEs the accumulator into the start of a
+scratch range. The arm therefore reads
+
+    Pool = Name2                              -- the MOVE
+    local Name3 = (Pool .. self.Pool) .. " "  -- extends the SCRATCH name
+
+Rotation 28's guard asks whether the value references the CARRIED name; here it
+references the alias, so it could not fire. Not a lost write-back and not a
+mis-assigned destination - a name-visibility gap, which is the third option J's
+question did not list.
+
+### The proof was inside one of the changed files
+`748_StatModifiers_CogsPerRound` has both shapes in one function:
+
+    if self.Op == "Add" then
+        Op3 = Op
+        local Op5 = ((((Op3 .. " (") .. FromUpgrade) .. " + ") ... )   -- DROPPED
+        return Op5
+    end
+    if self.Op == "Mul" then
+        Op = ((((Op .. " (") .. FromUpgrade) .. " + ") ... )           -- correct
+    end
+
+The Mul branch needs no alias, so rotation 28 already fixed it. The Add branch
+goes through `Op3 = Op` and did not. The two branches disagreeing about their
+own accumulator IS the defect, and after the fix they are identical.
+
+### The rule
+One level, and only when the MOVE is the IMMEDIATELY preceding statement. A
+longer chain is not evidence, and matching loosely is how rotations 25 and 27
+broke files. The BinOp gate still applies, so `X = X.field` cannot be smuggled
+through an alias.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,115 -> **1,118 clean (97.9%)**, 35 -> **31 defects**
+
+16 files changed; read five, all correct write-backs, including
+`708_ReadableTimeString` where the following `floor14 = floor15` was updated to
+`floor14 = floor11` consistently.
+
+    819_StatReqs   `Name2 = (Pool .. self.Pool) .. " "`, then `Name2 ..= "Quest"`
+    748_CogsPerRound  Add and Mul branches now agree
+
+939 unit tests plus 4 new alias cases (12 in the file); CoreScript ground truth
+passes; only the two pre-existing `opmap_dupclosure_detection` failures remain.
+
+### State after rotation 31
+SEMANTIC: **1,118/1,142 (97.9%), 31 defects** - and 3 of those are the proven
+  `885_Easing` checker false positives, so 28 real.
+  A, D, E, F, G, H, I, **J** CLOSED. MINUS lead closed as a measured dead end.
+  A2 PARKED (2). B PARKED (1). C PARKED (2).
+  K: 3 confirmed FP, 5 candidates, remainder folded into J and now fixed.
+SWEEP: still running against run_r27; it predates rotations 28 and 31.
