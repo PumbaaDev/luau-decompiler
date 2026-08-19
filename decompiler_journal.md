@@ -7200,3 +7200,65 @@ THE QUESTION: `LUAU_REG_WATCH=<reg>` inside each named proto, paired with the
 ### State after rotation 117
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `MINTAT` verified
 inert.
+
+
+## Rotation 118 - THE FORK RESOLVED: a call-cleared register is BOTTOM, not TOP
+
+### The measurement, in the right proto at last
+`53_PathDisplay`, `renderPoint@49`, register 7 (from r117's MINTAT):
+
+    38: CALL      R6 args=2 results=1     clears R7 - it is ABOVE the result
+    39: GETUPVAL  R9 U1
+    40: GETTABLEN R8 R9[1]
+    41: JUMPIF    R8 -> 44
+    42: LOADNIL   R7                      fall-through DEFINES R7 = nil
+    43: JUMP      -> 57
+    44: GETUPVAL  R9 U1                   taken path leaves R7 call-cleared
+    ...
+    read of R7 after the merge  ->  MINTED v7
+
+`LUAU_REG_WATCH=7` confirms it: Unknown at 39/42/44, then
+`READ reg=7 MINTED v7 (register held Some(Unknown))`.
+
+### The answer to the two-way fork
+r114/r117 posed it as: merge defect, or `clear_start` too broad? **Merge
+defect.** The clear at pc 38 is correct - R7 is above the call's result and the
+VM leaves it holding nothing. The fault is what happens at the JOIN:
+
+    arm A (fall-through)  R7 = nil            EXPLICIT, from LOADNIL
+    arm B (taken)         R7 = call-cleared   holds NOTHING
+    merge_regs            -> Unknown          -> mints `v7`
+
+`merge_regs` treats the two as disagreeing values and collapses to Unknown. But
+a call-cleared register is not a competing VALUE - it is the absence of one. In
+lattice terms it is BOTTOM, and the join of {nil, bottom} is nil, not TOP.
+
+So the correct output here is `nil`, and the decompiler emits an undeclared
+`v7` instead.
+
+### Why this matters beyond the file
+`UNK_CALL_CLEAR` is the largest of the remaining mint sites (22, 53, 85 - three
+of five orphans) and its own source comment already states the premise:
+"CORRECT by construction: a call leaves everything above its results genuinely
+holding nothing". That guarantee is exactly what makes the register bottom
+rather than unknown, and `merge_regs` does not use it.
+
+### THE FIX SHAPE
+Distinguish `RegVal::Unknown` arising from a CALL clear from `Unknown` meaning
+"the lifter lost this". At a merge, the former should yield to a defined value
+on the other arm; the latter must still poison the join. `mint_trace::
+unknown_origin` ALREADY records which registers were cleared by a call
+(`UNK_CALL_CLEAR`) - but only as a diagnostic, keyed per register, and it is
+overwritten as lifting proceeds. Making the distinction load-bearing needs it in
+`RegVal` itself (e.g. a `Dead` variant), not in a side table.
+
+RISK, stated up front: `RegVal` is threaded through the whole lifter and a new
+variant touches every match. Measure with the full census, not the score - and
+note that the three highest-scoring changes this session all shipped invisible
+damage.
+
+### State after rotation 118
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
+The five orphans now have: exact proto, exact register, the clearing pc, the
+defining pc on the other arm, and a named lattice defect. That is the first time
+this class has had a MECHANISM rather than a symptom.
