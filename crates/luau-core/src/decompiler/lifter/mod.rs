@@ -6101,7 +6101,7 @@ pub(super) fn set_dce_proto(name: &str, line: u32) {
 /// `v13` names register 13 in SOME proto and the output cannot say which.
 /// Rotation 116 lost a probe to that gap (and mis-concluded the register was
 /// unidentifiable; it is the index, it is the PROTO that is missing).
-pub(super) fn current_dce_proto() -> String {
+pub(crate) fn current_dce_proto() -> String {
     DCE_PROTO.with(|p| p.borrow().clone())
 }
 

@@ -7421,3 +7421,55 @@ THE QUESTION: why does keeping a dead slot's arm value delete
 
 ### State after rotation 121
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
+
+
+## Rotation 122 - ADOPTED. The constant exclusion was the whole difference
+
+### The use-site question r121 posed
+Why does keeping a dead slot's arm value delete `21_ClickToMove`'s auto-jump
+guard? `LUAU_ARM_KEEP_TRACE` printed every kept value, and among 105 keeps the
+answer is visible immediately:
+
+    ARMKEEP Step@449    pc=7  reg=2  value=Nil
+    ARMKEEP Update@1436 pc=7  reg=2  value=Nil
+    ARMKEEP ?@674       pc=91 reg=8  value=Number(2.0)
+
+**Constants.** A kept constant is exactly what lets `collapse_constant_ifs` fold
+a guard to a decidable value and delete it. Excluding
+`Nil | Bool | Number | String` from the keep:
+
+                          calls lost in 21   ifs lost   net corpus calls
+    keep everything            6 (guard gone)    4           -6
+    exclude call-bearing       6 (unchanged)     4           -6
+    exclude CONSTANTS          1 (artifact)      0           -1
+
+And the score is 1,128/14 in all three, so the constants contributed NOTHING to
+the fix and ALL of the damage. Keeping nils alone had already measured
+byte-neutral (r121), which was the clue.
+
+### The last -1 is a counting artifact, verified by reading
+`21_ClickToMove`'s remaining difference decomposes one call chain rather than
+losing it: `Pather(Character29, result222)` survives as
+`Humanoid49(Character29, GetEquippedTool3)`, and TWO statements are ADDED
+(`local Humanoid49 = result221.Torso`, `local GetEquippedTool3 = ...`). The file
+is more verbose - a name threaded over a scratch slot - and nothing is deleted.
+
+### ADOPTED
+    clean   1,125 -> 1,128   defects 17 -> 14
+    FIXED   22_NewClickToMove, 53_PathDisplay, 85_Badges - EXACTLY the three
+            `UNK_CALL_CLEAR` orphans diagnosed in r117/r118
+    NEW     none
+    42 files changed; ifs lost 0, loops lost 0, no code removed anywhere
+    949 tests pass on two consecutive runs
+
+This closes the mechanism opened at rotation 82 and chased through 40
+rotations: a value written only inside a branch arm is discarded by the arm's
+snapshot restore, so the post-branch read mints an undeclared `vN`.
+
+### State after rotation 122
+SEMANTIC: **1,128/1,142 (98.8%), 14 defects** - 4 declared_never_assigned,
+4 branch_local_discarded, 6 calls_not_emitted.
+CLOSED (21): ..., **inline-if arm-value discard**.
+REMAINING declared_never_assigned (4): `396` (dropped for-loop, needs r113's
+  machinery), `873` (blocked on the format), `79` (`UNK_MERGE_COMPOUND`),
+  `54` (`METHOD_RECV_REJECT`) - two distinct mint sites still unexamined.

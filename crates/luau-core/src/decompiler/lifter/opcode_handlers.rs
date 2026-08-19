@@ -338,6 +338,65 @@ fn pinned_write_consumed(
     true
 }
 
+/// Restore the pre-branch register view after an arm, optionally KEEPING values
+/// the arm defined into slots that were dead before it.
+///
+/// Rotation 120 printed the loss: `MERGE renderPoint@49 reg=7 before=Unknown
+/// self=Unknown other=Unknown` for a register whose arm did `LOADNIL R7`. The
+/// blanket `*regs = regs_snapshot` exists so arm writes cannot corrupt the
+/// fall-through view, which is right for a register that path still relies on
+/// and wrong for a slot that held NOTHING before the branch.
+///
+/// MEASURED (rotations 121-122), ADOPTED:
+///     clean 1,125 -> 1,128   defects 17 -> 14
+///     FIXES 22_NewClickToMove, 53_PathDisplay, 85_Badges - exactly the three
+///           `UNK_CALL_CLEAR` orphans diagnosed in r117/r118. NO new findings.
+///     42 files changed; ifs lost 0, loops lost 0, no code removed anywhere.
+///
+/// CONSTANTS ARE EXCLUDED, and that exclusion is load-bearing. Keeping them let
+/// `collapse_constant_ifs` fold a guard away: with constants in,
+/// `21_ClickToMove` lost its entire auto-jump guard, `doAutoJump()` included,
+/// twice (534 -> 528 calls, 348 -> 344 ifs). Keeping nils ALONE was separately
+/// measured byte-neutral, so constants contribute nothing to the fix and all of
+/// the damage.
+///
+/// `LUAU_ARM_KEEP_TRACE` prints every value kept.
+fn restore_regs_keeping_dead_defs(regs: &mut Vec<RegVal>, snapshot: &[RegVal], pc: usize) {
+    let trace = std::env::var("LUAU_ARM_KEEP_TRACE").is_ok();
+    let arm = std::mem::take(regs);
+    regs.extend_from_slice(snapshot);
+    for (i, slot) in regs.iter_mut().enumerate() {
+        if !matches!(slot, RegVal::Unknown) {
+            continue;
+        }
+        // NO CONSTANTS. A kept constant is what lets `collapse_constant_ifs`
+        // fold a guard away: rotation 122 traced `21_ClickToMove` keeping
+        // `Nil` into `Step@449` reg 2 and `Number(2.0)` into `?@674` reg 8,
+        // and that file lost its whole auto-jump guard. Keeping nils ALONE was
+        // separately measured byte-neutral (rotation 121), so constants
+        // contribute nothing to the fix and everything to the damage.
+        if let Some(v @ RegVal::Expr(e)) = arm.get(i) {
+            if matches!(
+                e,
+                Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_)
+            ) {
+                continue;
+            }
+            if trace {
+                let t = format!("{:?}", e);
+                eprintln!(
+                    "ARMKEEP	{}	pc={}	reg={}	value={}",
+                    crate::decompiler::lifter::current_dce_proto(),
+                    pc,
+                    i,
+                    &t[..t.len().min(70)]
+                );
+            }
+            *slot = v.clone();
+        }
+    }
+}
+
 /// Does this opcode define (write) register R(A)?
 ///
 /// Used by `table_needs_binding` to stop scanning once the constructor's
@@ -3417,7 +3476,7 @@ pub(super) fn lift_instruction_range(
                         None
                     };
 
-                    *regs = regs_snapshot;
+                    restore_regs_keeping_dead_defs(regs, &regs_snapshot, pc);
                     stmts.push(Stat::If {
                         condition,
                         then_body: then_stmts,
@@ -3547,7 +3606,7 @@ pub(super) fn lift_instruction_range(
                         None
                     };
 
-                    *regs = regs_snapshot;
+                    restore_regs_keeping_dead_defs(regs, &regs_snapshot, pc);
                     stmts.push(Stat::If {
                         condition: guard_cond,
                         then_body: then_stmts,
@@ -3658,7 +3717,7 @@ pub(super) fn lift_instruction_range(
                         None
                     };
 
-                    *regs = regs_snapshot;
+                    restore_regs_keeping_dead_defs(regs, &regs_snapshot, pc);
                     stmts.push(Stat::If {
                         condition: guard_cond,
                         then_body: then_stmts,
