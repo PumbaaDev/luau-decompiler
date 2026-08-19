@@ -2348,6 +2348,40 @@ fn lift_region(
             // Lift else-body (sorted by start PC for correct instruction order)
             let mut else_sorted = else_region.clone();
             else_sorted.sort_unstable();
+            if std::env::var("LUAU_ORDER_TRACE").is_ok() && !else_sorted.is_empty() {
+                // Does the block holding the function's trailing RETURN sort
+                // LAST? `else_sorted` is an ascending sort of block ids, which
+                // are start pcs, so it should - unless a block with a lower id
+                // contains a return that is not the function's exit.
+                let marks: Vec<String> = else_sorted
+                    .iter()
+                    .map(|bid| {
+                        let has_ret = cfg
+                            .blocks
+                            .get(bid)
+                            .map(|b| {
+                                let mut i = b.start;
+                                let mut found = false;
+                                while i < b.end && i < proto.code.len() {
+                                    let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                                    if matches!(op, LuauOpcode::Return) {
+                                        found = true;
+                                    }
+                                    i += if op.has_aux() { 2 } else { 1 };
+                                }
+                                found
+                            })
+                            .unwrap_or(false);
+                        format!("{}{}", bid, if has_ret { "*RET" } else { "" })
+                    })
+                    .collect();
+                eprintln!(
+                    "ORDER proto={}@{} else_sorted=[{}]",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    marks.join(" ")
+                );
+            }
             // `mut` because the phi reconstruction below may append an
             // assignment into each arm.
             let mut else_body = if !else_sorted.is_empty() {

@@ -4371,3 +4371,62 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: LUAU_DCE_TRACE now proto-qualified, + DCETRUNC naming the terminator
   and the loss.
+
+
+## Rotation 70 - MECHANISM B FULLY DIAGNOSED: a flattened else arm
+
+### The ordering trace answers the question, and refutes its premise
+    ORDER proto=OnInputBegin@184
+      else_sorted=[4 9*RET 10 13 16*RET 17 23 29*RET 30 36*RET 37 49 54 55 59
+                   61 72 83 94 97 105 108 117*RET]
+
+The question was "does the trailing RETURN block sort last, or mid-body?" It
+sorts LAST (117). The premise was wrong: the else arm contains **five** blocks
+carrying RETURN instructions, and the earliest - block 9 - sorts SECOND of 23.
+
+Those are the function's own `if ... then return end` guards. They are
+CONDITIONAL in the bytecode.
+
+### The complete chain, end to end
+    1. The `if` at block 0 has `merge=None` (rotation 64), so the structurer
+       cannot find where it ends and puts ALL 23 remaining blocks into the
+       else arm.
+    2. `else_sorted.sort_unstable()` orders them by ascending block id and
+       `lift_branch_region` lifts them as a FLAT LINEAR SEQUENCE - the nested
+       control flow among those 23 blocks is not reconstructed.
+    3. Block 9's return, conditional in the bytecode, becomes an
+       UNCONDITIONAL `return` at statement index 3 of 36 (rotation 69).
+    4. `eliminate_dead_code` Phase 2 correctly deletes the 32 statements after
+       an unconditional return, taking all 14 calls.
+    5. `calls_not_emitted` (rotation 61) reports the file; nothing else ever did.
+
+Every step is now measured rather than inferred, and each stage of the pipeline
+behaves correctly given its input. The single wrong thing is step 2: an arm of
+23 blocks with internal branching is lifted as straight-line code.
+
+### Innocent, each checked before being cleared
+`eliminate_dead_code` and all four of its phases; `is_terminator`;
+`exits_on_all_paths`; `is_empty_if`; `note_stmts_pushed`; the statement budget;
+CFG reachability; region production. Twelve candidates across nine rotations,
+one build each.
+
+### THE FIX, and why it is not a one-liner
+An if/else arm holding blocks with their own control flow must be STRUCTURED
+RECURSIVELY, not concatenated. `structure_control_flow` already does exactly
+this for a whole proto; the else arm needs the same treatment applied to its
+block subset.
+
+That is a real change to `lift_branch_region`, not a peephole, and it is where
+the next rotation starts. The reproducer is exact: `OnInputBegin@184`, else arm
+= 23 blocks, five containing RETURN, first at position 1.
+
+### State after rotation 70
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: FULLY DIAGNOSED** - flattened else arm turns a conditional return into
+  an unconditional one. Affects 8 protos emitting zero calls and 27 emitting
+  under half (29 files). Fix identified as recursive structuring of branch
+  arms; not attempted.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_ORDER_TRACE (else-arm block order with RETURN marks).
