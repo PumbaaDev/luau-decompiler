@@ -198,3 +198,58 @@ Only then is it sound to say which merges lack repair.
 Nothing regressed. No fix has been applied this rotation - the work was
 establishing the true defect count (349, not 97) and tracing A to its decision
 point.
+
+## 2026-08-19 — ROTATION 2: mechanism A's ROOT CAUSE FOUND (supersedes A2)
+
+### The census that redirected everything
+`LUAU_MINT_TRACE=1` over the whole corpus: 590 minted names total.
+    563 ASSIGNED   (490 sites=NONE, 72 GEN_VAR_NOHINT)
+     27 READONLY   (11 UNK_CALL_CLEAR, 5 UNK_MERGE_COMPOUND, 3 UNK_MERGE_ARM_NAMES, ...)
+Mechanism A is ~347 defects. The READONLY branch is 27 names corpus-wide, so the
+whole A2 thread (merge_regs terminal reset) was chasing a MINORITY path.
+A2 candidate fix (adopt the Expr when one side is Unknown) measured on a verified
+fresh binary: 1097/1142, 97 defects - a NO-OP. Reverted. A2 is disproved as the
+lever; it is real but marginal.
+
+### THE ACTUAL ROOT CAUSE — closure parameters emitted as parent-scope locals
+623_Beesmas2024BQuests, the densest file (35 findings), emits:
+
+    local v12 = "Gingerbread House"
+    local tbl2          -- bare
+    local tbl3          -- bare
+    local v13           -- bare
+    local v14           -- bare
+    local function Cutscene()                    -- NO PARAMETER LIST
+        tbl2 = tbl2 or "CameraTarget"            -- optional-parameter idiom
+        v12  = Toys2[v12]
+        tbl3 = tbl3 or "CameraPos"
+        ... ZoomDisplay(..., v13 or 1, v14 or 9999999999999)
+    end
+
+`x = x or default` is the Lua optional-parameter idiom. The bytecode agrees:
+
+    ; === Proto 1 "getToyCutscene" ===
+    ; params=5 stack=6 upvalues=0 vararg=false line=9
+
+FIVE declared parameters. The output emits a ZERO-parameter function and hoists
+all five into the enclosing scope as bare `local`s: v12, tbl2, tbl3, v13, v14.
+Two of them (tbl2, tbl3) are then assigned inside the body so the checker does
+not flag those; the read-only ones (v13, v14) are flagged. That is why the
+defect count is large and concentrated in files full of small closures.
+
+Also noted: the emitted function is named `Cutscene`, the proto is
+`getToyCutscene`. Same site, probably the same attribution bug.
+
+### Why this explains the distribution
+- It is per-closure, not per-file, so files dense in small closures dominate.
+- It produces BOTH `declared_never_assigned` (read-only params) and silently
+  wrong behaviour (a parameter that is always nil, so `or default` always wins).
+- It is invisible to the decode gate: the output parses and runs.
+
+### State
+A2  DISPROVED as the lever (no-op measured). Mechanism kept in the journal.
+A3  NEW, ACTIVE: closure parameter list lost; params hoisted to parent scope.
+    Smallest reproducer so far: 623_Beesmas2024BQuests Proto 1 `getToyCutscene`,
+    params=5, emitted as `Cutscene()` with 4 bare locals + 1 assigned.
+    NEXT: find where NEWCLOSURE/DUPCLOSURE emits the function head and why
+    `params` from the child proto header is not used to build its parameter list.
