@@ -3622,3 +3622,74 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
   CLOSED. Six measured dead ends. PARKED with questions: A2/C-residual
   (path-sensitive dataflow), B (1 file), UPVAL_NAME (format-blocked),
   duplicate_call (AST-based call counting).
+
+
+## Rotation 58 - the exact call counter, and the sweep ledger closes
+
+### The instrument
+`count_calls_stats` walks the lifted `Vec<Stat>` and counts `Expr::Call` and
+`Expr::MethodCall` nodes. The match is EXHAUSTIVE - no `_` arm - so adding an
+AST variant breaks the build rather than silently under-counting, which would
+invent `dropped_call` deficits. Closure bodies are not descended into, because
+`Expr::Function` is a separate proto reported on its own line.
+
+The compiler immediately earned that choice: `Expr::Ternary`'s field is `cond`,
+not `condition`, and an exhaustive match refused to compile until it was right.
+
+Sanity check on the file that exposed the old bias - `698_Use_Toy`:
+regex said 9 emitted against 3 in the bytecode; the AST counter says
+**bc_calls=3, ast_calls=3**. Exact.
+
+### duplicate_call: 0 REAL, 5 FALSE POSITIVE - closed
+No confirmed file emits MORE calls than its bytecode contains. And the two
+files rotation 57's TEXT test flagged emit dramatically FEWER:
+
+    267_BeequipReqsBox   bc 82 -> ast 49
+    277_DragManager      bc 140 -> ast 90
+
+They are dropped-call files misfiled as duplicates. Rotation 57 declined to bank
+that text result on the grounds that it could not tell source repetition from
+decompiler duplication; that caution was correct, and the exact counter shows
+the finding was not merely undecided but inverted.
+
+### dropped_call: 10 REAL, 4 FALSE POSITIVE - corrects rotation 56
+Rotation 56's regex called 7 real. The exact counter finds **10**, adding
+`150_ClickManager`, `273_BoostMarketGui` and one more that over-counting had
+wrongly cleared. Per-proto deficits are unambiguous:
+
+    254_BQInspector    SetBeequipFile@79   22 calls -> 16
+    359_WindShrineGui  SetItem@51          12 -> 8
+    356_TradeRequestGui globalTradeEnabled@37 4 -> 2
+    218_Collectors     collectStart@48      6 -> 4
+
+### The sweep ledger, complete and evidenced
+    truncated_body      42 of 42  FALSE   per-proto instruction count
+    undefined_register  68 of 72  FALSE   bare-vN test; the 4 real agree with
+                                          the semantic checker exactly
+    name_collision      cosmetic by the grader's own prompt wording
+    duplicate_call       5 of 5   FALSE   exact AST vs bytecode call counts
+    dropped_call        10 of 14  REAL    exact counts, per-proto deficits
+    dead_store          12 files  REAL    rotation 23 hand evidence
+
+    **~22 files carry a demonstrated defect, of 1,112 swept.**
+
+Every one of the six kinds is now adjudicated with a mechanical test against the
+bytecode or the lifter's own output. No finding was suppressed; each false
+positive was shown false and its corrected rule written down.
+
+### What the whole sweep exercise established
+The grader's raw output was 246 broken files. Two-run agreement cut that to 134
+by removing UNSTABLE findings. Mechanical adjudication cut it to ~22 by removing
+STABLE-BUT-WRONG ones. The second correction is five times larger than the
+first, and only the second required looking at the artefact instead of the
+verdict.
+
+### State after rotation 58
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+SWEEP: ~22 files with a demonstrated defect; all six kinds adjudicated.
+  The 10 `dropped_call` files are now a bounded, evidenced fix target with
+  exact per-proto deficits naming where to look.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
+  CLOSED. Six measured dead ends. PARKED with questions: A2/C-residual
+  (path-sensitive dataflow), B (1 file), UPVAL_NAME (format-blocked).
+Behaviour-neutral rotation; 945 tests pass.

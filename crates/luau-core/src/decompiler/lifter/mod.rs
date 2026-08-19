@@ -802,6 +802,94 @@ pub fn lift_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize)
 /// body the sweep flagged as truncated is CORRECT output for an empty shipped
 /// function. Only the per-proto instruction count can tell a real truncation
 /// from a function that genuinely does nothing.
+/// Count `Call`/`MethodCall` nodes in a lifted body, exactly.
+///
+/// Rotation 56 counted emitted calls with a REGEX over the output text and it
+/// over-counted badly (`698_Use_Toy`: 3 in the bytecode, 9 "emitted"), which
+/// made `duplicate_call` undecidable - over-counting manufactures exactly the
+/// signal that claim looks for.
+///
+/// The match is EXHAUSTIVE on purpose: no `_` arm, so adding an AST variant
+/// breaks the build here rather than silently under-counting, which would
+/// invent `dropped_call` deficits instead.
+///
+/// Closure bodies are NOT descended into: `Expr::Function` is a separate proto
+/// and is reported on its own line, so descending would double-count.
+fn count_calls_stats(stats: &[Stat]) -> usize {
+    stats.iter().map(count_calls_stat).sum()
+}
+
+fn count_calls_stat(s: &Stat) -> usize {
+    match s {
+        Stat::Local { values, .. } => values.iter().map(count_calls_expr).sum(),
+        Stat::Assign { targets, values } => {
+            targets.iter().map(count_calls_expr).sum::<usize>()
+                + values.iter().map(count_calls_expr).sum::<usize>()
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            count_calls_expr(condition)
+                + count_calls_stats(then_body)
+                + elseif_clauses
+                    .iter()
+                    .map(|(c, b)| count_calls_expr(c) + count_calls_stats(b))
+                    .sum::<usize>()
+                + else_body.as_ref().map(|b| count_calls_stats(b)).unwrap_or(0)
+        }
+        Stat::While { condition, body } => count_calls_expr(condition) + count_calls_stats(body),
+        Stat::Repeat { body, condition } => count_calls_stats(body) + count_calls_expr(condition),
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            count_calls_expr(start)
+                + count_calls_expr(stop)
+                + step.as_ref().map(count_calls_expr).unwrap_or(0)
+                + count_calls_stats(body)
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().map(count_calls_expr).sum::<usize>() + count_calls_stats(body)
+        }
+        Stat::Return { values } => values.iter().map(count_calls_expr).sum(),
+        Stat::Break | Stat::Continue | Stat::Comment(_) => 0,
+        Stat::DoBlock { body } => count_calls_stats(body),
+        Stat::ExprStat(e) => count_calls_expr(e),
+        // A closure is its own proto and is reported separately.
+        Stat::LocalFunction { .. } | Stat::MethodFunction { .. } => 0,
+    }
+}
+
+fn count_calls_expr(e: &Expr) -> usize {
+    match e {
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Name(_)
+        | Expr::Vector(_, _, _) => 0,
+        Expr::Field { object, .. } => count_calls_expr(object),
+        Expr::Index { object, key } => count_calls_expr(object) + count_calls_expr(key),
+        Expr::BinOp { left, right, .. } => count_calls_expr(left) + count_calls_expr(right),
+        Expr::UnOp { operand, .. } => count_calls_expr(operand),
+        Expr::Call { func, args } => {
+            1 + count_calls_expr(func) + args.iter().map(count_calls_expr).sum::<usize>()
+        }
+        Expr::MethodCall { object, args, .. } => {
+            1 + count_calls_expr(object) + args.iter().map(count_calls_expr).sum::<usize>()
+        }
+        // Separate proto - see the note above.
+        Expr::Function { .. } => 0,
+        Expr::Table { fields } => fields
+            .iter()
+            .map(|f| match f {
+                TableField::Sequential(v) => count_calls_expr(v),
+                TableField::Named(_, v) => count_calls_expr(v),
+                TableField::Indexed(k, v) => count_calls_expr(k) + count_calls_expr(v),
+            })
+            .sum(),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            count_calls_expr(cond) + count_calls_expr(then_expr) + count_calls_expr(else_expr)
+        }
+    }
+}
+
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
     if std::env::var("LUAU_BODY_REPORT").is_ok() {
@@ -827,6 +915,13 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
             proto.code.len(),
             out.len(),
             calls
+        );
+        eprintln!(
+            "BODYAST proto={}@{} bc_calls={} ast_calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            calls,
+            count_calls_stats(&out)
         );
     }
     out
