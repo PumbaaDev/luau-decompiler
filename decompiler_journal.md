@@ -4872,3 +4872,64 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
   `OnInputBegin` reproducer is NOT among them and still emits 4 of 36
   statements, so the dropped-body half remains open with its diagnosis intact.
   Nine measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 79 - B's remaining half, scoped and its question written down
+
+### The reproducer under the adopted fix: UNCHANGED
+    BODYAST proto=OnInputBegin@184 bc_calls=15 ast_calls=0
+    IFLIFT  else_blocks=23 else_stmts=Some(37) else_calls=Some(14)
+    IFPUSH  then_stmts=0  else_stmts=Some(37) else_calls=Some(14)
+
+Byte-identical to before rotation 78. The arm still lifts 37 statements with 14
+calls, still pushes them, still loses them.
+
+### Which half the adopted fix actually fixed
+`lift_structured_run` delegates to `structure_numeric_for_body`, which emits
+`Linear` and `ValueJoin` - and matches FOR-LOOPS. So structuring the arm span
+recovers arms whose blocks contain LOOPS (27 files, rotation 78) and does
+nothing for arms whose blocks contain only BRANCHES.
+
+`OnInputBegin`'s 23 blocks are guards - `if ... then return end` - with no loop
+among them. The fix cannot reach it, and that is a property of the structurer,
+not a gate condition.
+
+So mechanism B splits cleanly:
+    B-loops     arms containing loops       **FIXED** (27 files, rotation 78)
+    B-branches  arms containing branches    OPEN (the dropped-body half)
+
+### B-branches: the unblocking question, stated
+Adding `Region::IfThenElse` to arm structuring has been built twice and measured
+twice:
+
+    structure_block_subset (74)          -45 clean / +92 defects
+    structure_terminating_branches (76)  -40 clean / +93 defects
+
+Rotation 76 falsified the merge explanation (restricting to merge-free branches
+recovered 5 files of 45). The cost is real, reproducible, and UNEXPLAINED.
+
+**THE QUESTION: which specific files lose clean status under
+`structure_block_subset`, and what changes in them?**
+
+Rotation 78 answered exactly this shape of question for the loop fix - per-file
+attribution turned an apparent 4-file regression into 27 recovered loops - and
+that method was never applied to the branch build. Concretely: rebuild
+`structure_block_subset` from `backup/pre-subset-structurer`, run the corpus,
+diff per-file clean status against baseline, and read the top few losers. The
+answer is either a real defect the branch path introduces, or the same
+misreading rotation 71 made about chunk-top declarations.
+
+That is one rebuild and one corpus run, and it is where B-branches resumes.
+
+### State after rotation 79
+SEMANTIC: **1,104/1,142 (96.7%), 39 defects.** 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks,
+  **B-loops** CLOSED.
+  **B-branches** PARKED with the question above and the exact rebuild recipe.
+  A2/C-residual PARKED (needs path-sensitive dataflow; both peephole repairs
+  measured and rejected in rotations 35 and 52).
+  UPVAL_NAME BLOCKED (Roblox bytecode carries no CAPTURE data, so the upvalue's
+  identity is not present in the input at all).
+  Nine measured dead ends, each with its numbers and the file that killed it.
+SWEEP: 6 kinds adjudicated mechanically; ~19 files carry a demonstrated defect
+  of 1,112, none silenced.
