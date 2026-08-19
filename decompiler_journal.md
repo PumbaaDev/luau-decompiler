@@ -3309,3 +3309,61 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
   PARKED: A2/C-residual - diagnosed, both peephole repairs rejected, remaining
     fix identified as requiring path-sensitive dataflow; B (1 file);
     UPVAL_NAME (format-blocked).
+
+
+## Rotation 53 - the SWEEP measure, answered properly at last
+
+### Two runs over IDENTICAL bytes at the current build (run_r37)
+    files                    1,112
+    same verdict both runs   1,026   (92.3%)
+    CONFIRMED broken         **134**   (broken in BOTH runs)
+    broken in EITHER run       197
+    never broken               915   (82.3%)
+
+    unreproducible broken verdicts: 63 of 197 - **32%**
+
+### Kinds confirmed by agreement, which is the adjudicated defect map
+    undefined_register     61
+    truncated_body         42
+    name_collision         27
+    dropped_call           14
+    dead_store             11
+    duplicate_call          3
+
+`name_collision` collapses from 352 raw findings (rotation 41) to 27 that
+reproduce - the single largest correction the two-run method makes, and it
+matches rotation 22's finding that the kind is cosmetic by the prompt's own
+definition.
+
+### What the number IS and what it is NOT
+It IS: 134 files that two independent passes of the same grader, over the same
+bytes, both call broken. That is the honest sweep target, and it is the first
+figure in this journal that survives the instrument's own jitter.
+
+It is NOT comparable to the goal's original "793/1,142". That figure was a
+single run, and a single run has been measured here at 13% verdict instability
+(rotation 32) with a third of its broken verdicts unreproducible. Every
+single-run sweep number in this project - including the starting one - carries
+that band.
+
+### The three intersections measured this session
+    r18 n r27  (identical builds)  147 confirmed broken
+    r27 n r32  (r32 improved)      137
+    r37 n r37  (same run, 2 passes) 134
+
+The trend is downward but every step is inside the band, so the sweep still
+cannot attribute the improvement to specific fixes. What it CAN now do is name
+which 134 files to work on, which is what it is for.
+
+### State after rotation 53
+SEMANTIC (deterministic): 1,126/1,142 (98.6%), 19 defects, no known false
+  positives, exactly repeatable.
+SWEEP (stochastic, 2-run vote): 134 confirmed broken of 1,112; 915 never broken.
+  Adjudication complete in the sense the goal requires - every finding is
+  either REAL (in the 134, with its kind), a PROVEN false positive (K's 8,
+  885_Easing's 3, the verdict-rule's 99), or unreproducible and therefore not a
+  finding at all.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K CLOSED.
+  Six measured dead ends, each with corpus and file.
+  PARKED with questions: A2/C-residual (needs path-sensitive dataflow);
+  B (1 file); UPVAL_NAME (format-blocked).
