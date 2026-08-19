@@ -777,3 +777,60 @@ materialises its OWN local inside its OWN branch - which is why the output shows
 A  PARKED (1) - question above          A1 PARKED (1) - blocked on A, question above
 B  PARKED (1) - naive fix cost 13 files C  PARKED (2) - question above
 D  **CLOSED**                            E  **CLOSED**
+
+## 2026-08-19 — ROTATION 13. A's parked question ANSWERED with corpus numbers.
+
+Baseline re-verified after reverting instrumentation: 1101/1142 clean, 93 defects.
+
+### Method
+Tagged all SIX wholesale-rejection points on the value-join path and ran the
+WHOLE CORPUS (not one file), exactly as the rotation-9 tagging worked for E.
+
+### Result - ranked, corpus-wide
+    345  VJR FOLD_DECLINED      <- dominant, 4x the next
+     86  VJR IMPURE_NONTEMP
+     86  VJR ENUM_NONE
+      5  VJR GUARD_SPAN
+      0  VJR MAX_PATHS
+      0  VJR NOT_MEMBER
+      0  VJR TOO_FEW_PATHS
+
+`FOLD_DECLINED` is `combine_guarded_value` returning None. It declines when the
+selected value is not `is_provably_truthy`, because emit.rs renders an
+expression-position Ternary as `cond and a or b`, which is only faithful when
+the then-arm cannot be false or nil.
+
+### THE LINK TO MECHANISM A (this is the finding)
+When `fold_register_paths` returns None, `lift_value_join` falls to the
+"Fallback lowering" at mod.rs:1955, which emits:
+
+    stmts.push(Stat::Local { names: vec![name], values: vec![] });   // :1957-1963
+
+A BARE `local` with no value, followed by assignments inside the if/elseif arms.
+That is EXACTLY the shape mechanism A consists of - and rotation 1 independently
+identified this same site as an emitter of bare multi-name locals before there
+was any reason to connect it to A.
+
+So the chain is now: value not provably truthy -> combine_guarded_value declines
+-> fold_register_paths returns None -> fallback emits a bare `local` -> if the
+arm assignments do not all survive, the name is declared and never assigned.
+345 occurrences corpus-wide against ~347 A defects is a striking match, though
+the two counts are measured differently and I am NOT claiming they are the same
+set without checking.
+
+### A -> PARKED (2). Next question, now much narrower:
+  In the fallback at mod.rs:1955-1975, the `local r` is emitted unconditionally
+  but `r` is only assigned by the per-path `assigns` closure. For the files that
+  carry A defects, do those arm assignments get emitted at all?
+  Cheapest test: tag the fallback itself - one eprintln recording the name and
+  the number of assign statements actually pushed - then compare that name list
+  against the `declared_never_assigned` names the checker reports for the same
+  file. If they intersect, A is closed by fixing the fallback; if they do not,
+  the 345/347 match is a coincidence and A lies elsewhere.
+  This is the first test that can CONFIRM OR KILL the whole A hypothesis in one
+  run, rather than narrowing it further.
+
+### State after rotation 13 - all mechanisms still terminal
+A  PARKED (2) - question above      A1 PARKED (1) - blocked on A by design
+B  PARKED (1)                        C  PARKED (2)
+D  **CLOSED**                        E  **CLOSED**
