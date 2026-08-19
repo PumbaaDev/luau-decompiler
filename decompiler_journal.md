@@ -7309,3 +7309,61 @@ THE QUESTION: instrument `merge_regs` itself - print `i`, `regs_before[i]`,
 
 ### State after rotation 119
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
+
+
+## Rotation 120 - the join sees NOTHING, and the loss is an inline-if snapshot restore
+
+### The print that six rotations should have started with
+`LUAU_MERGE_WATCH=7` on `53_PathDisplay::renderPoint@49`:
+
+    MERGE renderPoint@49 reg=7 before=Unknown self=Unknown other=Unknown
+
+**All three Unknown.** The `LOADNIL R7` at pc 42 never reaches `merge_regs` as a
+value. So r118's model - one arm holds nil, the other is call-cleared, and the
+join collapses them - is FALSE at the join, and r119's rule could never have
+fired because there is no defined side to take. Both were built on an
+unprinted assumption.
+
+### Where the nil actually dies
+The `LoadNil` handler does store a value:
+
+    regs[a] = RegVal::Expr(Expr::Nil);
+    explicit_nil_regs.insert(a);
+
+so R7 genuinely holds nil at pc 42. It is discarded afterwards by the INLINE-IF
+path, which brackets each arm with a snapshot restore:
+
+    let regs_snapshot = regs.clone();
+    lift_instruction_range(... then_stmts ...);
+    ...
+    *regs = regs_snapshot;      // arm register state thrown away
+
+The comment states the intent plainly - "Lift the guarded block with isolated
+register state so assignments inside the then-body don't corrupt the
+fall-through path's register view" - and the cost is exactly this: a value
+assigned ONLY inside an arm does not survive the branch, so every post-branch
+read of it mints an undeclared `vN`.
+
+### This closes a loop opened at the start of the session
+That is the A2/C mechanism: a value assigned in a branch arm, discarded at the
+merge. Rotation 17 fixed one face of it (the `ValueJoin` fallback no longer
+emits a `Local` for a `Reassign`); this is the inline-if face, and it is
+deliberate isolation rather than an oversight - which is why every predicate
+aimed at the merge missed it.
+
+### PARKED, correctly located at last
+MECHANISM: inline-if discards arm register state wholesale; a value written only
+  in an arm is lost and the post-branch read mints `vN`.
+PROVED:    `LOADNIL` stores `Expr::Nil` (source); the join sees `Unknown` on all
+  three inputs (printed); the restore is unconditional (source).
+RULED OUT: merge-lattice rules (r119, measured: no fix, 2 files damaged);
+  call-clear as bottom at the join (r118 model, falsified by the print).
+THE QUESTION: which registers may safely survive an arm? The restore exists to
+  stop arm writes corrupting the fall-through view, so the answer is NOT
+  "keep everything" - it is the subset written on EVERY path that reaches the
+  join, which is the same path-sensitivity the very first rotation of this
+  session identified and which `merge_regs` still does not carry.
+
+### State after rotation 120
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_MERGE_WATCH`
+kept and verified inert.

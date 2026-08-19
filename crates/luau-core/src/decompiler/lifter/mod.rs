@@ -4091,6 +4091,34 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) 
         // matched — identical constant values (Number, String, Bool, Nil,
         // Field chains) from untouched registers were reset to Unknown
         // after any if/else merge, losing the value for all subsequent reads.
+        // Rotation 120: what does the join ACTUALLY see?
+        //
+        // Every rotation since 114 has reasoned about this and none has printed
+        // it - and r119 built a rule on the reasoning that did not fire for the
+        // register it was written for. `LUAU_MERGE_WATCH=<reg>` prints the three
+        // inputs for one register, proto-qualified.
+        if let Ok(w) = std::env::var("LUAU_MERGE_WATCH") {
+            if w.parse::<usize>() == Ok(i) {
+                let d = |v: Option<&RegVal>| match v {
+                    None => "MISSING".to_string(),
+                    Some(RegVal::Unknown) => "Unknown".to_string(),
+                    Some(RegVal::LoopVar(n)) => format!("LoopVar({})", n),
+                    Some(RegVal::Expr(e)) => {
+                        let t = format!("{:?}", e);
+                        format!("Expr({})", &t[..t.len().min(46)])
+                    }
+                    Some(_) => "other".to_string(),
+                };
+                eprintln!(
+                    "MERGE	{}	reg={}	before={}	self={}	other={}",
+                    current_dce_proto(),
+                    i,
+                    d(regs_before.get(i)),
+                    d(Some(&*slot)),
+                    d(other.get(i))
+                );
+            }
+        }
         let same = match (&slot, &other[i]) {
             (RegVal::Expr(a), RegVal::Expr(b)) => exprs_structurally_equal(a, b),
             (RegVal::LoopVar(a), RegVal::LoopVar(b)) => a == b,
