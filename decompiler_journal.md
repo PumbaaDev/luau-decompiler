@@ -253,3 +253,50 @@ A3  NEW, ACTIVE: closure parameter list lost; params hoisted to parent scope.
     params=5, emitted as `Cutscene()` with 4 bare locals + 1 assigned.
     NEXT: find where NEWCLOSURE/DUPCLOSURE emits the function head and why
     `params` from the child proto header is not used to build its parameter list.
+
+## 2026-08-19 — ROTATION 3. CORRECTION: rotation 2's root cause was WRONG.
+
+### What I got wrong
+Rotation 2 claimed "closure parameters emitted as parent-scope locals", inferred
+from `Proto 1 getToyCutscene params=5` next to an emitted `local function
+Cutscene()` with no params. I matched proto to function BY NAME without checking
+the output, and the file contains BOTH:
+
+    15: local function getToyCutscene(arg1, arg2, arg3, arg4, arg5)   <- 5 params, CORRECT
+   163: local function Cutscene()                                     <- a DIFFERENT, genuinely 0-param closure
+
+Parameters are NOT lost. That claim is superseded and must not be re-derived.
+
+### The verified mechanism (checked, not inferred)
+The child proto is instantiated TWICE and the two emissions differ:
+
+  inside getToyCutscene (params in scope)   |  at the second site
+  -----------------------------------------|---------------------------------
+  arg5 = arg5 or "CameraTarget"            |  tbl2 = tbl2 or "CameraTarget"
+  arg4 = arg4 or "CameraPos"               |  tbl3 = tbl3 or "CameraPos"
+  arg2 or 1, arg3 or 9999999999999         |  v13 or 1, v14 or 9999999999999
+
+Same body, same defaults. Where the enclosing parameters are in scope the
+captures bind (arg1..arg5). At the second instantiation the SAME captures are
+emitted as bare `local`s that nothing assigns.
+
+So mechanism A is a CAPTURE-BINDING failure, not a parameter-list failure: a
+closure whose upvalues are its enclosing function's parameters is re-emitted at
+a site where those parameters do not exist, and the captures become unbound
+declarations. The original was almost certainly
+`Cutscene = getToyCutscene("Gingerbread House", "CameraTarget", "CameraPos", 1, 9999999999999)`
+- the call's ARGUMENTS are what the bare locals should have been bound to.
+
+That also explains the scale: 110 bare locals in this one file, and the shape
+recurs wherever a factory function's returned closure is instantiated.
+
+### State
+A3  SUPERSEDED (wrong).
+A4  ACTIVE: capture binding lost when a child proto is instantiated away from
+    the scope that declares its upvalues.
+    Reproducer: 623_Beesmas2024BQuests, compare emitted lines 15-30 against
+    158-176 - same proto, one bound, one not.
+    NEXT QUESTION: at the second instantiation, what does the lifter have for
+    the closure's upvalue list, and why does it mint a fresh local instead of
+    binding to the CALL ARGUMENTS at that site? Look at how NEWCLOSURE/DUPCLOSURE
+    handles CAPTURE operands when the captured register holds a call argument.
