@@ -834,3 +834,57 @@ set without checking.
 A  PARKED (2) - question above      A1 PARKED (1) - blocked on A by design
 B  PARKED (1)                        C  PARKED (2)
 D  **CLOSED**                        E  **CLOSED**
+
+## 2026-08-19 — ROTATION 14. A's biggest hypothesis KILLED by a decisive test.
+
+Baseline re-verified after reverting all instrumentation: 1101/1142, 93 defects.
+
+### The confirm-or-kill test (rotation 13's plan), executed
+Tagged the fallback's bare-local emission (mod.rs:1945) and intersected the
+names it emits with the `declared_never_assigned` names the checker reports for
+the SAME file:
+
+    623_Beesmas2024BQuests   fallback names: 0   checker names: 6   INTERSECTION: EMPTY
+    215_CollectiblesAnimator fallback names: 0   checker names: 1   INTERSECTION: EMPTY
+
+KILLED. The fallback emits ZERO bare locals in the two files that actually carry
+A defects. The 345 FOLD_DECLINED / ~347 A-defect match was a COINCIDENCE - which
+is exactly the correspondence I refused to assume in rotation 13, and refusing it
+was correct.
+
+### Second emitter also killed
+Only two sites in the whole decompiler contain a literal `values: vec![]`:
+  mod.rs:1945  the value-join fallback   -> 0 names in 623 (above)
+  mod.rs:4161  hoist_loop_locals         -> 0 names in 623 (tagged and measured)
+Neither emits 623's bare locals.
+
+### And free_var_decls is ruled out FOR 623 specifically
+623 has ZERO chunk-top bare locals (`grep -cE '^local ...$'` = 0); its flagged
+names are INDENTED, i.e. inside a function body. free_var_decls only runs at
+depth 0 and inserts at chunk top, so it cannot be the source there.
+(It IS the source for 215 - rotation 1 proved that by disabling it.)
+
+### So A has at least TWO distinct emitters, and one is still unidentified
+215-style: chunk-top block from free_var_decls  (identified, rotation 1)
+623-style: INDENTED bare locals inside function bodies  (emitter UNKNOWN)
+
+### A -> PARKED (3). ATTACK MUST CHANGE (rule: parked three times).
+My search was too narrow: I grepped only the literal `values: vec![]` and found
+2 sites, but there are 74 `Stat::Local {` construction sites in decompiler/.
+Any of them could build an empty values vec via `Vec::new()`, a variable, or a
+drained collection.
+
+NEW ATTACK - stop searching the source, instrument the AST instead:
+  Add a debug assertion at the single point where statements are emitted
+  (emit.rs, the `Stat::Local` arm) that prints a backtrace-free marker when it
+  renders a Local with an empty values list. Every bare local in the OUTPUT must
+  pass through that one arm, so it cannot be missed by a source grep. Run it on
+  623 and the marker plus the name identifies the producer immediately.
+  This converts "find the emitter among 74 candidates" into "read one line of
+  output", and it is the same shape of move that closed E (measure at the
+  chokepoint rather than reason about the callers).
+
+### State after rotation 14 - all mechanisms terminal
+A  PARKED (3) - new attack above    A1 PARKED (1) - blocked on A by design
+B  PARKED (1)                        C  PARKED (2)
+D  **CLOSED**                        E  **CLOSED**
