@@ -184,10 +184,122 @@ pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     check_undefined_locals(&code, &mut out);
     check_declared_but_never_assigned(&code, &mut out);
     check_body_recovered(source, proto_count, &mut out);
+    check_branch_local_discarded(&code, &mut out);
     check_discarded_table_writes(source, &mut out);
     check_property_called_as_method(source, &mut out);
     out.sort_by_key(|f| (f.severity, f.line.unwrap_or(0)));
     out
+}
+
+
+// ── Check: a value computed in a branch and thrown away ───────────────────
+//
+// The shape, from `213_Collectibles_Tornado`:
+//
+//     local Lvl3 = Lvl2 + GetStacksBySource2 / 3.2
+//     if 0 < GetStacksBySource then
+//         local Lvl4 = Lvl3 + 2        -- computed, DISCARDED
+//     end
+//     local Lvl5 = Lvl3 * Multiplier   -- uses Lvl3, never the +2
+//
+// The original reassigned `Lvl3`; the lifter gave the branch arm a FRESH local
+// instead, so the `+ 2` is silently lost. Commit 26b3b9f names this family.
+// `734_StatModifiers_BaseConversionRate` is the same defect on strings and
+// returns the un-appended text.
+//
+// Every other check here was blind to it - a dropped value leaves no undefined
+// name, no missing body and no bad call - which is why the semantic measure
+// read 98.7% while the sweep, which does look for it, read far worse.
+//
+// SOUNDNESS. Three conditions together, and all three are needed:
+//   1. the local is never read ANYWHERE else in the file - one occurrence in
+//      total, its own declaration;
+//   2. its initialiser EXTENDS a base identifier (`base ..`, `base +`,
+//      `base *`, `base /`) rather than being a fresh value - an unused
+//      `local Players = game:GetService("Players")` is ordinary dead code, not
+//      a lost reassignment, and requiring the extension form is what separates
+//      them (measured: 1,161 candidates without it, 162 with);
+//   3. that base is still read AFTER this line, so the value the arm computed
+//      demonstrably failed to reach the code that goes on to use the base.
+//
+// Strings and comments are already blanked by `blank_noncode`, so words inside
+// a string literal cannot masquerade as identifiers here.
+fn check_branch_local_discarded(code: &str, out: &mut Vec<Finding>) {
+    let lines: Vec<&str> = code.lines().collect();
+    let mut occ: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        if t.starts_with("--") {
+            continue;
+        }
+        for tok in bare_idents(t) {
+            occ.entry(tok).or_default().push(i);
+        }
+    }
+
+    let mut reported = 0usize;
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        let Some(rest) = t.strip_prefix("local ") else { continue };
+        let Some(eq) = rest.find('=') else { continue };
+        let bytes = rest.as_bytes();
+        if rest[eq..].starts_with("==")
+            || (eq > 0 && matches!(bytes[eq - 1], b'~' | b'<' | b'>' | b'='))
+        {
+            continue;
+        }
+        let name = rest[..eq].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        // (1) declared here and mentioned nowhere else
+        if occ.get(name).map_or(0, |v| v.len()) != 1 {
+            continue;
+        }
+        let rhs = rest[eq + 1..].trim_start().trim_start_matches('(');
+        let base_end = rhs
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rhs.len());
+        if base_end == 0 {
+            continue;
+        }
+        let base = &rhs[..base_end];
+        if !base.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            continue;
+        }
+        // (2) the initialiser EXTENDS that base
+        let after = rhs[base_end..].trim_start();
+        let extends = after.starts_with("..")
+            || after.starts_with('+')
+            || after.starts_with('*')
+            || after.starts_with('/');
+        if !extends {
+            continue;
+        }
+        // (3) the base outlives this line
+        if !occ.get(base).is_some_and(|v| v.iter().any(|&j| j > i)) {
+            continue;
+        }
+        reported += 1;
+        if reported > 6 {
+            continue;
+        }
+        out.push(Finding::wrong(
+            "branch_local_discarded",
+            Some(i + 1),
+            format!(
+                "`{}` extends `{}` and is never read, while `{}` is used again below                  - the arm's value was written to a fresh local instead of back to                  `{}`, so it is silently dropped",
+                name, base, base, base
+            ),
+        ));
+    }
+    if reported > 6 {
+        out.push(Finding::wrong(
+            "branch_local_discarded",
+            None,
+            format!("... and {} further discarded branch values", reported - 6),
+        ));
+    }
 }
 
 // ── Check 1: a function's name must match the name it uses for itself ──────
@@ -814,6 +926,76 @@ pub fn format_report(findings: &[Finding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── branch_local_discarded: all three conditions are load-bearing ──────
+    //
+    // The positive case is `213_Collectibles_Tornado` reduced to its shape.
+    // Each negative below removes exactly ONE condition, so a fix that widens
+    // any of them turns that test red rather than silently inflating findings.
+
+    fn fires(src: &str) -> bool {
+        check(src, None)
+            .iter()
+            .any(|f| f.check == "branch_local_discarded")
+    }
+
+    #[test]
+    fn catches_a_branch_value_written_to_a_fresh_local() {
+        let src = "local Lvl3 = Lvl2 + 1
+if cond then
+    local Lvl4 = Lvl3 + 2
+end
+local Lvl5 = Lvl3 * m
+";
+        assert!(fires(src), "the discarded `+ 2` must be reported");
+    }
+
+    #[test]
+    fn ignores_an_ordinary_unused_local() {
+        // Condition 2. A fresh value that extends nothing is dead code, not a
+        // lost reassignment - this is the case that separated 162 real sites
+        // from 1,161 candidates.
+        let src = "local Players = game.Players
+local x = game.Workspace
+print(game)
+";
+        assert!(!fires(src), "an unused local that extends nothing is not this defect");
+    }
+
+    #[test]
+    fn ignores_a_local_that_is_read_later() {
+        // Condition 1. If the value reaches anything, it was not discarded.
+        let src = "local a = b + 1
+local c = a + 2
+print(c, b)
+";
+        assert!(!fires(src), "a local that is read again has not been dropped");
+    }
+
+    #[test]
+    fn ignores_an_extension_whose_base_dies_with_it() {
+        // Condition 3. If the base is never used after, nothing observed the
+        // old value, so no value demonstrably failed to arrive.
+        let src = "local base = 1
+local ext = base + 2
+print(other)
+";
+        assert!(!fires(src), "a base that is never read afterwards proves nothing");
+    }
+
+    #[test]
+    fn a_word_inside_a_string_is_not_an_identifier() {
+        // blank_noncode must hide string contents, or `Lvl3` appearing in a
+        // message would count as a later read and silence a real finding.
+        let src = "local Lvl3 = Lvl2 + 1
+if c then
+    local Lvl4 = Lvl3 + 2
+end
+print(\"Lvl3 done\")
+local z = Lvl3 * 2
+";
+        assert!(fires(src), "a string mentioning the name must not suppress the finding");
+    }
 
     /// The Events.lua defect: names paired with the wrong bodies.
     #[test]

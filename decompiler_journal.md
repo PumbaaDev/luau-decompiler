@@ -1555,3 +1555,56 @@ NEW MECHANISM **I: branch_local_discarded** - 162 sites in 89 files, verified by
   hand on 213_Tornado and 734_BaseConversionRate. Next action: add the semantic
   check FIRST so the family is measurable, then fix the lifter. Expect the
   semantic clean count to FALL when the check lands; that is the check working.
+
+
+## Rotation 24 - the check that made the measure honest, and it went DOWN
+
+### Added: `branch_local_discarded`
+Wired into `check()` on the blanked source. Three conditions, all load-bearing:
+the local is mentioned exactly once in the file; its initialiser EXTENDS a base
+(`base ..`, `+`, `*`, `/`) rather than being a fresh value; and that base is
+still read after the line. Condition 2 is what separates 162 real sites from the
+1,161 candidates the loose version produced.
+
+MUTATION TESTS, 5 added, 933 total passing. Each negative removes exactly ONE
+condition so a later widening turns a test red instead of quietly inflating
+findings:
+  - the Tornado shape fires
+  - an unused `local Players = game.Players` does NOT (condition 2)
+  - a local that is read later does NOT (condition 1)
+  - an extension whose base dies with it does NOT (condition 3)
+  - a string mentioning the name does NOT suppress a real finding
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,127 -> 1,045 clean   (98.7% -> 91.5%)
+    16    -> 153 defects
+
+**The number went down by 82 files and that is the point.** Those 137 dropped
+values were in the output the whole time; no check looked for them. 98.7% was
+never true. Nothing regressed - the same binary, the same output, a wider
+instrument. The two `opmap_dupclosure_detection` failures are the same
+pre-existing pair.
+
+This is the inverse of rotations 17 and 22, where the instrument was too LOOSE
+and the count rose once it was corrected. Same discipline, opposite direction:
+the measure follows the evidence, not the target.
+
+### Why the sweep was right and the semantic checker was wrong
+The sweep has flagged this family all along as `dead_store`, and its kind enum
+even reserves `branch_local_discarded`. Rotation 22 dismissed `dead_store` as
+cosmetic and rotation 23 had to take that back. The lesson is specific: when two
+instruments disagree, the one reporting MORE is not automatically the noisy one.
+Check what it sees before deciding which to trust.
+
+### State after rotation 24
+SEMANTIC: 1,045/1,142 (91.5%), 153 defects - an honest baseline for the first
+  time. 16 are the old families; ~137 are mechanism I, newly visible.
+  A, D, E, F, G, H CLOSED. A2 PARKED (2). B PARKED (1). C PARKED (2).
+MECHANISM **I: branch_local_discarded** - MEASURED (162 sites, 89 files),
+  checked, mutation-tested. NOT YET FIXED. The fix is in the lifter: an arm that
+  writes a register already bound before the branch must emit `Stat::Assign` to
+  the existing name, not a fresh `Stat::Local`. That is the same shape as
+  rotation 17's mechanism G, where `classify_write` already computes the right
+  answer (`Reassign`) and the caller discarded it - so the first place to look
+  is every remaining site that ignores the returned `WriteKind`.
+SWEEP: re-run against run_r18 still in flight.
