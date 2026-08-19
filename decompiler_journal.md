@@ -6722,3 +6722,44 @@ r87/r88/r93/r102 and is STALE. It should not be quoted as current.
 ### State after rotation 108
 Nothing changed in the decompiler. 1,125/17, 949 tests pass, tree clean apart
 from the untracked probe. Semantic work continues; it needs no model.
+
+
+## Rotation 109 - jump-terminated guard arms measured WORSE
+
+### The finding it came from
+`59_LocalCubs` is the densest remaining `calls_not_emitted` (3 protos, 30 calls).
+`LUAU_WALK_COVER` on its proto 0 gives gaps (36,39) (43,47) **(71,165)**
+(172,175); the big one is 93 instructions holding all ten of that proto's
+missing CALL sites. The stop is
+
+    71: JUMP -> 90
+
+an unconditional jump leaving the span, so the walk abandons 72..164. Same
+family as r87/r88/r93.
+
+### The experiment
+Shape C's `arm_terminates` only accepts `Return`. Extended it to `Jump`/`JumpX`
+behind `LUAU_GUARD_JUMP`:
+
+    clean 1,125 -> 1,123   defects 17 -> 19
+
+WORSE, and reverted per the standing rule. A jump-terminated arm is far more
+common than a return-terminated one, so the same wrap that pays for `error(...)`
+guards mis-fires broadly when the terminator is an ordinary jump - consistent
+with r93's own finding that this transformation is net-positive only where the
+arm genuinely does not rejoin.
+
+### PARKED
+MECHANISM: 6 `calls_not_emitted`, all walk-abandonment at a terminator.
+REPRODUCER: `59_LocalCubs` proto 0, gap (71,165), 10 CALL sites lost; also
+  `314_RoboBearGui::InitInfoBox` (7/20 missed, pcs 57..116).
+RULED OUT: treating a jump-terminated arm as a guard (r109, -2 clean).
+THE QUESTION: at pc 71 the jump target is 90, which is INSIDE the proto but
+  outside the current span. Which span is being lifted there, and why does it
+  end before 90? Print the span bounds at the moment `lift_instruction_range`
+  breaks on an out-of-range jump - that is the one number this family has never
+  been measured with, and r88's resume already declines here because pc 72 is
+  not a branch target.
+
+### State after rotation 109
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
