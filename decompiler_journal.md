@@ -7034,3 +7034,63 @@ PARKED (6): the register is cleared by a CALL on one path and read on another.
 ### State after rotation 114
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only;
 nothing changed.
+
+
+## Rotation 115 - 396 diagnosed exactly; the attempt to generalise it FAILED
+
+### 396_TadpoleTailInit: a dropped for-loop's iteration variable
+`v5` is read only inside `monitorSegments`, and the emitted body is:
+
+    while result do
+        Parent5 = Body.Parent
+        if Parent5 ~= nil then continue end
+        Position = Body.Position
+        result4, result25, result36 = ipairs(Body5)     <-- a FORGPREP, flattened
+        if v5.Parent ~= nil then continue end            <-- v5 = the loop variable
+        Position2 = (v5.Position - Position):Dot(...)
+
+`ipairs(...)` is emitted as a bare THREE-VALUE ASSIGNMENT because the generic
+for inside this `while` body was never structured. `v5` is that loop's iteration
+variable, so it is never bound and every use is nil.
+
+This is verbatim the failure the lifter's own comment already describes:
+"iterator call flattened to a bare 3-value local, body unguarded, loop variables
+permanently nil" - the arm-interior loop case. Same missing machinery that
+rotation 113 closed `calls_not_emitted` on: a loop/arm interior that the flat
+lifter cannot express.
+
+### The generalisation, tested and FALSE
+Natural next claim: the other `declared_never_assigned` files are the same
+dropped-loop shape, which would unify the two remaining classes. Counted the
+flattened-FORGPREP signature (`a, b, c = ipairs|pairs|next(...)`) in each:
+
+    396   1     <- the diagnosed one
+    22    0
+    53    0
+    85    0
+    79    0
+    54    0
+
+**Zero in all five others.** The unification is false. 396 is a specific
+instance, not a class explanation, and the remaining five orphans come from
+something else.
+
+That is the sixth time this session a plausible generalisation has been killed
+by counting rather than reasoning, and it cost one command rather than a
+rotation - which is the only reason to keep writing them down.
+
+### PARKED, split precisely
+DIAGNOSED (1): `396_TadpoleTailInit` - dropped generic-for inside a `while`
+  body; `v5` is its iteration variable. Blocked on the SAME machinery r113
+  closed: a real region builder for loop interiors. Four naive fills measured
+  worse (r83, r109, r112, and r93's boundary).
+BLOCKED ON THE FORMAT (1): `873_Translation` `upval_2` - no CAPTURE data.
+PARKED (5): 22, 53, 85 (`UNK_CALL_CLEAR`), 79 (`UNK_MERGE_COMPOUND`),
+  54 (`METHOD_RECV_REJECT`). No flattened loop, healthy walk coverage, no
+  span-break. THE QUESTION: for each, which pc last wrote the orphan register
+  and which pc reads it - `LUAU_REG_WATCH=<n>` in the proto that READS it, not
+  the one that hoists it. Rotation 115 wasted its first probe watching `?@5`
+  when the read is inside a nested closure; take the watch in the reading proto.
+
+### State after rotation 115
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
