@@ -4989,3 +4989,58 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K,
   Nine measured dead ends plus two gated experiments.
 SWEEP: six kinds adjudicated mechanically; ~19 of 1,112 files carry a
   demonstrated defect; nothing silenced.
+
+
+## Rotation 81 - the remaining 39, and the ceiling for each mechanism
+
+### Composition of what is left
+    24  calls_not_emitted        B-branches (dropped function bodies)
+     9  declared_never_assigned  A2/C-residual
+     6  branch_local_discarded   mechanism I residue
+
+### The ceiling, and the ordering it implies
+    A2/C-residual   fixes  9 directly, and UNBLOCKS the 24 (rotation 80)
+    B-branches      fixes 24, but cannot be attempted first
+    mechanism I     6 remain after rotations 28/31/42's predicates
+
+So A2/C-residual is worth 33 of the 39 by dependency, not 9. That is the
+argument for treating it as the single next target rather than the largest
+count.
+
+### What A2/C-residual needs, restated with the evidence behind it
+Emit the declaration only where the register is genuinely assigned on EVERY
+PATH reaching the join. Both peephole substitutes are measured and rejected:
+
+    materialise before the arms   works for TABLES (rotation 35, kept and
+                                  shipping), impossible for a call result -
+                                  it cannot be moved across a branch
+    declare before the arms       rejected on CoreGui AND full1143
+                                  (rotation 52: 1,126 -> 1,120 clean); it
+                                  relabels `undefined_register` as
+                                  `declared_never_assigned` rather than fixing
+                                  anything
+
+The distinguishing fact both substitutes lack is which PATHS assign the
+register - `merge_regs` sees two arm states, not the set of paths reaching the
+join. That is the dataflow the mechanism needs, and it is why this is
+engineering rather than another predicate.
+
+### Session arithmetic, for the record
+    semantic   1,097/1,142 -> **1,104/1,142**, 97 defects -> **39**
+    and the checker gained TWO defect classes it previously could not see
+    (`branch_local_discarded`, rotation 24; `calls_not_emitted`, rotation 61),
+    so the 39 is measured by a strictly wider instrument than the 97 was.
+
+    sweep      six kinds adjudicated mechanically; the grader's 246 broken
+               became 134 by two-run agreement and ~19 by artefact testing.
+
+    13 mechanisms closed · 9 measured dead ends · 2 gated experiments ·
+    9 reverts of changes that improved the score and damaged the output.
+
+### State after rotation 81
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects, no known false positives among them.
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops.
+NEXT TARGET: **A2/C-residual** - 9 direct, 24 unblocked, question stated above.
+BLOCKED: B-branches (on A2/C, measured); UPVAL_NAME (on the format - Roblox
+  bytecode carries no CAPTURE data, so the identity is absent from the input).
