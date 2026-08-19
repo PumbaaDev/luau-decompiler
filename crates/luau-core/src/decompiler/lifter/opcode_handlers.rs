@@ -3361,6 +3361,16 @@ pub(super) fn lift_instruction_range(
                 // `local x = <cond>` compiles to a branch over a LOADB pair.
                 // Store the predicate as a value instead of lowering it to
                 // control flow (which loses one half of the pair).
+                // Rotation 127: the last suspect. r126 cleared premateralization,
+                // leaving this handler as the only thing between a correct R3 at
+                // the top of pc 17 and a Nil one at the arm lift.
+                if std::env::var("LUAU_IDIOM_TRACE").is_ok() {
+                    if let Some(id) = recognize_bool_idiom(code, pc) {
+                        eprintln!("IDIOM	{}	pc={}	dest={}	taken={}	end_pc={}",
+                            crate::decompiler::lifter::current_dce_proto(),
+                            pc, id.dest, id.taken_value, id.end_pc);
+                    }
+                }
                 if let Some(idiom) = recognize_bool_idiom(code, pc) {
                     let taken = if op == LuauOpcode::JumpIf {
                         cond
@@ -3585,6 +3595,16 @@ pub(super) fn lift_instruction_range(
 
                 // `local x = a < b` compiles to a branch over a LOADB pair —
                 // store the comparison as a value, not as control flow.
+                // Rotation 127: the last suspect. r126 cleared premateralization,
+                // leaving this handler as the only thing between a correct R3 at
+                // the top of pc 17 and a Nil one at the arm lift.
+                if std::env::var("LUAU_IDIOM_TRACE").is_ok() {
+                    if let Some(id) = recognize_bool_idiom(code, pc) {
+                        eprintln!("IDIOM	{}	pc={}	dest={}	taken={}	end_pc={}",
+                            crate::decompiler::lifter::current_dce_proto(),
+                            pc, id.dest, id.taken_value, id.end_pc);
+                    }
+                }
                 if let Some(idiom) = recognize_bool_idiom(code, pc) {
                     let value = if idiom.taken_value {
                         condition
@@ -3718,6 +3738,16 @@ pub(super) fn lift_instruction_range(
 
                 // `local x = a < b` compiles to a branch over a LOADB pair —
                 // store the comparison as a value, not as control flow.
+                // Rotation 127: the last suspect. r126 cleared premateralization,
+                // leaving this handler as the only thing between a correct R3 at
+                // the top of pc 17 and a Nil one at the arm lift.
+                if std::env::var("LUAU_IDIOM_TRACE").is_ok() {
+                    if let Some(id) = recognize_bool_idiom(code, pc) {
+                        eprintln!("IDIOM	{}	pc={}	dest={}	taken={}	end_pc={}",
+                            crate::decompiler::lifter::current_dce_proto(),
+                            pc, id.dest, id.taken_value, id.end_pc);
+                    }
+                }
                 if let Some(idiom) = recognize_bool_idiom(code, pc) {
                     let value = if idiom.taken_value {
                         condition

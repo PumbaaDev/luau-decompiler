@@ -7669,3 +7669,55 @@ THE QUESTION: does `recognize_bool_idiom(code, 17)` return `Some` for this
 ### State after rotation 126
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Both prints verified
 inert.
+
+
+## Rotation 127 - not a clobber at all: TWO passes over one range, one of them stale
+
+### The last suspect is cleared
+`LUAU_IDIOM_TRACE` prints nothing for `?@74` - `recognize_bool_idiom` never
+fires at pc 17. Every named suspect is now eliminated: receiver predicate
+(r123), opmap/bytecode (r124), arm-exit restore (r122), premateralization
+(r126), bool idiom (r127).
+
+### Interleaving the traces explains every earlier contradiction
+    WATCH  before_pc=10  Expr(Nil)                    LOADNIL lands in R3
+    WATCH  before_pc=16  MethodCall{FindFirstChild}
+    WATCH  before_pc=17  Name("SteeringVelocity3")    correct
+    WATCH  before_pc=18  Name("SteeringVelocity3")    walk passes 18 correctly
+    PREMAT BEFORE pc=17  Expr(Nil)                    pc 17 handled AGAIN
+    PREMAT AFTER  pc=17  Expr(Nil)
+    ARMENTRY arm=18..22  Expr(Nil)
+    WATCH  before_pc=18  Expr(Nil)
+
+The walk passes pc 17 AND pc 18 holding the correct receiver. Then pc 17 is
+processed a SECOND time as an inline-if, in a pass where R3 still carries the
+`LOADNIL` from pc 10 - because that pass never executed pcs 13..16, where
+`FindFirstChild` lands.
+
+**Nothing clobbers R3.** Two lifting passes cover the same range and disagree,
+and the pass that builds the arm is the one with the stale state.
+
+That is why r126's `PREMAT pc=17 Nil` appeared to precede r124's
+`WATCH before_pc=18 Name` - they are from different passes, and every rotation
+from 123 read them as one timeline. Pc-qualification is not enough here; a
+PASS counter is required.
+
+### PARKED
+MECHANISM: one range is lifted twice with different register states; the arm is
+  built from the stale pass, so a correct receiver is replaced by a pc-10 nil
+  and `method_receiver_expr` rightly refuses it.
+PROVED:    the correct value reaches pc 18 in one pass (printed); the arm is
+  built with the pc-10 value in another (printed); no single instruction writes
+  the nil in between (all five suspects eliminated by print).
+RULED OUT: receiver predicate, opmap, arm-exit restore, premateralization, bool
+  idiom - each by measurement, each recorded above.
+THE QUESTION: WHICH two passes, and why does the second start with pre-13 state?
+  Add a monotonic pass counter to the lifter and stamp every trace with it -
+  `WATCH`, `PREMAT`, `ARMENTRY` and `LIFTPATH` are all pc-qualified and none is
+  pass-qualified, which is exactly the confusion above. This is the same lesson
+  as proto-qualification (r47, r86, r95, r110, r116) one level down: an
+  identifier the traces do not carry.
+
+### State after rotation 127
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. `LUAU_IDIOM_TRACE`
+added at all three sites and verified inert.
