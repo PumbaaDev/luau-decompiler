@@ -1143,3 +1143,48 @@ A1 PARKED (1) - still the only mechanism on the semantic measure. 16 remain.
 B  PARKED (1)   C PARKED (2)
 Open, not folded in: the two opmap_dupclosure_detection failures; the
 disassembler's proto attribution on 893. Sweep measure not yet attacked.
+
+
+## Rotation 19 - A1 split into four, and one measured dead end
+
+### The 16 survivors are not one mechanism
+`mint_trace` site tags across all 16, which separates them cleanly:
+
+    UNK_MERGE_COMPOUND    5   215, 544, 651, 654, 79
+    UNK_CALL_CLEAR        5   533 (x2), 22, 53, 368, 85
+    UNK_MERGE_ARM_NAMES   3   797, 305, 88
+    METHOD_RECV_REJECT    2   54, 21
+
+So A1 was never one mechanism - it is the free_var_decls pass reporting the
+downstream effect of four different upstream losses. `UNK_CALL_CLEAR` survives
+rotation 18's fix, so there is a second way for results to be wiped.
+
+### DEAD END: extending the pre-branch rule to the asymmetric case
+HYPOTHESIS: `merge_regs` keeps a pre-branch binding when BOTH sides hold a
+`Name`, but falls to a blunt `Unknown` reset when one side is `Unknown` and the
+other still holds the pre-branch value. Extending the same soundness argument
+(the value was established before the `if`, so it is live at the join) should
+recover the register - and `651_Collect_Goo`'s `v3.Color = Zone4`, a field write
+through a nil base, ERRORS at runtime rather than merely reading wrong.
+
+MEASURED: 1,127 clean / 16 defects, byte-identical to rotation 18 except ONE
+file, and that difference was `pushRowDef7` -> `pushRowDef6` - a name-counter
+shift with no semantic content. The condition effectively never fires.
+
+FALSIFIED, and the useful part is what it proves: the register behind
+`651`'s `v3` is NOT a preserved pre-branch value that one arm lost. Whatever
+kills it happens elsewhere, so the next attack on `UNK_MERGE_COMPOUND` must
+start by establishing what that register held, not by adjusting the merge.
+
+Reverted. Recorded here so it is not re-run - the same courtesy the MULTRET
+skip-the-clear note paid, which is what stopped rotation 18 wasting a cycle on
+it.
+
+### State after rotation 19
+A **CLOSED**  D **CLOSED**  E **CLOSED**  F **CLOSED**  G **CLOSED**  H **CLOSED**
+A1 SPLIT into A1a UNK_MERGE_COMPOUND (5), A1b UNK_CALL_CLEAR (5),
+   A1c UNK_MERGE_ARM_NAMES (3), A1d METHOD_RECV_REJECT (2).
+   A1a PARKED (2) after this dead end - next attempt must change the ATTACK:
+   trace one register to the bytecode rather than reasoning at the merge.
+B  PARKED (1)   C PARKED (2)
+Remaining: 16 defects. Sweep measure not yet attacked.
