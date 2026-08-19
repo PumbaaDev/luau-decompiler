@@ -571,3 +571,58 @@ one-condition fix with a corpus-wide measurement to prove or kill it.
 ### State after rotation 8
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
 B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (3), attack changes next rotation
+
+## 2026-08-19 — ROTATION 9. E's CAUSE FOUND EXACTLY. (Rotation 8's hypothesis also wrong.)
+
+### Rotation 8's guess was wrong before it was tested
+R8 suspected the entry block's DUPCLOSURE made every path impure. Reading the
+code first: `let body_start = if block_id == entry { body_end } else { block.start }`
+- the entry block's pre-branch code is ALREADY skipped. Hypothesis dead on arrival.
+
+### Bisection result (tagged every `return None` in enumerate_value_paths)
+    VJREJ IMPURE block=128 stmts=1
+
+ONE statement in ONE intermediate arm block rejects the whole three-arm join.
+Block 128 is [128..134):
+    128: GETIMPORT  R8 ; game
+    130: GETTABLEKS R8 R8."PrivateServerOwnerId"
+    132: JUMPXEQKN  R8 == 0 -> +3
+and the materialised statement is visible in the output:
+    local PrivateServerOwnerId = game.PrivateServerOwnerId
+
+### The defect, stated precisely
+The guard is:
+    // A statement means a side effect (or a materialised temp) that a
+    // per-path expression cannot represent without duplicating it.
+    if !scratch.is_empty() { return None; }
+
+It CONFLATES two different things. A side effect genuinely cannot be duplicated
+or reordered. A materialised temp binding a PURE expression (`game.X`) is only a
+naming choice - it can be hoisted before the branch and evaluated
+unconditionally without changing behaviour. Rejecting on it discards the entire
+value join and costs R7 its value.
+
+This is the same unknown-falls-through-to-the-blunt-answer shape the repo keeps
+closing: "any statement" is the conservative reading of "a statement I cannot
+safely move".
+
+### E -> the fix is now specified (not yet applied)
+Allow the path when every scratch statement is a single-name `Stat::Local` whose
+init is side-effect-free (`has_side_effects` already exists and is used by the
+ternary phi at mod.rs:2141). Such bindings must be HOISTED to the caller's
+statement list ahead of the region - sound precisely because they are pure - and
+`enumerate_value_paths` needs an out-param to carry them, since it currently has
+no access to the outer stmts.
+
+Risk to measure: hoisting evaluates the read on paths that would not have taken
+it. Sound for a pure index, but a metamethod-bearing table would be observable.
+`has_side_effects` is the existing arbiter of that question elsewhere in this
+file, so using it here is consistent rather than novel.
+
+MEASUREMENT PLAN: implement, then clean-run the corpus. Keep only if the clean
+count rises; revert and journal the numbers if it falls.
+
+### State after rotation 9
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
+B  PARKED (1)   C OPEN   D **CLOSED**
+E  cause FOUND, fix specified, implementation is rotation 10's work
