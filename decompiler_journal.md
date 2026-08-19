@@ -1678,3 +1678,77 @@ SEMANTIC: 1,104/1,142 (96.7%), 54 defects, measured honestly.
 SWEEP: re-run against run_r18 COMPLETE (1,111 files) - but r18 PREDATES this
   fix, so its numbers are already stale and understate the current build.
   Post-process with `enforce_verdict`, then re-run against run_r26.
+
+
+## Rotation 26 - the stem rule was a REGRESSION. Reverted.
+
+### What rotation 25 actually did
+It raised the semantic measure 1,045 -> 1,104 and it made real files worse. Both
+are true, and the second only became visible by READING the output.
+
+`25_CameraScript_RootCamera`, `rk4Integrator`, before and after:
+
+    BEFORE (r18)                          AFTER (r25/r26)
+    local v18 = v19 + (arg3 + v44*max9*arg4)   ... v44 * max * arg4
+    local max12 = v18 * (arg4 / 6)             max = v18 * (arg4 / 6)
+    local v22 = 2 * (v44 * max6)               local v22 = 2 * (v44 * max)
+    v21 = v44 * max3 + v22                     v21 = v44 * max + v22
+    v22 = 2 * (v44 * max9)                     v22 = 2 * (v44 * max)
+    v19 = v21 + v22 + v44 * max11              v19 = v21 + v22 + v44 * max
+
+Five distinct values - `max3`, `max6`, `max9`, `max11`, `max12` - collapsed onto
+one `max`. RK4 needs four distinct k terms; the fixed build sums ONE value four
+times. It also clobbers `local max = math.max` while the nested `acceleration`
+still calls `max(1, ...)`.
+
+### Why the rule was wrong
+`classify_write` is keyed on a register, so a stem match does mean the same
+REGISTER - but a register is REUSED, and the original source had distinct locals
+for each occupancy. Shadowing preserves that distinction; reassigning destroys
+it whenever an earlier value is still read later. `Lvl3 += 2` was safe because
+nothing needed the old `Lvl3` afterwards. RK4 needs every one of them.
+
+Same stem does not mean same value.
+
+### The instrument was blind to the damage, AGAIN
+The semantic checker has no check for a value collapse, so it scored the
+collapse as a 99-defect improvement. Rotation 24 taught that a rising number can
+mean a blind instrument; this is the same lesson pointing the other way, and it
+was caught only because I read `rk4Integrator` rather than trusting the count.
+
+The checker rule that follows: a fix that raises the score is not verified until
+its OUTPUT has been read on a file it changed.
+
+### Reverted
+`git checkout backup/pre-stem-rule -- naming.rs`. Clean run confirms the
+restoration: 1,104 -> **1,045 clean (91.5%), 153 defects**, and RootCamera again
+emits `max6` and `max9` as separate values. Only the two pre-existing
+`opmap_dupclosure_detection` failures remain.
+
+The `branch_local_discarded` CHECK stays - it is honest and the family is real.
+It is the FIX that was wrong.
+
+### Mechanism I, corrected hypothesis
+The discriminator is not the name. It is whether the initialiser is built FROM
+the register's own current value:
+
+    local Lvl4 = Lvl3 + 2          Lvl3 IS this register's current name -> accumulate
+    local max5 = (arg2 + max)/3.3  `max` is ANOTHER register's name    -> new value
+
+An accumulate can safely become `Lvl3 += 2`. A fresh value must keep its own
+binding. `classify_write` cannot make this call because it never sees the
+initialiser; the decision belongs at the CALL SITE, which has the RHS in hand.
+
+### State after rotation 26
+SEMANTIC: 1,045/1,142 (91.5%), 153 defects - honest, and unchanged from the
+  rotation-24 baseline.
+  A, D, E, F, G, H CLOSED. **I RE-OPENED, PARKED (1)** with the corrected
+  hypothesis above and a named next step: move the decision to the call site and
+  gate on "RHS references this register's current name".
+  A2 PARKED (2). B PARKED (1). C PARKED (2).
+POSSIBLE NEW CHECK, noted not built: the collapse itself is detectable - the
+  same statement emitted twice with identical text where the algorithm needs
+  different values (`v22 = 2 * (v44 * max)` twice). The sweep already has a kind
+  for this shape, `duplicate_call`.
+SWEEP: r26 run ABANDONED (it targeted the reverted build). Re-running against
+  run_r27.

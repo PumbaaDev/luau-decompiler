@@ -187,30 +187,6 @@ impl LocalTracker {
                 // Names differ.  Only shadow when BOTH are semantic
                 // (non-`v\d+`).  Otherwise reuse the old name to avoid
                 // counter-bump churn.
-                // SAME DEBUG NAME, DIFFERENT COUNTER. `Lvl3` -> `Lvl4` is one
-                // variable that the uniquifier numbered twice, not a new
-                // binding. Shadowing it emits `local Lvl4 = Lvl3 + 2` inside
-                // the arm and the value never reaches the `Lvl3` the code goes
-                // on to use - 162 sites across 89 files, measured, with
-                // 213_Tornado losing a `+ 2` and
-                // 734_StatModifiers_BaseConversionRate returning an
-                // un-appended string.
-                //
-                // A genuine rebind gets a genuinely different stem and still
-                // shadows.
-                // Only when the counter went UP. `Lvl3` -> `Lvl4` is the
-                // uniquifier handing out the next number for one variable.
-                // The reverse, `mapN` -> `map`, is the lifter recovering the
-                // CANONICAL debug name, and answering Reassign there keeps the
-                // numbered one and loses the real name: it deleted `map` from
-                // RbxCharacterSounds, which the published source has and the
-                // CoreScript ground-truth test checks.
-                if name_stem(&old) == name_stem(new_name)
-                    && !name_stem(&old).is_empty()
-                    && name_suffix(new_name) > name_suffix(&old)
-                {
-                    return (WriteKind::Reassign, old);
-                }
                 if is_semantic_local_name(&old) && is_semantic_local_name(new_name) {
                     self.current_names.insert(reg, new_name.to_string());
                     (WriteKind::Shadow, new_name.to_string())
@@ -250,23 +226,6 @@ impl LocalTracker {
 /// plausibly intentional; shadowing between them is safe and preserves the
 /// narrative of the bytecode (e.g., a `fn` closure register getting
 /// re-declared as a `tbl` is semantically meaningful).
-/// The alphabetic stem of a generated local name, i.e. the part before the
-/// uniquifying counter `ctx.reg_name` appends.
-///
-/// `Lvl3` and `Lvl4` are not two variables. They are one debug name, `Lvl`,
-/// handed out twice by the counter that keeps emitted names unique. Treating
-/// them as distinct is what turns a reassignment into a fresh `local`, which
-/// drops the value - see `check_branch_local_discarded` and 213_Tornado.
-fn name_stem(name: &str) -> &str {
-    name.trim_end_matches(|c: char| c.is_ascii_digit())
-}
-
-/// The uniquifying counter on a generated name; 0 when it carries none.
-fn name_suffix(name: &str) -> u32 {
-    let stem = name_stem(name);
-    name[stem.len()..].parse().unwrap_or(0)
-}
-
 pub(super) fn is_semantic_local_name(name: &str) -> bool {
     if name.is_empty() { return false; }
     let mut chars = name.chars();
