@@ -1787,6 +1787,42 @@ fn lift_structured_run(
     let regions = crate::analysis::structuring::structure_numeric_for_body(
         &proto.code, start, end, cfg, &loop_headers,
     );
+    // Rotation 87: what does the run structurer actually emit? Proto-qualified,
+    // because rotation 86 spent four rotations on the wrong near-duplicate
+    // proto for want of exactly this field.
+    if std::env::var("LUAU_RUNREG_TRACE").is_ok() {
+        for r in &regions {
+            let (kind, lo, hi) = match r {
+                Region::Linear { start, end } => ("Linear", *start, *end),
+                Region::IfThenElse { cond_pc, merge_pc, .. } => {
+                    ("IfThenElse", *cond_pc, merge_pc.unwrap_or(0))
+                }
+                Region::ValueJoin { entry, join, .. } => ("ValueJoin", *entry, *join),
+                Region::NumericFor { body_start, body_end, .. } => {
+                    ("NumericFor", *body_start, *body_end)
+                }
+                Region::GenericFor { body_start, body_end, .. } => {
+                    ("GenericFor", *body_start, *body_end)
+                }
+                Region::WhileDo { header, .. } => ("WhileDo", *header, 0),
+                Region::WhileTrue { header, .. } => ("WhileTrue", *header, 0),
+                Region::RepeatUntil { header, cond_pc, .. } => {
+                    ("RepeatUntil", *header, *cond_pc)
+                }
+                Region::InlineLoopInLoop { .. } => ("InlineLoopInLoop", 0, 0),
+                Region::InlineIfThenInLoop { .. } => ("InlineIfThenInLoop", 0, 0),
+            };
+            eprintln!(
+                "RUNREG	{}	run={}..{}	{}	{}..{}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                start,
+                end,
+                kind,
+                lo,
+                hi
+            );
+        }
+    }
     debug_assert!(
         regions.iter().all(|r| region_pc_extent_within(r, start, end)),
         "structured arm run [{start}, {end}) produced a region outside its span"

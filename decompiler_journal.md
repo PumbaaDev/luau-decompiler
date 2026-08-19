@@ -5389,3 +5389,78 @@ re-measured with everything off: 1,104/39, 949 tests pass.
 SEMANTIC: 1,104/1,142 (96.7%), 39 defects. No behaviour changed.
 The reproducer is now exact: `533_NPCs` proto `AddOverrideEvent`, span 130..151,
 expected to stop at 140.
+
+
+## Rotation 87 - FIXED. The inline-if arm swallowed everything past its own exit
+
+### The mechanism, at last
+`structure_numeric_for_body`, Phase B0.5 Shape B, wraps a forward conditional
+whose target range contains a nested for-loop as `Region::InlineIfThenInLoop`
+with body `jump_next_pc..target`. `LUAU_RUNREG_TRACE` on
+`533_NPCs::AddOverrideEvent` showed run 115..183 producing exactly two regions:
+
+    Linear 115..129
+    InlineIfThenInLoop            <- everything else, 130..183
+
+But the arm ENDS EARLY:
+
+    129: JUMPIF     R2 -> 183     `if not quest`
+    130..138       error(...)
+    139: JUMP      -> 183         <-- the arm's own exit
+    140..182       the rest of the function, NOT the arm's
+
+Taking the body as 130..183 swallowed 140..182. The flat lift of that span then
+stopped at the pc-139 jump, so `149: GETTABLEKS R3 R1."StartReqs"` was never
+lifted and its `JUMPIFNOT` at 151 rendered as a bare `v3`.
+
+### The fix
+Truncate the arm at its own exit jump, test `range_contains_nested_for` against
+the TRUE arm, and resume after the jump so the tail is structured on its own.
+
+**With one guard that the first attempt lacked**: a jump to the target is only an
+arm exit if what follows it is UNREACHABLE from inside the arm. An if/else
+inside the arm also jumps to the arm's end to skip its else. Without the guard
+(measured): 32 files changed, calls lost in six, and `555_DapperBearInit` lost a
+whole dialogue branch and three `table.insert` calls. With it: 11 files, zero
+calls lost.
+
+### Measured, adopted
+    clean 1,104 -> 1,105   defects 39 -> 38
+    FIXED   533_NPCs declared_never_assigned
+    NEW     none, anywhere
+    11 files changed; calls lost 0; loops lost 0
+    99_BeequipTypes   +76 lines, +13 ifs, +2 loops, +21 calls
+    87_BeeBoosts      nested ifs -> guard clauses, and `v3` now DECLARED
+    88_BeeStats       `Type12 = self.Type; if Type12 == "Gummy"` replacing
+                      `Type12 = arg3; Type12("GummyPower")`
+    949 tests pass.
+
+`533_NPCs::AddOverrideEvent` now reads as the source did - the `error` arm
+closes, and the condition is `if arg2.StartReqs then`.
+
+Mutations, both measured WORSE: no fix at all (1,104/39); fix without the
+reachability guard (damages 555, 576, 258, 368, 380, 879).
+
+### The trail this closes
+Six rotations, five wrong locations, each falsified by an instrument one level
+finer than the one before:
+
+    r81  path-sensitive dataflow at joins    not a join
+    r82  find_merge_point returns the jump   merge was correct
+    r83  contiguous arm never structured     structured_run runs
+    r84  pc 174 never lifted                 it is walked
+    r85  region-level condition construction correct at extraction
+    r86  WRONG PROTO for four rotations      AddEvent vs AddOverrideEvent
+    r87  the arm swallows past its own exit  FIXED
+
+The instrument that finally paid was `LUAU_RUNREG_TRACE`, which prints what the
+structurer EMITS rather than what any consumer receives. Every earlier
+instrument reported a consumer's view, and every consumer looked innocent
+because it was.
+
+### State after rotation 87
+SEMANTIC: **1,105/1,142 (96.8%), 38 defects**. 949 tests pass.
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops, **inline-if-arm-overrun**.
+NEXT: re-enumerate the 38 and check whether the four remaining
+  `REG_EXPR_UNKNOWN+UNK_CALL_CLEAR` files share this shape.

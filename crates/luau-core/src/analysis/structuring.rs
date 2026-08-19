@@ -1005,20 +1005,86 @@ pub(crate) fn structure_numeric_for_body(
         if let Some((jump_next_pc, target)) = forward_conditional_jump(op, pc, insn) {
             // Target must stay within this body range.
             if target > jump_next_pc && target <= body_end {
+                // THE ARM MAY END BEFORE THE TARGET.
+                //
+                // `jump_next_pc..target` is the fall-through side, but an arm
+                // that exits early with its OWN unconditional jump to the same
+                // place does not own the instructions between that jump and
+                // the target. Measured on `533_NPCs::AddOverrideEvent`:
+                //
+                //     129: JUMPIF     R2 -> 183      `if not quest`
+                //     130..138       error(...)
+                //     139: JUMP      -> 183          <-- the arm ends HERE
+                //     140..182       the rest of the function
+                //
+                // Taking the arm as 130..183 swallowed 140..182 into it, and
+                // the flat lift of the swallowed span stopped at the pc-139
+                // jump - so `149: GETTABLEKS R3 R1."StartReqs"` was never
+                // lifted and its `JUMPIFNOT` at 151 rendered as a bare `v3`
+                // that nothing assigns.
+                //
+                // Only a jump that leaves the WHOLE arm counts; a nested if's
+                // jump targets something inside it.
+                //
+                // MEASURED (rotation 87), ADOPTED:
+                //     clean 1,104 -> 1,105   defects 39 -> 38
+                //     fixes 533_NPCs; NO new findings anywhere
+                //     11 files changed; calls lost 0, loops lost 0
+                //     99_BeequipTypes gains +21 calls, +2 loops, +13 ifs
+                //     87_BeeBoosts turns nested ifs into guard clauses and
+                //     declares `v3` it previously left bare
+                let mut arm_end = target;
+                {
+                    let mut scan = jump_next_pc;
+                    while scan < target && scan < code.len() {
+                        let op2 = LuauOpcode::from_u8(insn_op(code[scan]));
+                        if matches!(op2, LuauOpcode::Jump) {
+                            let t2 = scan as i64 + insn_d(code[scan]) as i64 + 1;
+                            // A jump to the target is only an ARM EXIT if what
+                            // follows it is unreachable from inside the arm.
+                            // An if/else INSIDE the arm also jumps to the arm's
+                            // end to skip its else, and truncating there
+                            // deletes the rest of the arm - measured on
+                            // `555_DapperBearInit`, which lost a whole dialogue
+                            // branch and three `table.insert` calls.
+                            let after = scan + 1;
+                            let reachable_from_arm = cfg
+                                .blocks
+                                .get(&after)
+                                .map(|b| {
+                                    b.predecessors
+                                        .iter()
+                                        .any(|&p| p >= jump_next_pc && p < target)
+                                })
+                                .unwrap_or(true);
+                            if t2 >= target as i64 && !reachable_from_arm {
+                                arm_end = scan;
+                                break;
+                            }
+                        }
+                        scan += if op2.has_aux() { 2 } else { 1 };
+                    }
+                }
                 // Do not wrap if the range is trivial (no nested for inside).
-                if range_contains_nested_for(code, jump_next_pc, target) {
+                // Tested against the TRUE arm: a nested for that lives past the
+                // arm's exit is not the arm's, and wrapping for its sake is
+                // what swallowed the tail above.
+                if range_contains_nested_for(code, jump_next_pc, arm_end) {
                     if linear_start < pc {
                         regions.push(Region::Linear {
                             start: linear_start,
                             end: pc,
                         });
                     }
-                    let then_body = structure_numeric_for_body(code, jump_next_pc, target, cfg, loop_headers);
+                    let then_body =
+                        structure_numeric_for_body(code, jump_next_pc, arm_end, cfg, loop_headers);
                     regions.push(Region::InlineIfThenInLoop {
                         cond_pc: pc,
                         body: then_body,
                     });
-                    pc = target;
+                    // Resume AFTER the arm's exit jump when there was one, so
+                    // the tail it used to swallow is structured on its own.
+                    pc = if arm_end < target { arm_end + 1 } else { target };
                     linear_start = pc;
                     continue;
                 }
