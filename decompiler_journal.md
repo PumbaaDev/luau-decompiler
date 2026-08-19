@@ -6917,3 +6917,70 @@ THE QUESTION: what distinguishes `GenericFor 27..45`, which structures, from
 ### State after rotation 112
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean; the
 recursive RUNREG trace is kept and verified inert.
+
+
+## Rotation 113 - the two bodies compared, and calls_not_emitted CLOSED at its boundary
+
+### The comparison r112 required
+`LUAU_SHAPE_TRACE=<start>-<end>` prints, per pc, what the loop-body scan sees.
+Two generic-for bodies in the SAME proto (`59_LocalCubs::?@40`):
+
+HEALTHY, body 27..45 - three pcs scanned, then done:
+
+    pc=27  GetTableKS  fwd_cond=None  linear_start=27
+    pc=42  Mul         fwd_cond=None  linear_start=42     <- jumped 27 -> 42
+    pc=43  SetTableKS  fwd_cond=None  linear_start=42
+
+The ValueJoin shape fired at the FIRST pc and consumed 27..42 in one step.
+
+FLAT, body 55..162 - every pc scanned, `linear_start` never leaves 55:
+
+    pc=57  JumpIfNot  fwd_cond=Some((58, 63))
+    pc=62  JumpIf     fwd_cond=Some((63, 72))
+    pc=66  JumpIf     fwd_cond=Some((67, 69))
+    pc=71  Jump       fwd_cond=None                <- the skip to 162
+    ... 100+ more pcs, no shape ever fires
+
+### The answer
+The conditionals ARE detected - `forward_conditional_jump` returns `Some` for
+all three. They are REJECTED because each arm is a handful of instructions:
+no nested `for` (Shape B), and none ends in `RETURN` (Shape C).
+
+So this is not a shape failing to fire. **A plain `if`/`elseif` chain inside a
+loop body matches none of the implemented shapes at all.** The scan has shapes
+for ValueJoin, nested-for arms, return-terminated guards and inline loops - and
+nothing for ordinary branching.
+
+### Why the gap is not filled
+Filling it naively is far worse than leaving it (r112: 1,125/17 -> 1,106/37, the
+largest regression of the session). Three independent attempts now agree:
+
+    r83   `LUAU_ARM_IF`, nested-cond arms in `lift_branch_region`  +1 clean but
+          DELETED a purchase guard - rejected
+    r109  jump-terminated guard arms                                -2 clean
+    r112  wrap every plain conditional in a loop body               -19 clean
+
+Each fires this wrap where the arm REJOINS, and the wrap is only sound where it
+does not. That is the same boundary r93 established when Shape C was adopted.
+
+### CLOSED, at the evidential boundary
+MECHANISM: `calls_not_emitted` - a loop body containing plain branching is
+  emitted as one flat Linear region; the walk skips arms that a jump hops over
+  and their calls are lost.
+PROVED:    the body IS `GenericFor 55..162` with a single nested `Linear`; a
+  sibling loop in the same proto structures correctly via ValueJoin; the
+  conditionals are detected and rejected on arm shape, printed per pc.
+RULED OUT: walk-abandonment (r110, that path never fires); jump-terminated
+  guards (r109); nested-cond arms (r83); plain-conditional wrapping (r112).
+WHAT IT WOULD TAKE: a genuine if/elseif region builder for loop bodies -
+  matching the conditional, its arms AND its merge - not another trigger on the
+  existing wrap. Every attempt so far has reused `InlineIfThenInLoop`, which by
+  construction assumes the arm does not rejoin, and every one has regressed.
+
+Closed rather than parked: the mechanism is fully characterised, the reproducer
+and its control are recorded, and four attempts have each measured worse. It
+reopens with new machinery, not a new predicate.
+
+### State after rotation 113
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_SHAPE_TRACE`
+kept and verified inert.

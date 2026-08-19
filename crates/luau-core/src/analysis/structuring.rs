@@ -762,9 +762,31 @@ pub(crate) fn structure_numeric_for_body(
     let mut linear_start = body_start;
     let mut pc = body_start;
 
+    // Rotation 113: what does the scan SEE, per pc? Two generic-for bodies in
+    // the same proto (`59_LocalCubs::?@40`) get opposite results - 27..45
+    // structures into ValueJoin+Linear, 55..162 stays one flat Linear - and the
+    // difference between them has never been printed.
+    let shape_trace = std::env::var("LUAU_SHAPE_TRACE")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once('-')?;
+            Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+        })
+        .filter(|&(a, b)| a == body_start && b == body_end);
+    if shape_trace.is_some() {
+        eprintln!("SHAPE	scan body={}..{}", body_start, body_end);
+    }
+
     while pc < body_end {
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
+        if shape_trace.is_some() {
+            let fj = forward_conditional_jump(op, pc, insn);
+            eprintln!(
+                "SHAPE	  pc={}	op={:?}	fwd_cond={:?}	linear_start={}",
+                pc, op, fj, linear_start
+            );
+        }
 
         // ── Value join inside a loop body ────────────────────────────────
         //
