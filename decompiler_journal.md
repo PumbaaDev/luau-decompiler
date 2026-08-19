@@ -4430,3 +4430,61 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   50 protos with unreachable blocks - separate, parked.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_ORDER_TRACE (else-arm block order with RETURN marks).
+
+
+## Rotation 71 - the fix missed its own target, and the miss is the finding
+
+### The attempt
+`lift_branch_region` already structures a run recursively when it contains a
+nested for-loop (`range_contains_nested_for` -> `lift_structured_run`).
+Extended that gate with `run_has_early_return`: a run whose RETURN appears
+before its final block is the shape rotation 70 diagnosed.
+
+Measured: **1,100 -> 1,102 clean (96.5%), 48 -> 44 defects.** 31 files changed.
+
+### It did NOT fix the reproducer
+`277_DragManager::OnInputBegin@184` is byte-identical. The +2 came from
+elsewhere entirely.
+
+The reason is in my own guard. `split_contiguous_runs` requires PC-ADJACENCY
+(`ranges[j].1 == ranges[j+1].0`), and the else arm's 23 blocks are NOT adjacent
+- the then-block and other regions' blocks sit between them. So the arm
+fragments into single-block runs where `hi == lo`, and `run_has_early_return`
+returns false on its first line.
+
+**That is a new and precise fact:** the arm is fragmented BEFORE any structuring
+decision is made, so no gate placed at that point can ever see the arm as a
+whole. A fix must act before `split_contiguous_runs`, or on the block LIST
+rather than on contiguous PC spans.
+
+### Reverted anyway, on evidence
+    174_ClientStatCache  `if 1 < #arg2 then` -> `while v42 < #arg2 do`
+                         a genuine RECOVERY - an if that was really a loop
+    218/219_Collectors   `local stringValue2 = ...` inside the branch became
+                         chunk-top `local Parent2, stringValue2, value33`
+
+The second is the `free_var_decls` fallback, which rotation 33 established means
+the lifter LOST those bindings. So the change trades recovered loops for lost
+scoping, and the checker scores that +2 because it cannot see the difference.
+
+A change that misses its stated target, improves some files, degrades others,
+and is scored positively by an instrument blind to the degradation is not one to
+keep on a +2.
+
+### The count of reverts, stated plainly
+Seven fixes reverted this session after measuring well: stem rule (25),
+accumulate rule (27), preserve-declared-locals (42), preserve-pure-values (44),
+loop-join materialisation (48), declaration-only hoisting (52), and this one.
+Every one raised or held the score. Every one was caught by reading output the
+score could not see. That ratio is the argument for the checks added in
+rotations 24 and 61 rather than against the discipline.
+
+### State after rotation 71
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: diagnosis stands; fix location corrected.** The arm is fragmented by
+  `split_contiguous_runs` before any structuring gate sees it, so the repair
+  must operate on the block LIST (`else_region`) rather than on contiguous PC
+  spans. Reproducer unchanged.
+  50 protos with unreachable blocks - separate, parked.
+  Seven measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
