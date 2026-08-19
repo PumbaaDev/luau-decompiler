@@ -5716,3 +5716,79 @@ structurer.
 SEMANTIC: 1,106/1,142 (96.8%), 37 defects. Unchanged; this rotation is an
 instrument plus a retraction. Verified inert.
 REPRODUCER, minimal: `603_Orbiter` proto `Update@182`, 5 CALL sites, 1 emitted.
+
+
+## Rotation 92 - located: DCE phase 2, and why RET_RESUME is a no-op BY CONSTRUCTION
+
+### Answering r91's question
+`LUAU_IF_TRACE` on `603_Orbiter::Update@182`:
+
+    base        IFPUSH  then_stmts=1  else_stmts=Some(3)   else_calls=Some(1)
+    RET_RESUME  IFPUSH  then_stmts=1  else_stmts=Some(11)  else_calls=Some(5)
+
+So the else arm IS built with all 11 statements and all 5 calls, and IS pushed.
+Nothing is dropped at lift time. The loss is downstream, as r91 predicted.
+
+### The proto qualifier, for the third time
+The first run of the per-pass probe showed 20 statements / 5 calls holding
+through fifteen passes and then collapsing to 4 / 1. That collapse was the NEXT
+PROTO's pass chain beginning - the probe printed no proto. Same failure as
+rotation 86 and rotation 47 before it, third occurrence in this session, this
+time in an instrument I had written two rotations earlier while explicitly
+noting why proto identity matters. The probe is now proto-qualified and carries
+that note in its body.
+
+Qualified, the answer is immediate:
+
+    Update@182  simplify_stmts         stmts=1  calls=5
+    Update@182  eliminate_dead_stores  stmts=1  calls=5
+    Update@182  eliminate_dead_code    stmts=1  calls=1
+
+### The phase
+`LUAU_DCE_TRACE`, depth 2 (inside the else arm):
+
+    enter                  stmts=11  calls=5
+    after_phase1_recurse   stmts=11  calls=5
+    after_phase2_truncate  stmts=3   calls=1
+
+**Phase 2, "truncate after terminators."**
+
+### What this actually means - RET_RESUME cannot work as written
+The two faults r91 described as "stacked" are one coupled problem.
+`LUAU_RET_RESUME` resumes the walk past a `Return` and appends the resulting
+statements to the SAME flat statement list, producing
+
+    [ ..., Stat::Return, stmt, stmt, ... ]
+
+Those statements are then genuinely unreachable IN THE EMITTED AST, and DCE
+phase 2 removes them entirely correctly. DCE is not the bug.
+
+That is why the output is byte-identical with the gate on: RET_RESUME is a
+**no-op by construction**, not a partial fix waiting for a second one. r90's
+"neutral" measurement was right for a reason neither r90 nor r91 had.
+
+### The corrected fix shape
+The resumed statements must be placed STRUCTURALLY AFTER THE ENCLOSING `if`,
+not appended after the `return` inside its arm. The bytecode
+
+    15: JUMPIFNOT R2 -> 17    `if pulling or dragging then`
+    16: RETURN                    return end
+    17: ...                   <-- belongs AFTER the if, at the parent level
+
+is an early-exit guard, and the region structurer should emit
+`if cond then return end` as a complete region with 17.. as its SIBLING. Fixing
+it inside `lift_instruction_range` cannot express that, because that function
+owns one flat list and has no way to return "and these belong to my parent".
+
+### THE QUESTION, restated for the next attempt
+Can `structure_control_flow` recognise a guard arm - a conditional whose taken
+side terminates - and emit `IfThenElse{then: [return], merge: next}` so the
+tail becomes a sibling region? That is the r87 fix's shape (truncate the arm,
+resume after it) applied to a RETURN-terminated arm instead of a
+JUMP-terminated one. r87 is the working precedent and the place to start.
+
+### State after rotation 92
+SEMANTIC: 1,106/1,142 (96.8%), 37 defects. Unchanged; diagnosis only.
+949 tests pass, all instruments verified inert.
+GATED: `LUAU_RET_RESUME` now KNOWN to be a no-op by construction - do not
+  revisit it as written; the note above is why.
