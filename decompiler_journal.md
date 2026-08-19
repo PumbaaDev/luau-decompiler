@@ -2284,3 +2284,74 @@ SEMANTIC: 1,118/1,142 (97.9%), 31 defects (3 proven checker FPs -> 28 real).
   register's value at the merge, not paper over the symptom at the write.
   B PARKED (1).
 SWEEP: run 1 of 2 against run_r32 in flight.
+
+
+## Rotation 35 - A2/C CLOSED: a pending table cannot survive a branch
+
+### The last missing fact
+Traced `NewTable`/`DupTable` on `654_Collect_Pollen`:
+
+    TABLE DupTable pc=3  reg=2
+    TABLE DupTable pc=25 reg=3
+
+The table IS created. Register 3 really does receive it, and it is the MERGE
+that loses it - which is what rotation 33's `UNK_MERGE_COMPOUND` tag said and
+what rotation 34's seeding attempt was papering over.
+
+### Why the merge cannot help
+A table literal deliberately sits in its register UNEMITTED so later field
+writes can be folded into the constructor. Across a branch that is fatal: an arm
+that adds a field leaves `Expr::Table` with a DIFFERENT field set on its side,
+so at the join the two sides are not structurally equal and neither is a `Name`
+- the exact fall-through to `UNK_MERGE_COMPOUND`. The register resets to
+`Unknown` and every later use renders as an undeclared `v{reg}`.
+
+No merge rule fixes this. Keeping either side loses the other arm's fields.
+
+### The fix, at the only place it can go
+Materialise pending `Expr::Table` registers into named locals immediately BEFORE
+the arms lift, so both arms mutate ONE binding - which is what the source did.
+Inserted just above the `regs_before` snapshot; parameters excluded.
+
+    local Amount4 = { Category = "Pollen", Amount = Amount2 }
+    if self.Zone  then Amount4.Zone  = Zone2  end
+    if self.Color then Amount4.Color = Zone3  end
+    if self.Tag   then Amount4.Tag   = Color5 end
+
+The table now carries its real initial contents, and `Amount4.Zone = Zone2` -
+a field write that was MISSING ENTIRELY from the old output - is back.
+
+Contrast with rotation 34, which tried to seed `{}` at the write site: that
+fabricated tables where the register had held a game Instance. Repairing at the
+branch restores the table the bytecode actually created instead of inventing
+one, which is why this is sound and that was not.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,118 -> **1,122 clean (98.2%)**, 31 -> **27 defects**
+
+55 files changed; read four. All recoveries of tables that were previously lost:
+
+    1026_Coconut_Dispenser   a 4-field item table, previously absent entirely
+    142_CameraCutScenes      a 10-field cutscene state table, previously absent
+    140_CameraBlur           `local tbl22 = nil` -> the real
+                             `{BlurShadePressCallback = arg2}`
+
+`140` also fixes a second defect for free: `tbl22` had been holding BOTH the
+table and a boolean flag - one name for two variables - and materialising the
+table pushed the flag onto its own binding `tbl23`.
+
+943 unit tests pass; CoreScript ground truth passes; only the two pre-existing
+`opmap_dupclosure_detection` failures remain.
+
+### Verification note, stated plainly
+This fix is region-level, so the evidence is the corpus diff read by hand (4 of
+55 files, plus the 654 reproducer matching the source shape exactly) plus the
+full suite - not a new unit test. The rotation-28 and -31 predicates got unit
+tests because they are pure functions; this one is not.
+
+### State after rotation 35
+SEMANTIC: **1,122/1,142 (98.2%), 27 defects**, 3 of them proven checker false
+  positives -> 24 real.
+  A, D, E, F, G, H, I, J, **A2/C** CLOSED. MINUS closed as a measured dead end.
+  B PARKED (1). K: 3 confirmed FP, 5 candidates.
+SWEEP: run 1 of 2 against run_r32 in flight; run_r32 now predates this fix.

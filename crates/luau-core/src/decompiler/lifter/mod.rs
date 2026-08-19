@@ -2064,6 +2064,55 @@ fn lift_region(
                 );
             }
 
+            // MATERIALISE PENDING TABLES BEFORE THE ARMS RUN.
+            //
+            // A table literal sits in its register unemitted so later field
+            // writes can be folded into the constructor. That is right for
+            // straight-line code and fatal across a branch: an arm that adds a
+            // field leaves `Expr::Table` with a DIFFERENT field set on its
+            // side, `merge_regs` finds the two sides unequal and neither a
+            // `Name`, and resets the register to `Unknown` - destroying the
+            // table. Every later use then renders as an undeclared `v{reg}`.
+            //
+            // Measured on `654_Collect_Pollen`, whose source is
+            //
+            //     local filter = {}
+            //     if self.Zone  then filter.Zone  = self.Zone  end
+            //     if self.Color then filter.Color = self.Color end
+            //
+            // `DupTable` really does write the register (pc=25), and it is the
+            // merge that loses it - so the repair belongs here, before the
+            // arms, and NOT at the write site: rotation 34 tried seeding an
+            // empty table at the SETTABLEKS and merely fabricated tables where
+            // the register had held a game Instance.
+            //
+            // Emitting the binding first makes both arms mutate ONE named
+            // local, which is what the source did.
+            let pending_tables: Vec<usize> = (0..regs.len())
+                .filter(|&i| matches!(&regs[i], RegVal::Expr(Expr::Table { .. })))
+                .filter(|&i| locals.is_non_param(i))
+                .collect();
+            for i in pending_tables {
+                let RegVal::Expr(value) = regs[i].clone() else { continue };
+                let fresh = ctx.reg_name(proto, i as u8, branch_pc);
+                let (kind, name) = locals.classify_write(i, &fresh);
+                match kind {
+                    WriteKind::FirstDecl | WriteKind::Shadow => {
+                        stmts.push(Stat::Local {
+                            names: vec![name.clone()],
+                            values: vec![value],
+                        });
+                    }
+                    WriteKind::Reassign => {
+                        stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(name.clone())],
+                            values: vec![value],
+                        });
+                    }
+                }
+                regs[i] = RegVal::Expr(Expr::Name(name));
+            }
+
             // Snapshot register state before branches so then/else don't
             // corrupt each other's view of the registers.
             let regs_before = regs.clone();

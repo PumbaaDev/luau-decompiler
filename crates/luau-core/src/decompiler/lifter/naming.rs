@@ -104,6 +104,11 @@ impl LocalTracker {
         reg >= self.param_count && !self.declared.contains(&reg)
     }
 
+    /// A register that is not one of this proto's parameters.
+    pub(super) fn is_non_param(&self, reg: usize) -> bool {
+        reg >= self.param_count
+    }
+
     /// Snapshot the current declared set before entering a nested scope.
     pub(super) fn snapshot(&self) -> HashSet<usize> {
         self.declared.clone()
