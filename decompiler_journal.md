@@ -4178,3 +4178,69 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: LUAU_IF_TRACE now reports IF / IFLIFT / IFPUSH with per-arm statement
   and call counts.
+
+
+## Rotation 67 - MECHANISM B ROOT CAUSE FOUND: eliminate_dead_code
+
+### CORRECTS ROTATION 65
+Rotation 65 declared "the post-passes are exonerated" on the strength of a
+bracket that turned out to sit AFTER eight of them. Between the region loop and
+where I put that trace run:
+
+    simplify_stmts · eliminate_dead_stores · eliminate_dead_code
+    eliminate_dead_key_eq_value_locals · eliminate_dead_code
+    convert_while_true_break_to_repeat · convert_single_pass_loops
+    collapse_elseif_chains
+
+I bracketed the tail of the sequence and reported the whole stage clear. The
+lesson is the same one rotation 59 taught about the call counter: verify WHERE
+an instrument is placed, not just what it prints.
+
+### The bisect, one trace per pass
+    after_region_loop                     calls=14
+    after_simplify_stmts                  calls=14
+    after_eliminate_dead_stores           calls=14
+    after_eliminate_dead_code             calls=**0**   <-- HERE
+    ...everything downstream               calls=0
+
+`eliminate_dead_code` deletes the statement. Its own docstring describes the
+shape: "Empty if-blocks: `if v9 then end` ... If only some branches are empty,
+prune those branches."
+
+The `If` at this point is `if cond then <EMPTY> else <37 statements, 14 calls>
+end`. An empty THEN with a populated ELSE is read as an empty if-block and the
+whole statement goes, taking the else body with it.
+
+### Why the guard survives in the output
+`OnInputBegin` still emits `if not self.Pulling then ... return end`. That is a
+NESTED if inside what remains, not the deleted outer one - which is why the
+function looks like a plausible early-return guard rather than obviously
+truncated, and why every checker scored it clean for the whole project.
+
+### The full elimination record for B - nine candidates, one build each
+    unreachable blocks (62)          statement budget (62, and the sentinel
+    missing regions (63)              appears in ZERO files corpus-wide)
+    region construction (64)         empty else arm (65)
+    loss inside lift_branch_region (66)   is_empty_if (66)
+    note_stmts_pushed truncation (67)
+    -> eliminate_dead_code (67) CONFIRMED by before/after call counts
+
+### THE FIX, stated precisely for the next step
+An `If` whose THEN body is empty but whose ELSE body is not is NOT an empty
+if-block. The correct rewrite is to INVERT it -
+`if not cond then <else body> end` - not to delete it. Deleting is only sound
+when EVERY branch is empty, which is what `is_empty_if` already checks correctly
+one function away.
+
+Expected effect: the 8 protos emitting zero calls and the 27 emitting under
+half should recover; `277_DragManager::OnInputBegin` should regain 15 calls and
+37 statements.
+
+### State after rotation 67
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: ROOT CAUSE FOUND** - `eliminate_dead_code` deletes an if with an empty
+  then-arm and a populated else. Fix identified (invert rather than delete),
+  not yet applied.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.

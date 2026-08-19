@@ -1101,19 +1101,44 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
         note_stmts_pushed(&mut stmts, delta);
     }
 
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_region_loop calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     // Restore parent proto context for nested decompilation
     ctx.proto_stack.pop(); // B0.134b: match the push at entry
     ctx.current_proto_index = prev_proto;
 
     // Post-processing: eliminate dead stores and collapse control flow
     simplify_stmts(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_simplify_stmts calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     eliminate_dead_stores(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_stores calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     eliminate_dead_code(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_code calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     // C10b: drop `local v_N = { K = "K" }` artifact patterns when unused.
     // C10j: also drop `local v_N = <pure_rhs>` for bare literals/Name/Field
     // chains when never read/written downstream.
     // Second dead-code sweep because these drops can leave empty-if shells.
     eliminate_dead_key_eq_value_locals(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_key_eq_value_locals calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     eliminate_dead_code(&mut stmts);
     // Phase B0.46A: post-AST repeat-until detection. Catches `repeat ... until`
     // loops that the bytecode-level structuring pass emitted as
@@ -1121,8 +1146,23 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // `convert_single_pass_loops` so the trailing `if cond then break end`
     // is still present (single-pass collapse would rewrite it into an if/else).
     convert_while_true_break_to_repeat(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_convert_while_true_break_to_repeat calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     convert_single_pass_loops(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_convert_single_pass_loops calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     collapse_elseif_chains(&mut stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_collapse_elseif_chains calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
 
     // Phase B0.95: collapse `if cond then X = true else X = false end`
     // into `X = cond`. MUST run BEFORE collapse_short_circuit_assignments
