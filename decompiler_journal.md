@@ -469,3 +469,55 @@ the question is why this region was not classified as a ValueJoin.
 ### State after rotation 6
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)      A1 OPEN (deferred, would relabel)
 B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (1) with question above
+
+## 2026-08-19 — ROTATION 7. E's question ANSWERED. Structural cause located.
+
+Probe on 71_PlaceInfo proto 1 (main), --opmap AND --opmap-db:
+
+    BLOCK   0: [  0..121)  succ=[121, 153]
+    BLOCK 121: [121..128)  succ=[128, 138]
+    BLOCK 128: [128..134)  succ=[134, 136]
+    BLOCK 134: [134..136)  succ=[139]            LOADK R7 "VIPServer"
+    BLOCK 136: [136..138)  succ=[139]            LOADK R7 "ReservedServer"
+    BLOCK 138: [138..139)  succ=[139]            LOADK R7 "StandardServer"
+    BLOCK 139: [139..153)  pred=[134, 136, 138]  <- THREE-predecessor join
+    REGION IfThenElse { cond_pc: 0,
+                        then_region: [121, 128, 134, 136, 138, 139],
+                        else_region: [],
+                        merge_pc: Some(153) }
+
+ANSWER: it is NOT classified as a ValueJoin. Block 139 is a genuine three-arm
+value join, and it is SWALLOWED INSIDE the then_region of an IfThenElse rooted
+at block 0. else_region is empty and merge_pc is 153 - the RETURN block, not the
+real join at 139. No phi/merge logic ever sees 139 as a join, so R7's three arm
+writes are never reconciled and the post-join read mints an unassigned `v7`.
+
+### Why the classifier misses it (structuring.rs:303)
+ValueJoin detection is gated on `block.successors.len() == 2` and runs per block
+in reverse postorder. Block 0 has TWO successors so it is tested first;
+`find_value_join` declines it (block 0's branch is not a value selection), and
+the code falls through to the IfThenElse fallback, which claims 121/128/134/136/
+138/139 into `handled`. Block 121 - which IS the real value-join entry, and does
+have exactly 2 successors - is therefore never offered to the detector.
+
+So the defect is an ORDERING/CLAIMING problem, not a detection-capability
+problem: the outer IfThenElse claims an inner region that a later iteration
+would have matched.
+
+### Note on the lifting-side safety net
+`lift_branch_region` already calls `collect_value_joins_in_span` for the
+single-run case (mod.rs ~1246) specifically to splice back joins the structurer
+never saw. The then_region here is contiguous [121..153), so that path SHOULD
+have caught it. It did not, and why is the next question.
+
+### E -> PARKED (2). Narrowed question:
+  During lifting of this IfThenElse's then arm, what does
+  `collect_value_joins_in_span(cfg, proto, 121, 153)` return? If it returns the
+  join at 139, the splice is running and something downstream discards it; if it
+  returns nothing, the collector inherits the same 2-successor/handled gate as
+  the structurer and that is the single place to fix.
+  One eprintln in collect_value_joins_in_span answers it. 57-line file.
+
+### State after rotation 7
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
+B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (2), question above
