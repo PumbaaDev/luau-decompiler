@@ -3000,3 +3000,50 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
   PARKED: B (1, one file); UPVAL_NAME (format-blocked).
 Verified behaviour-neutral: clean run 1,126/19, 945 tests pass.
 SWEEP: run B against run_r37 in flight; run A gave 949/1,112 clean-or-suspect.
+
+
+## Rotation 48 - loop joins are NOT where the remaining tables die
+
+### The hypothesis, straight from rotation 47
+The read-side trace showed `85_Badges` losing an `Expr::Table` between pc=145
+and pc=152 with no branch involved. Rotation 35 materialises pending tables
+before if/else arms; loops are the obvious uncovered join. So: extract that
+block into `materialise_pending_tables()` and call it at all four loop regions
+as well.
+
+### Build note worth recording
+Three of the four loop sites had no `pc` in scope, then no `branch_pc`, then
+`loop_start` turned out to be declared inside a nested block. During that the
+build was RED while a corpus run still reported 1,126/19 - from the STALE
+BINARY. Caught by comparing binary mtime against source mtime, which is the
+check CLAUDE.md prescribes and which I nearly skipped. A measurement taken while
+the build is broken is not a measurement.
+
+### MEASURED after a verified-fresh build: no benefit, some noise
+    1,126/1,142 (98.6%), 19 defects - UNCHANGED
+    2 files differ
+
+    250_GlitchEffect        + local AnchorPoint22 = {}   (unused, pure noise)
+    852_StickerSeekerReward + a 9-field table materialised before the `if`,
+                              while the `else` arm REASSIGNS the same table
+                              wholesale two lines later - a DUPLICATION, not a
+                              recovery
+
+REVERTED. Loop joins do not hold the remaining table losses, and the extraction
+would have cost duplicated output for nothing.
+
+### What this rules out, which is the value
+A2/C's fix covers if/else. Loops are now excluded by measurement. The `85_Badges`
+loss between pc=145 and pc=152 therefore happens at neither - the remaining
+candidates are a nested region boundary or the block-level structuring itself,
+and the read/write trace pair can localise it per file.
+
+### State after rotation 48
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C (if/else), argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values; loop-join materialisation.
+  PARKED: A2/C-residual (5 files, the ex-UNK_CALL_CLEAR set) - join type
+    narrowed to "neither if/else nor loop"; B (1 file); UPVAL_NAME
+    (format-blocked).
+SWEEP: run B against run_r37 in flight.
