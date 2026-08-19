@@ -6406,3 +6406,56 @@ REMAINING branch_local_discarded (4): the arms that write their register more
   is what keeps them out; widening it needs a way to tell a multi-step
   extension from scratch reuse - `88_BeeStats` is the reproducer for the wrong
   side of that line.
+
+
+## Rotation 103 - the chain generalisation is NEUTRAL, and my model of the last 4 is wrong
+
+### The idea
+r102 shipped "the arm writes the register EXACTLY ONCE", which by construction
+excludes multi-step chains. Two of the four remaining findings look like exactly
+that. `958_Drakkarmon`:
+
+    Humanoid = Humanoid.WalkSpeed              reads Humanoid, writes it
+    local WalkSpeed = Humanoid / heightScale   reads it again, writes again
+
+Two writes, each consuming what the last produced - a carried identity walked in
+steps. `88_BeeStats` is the opposite: `x = tbl`, `x = arg3` read nothing, so the
+slot is being REUSED. So the general rule should be **every write is preceded by
+a read**, with "written once" as its degenerate case.
+
+Implemented as `every_write_extends`, with the B/C operand allowlist from r102
+factored out (`reg_is_source_operand`) and `SETTABLEKS`-style write-through
+opcodes excluded from counting as writes (`op_writes_through`).
+
+### Measured NEUTRAL
+    clean 1,125 -> 1,125   defects 17 -> 17
+    FIXED none.  NEW none.
+    28 files changed; calls lost 0; total emitted calls UNCHANGED (38,460)
+
+A strictly more permissive rule pins 28 more files' registers and moves NOT ONE
+finding. So the four remaining `branch_local_discarded` are not being held back
+by the one-write restriction at all - the pin is reaching them (or would) and
+they stay flagged regardless.
+
+**My model of these four is wrong.** They are not "carried identities excluded
+by an over-strict predicate". Something else keeps their arm value from
+surviving the merge.
+
+Reverted per r90's rule: a 28-file diff that moves no measurement does not ship.
+
+### PARKED, with the model corrected
+MECHANISM: 4 residual `branch_local_discarded` (21_ClickToMove,
+  317_ScreenParticles, 445_PluckedPetal, 958_Drakkarmon).
+RULED OUT: the one-write restriction (r103 - relaxing it is byte-neutral for
+  these files); arm-shape predicates generally (r94-r96 history).
+THE QUESTION: for `958_Drakkarmon` line 742, is `premateralize_branch_escapes_
+  spans` even REACHING that register? Print reg, the `regs[reg]` variant, and
+  which of the gates rejects it - `reg_used_in_range`, `parked_pure`,
+  `carried_identity` - one line per candidate register. Every previous rotation
+  assumed the gate was reached and tuned its predicate; that assumption has
+  never been checked for these four, and rotations 95 and 97 both turned on a
+  gate that was never firing.
+
+### State after rotation 103
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Tree clean apart from
+the untracked throwaway probe.
