@@ -2948,3 +2948,55 @@ TOOLING now in the tree, all env-gated and zero-cost when unset:
     LUAU_FRAME_TRACE  declared registers above a call base
     LUAU_REG_WATCH    every change to one register, with pc
 SWEEP: run against run_r37 in flight.
+
+
+## Rotation 47 - the read-side trace, and UNK_CALL_CLEAR was never the site
+
+### Tooling completed
+Added the READ half to `LUAU_REG_WATCH`, in `reg_expr`'s Unknown arm: it prints
+the moment a register is rendered as a minted `vN`. Paired with the write-side
+watch, that identifies WHICH read lost its value instead of assuming the nearest
+preceding call did - the assumption that cost rotations 40, 42 and 44.
+
+### The result, and it is unambiguous
+`85_Badges`, watching register 13:
+
+    WATCH reg=13 before_pc=145 value=Expr(Table { ... })
+    WATCH reg=13 before_pc=152 value=Unknown
+    READ  reg=13 MINTED v13 (register held Some(Unknown))
+
+    total READs of reg 13 that mint: **1**
+
+ONE read, immediately after pc=152. The call at pc=436 - which
+`UNK_CALL_CLEAR` pointed at for four rotations - is 280 instructions LATER and
+has nothing to do with it. The tag was attached only because `note_unknown` is
+register-keyed and overwriting, so the last call to touch register 13 claimed
+the label.
+
+### What it actually is
+The register held an `Expr::Table` at pc=145 and was `Unknown` by pc=152. That
+is the A2/C shape - a pending table literal destroyed at a control-flow join -
+which rotation 35 fixed for the if/else case by materialising before the arms.
+This instance survives that fix, so the loss is at a boundary rotation 35 does
+not cover (a loop head or a nested region are the obvious candidates).
+
+### The cost of not following my own rule
+Rotation 20 recorded: "use the tags to GROUP candidates, never to name a cause."
+Rotations 40, 42 and 44 each attacked the CALL CLEAR on the strength of that
+tag, and each produced a plausible fix that raised the score and damaged output.
+Every one of those was avoidable. The rule is now demonstrated, not just
+asserted: the tag was wrong by 280 instructions.
+
+### State after rotation 47
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values - all four were chasing a
+    mislabelled site.
+  **UNK_CALL_CLEAR: DISSOLVED.** It is not a mechanism and not a call problem.
+    The 5 files under it fold into A2/C - a value destroyed at a control-flow
+    join - and the open question is which join, answerable per-file now that
+    both trace halves exist.
+  PARKED: B (1, one file); UPVAL_NAME (format-blocked).
+Verified behaviour-neutral: clean run 1,126/19, 945 tests pass.
+SWEEP: run B against run_r37 in flight; run A gave 949/1,112 clean-or-suspect.

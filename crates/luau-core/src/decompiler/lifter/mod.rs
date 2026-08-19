@@ -7078,6 +7078,16 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
         Some(RegVal::LoopVar(s)) => Expr::Name(s.clone()),
         other => {
             let n = format!("v{}", idx);
+            // Read side of LUAU_REG_WATCH: the moment an Unknown register is
+            // rendered as a minted `vN`. Pairing this with the write-side watch
+            // is what identifies WHICH read lost its value, rather than
+            // assuming the nearest preceding call was responsible - an
+            // assumption that cost rotations 40, 42 and 44.
+            if let Ok(w) = std::env::var("LUAU_REG_WATCH") {
+                if w.parse::<usize>() == Ok(idx) {
+                    eprintln!("READ  reg={} MINTED {} (register held {:?})", idx, n, other);
+                }
+            }
             crate::decompiler::mint_trace::note(
                 match other {
                     None => "REG_EXPR_OUT_OF_RANGE",
