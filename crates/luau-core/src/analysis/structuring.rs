@@ -1127,6 +1127,54 @@ pub(crate) fn range_contains_nested_for(code: &[u32], start: usize, end: usize) 
     false
 }
 
+/// Does this range hold a complete nested CONDITIONAL - a forward-branching
+/// test whose target also lies inside the range?
+///
+/// The sibling `range_contains_nested_for` exists because an arm lifted as a
+/// flat span drops its loops. Arms drop their nested BRANCHES the same way and
+/// for the same reason, but only the loop case was ever wired up.
+///
+/// `533_NPCs::AddEvent`: the then-arm of the `type(...) == "string"` test is
+/// blocks 123..209, ONE contiguous range, so `ranges.len() > 1` is false and
+/// neither arm trigger in `lift_branch_region` can fire. Inside it the
+/// `if data.StartReqs` at pc 176 is emitted with its condition register never
+/// assigned, and the pc-139 block that should precede it comes out after.
+///
+/// Backward targets are excluded: those are loops, already handled.
+pub(crate) fn range_contains_nested_cond(code: &[u32], start: usize, end: usize) -> bool {
+    if end <= start || end > code.len() {
+        return false;
+    }
+    let mut pc = start;
+    while pc < end {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let step = if op.has_aux() { 2 } else { 1 };
+        if matches!(
+            op,
+            LuauOpcode::JumpIf
+                | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpIfEq
+                | LuauOpcode::JumpIfNotEq
+                | LuauOpcode::JumpIfNotLE
+                | LuauOpcode::JumpIfNotLT
+        ) {
+            let target = pc as i64 + insn_d(insn) as i64 + 1;
+            // STRICTLY inside. A test whose target is exactly `end` is the
+            // arm's OWN guard, not a nested branch: structuring the range then
+            // re-reads that guard as the region boundary and drops it.
+            // Measured - with `<= end`, `1125_Supreme_Star_Amulet_Generator`
+            // lost `if 490000000000 <= value2.Honey then` and ran the purchase
+            // body unconditionally, which no check in the suite can see.
+            if target > pc as i64 && (target as usize) < end {
+                return true;
+            }
+        }
+        pc += step;
+    }
+    false
+}
+
 /// Find the last real instruction PC in a basic block (skipping AUX words).
 fn last_real_pc(code: &[u32], block: &BasicBlock) -> usize {
     if block.end == 0 || block.end <= block.start {

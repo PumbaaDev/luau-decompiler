@@ -5129,3 +5129,74 @@ CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
   K, unreachable-blocks, B-loops.
 PARKED: UPVAL_NAME (format carries no CAPTURE data); synthetic reproducers
   (need a v9-emitting Luau).
+
+
+## Rotation 83 - a +1 that deletes a purchase guard, and a correction to r82
+
+### Correction to rotation 82
+R82 claimed the fault was `find_merge_point` returning the arm's jump target
+instead of the immediate postdominator, citing `merge=Some(210)` with pc 147 =
+`JUMP -> 62` (147+1+62 = 210). **That was wrong.** The conditional at
+`cond_block=112` is the `JUMPXEQKS` at pc 121, not the `JUMPIF` at pc 129. Its
+targets are 123 and 148, and both genuinely converge at 210, so 210 is the
+CORRECT merge for that test. `find_merge_point` is not at fault and its
+alternating BFS is sound.
+
+What is true from r82 stands: the write is in the bytecode at pc 174, the block
+is emitted out of order, and `AddEvent` is 37 blocks -> 4 regions. The `if not
+quest` at pc 129 is NESTED inside the 14-block then-arm of the pc-121 test.
+
+### The hole that is real
+`range_contains_nested_for` structures an arm that contains a complete FOR pair.
+Nothing does the same for a nested BRANCH, and a CONTIGUOUS arm cannot reach
+either trigger in `lift_branch_region` because both are behind
+`ranges.len() > 1`. Added `range_contains_nested_cond` + `LUAU_ARM_IF`.
+
+    clean 1,104 -> 1,105   defects 39 -> 38
+    fixed 286_LeaderboardsGui; NO new findings anywhere
+    23 files changed; loops gained in 13, lost in 0; calls lost in 1
+
+Sampled recoveries are genuine, not score-chasing:
+
+    93_Beequips     if INBOX_CAPACITY < #self.Beequips[v32]  ->  while ... do
+    383_Honey       if arg2.Honey == arg2.Honey - self.Amount -> while ... do
+                    (the baseline condition was self-referential nonsense)
+    974_MonsterLevel  gains a `while` with a `break`, replacing inverted logic
+
+### Why it is NOT adopted
+`1125_Supreme_Star_Amulet_Generator` LOSES this line outright:
+
+    if 490000000000 <= value2.Honey then
+
+and runs the body that spends 490 billion honey UNCONDITIONALLY. No check in
+the suite can see a deleted guard - the file still parses, still scores clean,
+and is now wrong in the most expensive direction available.
+
+Narrowing the predicate to strictly-nested targets (`target < end`, on the
+theory that a test whose target IS `end` is the arm's own guard) did not restore
+it: byte-identical output for 1125, same 1,105/38. So the guard is lost
+somewhere other than the predicate boundary, and the theory was wrong.
+
+The B-loops fix was adopted on "gained 27, lost 0". This one loses a construct
+in one file. By the project's own standard it does not ship. Left gated and
+verified inert (1,104/39 with the gate off, 949 tests pass).
+
+### 533 is still not located
+`LUAU_ARM_IF` structures exactly the shape 533 was diagnosed as - a contiguous
+arm with a nested conditional - and `533_NPCs` is UNCHANGED under it, as it was
+under `LUAU_ARM_COND`. Two different triggers built from that diagnosis, neither
+touches the file. So the then-arm of the pc-121 test is not lifted through the
+runs loop in `lift_branch_region` at all.
+
+**THE QUESTION**: which code path lifts the 14-block then-arm of
+`AddEvent`'s pc-121 `JUMPXEQKS`? Instrument the entry of every lift path with
+the proto and range and read it off, rather than inferring it from the shape a
+third time. Both triggers so far were built on an inference about that path and
+both missed.
+
+### State after rotation 83
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects (unchanged - the +1 was rejected).
+949 tests pass; the 2 `opmap_dupclosure_detection` failures are pre-existing.
+GATED, INERT, MEASURED: `LUAU_ARM_COND` (-1 clean), `LUAU_ARM_IF` (+1 clean,
+  deletes a guard), `LUAU_DECL_HOIST`, `LUAU_BRANCH_ARMS`.
+NEXT: answer THE QUESTION above by instrumentation, not inference.

@@ -1582,6 +1582,37 @@ fn lift_branch_region(
         // recurses and its loops DO survive), and lift the resulting regions.
         // Runs without a complete for-pair keep the exact pre-existing
         // behavior below.
+        // Same treatment for a nested BRANCH, gated. The loop case above was
+        // wired up in the B-loops fix; the branch case is the identical hole
+        // one construct over, and it is the only path that can reach a
+        // CONTIGUOUS arm (`ranges.len() > 1` is false, so both arm triggers
+        // above are dead for it). See `range_contains_nested_cond`.
+        //
+        // MEASURED, POSITIVE ON THE SCORE, AND NOT ADOPTED (rotation 83):
+        //
+        //     clean 1,104 -> 1,105   defects 39 -> 38
+        //     fixed 286_LeaderboardsGui; NO new findings anywhere
+        //     23 files changed; loops gained in 13, lost in 0; calls lost in 1
+        //
+        // Sampled recoveries are genuine - `93_Beequips` and `383_Honey` each
+        // turn a flattened `if` back into the `while` it was, `974_MonsterLevel`
+        // regains a loop with a `break`. But `1125_Supreme_Star_Amulet_Generator`
+        // LOSES `if 490000000000 <= value2.Honey then` outright and runs the
+        // body that spends 490 billion honey unconditionally. Narrowing the
+        // predicate to strictly-nested targets (`< end`, kept - it is the
+        // correct reading either way) did not restore it.
+        //
+        // The B-loops fix was adopted on "gained 27, lost 0". This one loses a
+        // guard in one file, so by that same standard it does not ship. A
+        // defect the checker cannot see is worth more than a defect it can.
+        if std::env::var("LUAU_ARM_IF").is_ok()
+            && crate::analysis::structuring::range_contains_nested_cond(&proto.code, start, end)
+        {
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, start, end, regs, locals, out, in_loop,
+            );
+            continue;
+        }
         if crate::analysis::structuring::range_contains_nested_for(&proto.code, start, end) {
             lift_structured_run(
                 ctx, proto, proto_index, cfg, depth, start, end, regs, locals, out, in_loop,
