@@ -3959,7 +3959,41 @@ pub(super) fn store_complex(
             // unknown-seed pass could not hold without this gate
             // (16_StickerPlacer: the arm CALL's "GetLocalPlayerCanvasSet"
             // hint out-ranked the seeded identity).
-            let do_peek = !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc);
+            // SELF-MUTATION IS NOT A REBIND.
+            //
+            // `Lvl3 = Lvl3 + 2` recomputes a register FROM ITSELF. The peek
+            // below asks `ctx.reg_name` for a fresh hint, gets `Lvl4` because
+            // the uniquifier bumped its counter, sees a different semantic name
+            // and treats it as a new binding - so the arm emits
+            // `local Lvl4 = Lvl3 + 2` and the value never reaches the `Lvl3`
+            // used after the branch. 213_Tornado loses a `+ 2` this way and
+            // 734_StatModifiers_BaseConversionRate returns an un-appended
+            // string.
+            //
+            // `store_complex` already detects this shape for the loop case
+            // (Phase B0.3, see the header) and the `else` branch below keeps
+            // the carried name for exactly this reason. The peek simply ran
+            // first. Suppressing the peek when the value reads the carried name
+            // routes self-mutation into that existing path.
+            // ONLY an arithmetic or concat extension counts.
+            //
+            // `X = X.field` reads the SAME name and is not an accumulate - it
+            // NARROWS one value into a different one, and the old value is
+            // usually still needed. Accepting it rewrote
+            // `local VREnabled6 = VRService.VREnabled` into
+            // `VRService = VRService.VREnabled`, destroying the service
+            // reference that the rest of 25_RootCamera goes on to use, and the
+            // same for `Players = Players.LocalPlayer`.
+            //
+            // A `BinOp` whose operand is the carried name is the shape that IS
+            // an accumulate: `Lvl3 + 2`, `Op .. " Bees)"`, `count * 2`. This is
+            // deliberately the same predicate `check_branch_local_discarded`
+            // uses to recognise the family - the checker and the fix agree on
+            // what the defect is.
+            let self_mutation =
+                matches!(&value, Expr::BinOp { .. }) && expr_references_name(&value, &name);
+            let do_peek =
+                !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc) && !self_mutation;
             let rebind_name: Option<String> = if do_peek {
                 let fresh = ctx.reg_name(proto, reg as u8, pc);
                 if fresh != name && is_semantic_local_name(&fresh) {

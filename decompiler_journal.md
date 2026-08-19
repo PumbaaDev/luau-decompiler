@@ -1822,3 +1822,73 @@ SEMANTIC: 1,045/1,142 (91.5%), 153 defects.
   A2 PARKED (2). B PARKED (1). C PARKED (2).
 SWEEP: running against run_r27, which is byte-identical to run_r29 for this
   purpose (both are the reverted build).
+
+
+## Rotation 28 - mechanism I CLOSED, on the third predicate
+
+### Finding the path that actually emits it
+Rotation 27 proved `emit_local_or_assign` is not it - patching there left
+`213_Tornado` untouched. The real site is the REBIND PEEK inside
+`store_complex`:
+
+    let do_peek = !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc);
+    let rebind_name = if do_peek {
+        let fresh = ctx.reg_name(proto, reg as u8, pc);
+        if fresh != name && is_semantic_local_name(&fresh) { Some(fresh) } else { None }
+    } ...
+
+On `Lvl3 = Lvl3 + 2` the peek asks for a fresh hint, the uniquifier answers
+`Lvl4`, that differs and is semantic, so it reads as a rebind -> Shadow ->
+`local Lvl4 = Lvl3 + 2` inside the arm. `store_complex` ALREADY detects this
+shape for loops (Phase B0.3, in its own header) and its `else` branch keeps the
+carried name for exactly this reason. The peek simply ran first.
+
+### Three predicates, two of them wrong - and the third is the checker's
+    1. NAME STEMS (rotation 25)   `Lvl3`~`Lvl4` -> collapsed max3/max6/max9 in
+                                  rk4Integrator into one `max`. REVERTED.
+    2. ANY reference (this rotation, first cut)
+                                  `X = X.field` counted, so
+                                  `local VREnabled6 = VRService.VREnabled`
+                                  became `VRService = VRService.VREnabled` and
+                                  destroyed the service reference. Also
+                                  `Players = Players.LocalPlayer`.
+    3. BinOp reference            `matches!(value, Expr::BinOp{..})
+                                  && expr_references_name(value, name)`
+
+Predicate 3 is deliberately the SAME one `check_branch_local_discarded` uses to
+recognise the family. The checker and the fix now agree on what the defect is,
+which is why the fix lands exactly on what the check reports.
+
+A field read narrows one value into another and the old value stays live; a
+BinOp on the carried name consumes it. That is the liveness distinction rotation
+27 asked for, expressible without a liveness pass because the SHAPE carries it.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,045 -> **1,115 clean (91.5% -> 97.6%)**, 153 -> **35 defects**
+
+VERIFIED BY READING THE OUTPUT, per the rule earned in rotations 25-27, on the
+target AND on both previous regression victims:
+
+    213_Tornado    `Lvl3 += 2` inside the arm; `Lvl3 *= Multiplier` after   FIXED
+    25_RootCamera  `local VREnabled = VRService.VREnabled` intact           SAFE
+                   max3 / max6 / max9 / max12 still distinct                SAFE
+    149_Class      byte-identical                                          SAFE
+
+933 unit tests plus 6 new ones; CoreScript ground truth passes; only the two
+pre-existing `opmap_dupclosure_detection` failures remain.
+
+### Mutation tests - `tests/self_mutation_peek_tests.rs`
+Six cases pinning the predicate, each negative reproducing a real regression so
+neither dead hypothesis can be reintroduced silently:
+  arithmetic on itself / concat onto itself / nested reference   -> accumulate
+  a FIELD read of itself (the RootCamera regression)             -> not
+  arithmetic on a DIFFERENT name (the max5 case)                 -> not
+  a fresh value                                                  -> not
+
+### State after rotation 28
+SEMANTIC: **1,115/1,142 (97.6%), 35 defects.**
+  A, D, E, F, G, H, **I** CLOSED - I on the third attempt, with both failures
+  recorded and pinned by tests.
+  A2 PARKED (2). B PARKED (1). C PARKED (2).
+SWEEP: running against run_r27. NOTE it now predates this fix, so its numbers
+  will understate the build again; re-run after it lands.

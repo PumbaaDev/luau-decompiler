@@ -86,3 +86,4 @@ mod pinned_arm_write_tests;
 mod arith_table_base_tests;
 #[cfg(test)]
 mod branch_unknown_seed_tests;
+mod self_mutation_peek_tests;
