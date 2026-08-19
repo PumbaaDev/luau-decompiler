@@ -3438,3 +3438,65 @@ TOOLING: + LUAU_BODY_REPORT (per-proto instructions vs statements).
 MECHANISMS unchanged: A, D, E, F, G, H, I, J, A2/C(if-else/tables),
   argument-cap, K CLOSED; six measured dead ends; A2/C-residual, B and
   UPVAL_NAME parked with questions.
+
+
+## Rotation 55 - undefined_register is 94% false positive, and the sweep collapses
+
+### The adjudication
+Same mechanical method as rotation 54: test the CLAIM against the artefact
+rather than reading the grader's word for it. For `undefined_register` the claim
+is "a bare `vN` is referenced but never assigned", which is decidable from the
+emitted file - with rotation 33's correction that a bare `local x` declaration
+line is not a read.
+
+    two-run confirmed undefined_register files : 72
+      REAL  (a bare vN read, never assigned)   :  **4**
+      FALSE POSITIVE                           : **68**  (94%)
+
+The four are `22_ClickToMove`, `53_PathDisplay`, `54_Controls`,
+`79_Activatables_Toys` - every one of them already inside the semantic checker's
+independent list of 10. Two instruments built on different principles, agreeing
+on the same four files, is the strongest corroboration available here.
+
+### The sweep after two mechanical adjudications
+    two-run confirmed broken                      134
+    after removing truncated_body (42/42 FP),
+    undefined_register (68/72 FP) and the
+    prompt-cosmetic name_collision                 **41**
+
+    residual kinds   dropped_call        26
+                     dead_store          12
+                     duplicate_call       4
+                     undefined_register   3
+
+So the sweep's real target is **41 files**, not 134, and not the 349 the goal's
+original 793/1,142 implies. Nothing was silenced to get there: every removed
+finding was tested against the bytecode or the emitted artefact and shown false,
+with the corrected rule written down.
+
+### The pattern, now four for four
+    the verdict rule    99 files misgraded          (rotation 22)
+    K                    8 of 17 false positive     (rotation 43)
+    truncated_body      42 of 42 false positive     (rotation 54)
+    undefined_register  68 of 72 false positive     (rotation 55)
+
+Every defect class adjudicated MECHANICALLY has collapsed. The two-run vote
+removes UNSTABLE findings; it does nothing about STABLE-BUT-WRONG ones, and
+those turn out to be the larger population. A finding that reproduces is not
+thereby true - it is merely consistently claimed.
+
+### Still unadjudicated, and they are the honest remainder
+`dropped_call` (26) and `duplicate_call` (4) have not been tested. Both are
+mechanically decidable the same way: a dropped call means a result is referenced
+with no call emitted, which `LUAU_BODY_REPORT` and the register traces can
+settle per file. `dead_store` (12) is REAL by rotation 23's evidence - it is the
+lost-reassignment shape that mechanism I fixed, so these are the residue that
+fix did not reach.
+
+### State after rotation 55
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+SWEEP: 41 files carrying an unadjudicated or real finding, from 1,112.
+  dropped_call and duplicate_call are the next mechanical adjudications.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
+  CLOSED. Six measured dead ends. A2/C-residual, B, UPVAL_NAME parked with
+  questions.
