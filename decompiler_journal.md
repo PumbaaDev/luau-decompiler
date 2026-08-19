@@ -1188,3 +1188,82 @@ A1 SPLIT into A1a UNK_MERGE_COMPOUND (5), A1b UNK_CALL_CLEAR (5),
    trace one register to the bytecode rather than reasoning at the merge.
 B  PARKED (1)   C PARKED (2)
 Remaining: 16 defects. Sweep measure not yet attacked.
+
+
+## Rotation 20 - three sub-mechanisms collapse into one, and a BLOCKED capability
+
+### A1d is not a naming bug: the receiver really is nil  **RESOLVED as symptom**
+`54_Controls` emits
+
+    local SteeringVelocity3 = Character.PrimaryPart:FindFirstChild("SteeringVelocity")
+    if SteeringVelocity3 then
+        v3:Destroy()                 -- should be SteeringVelocity3:Destroy()
+    end
+
+which looks exactly like the namer refusing to use a live binding. It is not.
+`LUAU_MINT_TRACE=1` prints what `method_receiver_expr` discarded:
+
+    REJECT  METHOD_RECV  v3   discarded=Nil
+    REJECT  METHOD_RECV  v7   discarded=Nil
+    REJECT  METHOD_RECV  v13  discarded=Nil     (21_ClickToMove)
+
+The register genuinely holds `Nil`. Rejecting it is CORRECT - `nil:Destroy()`
+is not emittable - so `METHOD_RECV_REJECT` is a symptom of a register losing its
+value, not a defect in receiver resolution. Do not "fix" the namer here.
+
+### A1b is not one mechanism either
+Instrumented the MULTRET path (`nresults == 0`) and counted clears per file:
+
+    533  30 clears     22  11     368  1     85  1     53  ZERO
+
+`53_PathDisplay` has NO multret clear at all, so its `v7` cannot be the
+assumes-one-result hole. Its emitted `renderPoint` shows the actual damage: an
+`if` whose ELSE ARM IS MISSING, with the pooled-object assignment gone from both
+arms. Different mechanism, wrongly grouped by the tag.
+
+For 368 and 85 the single clear DOES cover the defect register (clear_start=1
+with reg 19; clear_start=5 with reg 13).
+
+### The tags are correlational, not causal
+`note_unknown` is REGISTER-KEYED AND OVERWRITING, so a tag records a site that
+touched the register last, not the site that caused the loss. Rotation 19's
+census was read as four mechanisms; that reading is too strong. Corrected rule:
+use the tags to GROUP candidates, never to name a cause.
+
+### The consolidation
+A1a (MERGE_COMPOUND), A1c (MERGE_ARM_NAMES), A1d (METHOD_RECV_REJECT) and
+`53`'s `v7` are all the SAME question: a register holding a live value around an
+`if` loses it. That is one mechanism with four downstream reporters, which is
+why fixing at the reporters kept failing.
+
+### BLOCKED: no v9-emitting compiler, so no synthetic reproducer
+The escalation rule says build a sub-20-line reproducer, compile it, diff. Tried:
+
+    local function destroySteering(char)
+        local sv = char.PrimaryPart:FindFirstChild("SteeringVelocity")
+        if sv then sv:Destroy() end
+    end
+
+`tools/luau/luau-compile.exe` emits **bytecode version 11**; the corpus and the
+lifter are **v9**. Widening the gate to 3..=11 as an experiment decoded that
+function into two module-level locals - the whole function body gone - which is
+the version mismatch, not a lifter defect. Any bug "found" this way would be an
+artifact. Gate reverted to 3..=9.
+
+MISSING CAPABILITY, stated precisely: a compiler that emits v9. Until there is
+one, the reproducer step of the escalation rule is unavailable and the
+substitute is the corpus itself - find a file where the same construct
+decompiles CORRECTLY and diff the two. Candidate sources for the capability: a
+Roblox client's own compiler (the same route `probe align` already uses to read
+opcode permutations), or an older Luau build pinned to v9.
+
+### State after rotation 20
+A **CLOSED**  D **CLOSED**  E **CLOSED**  F **CLOSED**  G **CLOSED**  H **CLOSED**
+A1d **RESOLVED as symptom** (receiver correctly rejected; cause is upstream)
+A1* MERGED into **A2: a register loses a live value across an `if`** - PARKED (1)
+    under the new framing, with the attack changed from "adjust the merge" to
+    "find a corpus file where the construct survives, and diff".
+A1b partially separated: 368/85 remain multret-plausible; 53 is the
+    missing-else-arm mechanism and is regrouped with B.
+B  PARKED (1)   C PARKED (2)
+Remaining: 16 defects. Sweep re-run against run_r18 IN PROGRESS.
