@@ -7094,3 +7094,53 @@ PARKED (5): 22, 53, 85 (`UNK_CALL_CLEAR`), 79 (`UNK_MERGE_COMPOUND`),
 
 ### State after rotation 115
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
+
+
+## Rotation 116 - the watch does not implicate register 13, and that is itself the finding
+
+### Taking r115's measurement on 85_Badges
+`v13` is read at emitted lines 2348/2351 inside `setData`. Watched register 13
+in `setData@1163`:
+
+    walked=159 steps=169 pct=94        <- coverage HEALTHY
+    reg 13 cycles Unknown -> String -> Name("arg2") -> Unknown -> Index{...}
+
+So the walk is fine and the register is repeatedly live. Then the comparisons in
+that proto:
+
+    24: JUMPIFNOTLT R7 >= R5
+    38: JUMPIFNOTLT R8 >= R7
+   157: JUMPIFNOTLT R9 >= R8
+   202: JUMPIFNOTLE R9 > R8
+
+**Not one of them reads R13.** The emitted `if getTask6.Amount < v13` therefore
+does not correspond to a comparison against register 13 in this proto.
+
+### The trap this exposes
+`v13` is a NAME produced by the generic-name mint (`reg_expr`'s `v{idx}`
+family), and I assumed `v13` -> register 13. The watch says otherwise. Either the
+name was minted for a different register in a different proto and folded by
+`free_var_decls` (which "folds every same-named orphan into ONE chunk-top
+`local vN`" - its own comment), or the read sits in a nested closure of
+`setData` rather than `setData` itself.
+
+That folding is the point: chunk-wide `vN` names are NOT unique per register, so
+**reading a register index out of a generated name is unsound**. Rotation 116
+spent its probe on that assumption. It is the same class of error as reading a
+pc across protos (r47, r86, r95, r110) - inferring an identity from a label that
+does not carry one.
+
+### PARKED, with the trap recorded
+MECHANISM: 5 orphans (22, 53, 85, 79, 54).
+RULED OUT: walk abandonment (r114); dropped for-loop (r115, zero signature in
+  all five); register-index-from-name (r116, unsound).
+THE QUESTION, restated safely: instrument `free_var_decls` to print, for each
+  hoisted READONLY name, the PROTO and REGISTER it was minted from - the mint
+  site is already recorded (`mint_trace`), but not the register or proto. Until
+  that exists, every attempt to trace one of these orphans starts by guessing
+  which register it is, and this rotation shows the guess is wrong at least
+  sometimes.
+
+### State after rotation 116
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only;
+nothing changed.
