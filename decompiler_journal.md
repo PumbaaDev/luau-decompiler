@@ -7262,3 +7262,50 @@ SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
 The five orphans now have: exact proto, exact register, the clearing pc, the
 defining pc on the other arm, and a named lattice defect. That is the first time
 this class has had a MECHANISM rather than a symptom.
+
+
+## Rotation 119 - the dead-join rule implemented, measured NEGATIVE, reverted
+
+### What was built
+r118's fix shape, in the smallest form that needs no new `RegVal` variant.
+`merge_regs` already receives `regs_before`, so the rule was: if the pre-branch
+slot is `Unknown` (dead) and one arm left it untouched while the other DEFINED
+it, take the defined value instead of resetting both to `Unknown`. Restricted to
+an arm that never touched the register, so an arm that actively LOST a value
+still poisons the join.
+
+### Measured
+    clean 1,125 -> 1,125   defects 17 -> 17
+    53_PathDisplay `v7`:  4 occurrences before, 4 after   NOT FIXED
+    31 files changed
+    calls LOST in 2 files (22_NewClickToMove 372->371,
+                           43_ClickToMoveController 389->388)
+
+No benefit, real damage. Reverted.
+
+### What that says about r118
+The diagnosis stands - at `renderPoint@49` pc 42 defines R7 while the other arm
+leaves it call-cleared, and the read after the merge mints `v7`. But the rule
+built from it does not fire for that register, so the merge that produces the
+orphan is NOT the one this rule inspects. Either the arms reach `merge_regs`
+with both sides already `Unknown` (the `LOADNIL` value consumed or parked
+elsewhere before the join), or the join for this register happens on a different
+path entirely.
+
+So r118's mechanism is correct as a description and incomplete as a location:
+"the join loses it" is established, "which join, and in what state" is not.
+
+### PARKED
+MECHANISM: 5 orphans, `UNK_CALL_CLEAR` dominant. Proto and register known for 4
+  (r117); the clearing CALL and the defining arm known for `53` (r118).
+RULED OUT: walk abandonment (r114); dropped for-loop (r115); register
+  unidentifiable (r117); pre-branch-dead join rule (r119, no fix + 2 files
+  damaged).
+THE QUESTION: instrument `merge_regs` itself - print `i`, `regs_before[i]`,
+  `slot`, `other[i]` for register 7 in `renderPoint@49`. Every rotation from 114
+  has reasoned about what the merge sees; none has printed it. That is the same
+  gap that r104-r107 closed for the pin gate, and closing it there took one
+  print.
+
+### State after rotation 119
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
