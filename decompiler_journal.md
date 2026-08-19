@@ -4015,3 +4015,56 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   **50 protos with unreachable blocks** - separate, parked.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_REGION_TRACE (blocks vs regions produced).
+
+
+## Rotation 64 - CORRECTS rotation 63: the region HAS the blocks, the lifter drops them
+
+### The trace
+`LUAU_IF_TRACE` reports what each `IfThenElse` absorbs:
+
+    IF proto=OnInputBegin@184 cond_block=0 then=1 else=23 merge=None has_else=true
+
+One block in the then-arm, **23 in the else-arm**, and **no merge point**.
+
+### What that overturns
+Rotation 63 concluded "the loss is inside region construction - the code after
+the `if` never gets a region of its own". That is WRONG in an important way:
+`has_else=true` and `else_region` carries all 23 blocks. Structuring is
+arguably CORRECT here - with the then-arm returning, the rest of the function
+genuinely IS the else arm.
+
+The region holds the blocks and the emitted output has NO `else` BRANCH AT ALL.
+So the fault is in the LIFTER's handling of an `IfThenElse` whose `merge_pc` is
+`None`, one layer below where I put it last rotation.
+
+Three rotations, three localisations, each corrected by the next instrument:
+    62  not unreachability, not the budget
+    63  "region construction"          <- too high
+    64  the lifter's else-arm handling when merge is None
+
+### A second number I am NOT reporting
+Corpus-wide, 935 if/else regions have `merge=None` with >= 5 else-blocks.
+
+Not a defect count, for the same reason as rotation 63's 797: a function whose
+arms both RETURN legitimately has no merge point, so the shape is common and
+mostly correct. Two rotations running I have produced a large, alarming ratio
+and had to decline to report it - the discipline that matters is that the
+verified 29-file call deficit stays the measure, and structural ratios are
+context for it rather than evidence in their own right.
+
+### UNBLOCKING QUESTION, one layer lower
+In the lifter's `Region::IfThenElse` arm, what happens to `else_region` when
+`merge_pc` is `None`? The reproducer emits the then-arm and nothing else, so
+either the else blocks are never lifted, or they are lifted and discarded. One
+trace on that arm distinguishes them, and it is the last question before a fix.
+
+### State after rotation 64
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: localised to the lifter's else-arm handling with merge_pc = None.**
+  Ruled out: unreachable blocks, statement budget, missing regions, region
+  construction. Reproducer `277_DragManager::OnInputBegin@184` - 25 blocks,
+  1 region, else arm holds 23 blocks, 0 of 15 calls emitted.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_IF_TRACE (what each if/else absorbs).

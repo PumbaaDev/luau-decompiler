@@ -373,6 +373,22 @@ pub fn structure_control_flow(
                 merge_pc: merge,
             });
 
+            if std::env::var("LUAU_IF_TRACE").is_ok() {
+                // How much of the proto does ONE if/else absorb? An arm that
+                // runs to the end of the function marks every remaining block
+                // handled, so nothing after it ever receives a region - which
+                // is what a vanished body looks like from here.
+                eprintln!(
+                    "IF proto={}@{} cond_block={} then={} else={} merge={:?} has_else={}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    block_id,
+                    then_blocks.len(),
+                    else_blocks.len(),
+                    merge,
+                    has_else
+                );
+            }
             handled.insert(block_id);
             for &b in &then_blocks {
                 handled.insert(b);
