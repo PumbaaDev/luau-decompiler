@@ -805,12 +805,28 @@ pub fn lift_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize)
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
     if std::env::var("LUAU_BODY_REPORT").is_ok() {
+        // Also count CALL-family opcodes. A `dropped_call` claim - "a call whose
+        // result is referenced but the call itself is missing" - is decidable by
+        // comparing the calls the BYTECODE contains against the calls the output
+        // emits, which is the same artefact-vs-claim test that collapsed
+        // truncated_body and undefined_register.
+        let mut calls = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
+            let insn = proto.code[i];
+            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+            if matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) {
+                calls += 1;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
         eprintln!(
-            "BODY proto={}@{} insns={} stmts={}",
+            "BODY proto={}@{} insns={} stmts={} calls={}",
             proto.debug_name.as_deref().unwrap_or("?"),
             proto.line_defined,
             proto.code.len(),
-            out.len()
+            out.len(),
+            calls
         );
     }
     out

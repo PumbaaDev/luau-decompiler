@@ -3500,3 +3500,63 @@ SWEEP: 41 files carrying an unadjudicated or real finding, from 1,112.
 MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
   CLOSED. Six measured dead ends. A2/C-residual, B, UPVAL_NAME parked with
   questions.
+
+
+## Rotation 56 - dropped_call adjudicated: 7 real, 7 false, and the bias is stated
+
+### The test
+`LUAU_BODY_REPORT` now also counts CALL and NAMECALL opcodes per proto, so the
+`dropped_call` claim - "a call whose result is referenced but the call itself is
+missing" - can be tested by comparing the calls the BYTECODE contains against
+the calls the OUTPUT emits.
+
+    CONFIRMED dropped_call files                 14
+      bytecode calls > emitted  (likely REAL)     7   deficits 3 to 21
+      emitted >= bytecode       (FALSE POSITIVE)  7
+
+    359_WindShrineGui   108 -> 87   deficit 21
+    240_Events          103 -> 83   deficit 20
+    254_BQInspector      72 -> 56   deficit 16
+    354_TradableGrid    109 -> 98   deficit 11
+    218_Collectors       44 -> 36   deficit 8
+    356_TradeRequestGui 172 -> 167  deficit 5
+    413_BeamShot         25 -> 22   deficit 3
+
+### The bias, stated rather than hidden
+The emitted-call count is a REGEX over the output text and it demonstrably
+OVER-counts: `698_Use_Toy` reads bytecode=3, emitted=9, and
+`850_Statistics` 29 against 48. Function definitions, table constructors and
+parenthesised expressions all match it.
+
+That bias runs in ONE direction, and it makes the result conservative: a file
+where the bytecode still exceeds the output DESPITE over-counting the output has
+a real deficit. So the 7 are strong; the 7 "false positives" are weaker and
+should be read as "not demonstrated", not "disproven".
+
+This is the first adjudication this session where the instrument's error
+direction matters to the conclusion, so it is recorded with the conclusion
+rather than left implicit.
+
+### Sweep standing after four adjudicated kinds
+    two-run confirmed broken                     134
+    truncated_body       42 of 42 FALSE          (rotation 54)
+    undefined_register   68 of 72 FALSE          (rotation 55)
+    name_collision       cosmetic by the prompt  (rotation 22)
+    dropped_call          7 of 14 likely REAL    (this rotation)
+    dead_store           REAL by rotation 23's evidence (12 files)
+    duplicate_call       4 files, STILL UNTESTED
+
+Honest residual: **~19-23 files** carrying a demonstrated or undisputed defect,
+against 1,112 swept. Every removal was tested against the bytecode or the
+emitted artefact, and every corrected rule is written down.
+
+### State after rotation 56
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  Behaviour-neutral rotation; 945 tests pass.
+SWEEP: ~19-23 files with a real or undisputed finding; `duplicate_call` (4) is
+  the last untested kind.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
+  CLOSED. Six measured dead ends. A2/C-residual, B, UPVAL_NAME parked with
+  questions.
+TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH,
+  LUAU_PC_WINDOW, LUAU_LEADER_TRACE, LUAU_BODY_REPORT (insns/stmts/calls).
