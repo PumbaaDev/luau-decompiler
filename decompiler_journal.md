@@ -1082,3 +1082,64 @@ A1 PARKED (1) - and now the ONLY mechanism left on the semantic measure: all 25
    `v3.Color = Zone4`), and the plain hoisted-hole case.
 B  PARKED (1)   C PARKED (2)
 Remaining: 25 defects across the corpus. Sweep measure not yet attacked.
+
+
+## Rotation 18 - a guessed constant where the bytecode carried the exact bound
+
+### H: a call returning 12 values was called a statement  **CLOSED**
+`mint_trace` on `893_Utils_Matrix3D` tagged all four survivors
+`UNK_CALL_CLEAR` - a CALL had cleared their registers to Unknown. Following that
+to the CALL handler:
+
+    // Clamp to sane maximum - Luau functions almost never return >10 values.
+    let nresults = if raw_nresults > 10 && raw_nresults != 0 { 1 } else { raw_nresults };
+
+`CFrame:GetComponents()` returns exactly 12, so `raw_nresults` is 13, so the
+call was rewritten to "statement, 0 results captured" - and the register clear
+below then wiped all twelve results. The emitted body was
+
+    function tbl.FromCFrame(self)
+        self:GetComponents()
+        return { v4, v5, v6, 1, ... v1, v2, v3, 1 }   -- twelve names nothing assigns
+    end
+
+The clamp exists to reject garbage C from a misdetected opcode, which is a real
+hazard. But it could not tell 12-real-results from garbage, and a flat 10 is a
+guess when the bytecode carries the exact bound: results occupy R(A)..R(A+n-1)
+and the proto declares `max_stack_size`. A count that does not fit the frame is
+impossible; one that fits is a real call whatever its size. The opmap detectors
+already bound operands this way (`opmap.rs:1244`).
+
+    let captured = raw_nresults.saturating_sub(1) as usize;
+    let fits_frame = a + captured <= proto.max_stack_size as usize;
+
+After: `local getcomponents, result2, ... result12 = self:GetComponents()`, and
+the returned table reads real names.
+
+### The DISASSEMBLER lied on this file, with both flags
+`disassemble --opmap --opmap-db` on 893 printed proto 16 as `constants (1): K0`
+and then referenced K1..K12 in its body, full of UNKNOWN opcodes and DUPCLOSURE
+instructions belonging to the main proto. Self-evidently desynchronised, so the
+mechanism was traced through `mint_trace` and the decoder instead. CLAUDE.md's
+rule ("never read operands off the printer") is not strong enough - on this file
+the printer's PROTO ATTRIBUTION is wrong too. Logged as its own open item.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+1,125 -> **1,127 clean (98.7%)**, 25 -> **16 defects**. Nine defects for two
+files: several files lost defects without reaching clean. `893_Matrix3D` (4) and
+`255_BackpackGui` (3) went fully clean; `21_ClickToMove` went 3 -> 1.
+928 unit tests pass; the two `opmap_dupclosure_detection` failures are the same
+pre-existing pair, verified against HEAD by stash in rotation 17.
+
+### This is the shape for the FIFTH time
+An UNKNOWN falling through to a blunt permissive answer:
+D "any referenced name", E "any statement", A "no `=` in the text",
+F "a token on the line", H "any C over ten is corruption".
+Each was a guess standing in for something the input already stated exactly.
+
+### State after rotation 18
+A **CLOSED**  D **CLOSED**  E **CLOSED**  F **CLOSED**  G **CLOSED**  H **CLOSED**
+A1 PARKED (1) - still the only mechanism on the semantic measure. 16 remain.
+B  PARKED (1)   C PARKED (2)
+Open, not folded in: the two opmap_dupclosure_detection failures; the
+disassembler's proto attribution on 893. Sweep measure not yet attacked.

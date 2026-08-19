@@ -2442,13 +2442,30 @@ pub(super) fn lift_instruction_range(
                 let is_vararg_call = b == 0;
                 let nargs = if b == 0 { 0 } else { b - 1 };
                 // C encoding: 0 = varargs, 1 = 0 results, 2+ = (C-1) results
-                // Clamp to sane maximum — Luau functions almost never return >10 values.
-                // Very large C values indicate corrupted/misdetected bytecode.
-                // Clamp to 1 (statement, 0 captures) rather than 0 (vararg),
-                // because vararg mode triggers aggressive register scanning that
-                // can over-collect stale arguments from previous calls.
+                //
+                // A corrupted or misdetected opcode yields a garbage C, and
+                // believing it makes the lifter capture dozens of registers
+                // that were never results. This used to be rejected with a flat
+                // `> 10`, on the reasoning that "Luau functions almost never
+                // return >10 values" - but `CFrame:GetComponents()` returns
+                // exactly 12, and it is everywhere in Roblox code. The clamp
+                // could not tell that from garbage, so it called the whole call
+                // a statement, and the register clear below then wiped all 12
+                // results to Unknown. `893_Utils_Matrix3D` returned
+                // `{v4, v5, v6, 1, ...}` reading twelve names nothing assigns.
+                //
+                // The bytecode bounds this exactly, so guessing is unnecessary:
+                // the results occupy R(A)..R(A+n-1) and the proto declares how
+                // many registers it has. A count that does not fit the frame is
+                // genuinely impossible; one that fits is a real call, whatever
+                // its size. Rejection still clamps to 1 (statement, 0 captures)
+                // rather than 0 (vararg), because vararg mode triggers
+                // aggressive register scanning that over-collects stale
+                // arguments from previous calls.
                 let raw_nresults = c;
-                let nresults = if raw_nresults > 10 && raw_nresults != 0 { 1 } else { raw_nresults };
+                let captured = raw_nresults.saturating_sub(1) as usize;
+                let fits_frame = a + captured <= proto.max_stack_size as usize;
+                let nresults = if raw_nresults != 0 && !fits_frame { 1 } else { raw_nresults };
 
                 // For method calls (from NAMECALL), skip the implicit self argument at A+1
                 let is_method = matches!(&func, Expr::MethodCall { .. });
