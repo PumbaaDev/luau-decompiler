@@ -6277,3 +6277,74 @@ CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
 PARKED: UPVAL_NAME (format carries no CAPTURE data); synthetic reproducers
   (bundled Luau emits v11, parser reads to v9); guard-arm residual (priced, six
   suppression attempts all worse); the flaky opmap augmenter test (spun out).
+
+
+## Rotation 101 - branch_local_discarded ADJUDICATED REAL, and the fix priced
+
+### All six adjudicated, with bytecode
+Previously unadjudicated. All six are REAL and one mechanism.
+`646_Capture_Chicks::Description`:
+
+    31: CONCAT     R5 R6..R9      R5 = "Capture " .. n .. " " .. name
+    34: JUMPIFNOT  R6 -> 40
+    35: MOVE       R6 R5          the arm READS R5 ...
+    39: CONCAT     R5 R6..R8      ... then REASSIGNS it
+    40: MOVE       R7 R5          post-merge read
+    43: RETURN     R6
+
+pc 39 writes the same register pc 40 reads. The emitter minted
+`local MonsterType3 = ...` and returned the PRE-branch value, so the zone suffix
+is silently dropped from every quest description that has one.
+
+MECHANISM: a write inside a branch arm to a register live across the merge is
+emitted as a declaration instead of a reassignment.
+
+### It is a KNOWN residual, and the source says why
+`premateralize_branch_escapes_spans` deliberately excludes a register already
+bound to a declared local: pin-only threading was measured at "+4 clean but -2
+previously-clean files". The comment names the missing piece - "a pass that can
+distinguish a carried identity from a repurposed register".
+
+### The discriminant, and what it cost
+The bytecode supplies exactly that: an arm that READS the register before
+writing it is EXTENDING the value it already held; a repurposed slot has nothing
+to read. Implemented as `reg_read_before_write` (CONCAT reads a RANGE B..C,
+which is how `MOVE R6 R5; CONCAT R5 R6..R8` reaches its own prior value).
+
+    shipping (no carried-id)      1,123 / 19
+    carried-id                    1,126 / 16   FIXED 263, 646, 79; NEW none
+    carried-id + non-param gate   1,122 / 21
+
+The middle row is the best score of the session. It is NOT adopted, because
+214 files changed and two are damaged in ways no check can see:
+
+    284_GuiTile   `isinworkspace = type`, `= UDim2.new`, `= isinworkspace(...)`
+                  - the name threaded across a reused SCRATCH slot, which is
+                  the exact 476_BadgeMenu orphaning this gate exists to prevent
+    88_BeeStats   `arg4 = function(...)` - a closure assigned over a PARAMETER
+
+Excluding parameter slots kills the benefit outright (1,122/21), so the two
+failures are not independent of the win: the same predicate that catches the
+carried identity is admitting repurposed slots.
+
+Compare the r93 decision, where a residual WAS accepted: +17 clean and +324
+calls against 9 files. Here it is +3 clean against 2 files, one of them
+reproducing a documented past regression. That trade does not clear the bar.
+
+### PARKED, priced
+MECHANISM: branch-arm reassignment emitted as declaration. REAL, 6 findings,
+  bytecode-confirmed, and it silently changes program output (dropped string
+  suffixes, not just cosmetics).
+RULED OUT: pin-only threading on any Name-bound register (prior work, -2 files);
+  read-before-write discriminant alone (r101, -2 files); read-before-write plus
+  non-param (r101, kills the gain).
+THE QUESTION: `reg_read_before_write` returns true for `284_GuiTile`'s scratch
+  slot. Find which instruction it counts as the read - print pc and opcode for
+  the first read it finds - and decide whether an operand-position rule (source
+  vs destination on that specific opcode) separates the two cases. Do not widen
+  the predicate again without that print; three of this session's four
+  predicate attempts failed for want of one.
+
+### State after rotation 101
+SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Tree clean apart
+from the untracked throwaway probe.
