@@ -3120,3 +3120,71 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral this rotation
     (format-blocked).
 TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH
   (write+read halves), LUAU_PC_WINDOW - all env-gated, all proto-qualified.
+
+
+## Rotation 50 - the losing instruction identified, and it is a region boundary
+
+### Interleaving the read trace with the opcode stream
+Dumping `setData@1163` around the single minting read:
+
+    PC 150 Call  a=16 b=3 c=2      -- 1 result into R16
+    PC 151 Move  a=13 b=16         -- R13 = R16
+    PC 152 Move  a=8  b=13         -- R8 = R13
+    READ reg=13 MINTED v13
+
+The CALL at 150 has base 16 and one result, so its clear starts at 17 and never
+touches R13. Rotation 49's hypothesis - that a condition read the argument copy
+instead of its source - is WRONG: there is no comparison here at all, just two
+MOVEs.
+
+### What the two watches show together
+Watching R16:
+
+    WATCH reg=16 before_pc=151 value=Expr(Name("GetStat8"))   -- result bound
+    WATCH reg=16 before_pc=152 value=Unknown                  -- SOURCE wiped
+
+Watching R13 (separate deterministic run): the read at 152 finds `Unknown`.
+
+So after pc=151, BOTH the source and the destination read `Unknown`. The `Move`
+handler cannot produce that - for a `Name` source it does
+`regs[a] = RegVal::Expr(src_expr)` and never touches `regs[b]`. Neither
+register's state is consistent with that handler having run.
+
+### The conclusion, and it is a fourth reframing
+`lift_instruction_range` runs PER REGION. A state where both registers are
+`Unknown` at 152 is what a REGION BOUNDARY produces: 151 and 152 are lifted in
+different regions, and the state at 152 arrives through `merge_regs` rather than
+from 151's execution. The call result is bound correctly, the MOVE would
+propagate it correctly, and the boundary between them discards both.
+
+This is the A2/C family after all - a value destroyed at a control-flow join -
+but at a join that is neither an if/else (rotation 35 covers those) nor a loop
+(rotation 48 excluded those by measurement). It is a boundary INSIDE a linear
+run of instructions, which is the case none of the materialisation work touches.
+
+### UNBLOCKING QUESTION - and it is now a structural one
+Why is there a region boundary between pc=151 and pc=152, two consecutive MOVEs
+in straight-line code? Either the CFG is splitting a basic block that has no
+branch in it, or the region walker is lifting these two instructions under
+different parents. Dumping the block/region assignment for
+`setData@1163` pcs 145-155 answers it, and it decides whether the fix is in
+block construction or in what `merge_regs` does at a boundary with no
+divergence.
+
+### State after rotation 50
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral rotation; 945 tests
+  pass.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C (if/else), argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values; loop-join materialisation.
+  PARKED: A2/C-residual - now localised to ONE instruction pair
+    (`setData@1163` pc 151/152) with a structural question; B (1 file);
+    UPVAL_NAME (format-blocked).
+
+### Honest note on this thread
+Four reframings: call clear -> merge -> stale-register read in a condition ->
+region boundary in straight-line code. Each was corrected by an instrument, not
+by argument, and three of the four corrections came from admitting a
+correlation had been mistaken for a measurement. The tooling built along the way
+(proto-qualified register watch, read side, pc window) is what makes the current
+localisation exact rather than plausible.
