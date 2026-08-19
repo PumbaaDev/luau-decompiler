@@ -150,6 +150,7 @@ impl ControlFlowGraph {
 
         if leader_trace {
             let ls: Vec<usize> = leaders.iter().copied().collect();
+            let _ = &ls;
             eprintln!(
                 "LEADERS proto={}@{} {:?}",
                 proto.debug_name.as_deref().unwrap_or("?"),

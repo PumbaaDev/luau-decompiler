@@ -3915,3 +3915,55 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   reproducer `277_DragManager::OnInputBegin@184` and three sibling `GrowStar`
   files that should decompile identically. NOT yet fixed.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 62 - two causes of B eliminated, and a third found by accident
+
+### Cause 1 ELIMINATED: unreachable blocks
+`structure_control_flow` walks `cfg.reverse_postorder()`, so a block absent from
+the RPO is unreachable from the entry, gets no region, and its code vanishes.
+That is exactly what a dropped body looks like from the structurer, so it was
+the first hypothesis.
+
+Added `LUAU_RPO_TRACE`, reporting blocks the structurer will never visit.
+`OnInputBegin@184` does NOT appear: all 25 of its blocks are reachable. The
+structurer visits them and the code is still not emitted, so the loss is
+downstream of region selection.
+
+### Cause 2 ELIMINATED: the statement budget
+`MAX_STMTS_PER_PROTO` is 50,000. `OnInputBegin` is a 117-instruction function.
+It cannot trip.
+
+Both eliminations cost one build each and remove the two explanations that
+would have been most satisfying to find. What remains is the shape the journal
+named for B originally - a RETURN abandoning the blocks after it - now with the
+two competing hypotheses ruled out rather than merely unlisted.
+
+### Cause 3, FOUND BY THE INSTRUMENT, and separate
+Running the RPO trace over the whole corpus: **50 protos contain at least one
+block unreachable from their entry.** Those blocks get no region and their code
+IS silently dropped - a real defect source, independent of B, that nothing has
+ever reported.
+
+`?@323` in `277_DragManager` is the first case: 16 blocks, 15 reachable, block
+65 orphaned.
+
+An unreachable block is either genuine dead code the compiler emitted (possible,
+and harmless to drop) or a MISSING CFG EDGE (a real defect that silently deletes
+live code). Distinguishing them needs the edge builder, not the structurer, and
+50 protos is worth that check.
+
+### State after rotation 62
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral rotation; 949 tests
+  pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: measured, visible, two causes eliminated.** Reproducer
+  `277_DragManager::OnInputBegin@184` (0 of 15 calls, all blocks reachable,
+  budget intact). The remaining hypothesis is the RETURN-abandons-later-blocks
+  shape, and the next step is to trace which regions the lifter actually
+  consumes for that proto against the 25 the structurer produced.
+  **NEW: 50 protos with unreachable blocks** - park with the question "is each
+  orphan genuine dead code or a missing CFG edge?", answerable in the edge
+  builder.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_RPO_TRACE (blocks the structurer will never visit).

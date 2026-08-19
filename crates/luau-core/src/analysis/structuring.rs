@@ -161,6 +161,24 @@ pub fn structure_control_flow(
     let mut regions = Vec::new();
     let mut handled = BTreeSet::new();
     let rpo = cfg.reverse_postorder();
+    // LUAU_RPO_TRACE reports blocks the structurer will never visit. A block
+    // absent from the reverse postorder is UNREACHABLE from the entry in the
+    // CFG, so it gets no region and its code is silently dropped - which is
+    // what a vanished function body looks like from here.
+    if std::env::var("LUAU_RPO_TRACE").is_ok() {
+        let seen: BTreeSet<usize> = rpo.iter().copied().collect();
+        let missing: Vec<usize> = cfg.blocks.keys().copied().filter(|b| !seen.contains(b)).collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "RPO proto={}@{} blocks={} reachable={} UNREACHABLE={:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                cfg.blocks.len(),
+                rpo.len(),
+                missing
+            );
+        }
+    }
 
     for &block_id in &rpo {
         if handled.contains(&block_id) {
