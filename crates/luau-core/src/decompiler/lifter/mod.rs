@@ -903,7 +903,19 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
         while i < proto.code.len() {
             let insn = proto.code[i];
             let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
-            if matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) {
+            // COUNT ONLY `Call`.
+            //
+            // `obj:Method()` compiles to NAMECALL followed by CALL - two
+            // instructions for ONE call expression. Counting both inflated the
+            // bytecode side by one per method call and manufactured deficits:
+            // `218_Collectors::getSwingSpeedMultiplier` reported 2 bytecode
+            // calls against 1 emitted while its whole body is
+            // `return value3:Get().Transient.CollectorSpeed or 1` - a single
+            // method call, correctly emitted.
+            //
+            // Every call, plain or method, terminates in exactly one CALL, so
+            // CALL alone is the right unit to compare against AST call nodes.
+            if matches!(op, LuauOpcode::Call) {
                 calls += 1;
             }
             i += if op.has_aux() { 2 } else { 1 };

@@ -3693,3 +3693,71 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
   CLOSED. Six measured dead ends. PARKED with questions: A2/C-residual
   (path-sensitive dataflow), B (1 file), UPVAL_NAME (format-blocked).
 Behaviour-neutral rotation; 945 tests pass.
+
+
+## Rotation 59 - CORRECTION: my call counter double-counted every method call
+
+### The bug, found by picking the smallest deficit
+`218_Collectors::getSwingSpeedMultiplier@37` reported bc_calls=2 against
+ast_calls=1. Its entire body is
+
+    local function getSwingSpeedMultiplier()
+        return value3:Get().Transient.CollectorSpeed or 1
+    end
+
+One method call, correctly emitted. In Luau `obj:Method()` compiles to NAMECALL
+FOLLOWED BY CALL - two instructions for ONE call expression - and rotation 58's
+counter counted both. Every method call inflated the bytecode side by one and
+MANUFACTURED a deficit.
+
+Fixed: count only `LuauOpcode::Call`. Every call, plain or method, terminates in
+exactly one CALL, so that is the right unit to compare against AST call nodes.
+After the fix all six of 218's protos match exactly: 1/1, 4/4, 1/1, 3/3, 10/10.
+
+### Rotation 58's dropped_call result was WRONG
+    before (double-counted)   10 REAL of 14
+    after  (corrected)         **1 REAL of 14**
+
+The files I listed last rotation with "unambiguous per-proto deficits" -
+`254_BQInspector` 22->16, `359_WindShrineGui` 12->8, `356_TradeRequestGui`
+4->2 - now match EXACTLY. Those deficits were entirely my own miscount. Only
+`240_Events` survives, losing one call in `safeInvokeClient@17` (72 vs 71).
+
+`duplicate_call` is unchanged at 0 of 5 real - the corrected count did not
+resurrect it - but two of those files show genuine DEFICITS
+(`267_BeequipReqsBox` 62->49, `277_DragManager` 105->90), so they are
+dropped-call cases the grader misfiled.
+
+### The lesson, and it is the third instance this session
+Rotation 56 flagged a regex that OVER-counted the emitted side. Rotation 58
+replaced it with an exact AST walker and I treated the result as settled - while
+the BYTECODE side still carried a systematic bias I had not tested. I checked
+one side of the comparison and not the other.
+
+The check that caught it cost nothing: take the SMALLEST reported deficit and
+read the function. A three-line body that "loses" one of two calls is not a
+decompiler defect, it is a counting error, and the smallest case makes that
+obvious where the large ones look convincing.
+
+Corrected rule recorded: **before believing a comparison, verify BOTH sides
+against a case whose answer is known by inspection.**
+
+### The sweep ledger, corrected
+    truncated_body      42 of 42  FALSE
+    undefined_register  68 of 72  FALSE   (4 real, agreeing with the checker)
+    name_collision      cosmetic by the grader's own prompt
+    duplicate_call       5 of 5   FALSE
+    dropped_call         1 of 14  REAL    (240_Events)
+    misfiled deficits    2 files  REAL    (267, 277 - flagged duplicate_call)
+    dead_store          12 files  REAL    (rotation 23 hand evidence)
+
+    **~19 files carry a demonstrated defect, of 1,112 swept.**
+
+### State after rotation 59
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+SWEEP: ~19 demonstrated of 1,112; all six kinds adjudicated with both sides of
+  every comparison now verified.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
+  CLOSED. Six measured dead ends. PARKED: A2/C-residual (path-sensitive
+  dataflow), B (1 file), UPVAL_NAME (format-blocked).
+Behaviour-neutral rotation; 945 tests pass.
