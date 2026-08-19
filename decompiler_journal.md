@@ -521,3 +521,53 @@ have caught it. It did not, and why is the next question.
 ### State after rotation 7
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
 B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (2), question above
+
+## 2026-08-19 — ROTATION 8. Rotation 7's conclusion CORRECTED. Fault narrowed to lift_value_join.
+
+Baseline re-verified after reverting the probe: 1098/1142 clean, 96 defects.
+
+### What rotation 7 concluded, and why it was wrong
+R7 said: the three-arm join at block 139 is swallowed by an outer IfThenElse, so
+no phi logic ever sees it. That inference was based on the REGION dump alone.
+
+Instrumented `collect_value_joins_in_span` (the lifting-side splice) and measured:
+
+    VJPROBE span=[121..153) pc=121 succ=[128, 138] found=true
+    VJPROBE   -> join=139 join_start=139 end=153 accepted=true
+    VJPROBE span=[121..153) pc=139 succ=[153] found=false
+
+The collector DOES find the join at 139 and DOES accept it. So the splice
+compensates for the structurer exactly as its comment says it is meant to, and
+`lift_value_join(entry=121, arms=[...], join=139)` IS called with the right
+region. The structurer swallowing it is therefore NOT the defect.
+
+### Where the fault actually is
+`lift_value_join` is invoked correctly and still leaves R7 with no binding: the
+post-join read mints `v7` and the output emits
+`tbl.IsPublicServer = v7 == "StandardServer"`.
+
+The three root-to-join paths are:
+    121 -> 138 -> 139           LOADK R7 "StandardServer"
+    121 -> 128 -> 134 -> 139    LOADK R7 "VIPServer"
+    121 -> 128 -> 136 -> 139    LOADK R7 "ReservedServer"
+All three arms are pure LOADK writes to the SAME register - the ideal shape for
+`enumerate_value_paths` + `fold_register_paths`.
+
+### E -> PARKED (3). Next attack must CHANGE, per the rules.
+Question: inside `lift_value_join` for this region, does `enumerate_value_paths`
+return None (a path emitted a statement / caps exceeded), or does it return three
+paths and `fold_register_paths` then decline?
+  - `enumerate_value_paths` returns None if ANY path emits a statement. Path
+    121->138->139 passes through block 121, which contains DUPCLOSURE R5 (proto 0,
+    getServerType) - a statement. THAT is the strongest candidate: the entry
+    block's own closure creation makes every path "impure", so the whole region
+    is rejected despite the arms being pure.
+  - Cheapest test: one eprintln of the None-reason inside enumerate_value_paths.
+PARKED THREE TIMES -> attack changes from instrumentation to bisection: disable
+the purity rejection for the ENTRY block only (arms still required pure) and
+measure. If the entry block's own statements are the blocker, that is a
+one-condition fix with a corpus-wide measurement to prove or kill it.
+
+### State after rotation 8
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
+B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (3), attack changes next rotation
