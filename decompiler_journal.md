@@ -4752,3 +4752,61 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
   the reproducer.
   **Nine measured dead ends** plus one gated experiment.
   PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 77 - the per-file comparison: structuring RECOVERS A LOOP the measure cannot see
+
+### The comparison rotation 76 called for
+Ran `174_ClientStatCache` through both paths - default (flat) and
+`LUAU_ARM_SPAN` (structured) - and diffed:
+
+    FLAT (shipping today)              STRUCTURED
+    if 1 < #arg2 then                  while v42 < #arg2 do
+        local tbl9 = StatTools2[arg2[1]]   tbl9 = StatTools2[arg2[v42]]
+        if StatTools2[arg2[1]] == nil      if StatTools2[arg2[v42]] == nil
+        ...                                ...
+                                           v42 += 1
+                                       end
+    StatTools2[arg2[#arg2]] = arg3     tbl9[arg2[#arg2]] = arg3
+
+The flat path renders a `while` LOOP as a single `if` with the index HARDCODED
+to `arg2[1]`, and writes the result to the wrong target. The structured path
+recovers the loop, the loop variable, the increment, and the correct target.
+
+The structured output is substantially, obviously more correct.
+
+### And the checker scores them IDENTICALLY
+    flat.lua   : 1 finding - calls_not_emitted, 5 calls short
+    struct.lua : 1 finding - calls_not_emitted, 5 calls short
+
+One finding each, the same one. **The measure cannot distinguish a recovered
+loop from a lost one.**
+
+### What that does and does not establish
+It does NOT support the hypothesis I formed on seeing the diff - that the
+checker PENALISES correct output. It scores them the same, not worse. I nearly
+recorded the stronger claim; the check took one run and did not support it.
+
+It DOES establish that the corpus-level -45 clean measured in rotations 74 and
+76 is driven by other files, and that at least some of what the structured path
+produces is a real improvement the measure is blind to. So "structuring costs 45
+clean files" is not the same statement as "structuring makes the output worse",
+and I have been treating them as one.
+
+### Process slip, recorded
+`rm -rf crates/luau-core/examples` to remove a throwaway comparison harness also
+deleted the tracked `decompile_demo.rs`. Caught by `git status` in the same
+command and restored immediately. The lesson is the obvious one: remove the file
+you created, not the directory it happens to sit in.
+
+### State after rotation 77
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Tree clean; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
+  CLOSED.
+  **B: the structured path is now known to produce genuinely better output on at
+  least one file while scoring identically.** The -45 needs attributing to
+  specific files before any verdict on structuring is justified - the next step
+  is a per-file diff of the corpus run under `LUAU_ARM_SPAN`, ranked by which
+  files LOST clean status, not another implementation.
+  Nine measured dead ends plus one gated experiment.
+  PARKED: A2/C-residual, UPVAL_NAME.
