@@ -150,6 +150,29 @@ fn detect_else_skip(
     }
 }
 
+/// Does any branch or jump in this proto target `want`?
+///
+/// Used to tell a genuinely dead tail from one the walk merely stopped short
+/// of: an instruction something jumps TO is reachable regardless of the path
+/// that was just abandoned.
+fn pc_is_branch_target(code: &[u32], want: usize) -> bool {
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if is_control_flow_op(op) {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            if t == want as i64 {
+                return true;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
 fn is_control_flow_op(op: LuauOpcode) -> bool {
     matches!(
@@ -3165,6 +3188,28 @@ pub(super) fn lift_instruction_range(
                         } else {
                             stmts.push(Stat::Break);
                         }
+                    }
+                    // "Remaining instructions are dead code" is only true when
+                    // the span was carved correctly. Measured false on
+                    // `368_HoneycombTools::ConstructCell`: the span 22..99
+                    // holds `57: JUMP -> 216`, and pc 58 is the OTHER side of a
+                    // conditional above it - reachable, not dead. Breaking
+                    // there abandoned 58..98, so `98: CALL R19` never ran and
+                    // the `JUMPIFNOT R19` at 99 emitted a bare `v19`.
+                    //
+                    // Resume instead when something else in the proto jumps to
+                    // the next instruction, which makes it reachable
+                    // independently of the path just abandoned.
+                    //
+                    // MEASURED (rotation 88), ADOPTED:
+                    //     clean 1,105 -> 1,106   defects 38 -> 37
+                    //     fixes 368_HoneycombTools; NO new findings
+                    //     7 files changed; EVERY delta non-negative -
+                    //     calls gained in six, nothing lost anywhere
+                    let next_pc = pc + if op.has_aux() { 2 } else { 1 };
+                    if next_pc < end && pc_is_branch_target(code, next_pc) {
+                        pc = next_pc;
+                        continue;
                     }
                     // Unconditional jump — remaining instructions are dead code
                     break;

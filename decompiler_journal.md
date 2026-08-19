@@ -5464,3 +5464,71 @@ CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
   K, unreachable-blocks, B-loops, **inline-if-arm-overrun**.
 NEXT: re-enumerate the 38 and check whether the four remaining
   `REG_EXPR_UNKNOWN+UNK_CALL_CLEAR` files share this shape.
+
+
+## Rotation 88 - the SAME fault one level down: "remaining instructions are dead code"
+
+### Re-enumerating after r87
+    24  calls_not_emitted
+     8  declared_never_assigned   (533 closed)
+     6  branch_local_discarded
+
+Of the five `REG_EXPR_UNKNOWN+UNK_CALL_CLEAR` files, only `368_HoneycombTools`
+still showed an Unknown branch condition:
+
+    COND  ConstructCell  pc=99  JumpIfNot  reg=19  Unknown
+
+### Same shape, different trigger
+`LUAU_RUNREG_TRACE` again showed `InlineIfThenInLoop`, and `LUAU_LIFTPATH` a
+`flat 22..99`. But `LUAU_PC_WINDOW=85-105` proved pc 88..98 were NEVER WALKED -
+the walk jumped straight to 100. The abort is at
+
+    56: LOADN  R7 1
+    57: JUMP  -> 216        <-- leaves the span 22..99
+
+and `lift_instruction_range`'s unconditional-jump arm did:
+
+    // Unconditional jump - remaining instructions are dead code
+    break;
+
+That assumption holds for straight-line code and fails here: pc 58 is the OTHER
+side of a conditional above it, reachable regardless of the path just
+abandoned. Breaking there abandoned 58..98, so `98: CALL R19` never ran and the
+`JUMPIFNOT R19` at 99 emitted a bare `v19`.
+
+### The fix
+On a forward jump that leaves the span, resume at the next instruction instead
+of breaking WHEN something else in the proto jumps to it (`pc_is_branch_target`)
+- which is exactly the condition under which the tail is not dead.
+
+### Measured, adopted
+    clean 1,105 -> 1,106   defects 38 -> 37
+    FIXED   368_HoneycombTools declared_never_assigned
+    NEW     none
+    7 files changed; EVERY delta non-negative:
+        368_HoneycombTools  +12 lines, +1 call   `v19` gone from line 8, and
+                            the lost block returns - the "How many ... will you
+                            feed to" prompt and its `ClientCall`
+        532_MusicPlayer     +26 lines, +5 ifs, +3 calls
+        25/27/29/43         +1..+3 calls each
+    calls lost 0, loops lost 0, ifs lost 0 - the first census with no
+    negative entry anywhere.
+    949 tests pass.
+
+### The pattern worth naming
+r87 and r88 are the same fault at two levels: **a span whose walk stops at a
+jump that leaves it, while the instructions after that jump still belong to the
+program.** r87 fixed it where the span is CARVED (the arm swallowed past its
+exit); r88 where the span is WALKED (the walk quit at a jump out of range).
+Both were invisible to every consumer-side instrument, and both showed up
+immediately once the structurer's own output and the raw pc walk were printed.
+
+### State after rotation 88
+SEMANTIC: **1,106/1,142 (96.8%), 37 defects**. 949 tests pass.
+Two fixes adopted in two rotations after six rotations of none; the difference
+was instrumenting producers instead of consumers.
+REMAINING: 24 calls_not_emitted, 7 declared_never_assigned, 6
+  branch_local_discarded.
+NEXT: the 24 `calls_not_emitted` are the dropped-body class and are the same
+  family - check whether they are spans that stop early for either of these two
+  reasons, using `LUAU_PC_WINDOW` against the proto's instruction count.
