@@ -1327,3 +1327,56 @@ A2 PARKED (2) WITH A REPRODUCER (531_Morpher:146-153) and a falsifiable
    the guard's CALL result, or the enclosing NAMECALL's self slot?
 B  PARKED (1)   C PARKED (2)
 Remaining: 16 semantic defects. Sweep re-run against run_r18 in progress.
+
+
+## Rotation 21 CORRECTION - I invented two of the four defects
+
+### SUPERSEDES the rotation 21 census above. Read this with it.
+The claim "20 correct, 4 broken" is WRONG. The heuristic behind it - that in
+`local x = recv:FindFirstChild(k); if x then <recv2>:m() end` the receiver must
+equal the guard - is not a property of correct Luau. `if x then self:m() end` is
+ordinary code.
+
+`LUAU_RECV_TRACE` on `531_Morpher` printed what each NAMECALL receiver resolved
+to:
+
+    RECV idx=1 holds=Name("PreMorphTransparency2")   <- the "working" block
+    RECV idx=0 holds=Name("self")                    <- the "broken" block
+
+Register 0 is `self` and it genuinely holds `self`. The emitted `self:Destroy()`
+is what the bytecode says, and as game logic it is right: a Morpher part that
+finds an `IsMorph` marker destroys ITSELF. `394_LocalBees` is the same shape -
+`local BeequipPart = self:FindFirstChild("BeequipPart"); if BeequipPart then
+self:Destroy() end`.
+
+CONFIRMATION FROM THE INSTRUMENT: the semantic checker never flagged 531 or 394.
+It flagged only `54_Controls`, where the receiver is literally `Nil`. The
+checker was right and my census was wrong.
+
+### What actually remains
+Of the four, TWO were my invention and two are real - and the two real ones
+(`54_Controls` v3 and v7) are already inside the 16 the checker reports. This
+census added no new information; it added noise, and cost a rotation.
+
+### The rule this breaks, and the corrected one
+CLAUDE.md already warns that models invent defects on this corpus, and names
+Roblox child-instance lookups as the classic false positive. I wrote a NEW
+heuristic and trusted it without checking it against a case I knew to be
+correct. The corrected rule: **a hand-written census is an instrument too, and
+an instrument that disagrees with the checker must be validated before its
+disagreements are treated as findings** - the same standard applied to the
+checker itself in rotation 17, where five findings were proven false before the
+scanner was touched.
+
+The prediction offered in rotation 21 ("a read of the guard before the method
+call keeps it alive") was already falsified by data in hand when it was written:
+`260_BeePopUp`'s `if GiftedSong2 then GiftedSong2:Play() end` has no prior read
+and is correct. It should not have been recorded as open.
+
+### State after the correction
+A2 remains PARKED (2). Its evidence is now ONLY `54_Controls` v3/v7 - a receiver
+register holding `Nil` where the source has a live `FindFirstChild` result. The
+`self` flavour does not exist. `531_Morpher` is NOT a reproducer and must not be
+resumed on.
+No code was changed by rotation 21; the instrumentation was reverted.
+Remaining: 16 semantic defects, unchanged. Sweep re-run in progress.
