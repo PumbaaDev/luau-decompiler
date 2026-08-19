@@ -7010,7 +7010,34 @@ fn premateralize_branch_escapes_spans(
         if reg >= regs.len() {
             continue;
         }
+        // Rotation 104: WHICH GATE rejects each candidate register?
+        //
+        // Every rotation on this mechanism tuned a predicate while ASSUMING the
+        // gate was reached. Rotations 95 and 97 both turned out to be tuning
+        // gates that never fired, and r103 showed a strictly more permissive
+        // rule moving nothing - which only makes sense if these registers never
+        // arrive here at all. This reports the answer instead of assuming it.
+        let gate_trace = std::env::var("LUAU_GATE_TRACE").is_ok();
+        if gate_trace {
+            eprintln!(
+                "GATE	{}@{}	reg={}	val={:?}	after={}..{}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                reg,
+                regs.get(reg).map(|v| match v {
+                    RegVal::Unknown => "Unknown",
+                    RegVal::Expr(Expr::Name(_)) => "Expr(Name)",
+                    RegVal::Expr(_) => "Expr(other)",
+                    _ => "other",
+                }),
+                after_start,
+                after_end
+            );
+        }
         if !reg_used_in_range(&proto.code, after_start, after_end, reg) {
+            if gate_trace {
+                eprintln!("GATE	  reject reg={} : not used after merge", reg);
+            }
             continue;
         }
         // Round 4 — the UNKNOWN-seed case, the residual this file's parked-pure

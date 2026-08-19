@@ -6459,3 +6459,59 @@ THE QUESTION: for `958_Drakkarmon` line 742, is `premateralize_branch_escapes_
 ### State after rotation 103
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Tree clean apart from
 the untracked throwaway probe.
+
+
+## Rotation 104 - the gate IS reached, so the fault is DOWNSTREAM of the pin
+
+### r103's question, answered
+Added `LUAU_GATE_TRACE`: one line per candidate register reaching
+`premateralize_branch_escapes_spans`, with the register's value variant and the
+post-merge range, plus a line naming any gate that rejects it.
+
+`958_Drakkarmon::onRunning@729` - the proto holding the line-742 finding:
+
+    GATE onRunning@729 reg=0  val=Expr(Name)  after=62..111
+    GATE onRunning@729 reg=2  val=Expr(Name)  after=62..111
+    GATE onRunning@729 reg=3  val=Unknown     after=62..111
+    ... 18 candidates in total, NONE rejected by the use-after-merge filter
+    GATE onRunning@729 reg=3  val=Expr(Name)  after=78..111
+    GATE onRunning@729 reg=4  val=Expr(other) after=78..111
+
+So the gate is REACHED, the registers arrive, and the first filter passes them.
+The "it never fires" hypothesis - true for rotations 95 and 97, and the reason I
+went looking - is FALSE here.
+
+### Combined with r103, this locates the fault
+r103 relaxed the predicate so these registers ARE pinned (28 more files changed)
+and **not one finding moved**. r104 shows they reach the gate in the first
+place. Together:
+
+    reaches the gate      YES (r104)
+    passes the filters    YES, under the chain rule (r103)
+    gets pinned           YES (r103, 28 files changed)
+    defect persists       YES
+
+**The pin is applied and the arm value still does not survive the merge.** So
+the fault is downstream of `premateralize_branch_escapes_spans` entirely - in
+how a pinned write is emitted, or in `merge_regs` discarding it afterwards.
+
+Every rotation from 101 to 103 was tuning the admission predicate of a gate that
+was already admitting these registers. That whole line of attack is closed.
+
+### PARKED, re-aimed
+MECHANISM: 4 residual `branch_local_discarded` (21_ClickToMove,
+  317_ScreenParticles, 445_PluckedPetal, 958_Drakkarmon).
+PROVED:    the registers reach the gate; pinning them is byte-neutral for these
+           findings.
+RULED OUT: gate never fires (r104); one-write restriction (r103); arm-shape
+           predicates (r94-r96).
+THE QUESTION: with the chain rule ON so the register IS pinned, trace
+  `store_complex`'s pinned path for `onRunning` reg 3 - does it emit a Reassign
+  against the pinned name, or does `classify_write` still return FirstDecl? If
+  FirstDecl, the pin is not consulted where it matters and `pinned_write_
+  consumed` is the place to look; if Reassign, the statement is emitted and
+  something later deletes it, which puts it in DCE territory like rotation 92.
+
+### State after rotation 104
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_GATE_TRACE`
+kept and verified inert.
