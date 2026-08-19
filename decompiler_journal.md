@@ -1752,3 +1752,73 @@ POSSIBLE NEW CHECK, noted not built: the collapse itself is detectable - the
   for this shape, `duplicate_call`.
 SWEEP: r26 run ABANDONED (it targeted the reverted build). Re-running against
   run_r27.
+
+
+## Rotation 27 - second hypothesis for mechanism I, also falsified
+
+### The attempt
+Rotation 26's corrected hypothesis: the discriminator is not the NAME but the
+INITIALISER - `local Lvl4 = Lvl3 + 2` is built from this register's own current
+value and is therefore an accumulate, while `local max5 = (arg2 + max) / 3.3`
+reads a different register and must keep its binding. Implemented in
+`emit_local_or_assign`, which is the one site holding both the register and the
+value: on `Shadow`, if `expr_references_name(&value, prev)` then emit
+`Assign` to `prev` instead.
+
+### MEASURED: no gain, and a regression
+Clean run: **1,045 clean / 153 defects - identical to the baseline.** It did not
+fix `213_Tornado` at all (`local Lvl4 = Lvl3 + 2` unchanged), which proves
+`emit_local_or_assign` is not the path that emits the family.
+
+It changed 9 files, and reading one - the rule rotation 26 wrote down - shows it
+made `149_ReplicatedStorage_Class` wrong:
+
+    BEFORE                                  AFTER
+    local tbl = self or {}                  local tbl = self or {}
+    local tbl2 = {                          tbl = {
+        __metatable = tbl,                      __metatable = tbl,
+        __index = tbl }                         __index = tbl }
+    ...                                     ...
+    tbl.new = tbl.new or new                tbl.new = tbl.new or new
+    return tbl2                             return tbl
+
+Before, `tbl` is the class table and `tbl2` the metatable pointing at it, so
+`tbl.new = ...` adds methods to the CLASS. After, `tbl` has been overwritten by
+the metatable, the methods land on the wrong table, and `__index = tbl` still
+captures the old one - both objects are live and the rule merged them.
+
+### What both failures share
+    Lvl3 = Lvl3 + 2        old value CONSUMED, dead afterwards   -> safe
+    tbl  = {__index = tbl} old value CAPTURED, still live        -> unsafe
+    max9 = f(other regs)   unrelated value                       -> unsafe
+
+Neither the name (rotation 25) nor the initialiser (rotation 27) distinguishes
+these. Both are proxies for the property that actually matters: **is the
+register's OLD value read after this write?** If it is dead, reassigning is
+safe; if it is live, the arm needs its own binding.
+
+### Mechanism I: PARKED (2), attack must change
+UNBLOCKING QUESTION, stated exactly: at the point of a `Shadow` write to
+register R at pc P, is R's previous value read anywhere reachable from P before
+being overwritten? The lifter tracks `regs` and has the proto's instruction
+stream, so a backward scan from P over the remaining code of the enclosing
+region should answer it without a full dataflow pass. If that is too coarse
+inside branches, the fallback is to restrict the rewrite to the case where the
+write and every subsequent read lie in the SAME region.
+
+Reverted to `backup/pre-accumulate-rule`. `149_Class` confirmed restored:
+1,045 clean / 153 defects.
+
+### Rule earned across 25-27, worth keeping
+Rotation 25's fix raised the score and broke files. Rotation 27's fix changed
+nothing and broke a file. In both cases the semantic checker was content.
+**Read the diff on a changed file before believing any measurement** - the count
+is necessary and never sufficient.
+
+### State after rotation 27
+SEMANTIC: 1,045/1,142 (91.5%), 153 defects.
+  A, D, E, F, G, H CLOSED. **I PARKED (2)** with a liveness question and two
+  falsified hypotheses recorded so neither is retried.
+  A2 PARKED (2). B PARKED (1). C PARKED (2).
+SWEEP: running against run_r27, which is byte-identical to run_r29 for this
+  purpose (both are the reverted build).
