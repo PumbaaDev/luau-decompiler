@@ -940,3 +940,61 @@ A  PARKED (3) - emitter FOUND, adjudication question above (this is progress:
    the question is no longer "where does it come from" but "is it wrong at all")
 A1 PARKED (1) - blocked on A by design
 B  PARKED (1)   C PARKED (2)   D **CLOSED**   E **CLOSED**
+
+## 2026-08-19 — ROTATION 16. Mechanism A ADJUDICATED: FALSE POSITIVE. 93 -> 32 defects.
+
+### The adjudication, from the bytecode
+623_Beesmas2024BQuests carries **122 LOADNIL** instructions; R14 alone is written
+by LOADNIL 12 times. The registers behind every flagged name are genuinely
+assigned nil. NOTHING WAS DROPPED.
+
+So `local v14 = nil` is faithful output. emit.rs's "Phase B0.94b" then stripped
+the `= nil` as a cosmetic tidy-up, and the semantic checker - which reads the
+EMITTED TEXT - saw `local v14`, found no assignment, and reported
+`declared_never_assigned`. The checker was analysing evidence the renderer had
+already removed.
+
+Verified by intersection (rotation 15): 110 nil-strips in that file, and all six
+flagged names among them.
+
+### The fix
+Strip trailing nils only when a REAL value survives (`local x, y = 1, nil` ->
+`local x, y = 1`, unchanged). When the whole initialiser is nil, keep it.
+Semantically identical in Lua; strictly more faithful to the bytecode.
+
+MEASURED, clean out-dir, timestamp-verified binary:
+    before  1101/1142 clean (96.4%), 93 defects
+    after   1118/1142 clean (97.9%), 32 defects
++17 files, -61 defects. Largest single gain of the run.
+MUTATION-PROVEN: forcing the strip back on returns exactly 1101/93.
+
+### TESTS CHANGED - stated plainly because that is normally a red flag
+`b094b_local_nil_strips_to_bare_local` and `b094b_local_all_nils_stripped`
+asserted the old behaviour and now fail. I updated both, with the reason
+recorded in the test bodies. Justification: they pinned a COSMETIC choice, not a
+correctness property - the two renderings are identical to Lua - and that choice
+was measurably destroying evidence. The other two B0.94b tests
+(trailing-nils-stripped, non-trailing-nil-preserved) are UNCHANGED and still pass,
+so the narrowing is exactly what it claims to be.
+
+### HONESTY: what this gain is and is not
+The 61 defects were FALSE POSITIVES. The decompiler's output was already correct
+for them; it is now one token more informative per nil local. The clean rate rose
+because the INSTRUMENT stopped misreading correct output, not because broken
+output was repaired. Real correctness is unchanged by this commit.
+
+That is still worth having - 61 false findings were hiding the 32 real ones - but
+it must not be read as 61 bugs fixed.
+
+### This is the D/E shape for the third time
+D: "any referenced name" meant "a name that is not my parent".
+E: "any statement" meant "a statement I cannot safely move".
+A: "no `=` in the text" meant "never assigned" - it could not tell ASSIGNED NIL
+   from NEVER ASSIGNED, because the renderer had deleted the distinction.
+
+### State after rotation 16
+A  **CLOSED** (false positive, emitter corrected, rule recorded)
+A1 PARKED (1) - now unblocked by A's closure; the rotation-2 census should be
+   re-run to see how many of the 27 READONLY names survive
+B  PARKED (1)   C PARKED (2)   D **CLOSED**   E **CLOSED**
+Remaining: 32 defects across the corpus.

@@ -83,7 +83,31 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
                 }
                 v
             };
-            if !trimmed.is_empty() {
+            // KEEP `= nil` WHEN NIL IS THE WHOLE VALUE.
+            //
+            // Stripping every trailing nil turns `local x = nil` into
+            // `local x`. Identical to Lua - but it DESTROYS THE EVIDENCE that
+            // the register was assigned at all, and the semantic checker works
+            // on the emitted text.
+            //
+            // Measured 19 Aug 2026 on 623_Beesmas2024BQuests: 110 declarations
+            // were rendered bare by this strip, and ALL SIX names the checker
+            // reported as `declared_never_assigned` were among them. That file's
+            // bytecode carries 122 LOADNIL instructions, 12 of them writing the
+            // register behind `v14` alone - so nil IS what the bytecode assigned
+            // and nothing was dropped. The finding was a false positive created
+            // by this cosmetic strip.
+            //
+            // Strip trailing nils only when a REAL value survives
+            // (`local x, y = 1, nil` -> `local x, y = 1`, still tidy). When the
+            // whole initialiser is nil, keep it: `local x = nil` says what the
+            // bytecode did.
+            let all_nil = !values.is_empty() && values.iter().all(|e| matches!(e, Expr::Nil));
+            if all_nil {
+                out.push_str(" = ");
+                let exprs: Vec<String> = values.iter().map(|e| emit_expr(e, depth)).collect();
+                out.push_str(&exprs.join(", "));
+            } else if !trimmed.is_empty() {
                 out.push_str(" = ");
                 let exprs: Vec<String> = trimmed.iter().map(|e| emit_expr(e, depth)).collect();
                 out.push_str(&exprs.join(", "));
@@ -1959,13 +1983,22 @@ mod tests {
 
     #[test]
     fn b094b_local_nil_strips_to_bare_local() {
-        // local x = nil → local x
+        // CORRECTED 19 Aug 2026: `local x = nil` now KEEPS its initialiser.
+        //
+        // This test pinned a COSMETIC choice, not a correctness property - the
+        // two forms are identical to Lua. Measured on 623_Beesmas2024BQuests:
+        // stripping rendered 110 declarations bare, and all six names the
+        // semantic checker reported as `declared_never_assigned` were among
+        // them. That file's bytecode carries 122 LOADNIL instructions, 12 of
+        // them writing the register behind `v14`, so nil was genuinely the
+        // assigned value. The strip destroyed the evidence and manufactured 61
+        // false-positive defects corpus-wide (93 -> 32).
         let mut out = String::new();
         emit_stat(&mut out, &Stat::Local {
             names: vec!["x".into()],
             values: vec![Expr::Nil],
         }, 0);
-        assert_eq!(out.trim(), "local x");
+        assert_eq!(out.trim(), "local x = nil");
     }
 
     #[test]
@@ -1981,13 +2014,15 @@ mod tests {
 
     #[test]
     fn b094b_local_all_nils_stripped() {
-        // local x, y = nil, nil → local x, y
+        // CORRECTED 19 Aug 2026, same reason as above: an all-nil initialiser
+        // is kept. Trailing nils are still stripped when a REAL value survives
+        // (see b094b_local_trailing_nils_stripped, unchanged and still passing).
         let mut out = String::new();
         emit_stat(&mut out, &Stat::Local {
             names: vec!["x".into(), "y".into()],
             values: vec![Expr::Nil, Expr::Nil],
         }, 0);
-        assert_eq!(out.trim(), "local x, y");
+        assert_eq!(out.trim(), "local x, y = nil, nil");
     }
 
     #[test]
