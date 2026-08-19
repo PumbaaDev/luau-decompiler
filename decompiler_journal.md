@@ -5792,3 +5792,85 @@ SEMANTIC: 1,106/1,142 (96.8%), 37 defects. Unchanged; diagnosis only.
 949 tests pass, all instruments verified inert.
 GATED: `LUAU_RET_RESUME` now KNOWN to be a no-op by construction - do not
   revisit it as written; the note above is why.
+
+
+## Rotation 93 - GUARD ARMS. The largest single move of the session
+
+### The shape
+`603_Orbiter::Update@182` is a chain of early-exit guards, and `RUNREG` showed
+`run=5..61 Linear 5..61` - ONE region for the whole body. The flat walk stops at
+the guard's RETURN and loses everything after it:
+
+     7: JUMPIFNOT R2 -> 11     `if not self.Root`
+    10: JUMPIF    R3 -> 17      `or not ...Parent then`
+    14: CALL      Destroy           self:Destroy(false)
+    16: RETURN                      return false end
+    17: ...                     <-- four of five CALL sites live here
+
+### The fix - Shape C in `structure_numeric_for_body`
+Exactly r87's move, keyed on the arm TERMINATING rather than on it containing a
+nested for: emit the guard as its own region and continue at the target, so the
+tail becomes a SIBLING rather than the arm's tail. That is what r92 established
+was required - `LUAU_RET_RESUME` appended the tail INSIDE the arm and DCE
+phase 2 correctly deleted it.
+
+`Update` now emits all five calls and reads like its source:
+
+    if self.Active then
+        if not self.Root.Parent then self:Destroy(false) return false end
+        self.Age += arg2
+        self.CycleAge += arg2
+        if self.Dur then if self.Dur <= self.Age then
+            if self.OnExpire then self.OnExpire(self) end
+            self:Destroy(false) return false
+        end end
+        self:UpdateCF()
+        if self.OnUpdate then self.OnUpdate(self) end
+        return true
+
+### Measured, ADOPTED
+    clean    1,106 -> 1,123  (96.8% -> 98.3%)
+    defects     37 -> 22
+    total emitted calls across the corpus  38,177 -> 38,501  (+324)
+    187 files changed; files losing a LOOP: 0
+    949 tests pass
+
+Defect kinds now: 10 declared_never_assigned, 7 branch_local_discarded,
+5 calls_not_emitted (was 24).
+
+### The narrower variant, MEASURED WORSE
+"Straight-line arms only" (no internal control flow) looks obviously safer and
+is not:
+
+                       wide      narrow
+    clean              1,123     1,120
+    files losing calls     9        19
+    files losing loops     0         3
+    total calls         +324      +153
+
+Structuring is ORDER-DEPENDENT: declining to wrap one site lets a worse wrap
+happen later. A narrower predicate is not automatically a safer one. The note
+is in the source so it is not re-narrowed on intuition.
+
+### KNOWN RESIDUAL - recorded, not suppressed
+Six new findings in three files, and nine files lose calls:
+
+    381_Eggs             3 new declared_never_assigned + 1 branch_local_discarded
+    396_TadpoleTailInit  1 new declared_never_assigned
+    351_PassiveTile      1 new calls_not_emitted, and 72 -> 62 call tokens
+    plus 8 more files with smaller call losses
+
+`351_PassiveTile` is the reproducer: its lost block sits inside a `for` body
+whose arms end in `break`, so hoisting a tail out of an arm crosses a loop
+boundary. This is a real regression against a much larger real gain (21 defects
+closed, 6 opened; +324 calls net). It is adopted on that balance and the
+residual is the next target, NOT dismissed.
+
+### State after rotation 93
+SEMANTIC: **1,123/1,142 (98.3%), 22 defects**. 949 tests pass.
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops, inline-if-arm-overrun, **guard-arms**.
+NEXT: the guard-arm residual - `351_PassiveTile`, guard hoisting across a loop
+  boundary where arms end in `break`. Find whether the wrap can be suppressed
+  when `target` lies outside the enclosing loop body, using `loop_headers`
+  (already a parameter) rather than by inspecting the arm.

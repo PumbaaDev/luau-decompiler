@@ -1091,6 +1091,56 @@ pub(crate) fn structure_numeric_for_body(
             }
         }
 
+        // ── Shape C: an early-exit GUARD ────────────────────────────────
+        //
+        // `if <cond> then return end` followed by the rest of the function.
+        // The arm terminates, so it has no merge and `structure_control_flow`
+        // hands the ENTIRE remainder to the else side; the arm is then lifted
+        // as one flat span and `lift_instruction_range` stops at the arm's
+        // RETURN, losing everything after it.
+        //
+        // Measured on `603_Orbiter::Update@182` - `RUNREG run=5..61 Linear
+        // 5..61`, one region for the whole body, and pcs 17..58 (four of the
+        // function's five CALL sites) never emitted:
+        //
+        //      7: JUMPIFNOT R2 -> 11    `if not self.Root`
+        //     10: JUMPIF    R3 -> 17     `or not ...Parent then`
+        //     14: CALL      Destroy          self:Destroy(false)
+        //     16: RETURN                     return false end
+        //     17: ...                    <-- belongs AFTER the guard
+        //
+        // Same treatment as Shape B, keyed on the arm TERMINATING rather than
+        // on it containing a nested for: emit the guard as its own region and
+        // continue at the target, so the tail becomes a SIBLING.
+        //
+        // Appending the tail inside the arm instead is what `LUAU_RET_RESUME`
+        // did, and DCE phase 2 correctly deleted it (rotation 92) - the tail
+        // has to be structurally outside the `if`, not textually after the
+        // `return`.
+        // MEASURED (rotation 93), ADOPTED:
+        //     clean 1,106 -> 1,123   defects 37 -> 22
+        //     total emitted calls across the corpus 38,177 -> 38,501
+        //     187 files changed; files losing a loop: 0
+        //     KNOWN RESIDUAL, recorded not suppressed: 9 files lose calls and
+        //     6 new findings appear in 3 files (381_Eggs, 396_TadpoleTailInit,
+        //     351_PassiveTile). See the journal, rotation 93.
+        {
+            if let Some((jump_next_pc, target)) = forward_conditional_jump(op, pc, insn) {
+                if target > jump_next_pc && target <= body_end && arm_terminates(code, jump_next_pc, target)
+                {
+                    if linear_start < pc {
+                        regions.push(Region::Linear { start: linear_start, end: pc });
+                    }
+                    let then_body =
+                        structure_numeric_for_body(code, jump_next_pc, target, cfg, loop_headers);
+                    regions.push(Region::InlineIfThenInLoop { cond_pc: pc, body: then_body });
+                    pc = target;
+                    linear_start = pc;
+                    continue;
+                }
+            }
+        }
+
         // Advance by 1 or 2 depending on AUX presence (mirrors the walk in
         // `ControlFlowGraph::build` and `lift_instruction_range`).
         let step = if op.has_aux() { 2 } else { 1 };
@@ -1192,6 +1242,31 @@ pub(crate) fn range_contains_nested_for(code: &[u32], start: usize, end: usize) 
     }
     false
 }
+
+/// Does `[start, end)` end in a RETURN, making it an early-exit guard arm?
+///
+/// The LAST instruction specifically: an arm containing a return somewhere in
+/// the middle has its own internal structure and is not a guard.
+fn arm_terminates(code: &[u32], start: usize, end: usize) -> bool {
+    if end <= start || end > code.len() {
+        return false;
+    }
+    // A "straight-line arms only" variant was built and MEASURED WORSE on every
+    // axis (rotation 93): 1,120/22 vs 1,123/22, files losing calls 19 vs 9,
+    // files losing loops 3 vs 0, total emitted calls +153 vs +324. Structuring
+    // is order-dependent - declining to wrap one site lets a worse wrap happen
+    // later - so a narrower predicate is not automatically a safer one. Kept
+    // permissive; the note is here so it is not re-narrowed on intuition.
+    let mut pc = start;
+    let mut last = start;
+    while pc < end {
+        last = pc;
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    matches!(LuauOpcode::from_u8(insn_op(code[last])), LuauOpcode::Return)
+}
+
 
 /// Does this range hold a complete nested CONDITIONAL - a forward-branching
 /// test whose target also lies inside the range?
