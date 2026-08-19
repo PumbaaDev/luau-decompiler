@@ -4593,3 +4593,66 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   Seven measured dead ends plus one gated experiment (LUAU_ARM_SPAN, +4/-9,
   0 of 60 sampled validation failures). PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_ARM_TRACE (what each branch-arm lift receives).
+
+
+## Rotation 74 - the subset structurer BUILT and MEASURED: it regresses badly
+
+### What was built
+`structure_block_subset(cfg, proto, subset)` - the change rotation 73 named. It
+mirrors `structure_control_flow`'s if/else matching but is CONFINED to the arm's
+own blocks: a branch is matched only when both arms lie entirely inside the
+subset, so it cannot claim foreign blocks the way the `min..max` span attempt
+did. Unmatched blocks fall through to `Region::Linear`, so in principle the
+result is never worse than the flat lift.
+
+Wired into `lift_branch_region` behind the same early-return gate.
+
+### Result 1: infinite recursion
+The corpus run overflowed the stack. `lift_structured_regions` routes an
+`IfThenElse` back through `lift_region`, which calls `lift_branch_region` on the
+arms, which structures again - and if a produced arm is not STRICTLY smaller
+than the input, that never terminates.
+
+Added a progress guard requiring every produced arm to be smaller than the input
+block list. That is the right shape of fix and it stopped the overflow.
+
+### Result 2: a large regression
+    before  1,100 clean / 48 defects
+    after   **1,055 clean / 140 defects**
+
+Ninety-two defects worse. Reverted.
+
+### What the failure teaches
+"Never worse than the flat lift" was wrong, and the reasoning behind it was
+wrong in a specific way: matching a branch inside the arm CHANGES REGISTER
+STATE HANDLING. A flat lift threads one register state through the whole span;
+an `IfThenElse` region splits it, merges the arms through `merge_regs`, and
+every value the merge cannot reconcile becomes `Unknown`. Introducing branch
+structure therefore introduces every merge-loss mechanism this session has
+already documented (A2/C, rotation 35's tables, rotation 51's single-arm
+bindings) into 29 files that previously lifted linearly.
+
+So the flat lift is not merely a missing feature - it is avoiding a cost. A
+correct fix has to structure the arm AND survive the merges that structuring
+creates, which is why this is not a self-contained change.
+
+### The honest position on mechanism B
+Root cause: established and attributable (rotations 69-70).
+Required change: named (rotation 73).
+Change: BUILT and MEASURED here, and it costs 92 defects.
+
+That is not a park for want of an idea; it is a measured verdict that the
+obvious implementation of the named change is net-negative, and the next
+attempt must handle arm merges rather than only arm structure.
+
+### State after rotation 74
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. 949 tests pass; baseline restored
+  and verified.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: diagnosis complete; the named fix implemented and measured at
+  -45 clean / +92 defects.** Reproducer `277_DragManager::OnInputBegin@184`.
+  Next attempt must pair arm structuring with the merge handling that
+  structuring introduces.
+  50 protos with unreachable blocks - separate, parked.
+  **Eight measured dead ends** plus one gated experiment. PARKED:
+  A2/C-residual, UPVAL_NAME.
