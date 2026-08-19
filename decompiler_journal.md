@@ -1267,3 +1267,63 @@ A1b partially separated: 368/85 remain multret-plausible; 53 is the
     missing-else-arm mechanism and is regrouped with B.
 B  PARKED (1)   C PARKED (2)
 Remaining: 16 defects. Sweep re-run against run_r18 IN PROGRESS.
+
+
+## Rotation 21 - A2 gets its reproducer, from the corpus instead of a compiler
+
+### The census: 20 correct, 4 broken, same construct
+Scanned all 1,142 outputs for `local x = <recv>:FindFirstChild(k)` followed by
+`if x then x:method() end`, comparing the guard name against the receiver name:
+
+    CORRECT (receiver == guard)   20
+    BROKEN  (receiver != guard)    4
+        394_LocalBeequip   BeequipPart      -> self
+        531_Morpher        Transparency3    -> self
+        54_Controls        SteeringVelocity3-> v3
+        54_Controls        SteeringVelocity4-> v7
+
+The construct decompiles correctly five times out of six, so this is not a
+missing feature - it is a condition that occasionally destroys the receiver.
+The broken receiver is `self` twice and a minted `vN` twice, and the `vN` cases
+are the ones `method_receiver_expr` reports, i.e. the register held `Nil`.
+
+### THE REPRODUCER - two adjacent blocks, one file, one correct one broken
+`531_Morpher`, lines 146-153, is the minimal case the missing v9 compiler could
+not give me:
+
+    local PreMorphTransparency2 = self:FindFirstChild("PreMorphTransparency")
+    if PreMorphTransparency2 then
+        self.Transparency = PreMorphTransparency2.Value
+        PreMorphTransparency2:Destroy()      -- CORRECT
+    end
+    local Transparency3 = self:FindFirstChild("IsMorph")
+    if Transparency3 then
+        self:Destroy()                        -- WRONG: Transparency3:Destroy()
+    end
+
+Same file, same function, same construct, same NAMECALL receiver (`self`),
+adjacent. Everything global is held constant, so whatever differs between these
+two blocks IS the mechanism. The visible difference: the working block's body
+reads `PreMorphTransparency2.Value` BEFORE the method call; the broken block's
+body contains the method call ALONE.
+
+That makes the candidate mechanism precise: when the guard register's only use
+inside the arm is as a NAMECALL receiver, the receiver resolves to the stale
+NAMECALL self-slot (or to Nil) instead of the guard's binding. A read of the
+register earlier in the arm appears to be what keeps it alive.
+
+### Why this is the right artifact to resume on
+It needs no compiler, it is four lines, it holds every confound fixed, and it
+predicts a discriminating test: add a read of the guard before the method call
+in a broken case and the defect should disappear. That prediction has NOT been
+run yet - it is the next step, and it is cheap.
+
+### State after rotation 21
+A **CLOSED**  D **CLOSED**  E **CLOSED**  F **CLOSED**  G **CLOSED**  H **CLOSED**
+A1d **RESOLVED as symptom**
+A2 PARKED (2) WITH A REPRODUCER (531_Morpher:146-153) and a falsifiable
+   prediction. Unblocking question: in the broken block, what does the
+   receiver register hold at the NAMECALL, and which instruction last wrote it -
+   the guard's CALL result, or the enclosing NAMECALL's self slot?
+B  PARKED (1)   C PARKED (2)
+Remaining: 16 semantic defects. Sweep re-run against run_r18 in progress.
