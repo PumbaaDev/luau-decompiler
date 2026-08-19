@@ -169,6 +169,23 @@ pub fn structure_control_flow(
         let seen: BTreeSet<usize> = rpo.iter().copied().collect();
         let missing: Vec<usize> = cfg.blocks.keys().copied().filter(|b| !seen.contains(b)).collect();
         if !missing.is_empty() {
+            // Is each orphan genuine dead code, or a MISSING EDGE? If some
+            // block lists it as a successor, the CFG knows the edge exists and
+            // reachability lost it - a real defect that silently deletes live
+            // code. If nothing points at it, the compiler emitted dead code and
+            // dropping it is correct.
+            let orphan_with_pred: Vec<usize> = missing
+                .iter()
+                .copied()
+                .filter(|m| cfg.blocks.values().any(|b| b.successors.contains(m)))
+                .collect();
+            eprintln!(
+                "RPOPRED proto={}@{} orphans={} with_predecessor={:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                missing.len(),
+                orphan_with_pred
+            );
             eprintln!(
                 "RPO proto={}@{} blocks={} reachable={} UNREACHABLE={:?}",
                 proto.debug_name.as_deref().unwrap_or("?"),

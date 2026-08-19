@@ -4656,3 +4656,46 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   50 protos with unreachable blocks - separate, parked.
   **Eight measured dead ends** plus one gated experiment. PARKED:
   A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 75 - the unreachable-block thread CLOSED as a false alarm
+
+### Returning to a parked item with better tooling
+Rotation 62 found 50 protos containing blocks unreachable from their entry, and
+parked the question: is each orphan genuine dead code, or a MISSING CFG EDGE
+silently deleting live code? It was the one thread never revisited.
+
+The question is mechanically decidable. If any block lists the orphan as a
+SUCCESSOR, the CFG knows the edge and reachability lost it - a real defect. If
+nothing points at it, the compiler emitted dead code and dropping it is correct.
+
+### The adjudication
+    protos with unreachable blocks : 50
+      orphan has a predecessor     :  0
+      orphan has NO predecessor    : **50**
+
+All fifty are genuine dead code. No block anywhere lists any orphan as a
+successor, so nothing reaches them and discarding them is correct behaviour.
+
+**CLOSED as a false alarm**, with a mechanical proof over the whole set rather
+than a sample - the same standard that resolved `truncated_body` (42 of 42) and
+`undefined_register` (68 of 72).
+
+### Worth noting about the original finding
+Rotation 62 recorded this as "a real defect source, independent of B, that
+nothing has ever reported". That framing was too strong: it was an
+UNADJUDICATED observation, and stating it as a defect source was the same
+overreach as the 797- and 935-block ratios I later declined to report. The
+correction is that finding an anomaly and demonstrating a defect are different
+acts, and only the second belongs in a count.
+
+### State after rotation 75
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **unreachable blocks CLOSED** (50 of 50 genuine dead code).
+  B: diagnosis complete, named fix built and measured at -45 clean / +92
+  defects; next attempt must pair arm structuring with merge handling.
+  Eight measured dead ends plus one gated experiment.
+  PARKED: A2/C-residual (path-sensitive dataflow), UPVAL_NAME (format-blocked).
+TOOLING: LUAU_RPO_TRACE now reports orphan predecessors, which is what made the
+  adjudication a one-line question.
