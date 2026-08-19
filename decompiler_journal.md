@@ -2760,3 +2760,72 @@ SEMANTIC: **1,126/1,142 (98.6%), 19 defects** - and unlike earlier figures this
   preserve-declared-locals.
   PARKED: B (1, one file). UPVAL_NAME format-blocked.
 SWEEP: run against run_r37 in flight.
+
+
+## Rotation 44 - the CALL clear resists a THIRD preservation strategy
+
+### The reasoning that looked sound
+Rotation 42 showed the VALUE preservation was right (85_Badges' `v13` correctly
+became `LastTier + 1`) while the NAME staying bound caused the harm (861 wrote
+temporaries through its own `for` variable). Those separate cleanly, so:
+preserve only PURE, NON-`Name` expressions - arithmetic, literals, field chains
+- and never a bare `Name` or `LoopVar`.
+
+Measured **1,126 -> 1,127 clean (98.7%), 19 -> 18**, and `85_Badges` gained a
+real value: `local GetStat4` became `local GetStat4 = v42 + 1`.
+
+### Reverted: 321 files changed and 861 broke a different way
+    before   local Animate2
+             Animate2 = tbl.Animate
+             Animate2(arg1, arg2, arg3)
+    after    local tbl2 = task.wait      <- stale value survived the call
+             tbl2 = tbl
+             tbl2 = tbl2.Animate         <- one name, three different things
+             tbl2(arg1, arg2, arg3)
+
+`task.wait` is `Field { object: Name("task") }`, which my purity predicate
+accepted, so it survived the clear and polluted the register downstream. The
+predicate allowed `Name` INSIDE a compound while forbidding a bare one, and a
+field chain rooted at a name is exactly the case that distinction fails to
+exclude.
+
+### Three strategies, three different failures - the pattern is the point
+    rotation 40  skip the clear for MULTRET
+                 -> argument registers leak into a following SETLIST
+                    (1022_Amulet_Generator)
+    rotation 42  keep registers holding a DECLARED LOCAL
+                 -> temporaries write through a live loop variable (861)
+    rotation 44  keep registers holding a PURE NON-NAME value
+                 -> stale field chains survive and are threaded through
+                    later scratch (861 again, differently)
+
+Every one raised the semantic score. Every one damaged output the score cannot
+see. The CALL clear is load-bearing for the correctness of emitted NAMES, not
+just values, and any relaxation lets a stale register participate in later
+naming decisions.
+
+### UNK_CALL_CLEAR: PARKED (3) - and the attack must change
+Per the escalation rule this is now parked three times, so the next attempt must
+not be another preservation variant. What is ruled out is above, each with the
+file that killed it. The unblocking question has moved:
+
+  NOT "which registers can survive the clear" - three answers tried, all wrong.
+  BUT "why does a register the source still needs live ABOVE a call's base at
+  all?" A Luau call frame is allocated above every live local, so a live value
+  sitting above `A` means either the call's `A` is decoded too low, or the value
+  was placed there by an earlier instruction the lifter mis-assigned. That is
+  checkable on ONE file (85_Badges, register 13, call at A=4) by dumping the
+  instruction that last wrote register 13 before the call - and it decides
+  whether this is a clear problem at all, or an opcode-decode problem wearing a
+  clear problem's clothes.
+
+### State after rotation 44
+SEMANTIC: **1,126/1,142 (98.6%), 19 defects**, no known false positives among
+  them.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values.
+  PARKED: UNK_CALL_CLEAR (3, attack must change, question restated above);
+    B (1, one file); UPVAL_NAME (format-blocked - Roblox bytecode carries no
+    CAPTURE, so the identity is not in the input).
+SWEEP: run against run_r37 in flight.
