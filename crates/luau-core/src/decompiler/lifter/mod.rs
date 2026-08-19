@@ -1622,6 +1622,7 @@ fn enumerate_value_paths(
     base_regs: &[RegVal],
     locals: &LocalTracker,
     in_loop: bool,
+    hoist: &mut Vec<Stat>,
 ) -> Option<Vec<ValuePath>> {
     let mut out: Vec<ValuePath> = Vec::new();
     // Depth-first, fall-through edge first, so paths come back in program
@@ -1653,10 +1654,37 @@ fn enumerate_value_paths(
                 ctx, proto, proto_index, depth + 1, body_start, body_end,
                 &mut regs, &mut trial_locals, &mut scratch, in_loop,
             );
-            // A statement means a side effect (or a materialised temp) that a
-            // per-path expression cannot represent without duplicating it.
+            // A SIDE EFFECT AND A MATERIALISED TEMP ARE NOT THE SAME THING.
+            //
+            // This rejected on ANY statement. Measured 19 Aug 2026 on
+            // 71_PlaceInfo (57 lines): ONE statement in ONE arm block killed a
+            // whole three-arm value join -
+            //     local PrivateServerOwnerId = game.PrivateServerOwnerId
+            // - and the register the three arms all wrote (R7) lost its value,
+            // so the post-join read minted an unassigned `v7` and the output
+            // compared against nil.
+            //
+            // A side effect genuinely cannot be duplicated or reordered. A temp
+            // binding a SIDE-EFFECT-FREE expression is only a naming choice: it
+            // can be evaluated ahead of the branch without changing behaviour,
+            // which is what hoisting it does. `has_side_effects` is already the
+            // arbiter of exactly this question for the ternary phi below.
+            //
+            // Anything else still rejects, so a real side effect is still
+            // refused - this narrows the guard, it does not remove it.
             if !scratch.is_empty() {
-                return None;
+                let all_pure_temps = scratch.iter().all(|st| match st {
+                    Stat::Local { names, values } => {
+                        names.len() == 1
+                            && values.len() == 1
+                            && !has_side_effects(&values[0])
+                    }
+                    _ => false,
+                });
+                if !all_pure_temps {
+                    return None;
+                }
+                hoist.extend(scratch.drain(..));
             }
         }
 
@@ -1790,11 +1818,21 @@ fn lift_value_join(
     let members: std::collections::BTreeSet<usize> =
         arms.iter().copied().chain(std::iter::once(entry)).collect();
     let base_regs = regs.clone();
+    // Pure temps materialised inside an arm are hoisted here and emitted ahead
+    // of the region; see the guard in enumerate_value_paths for why that is
+    // sound. Dropped on the fallback path, where the linear lift re-emits them.
+    let mut hoisted_temps: Vec<Stat> = Vec::new();
     let paths = enumerate_value_paths(
         ctx, proto, proto_index, cfg, depth, entry, &members, join, &base_regs, locals, in_loop,
+        &mut hoisted_temps,
     );
     let paths = match paths {
-        Some(p) if p.len() >= 2 => p,
+        Some(p) if p.len() >= 2 => {
+            for st in hoisted_temps.drain(..) {
+                stmts.push(st);
+            }
+            p
+        }
         // Not a pure value selection after all. Fall back to the linear lift of
         // the whole span, which is exactly what a `Region::Linear` would do.
         _ => {

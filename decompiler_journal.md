@@ -626,3 +626,37 @@ count rises; revert and journal the numbers if it falls.
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)   A1 OPEN (deferred, would relabel)
 B  PARKED (1)   C OPEN   D **CLOSED**
 E  cause FOUND, fix specified, implementation is rotation 10's work
+
+## 2026-08-19 — ROTATION 10. E **CLOSED**. First real decompiler fix.
+
+Implemented the rotation-9 specification: `enumerate_value_paths` now accepts a
+path whose scratch statements are all single-name `Stat::Local` bindings with a
+side-effect-free init, hoisting them (new `hoist` out-param) into the caller's
+statement list ahead of the region. Anything else still rejects.
+
+MEASURED, clean out-dir, timestamp-verified binary:
+    before  1098/1142 clean (96.1%), 96 defects
+    after   1101/1142 clean (96.4%), 93 defects
++3 files, -3 defects. No regression.
+
+REPRODUCER REPAIRED - 71_PlaceInfo now emits
+    tbl.IsPublicServer = Value2 == "StandardServer"
+where it previously emitted `v7 == "StandardServer"` with `v7` never assigned.
+The three-arm value join is reconstructed and the register keeps its value.
+
+MUTATION-PROVEN: forcing the guard back to reject-always (`if true`) returns
+exactly 1098/96; restoring gives 1101/93.
+Rust suite: 0 failures apart from the two pre-existing
+opmap_dupclosure_detection tests, identical at backup/pre-batch.
+
+### Why this generalises beyond one file
+The guard conflated "a side effect" with "a materialised temp". Any value join
+containing a pure field read in an arm was being discarded wholesale. That is
+why three files moved rather than one, and it is the same
+unknown-falls-through-to-the-blunt-answer shape as mechanism D: "any statement"
+was the conservative reading of "a statement I cannot safely move".
+
+### State after rotation 10
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)
+A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
+B  PARKED (1)   C OPEN   D **CLOSED**   E **CLOSED**
