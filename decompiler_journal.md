@@ -5044,3 +5044,88 @@ CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
 NEXT TARGET: **A2/C-residual** - 9 direct, 24 unblocked, question stated above.
 BLOCKED: B-branches (on A2/C, measured); UPVAL_NAME (on the format - Roblox
   bytecode carries no CAPTURE data, so the identity is absent from the input).
+
+
+## Rotation 82 - rotation 81 was wrong about the 9, and the real fault is located
+
+### Correction: these are not branch-join declarations
+Rotation 81 filed the 9 `declared_never_assigned` as "A2/C-residual, needs
+path-sensitive dataflow". That was wrong, and the file's own trace says so.
+Eight of the nine sit at LINE 8 - the chunk prologue, not a join - and
+`LUAU_MINT_TRACE` classifies every one as the READONLY branch of
+`free_var_decls` with these mint sites:
+
+    REG_EXPR_UNKNOWN + UNK_CALL_CLEAR      5   (533, 85, 22, 368, 53)
+    REG_EXPR_UNKNOWN + UNK_MERGE_COMPOUND  1   (79)
+    METHOD_RECV_REJECT                     1   (54)
+    TABLE_EXPR_REJECT                      1   (376)
+    UPVAL_NAME                             1   (873, already blocked on format)
+
+Five distinct mint sites, not one dataflow gap. `merge_regs` is not involved.
+
+### The write is in the bytecode; the BLOCK is in the wrong place
+`533_NPCs::AddEvent`, the `if v3 then` at emitted line 195:
+
+    174: GETTABLEKS  R3 R1."StartReqs"     <- the write is RIGHT THERE
+    176: JUMPIFNOT   R3 -> +16
+
+So nothing was dropped by a naming pass. The emitted block sits INSIDE the
+`error(...)` arm and BEFORE the pc-139 `SETTABLEKS R2."NPC"` block - out of
+bytecode order. `REGIONS proto=AddEvent blocks=37 regions=4` is the same fact
+from the other side.
+
+### The located fault
+`LUAU_IF_TRACE` on AddEvent:
+
+    IF cond_block=112 then=14 else=0 merge=Some(210) has_else=false
+
+The `if` is `JUMPIF R2 -> +9` at pc 129, so its target is pc 139, and the error
+block 130..138 FALLS THROUGH to 139. Both paths converge at 139: that is the
+immediate postdominator and the correct merge. The structurer instead returned
+210 - and pc 147 is `JUMP -> 62`, i.e. 147+1+62 = 210 exactly.
+
+**The merge is being taken as the target of the arm's terminating unconditional
+jump instead of the immediate postdominator.** Blocks 139..209 are therefore
+handed to `lift_branch_region` already inside the arm.
+
+### The experiment that proved it, by failing
+Widened the adopted arm trigger from "contains Return" to "contains a
+conditional branch" (`LUAU_ARM_COND`, left gated, inert - re-measured 1,104/39
+with the gate off):
+
+    clean 1,104 -> 1,103   defects 39 -> 40
+    fixed 286_LeaderboardsGui; broke 7_Shop and 919_pprint
+    533_NPCs - the file it was BUILT from - UNCHANGED
+
+The negative result is the useful half. No trigger inside `lift_branch_region`
+can fix 533, because by the time that function runs the join is already in the
+arm. That rules out the whole family of fixes attempted in rotations 78-81 and
+points at one function instead.
+
+### What this does to the ceiling
+`calls_not_emitted` (24) is dropped bodies; `UNK_CALL_CLEAR` (5) is a register
+cleared by a call that a later read reaches because the read was placed on the
+wrong side of a join. Both are consistent with one wrong merge point, which
+would make **~29 of the 39** one mechanism rather than three.
+
+Not yet proven - it is proven for 533 and consistent with the rest.
+
+### Attack that is blocked, with the reason
+The goal's "compile a sub-20-line reproducer yourself" route: `tools/luau/
+luau-compile.exe` emits **bytecode v11**. Opening the parser gate 3..=9 -> 3..=11
+gets past the version check and then fails in the proto reader ("unexpected end
+of bytecode reading u32 at offset 414") - v11 changed the proto encoding. This
+build exposes no bytecode-version fflag (`LuauBytecodeVersion` is registered but
+rejects an integer value). Gate change reverted. Synthetic reproducers need a
+Luau build old enough to emit v9, or v11 proto support in the parser.
+
+### State after rotation 82
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects. 949 tests pass; the 2
+  `opmap_dupclosure_detection` failures are pre-existing and unrelated.
+NEXT TARGET: the merge computation in `structure_control_flow` - make the merge
+  the immediate postdominator rather than the arm's jump target. Reproducer:
+  `533_NPCs` proto `AddEvent`, expect merge=139, currently 210.
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops.
+PARKED: UPVAL_NAME (format carries no CAPTURE data); synthetic reproducers
+  (need a v9-emitting Luau).

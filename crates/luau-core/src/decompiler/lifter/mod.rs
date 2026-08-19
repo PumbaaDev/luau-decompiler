@@ -1504,7 +1504,57 @@ fn lift_branch_region(
             }
             found
         });
-        if early_ret {
+        // WIDER TRIGGER, gated (rotation 82). `Return` is only one way an arm
+        // ends without falling through: `error(...)` never returns either, and
+        // an arm ending that way swallows the join the same way. The evidence
+        // is `533_NPCs::AddEvent` - 37 blocks collapsed to 4 regions, and the
+        // block at pc 174 (`GETTABLEKS R3 R1."StartReqs"`, the write the
+        // emitted `if v3 then` is missing) placed INSIDE the `error` arm and
+        // BEFORE pc 139, i.e. out of bytecode order.
+        //
+        // `error` cannot be recognised by opcode, so the proxy is the property
+        // that actually defeats the flat lifter: a non-last arm range holding
+        // its own conditional branch.
+        //
+        // MEASURED and NEGATIVE (rotation 82), left gated rather than deleted
+        // because the measurement is the point:
+        //
+        //     clean 1,104 -> 1,103   defects 39 -> 40
+        //     fixed  : 286_LeaderboardsGui (calls_not_emitted)
+        //     broke  : 7_Shop (branch_local_discarded),
+        //              919_pprint (calls_not_emitted)
+        //     533_NPCs, the file the trigger was BUILT from: unchanged.
+        //
+        // That last line is the finding. The trigger never fires there, because
+        // the swallowing does not happen in this function at all - it happens in
+        // `structure_control_flow`, which hands `lift_branch_region` an arm that
+        // ALREADY contains the join. See the journal, rotation 82: for
+        // `AddEvent` the trace reads `cond_block=112 then=14 merge=Some(210)`,
+        // and 210 is the target of the arm's terminating `JUMP` at pc 147, not
+        // the immediate postdominator at pc 139 where both paths converge.
+        // No re-triggering here can reach that.
+        let cond_arm = std::env::var("LUAU_ARM_COND").is_ok()
+            && ranges[..last].iter().any(|&(s, e)| {
+                let mut i = s;
+                let mut found = false;
+                while i < e && i < proto.code.len() {
+                    let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                    if matches!(
+                        op,
+                        LuauOpcode::JumpIf
+                            | LuauOpcode::JumpIfNot
+                            | LuauOpcode::JumpIfEq
+                            | LuauOpcode::JumpIfNotEq
+                            | LuauOpcode::JumpIfNotLE
+                            | LuauOpcode::JumpIfNotLT
+                    ) {
+                        found = true;
+                    }
+                    i += if op.has_aux() { 2 } else { 1 };
+                }
+                found
+            });
+        if early_ret || cond_arm {
             let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
             let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
             lift_structured_run(
