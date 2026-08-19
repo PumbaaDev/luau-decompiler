@@ -44,6 +44,12 @@ impl ControlFlowGraph {
         }
 
         // Step 1: Find block leaders
+        //
+        // LUAU_LEADER_TRACE reports every leader with the pc and opcode that
+        // created it. A boundary between two consecutive MOVEs in straight-line
+        // code is not something the emitted Lua can explain, so this is the
+        // only place that can say why one exists.
+        let leader_trace = std::env::var("LUAU_LEADER_TRACE").is_ok();
         let mut leaders = BTreeSet::new();
         leaders.insert(0);
 
@@ -142,6 +148,15 @@ impl ControlFlowGraph {
             pc = next_pc;
         }
 
+        if leader_trace {
+            let ls: Vec<usize> = leaders.iter().copied().collect();
+            eprintln!(
+                "LEADERS proto={}@{} {:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                ls
+            );
+        }
         // Step 2: Create blocks
         let leader_vec: Vec<usize> = leaders.iter().copied().collect();
         let mut blocks = BTreeMap::new();

@@ -3188,3 +3188,65 @@ by argument, and three of the four corrections came from admitting a
 correlation had been mistaken for a measurement. The tooling built along the way
 (proto-qualified register watch, read side, pc window) is what makes the current
 localisation exact rather than plausible.
+
+
+## Rotation 51 - A2/C-residual DIAGNOSED: a phi that is confined to empty arms
+
+### The structural question, answered
+Added `LUAU_LEADER_TRACE` to `ControlFlowGraph::build`, reporting every block
+leader with its proto. For `setData@1163`:
+
+    LEADERS ... 145, **152**, 159, ...
+
+pc=152 IS a block leader. pc=151 is a `Move`, not a branch, so 152 can only be a
+leader because something JUMPS to it. It is a merge point, and rotation 50's
+inference from the register states was right.
+
+### The complete mechanism, at last
+    PC 150 Call a=16 b=3 c=2    -- result bound to Name("GetStat8") in R16
+    PC 151 Move a=13 b=16       -- R13 = R16      (fall-through path only)
+    -- pc 152 is a JOIN: another edge arrives here without ever executing 151
+    PC 152 Move a=8  b=13       -- reads R13 -> merge_regs already reset it
+
+Source shape: `if cond then x = f(...) end` and then a use of `x`. One arm
+binds the register; the other does not; `merge_regs` finds the two sides
+unequal with neither a `Name` and resets to `Unknown`; the later read mints
+`v13`.
+
+### Why the existing machinery misses it
+The lifter ALREADY reconstructs a phi for exactly this - "Materialize a phi for
+registers that the two arms disagree on" - but its own comment says it is
+"deliberately confined to arms that emit no statements: with no statements there
+is no side effect and no ordering consequence". Here the arm emits a CALL, so
+the phi is skipped and the blunt reset wins.
+
+Rotation 35 solved the same join for TABLES by materialising before the arms,
+because a table literal is a pure allocation that can be moved. A call result
+cannot be moved. So the fix is not materialisation - it is the B0.57 shape:
+declare the binding BEFORE the branch and turn the arm's write into an
+assignment, which is exactly what `hoist_escaping_locals` does for
+`Stat::Local` nodes whose initialiser is safe to hoist.
+
+### UNBLOCKING QUESTION, now a design choice rather than a mystery
+Can the phi reconstruction be extended from "arms with no statements" to "arms
+whose disagreement is a single register bound by a statement that STAYS IN THE
+ARM"? That needs `local X` emitted before the `if` and the arm's
+`local X = f(...)` rewritten to `X = f(...)` - no statement moves, no side
+effect is reordered, and the join then has a `Name` on both sides so
+`merge_regs` keeps it.
+
+The risk to measure is scope: `hoist_escaping_locals` already does this for safe
+initialisers and `docs/MERGE_REGS_SCOPE_RISK.md` records where that goes wrong.
+This extension is the unsafe-initialiser case it currently declines.
+
+### State after rotation 51
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral rotation; 945 tests
+  pass.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C (if/else, tables), argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values; loop-join materialisation.
+  PARKED: A2/C-residual - FULLY DIAGNOSED (single-arm binding lost at a join
+    because phi reconstruction requires statement-free arms), with a concrete
+    fix shape and the named risk; B (1 file); UPVAL_NAME (format-blocked).
+TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH,
+  LUAU_PC_WINDOW, LUAU_LEADER_TRACE - all env-gated, all proto-qualified.
