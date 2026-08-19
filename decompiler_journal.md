@@ -2131,3 +2131,83 @@ MECHANISMS: A, D, E, F, G, H, I, J CLOSED. MINUS closed as a measured dead end.
   A2 PARKED (2). B PARKED (1). C PARKED (2). K part-adjudicated.
 NEXT: fresh sweep against run_r32 (which has rotations 28 and 31), run TWICE,
   and adjudicate the intersection.
+
+
+## Rotation 33 - mechanism C localised to one predicate
+
+### The remaining 14 declared_never_assigned are all one thing
+Every one sits at LINE 8 - the `free_var_decls` chunk-top declaration - so they
+are all the A2/C family, plus one new name shape (`upval_2` in
+`873_Translation`).
+
+### The clearest reproducer yet: 651/654, sibling files
+`654_Quests_TaskTypes_Collect_Pollen`, `Fulfill`:
+
+    local Zone2 = self.Zone
+    if self.Zone then
+        Zone2 = self.Zone            -- and NO field write at all
+    end
+    local Zone3 = self.Color
+    if self.Color then
+        Zone3 = self.Color
+        v3.Color = Zone3             -- base never bound
+    end
+    local Color5 = self.Tag
+    if self.Tag then
+        Color5 = self.Tag
+        v3.Tag = Color5
+    end
+
+The source is a conditionally-built table:
+
+    local filter = {}
+    if self.Zone  then filter.Zone  = self.Zone  end
+    if self.Color then filter.Color = self.Color end
+    if self.Tag   then filter.Tag   = self.Tag   end
+
+`local filter = {}` is absent from the output entirely, and the FIRST field
+write is missing outright. `651_Collect_Goo` is the same file with one field.
+This is exactly mechanism C's question - "can the table register be materialised
+into one named local before the first branch that writes it?"
+
+### The seeder exists, is called, and declines
+`ensure_table_reg_declared` was written for precisely this and is called
+UNCONDITIONALLY at the top of the `SetTableKS` handler
+(`opcode_handlers.rs:1199`), which is what `v3.Color = Zone3` is. So the failure
+is inside its two gates:
+
+    needs_seed                  regs[reg] is Unknown | Bool | Number | String | Nil
+    is_undeclared_non_param     reg >= param_count && !declared.contains(reg)
+
+`LUAU_MINT_TRACE` on 654 shows `v3` tagged `REG_EXPR_UNKNOWN+UNK_MERGE_COMPOUND`
+and NO `TABLE_EXPR_REJECT`, so the register really is `Unknown` and gate 1
+passes. `Fulfill(self, arg2)` has 2 params and the register is 3, so the
+param half of gate 2 passes.
+
+That leaves ONE candidate: `declared` already contains the register, because
+something called `locals.pre_declare(reg)` without ever emitting a `local`.
+`pre_declare` inserts into `declared` and emits nothing
+(`naming.rs:120`), and there are call sites at `mod.rs:2679` and `mod.rs:2913`.
+A register marked declared but never declared makes every later seeder decline,
+which is the same UNKNOWN-falls-through-to-a-permissive-answer shape this repo
+keeps closing.
+
+### UNBLOCKING QUESTION for C, now one line wide
+Instrument `ensure_table_reg_declared` to log which gate rejected, run 654, and
+confirm it is `is_undeclared_non_param`. If so the fix is either to make
+`pre_declare` emit the declaration it promises, or to have the seeder treat
+"declared but never emitted" as needing a seed. That is a decidable question
+with a two-file reproducer (651 and 654) and a one-run test.
+
+NOT attempted this rotation on purpose: rotations 25, 27 and the first cut of 28
+each shipped a plausible fix that had to be reverted, and the cheap
+instrumentation above settles it before any code changes.
+
+### State after rotation 33
+SEMANTIC: 1,118/1,142 (97.9%), 31 defects (28 real).
+  A, D, E, F, G, H, I, J CLOSED. MINUS closed as a measured dead end.
+  **C PARKED (3) - but localised from "a mechanism" to "one of two gates in one
+  function", with the instrumentation named.** A2 and C are the same family and
+  should be resumed together. A2 PARKED (2). B PARKED (1).
+SWEEP: two-run intersection on run_r27 gives 147 confirmed broken, 756 confirmed
+  clean. Run 1 of 2 against run_r32 in flight.
