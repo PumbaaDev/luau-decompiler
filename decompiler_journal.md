@@ -2702,3 +2702,61 @@ SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real).
 SWEEP: run 1 of 2 against run_r37 in flight - NOTE it predates this rotation's
   21-file repair, so a third run against the final build will be needed for the
   intersection to describe the shipped state.
+
+
+## Rotation 43 - K adjudicated in full: 8 of 17 were the checker's fault
+
+### The remaining candidates, read by hand
+All three unresolved cases turned out to be one shape:
+
+    21_ClickToMove   local v34 = arg1 + 0.1
+                     if arg2 < arg1 + 0.1 then          -- recomputed inline
+    381_Eggs         local v7 = arg1 + arg2
+                     for i = arg1, arg1 + arg2 - 1 do
+    919_pprint       local found8 = found7 + len4
+                     if make_option2.level_width < found7 + len4 then
+
+The emitter materialises a dead copy and the use site recomputes the expression.
+NOTHING IS LOST. Together with `885_Easing` x3 from rotation 30 that is SIX
+hand-confirmed false positives, which is the evidence rotation 30 lacked when it
+refused to add this rule on a bare substring test.
+
+### Condition 4 added: not simply recomputed
+`check_branch_local_discarded` claims "a value the bytecode carried was
+dropped". If the identical expression is evaluated again elsewhere, that premise
+is false. Deliberately EXACT-text after whitespace normalisation: a looser match
+would suppress real losses, and a dropped value that happens to share its
+spelling with a live computation is a case worth MISSING rather than one worth
+INVENTING.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,122 -> **1,126 clean (98.6%)**, 27 -> **19 defects**
+
+MUTATION TEST, and it is exact:
+  * decompiler output changed on **0 files** - this is a checker-only change,
+    verified by diffing the trees rather than assumed;
+  * all six confirmed false positives disappeared;
+  * `859_StickerPlacer`'s `Size` and `Size2` SURVIVE - their expression
+    (`arg3 + arg2.Size.X / 2`) appears nowhere else, so the computation really
+    is discarded. That is the case condition 4 must not swallow, and it did not.
+  * two unit tests pin both directions; 945 passing.
+
+### K is now fully adjudicated
+    17 computed_value_discarded
+      8 FALSE POSITIVE  - recomputed elsewhere, checker corrected, rule recorded
+      9 REAL            - 859 x2, 297, 445, 646, 958, 263, 317, 21(new11)
+
+No finding was silenced: the eight were each shown to have their value present
+elsewhere in the same file before the rule was written.
+
+### State after rotation 43
+SEMANTIC: **1,126/1,142 (98.6%), 19 defects** - and unlike earlier figures this
+  one has no known false positives left in it. 19 real.
+    9 computed_value_discarded (real)
+    10 declared_never_assigned (5 UNK_CALL_CLEAR, 2 METHOD_RECV_REJECT,
+       1 UNK_MERGE_COMPOUND, 1 UPVAL_NAME format-blocked, 1 other)
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap, **K**.
+  MEASURED DEAD ENDS: MINUS-as-operator, MULTRET-clear-skip,
+  preserve-declared-locals.
+  PARKED: B (1, one file). UPVAL_NAME format-blocked.
+SWEEP: run against run_r37 in flight.

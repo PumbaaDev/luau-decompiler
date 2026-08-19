@@ -280,6 +280,33 @@ fn check_branch_local_discarded(code: &str, out: &mut Vec<Finding>) {
         if !occ.get(base).is_some_and(|v| v.iter().any(|&j| j > i)) {
             continue;
         }
+        // (4) the value is not simply RECOMPUTED somewhere else.
+        //
+        // The finding claims "a value the bytecode carried was dropped". If the
+        // identical expression is evaluated again elsewhere in the file, that
+        // premise is false - the value exists, the emitter merely materialised
+        // a dead copy of it:
+        //
+        //     local v34 = arg1 + 0.1
+        //     if arg2 < arg1 + 0.1 then        -- recomputed inline
+        //
+        // Six such findings were confirmed by hand before this rule was added
+        // (885_Easing x3 with `arg4 / 2` already in the condition above it,
+        // 21_ClickToMove, 381_Eggs, 919_pprint). It is deliberately EXACT-text:
+        // a looser match would suppress real losses, and a dropped value that
+        // happens to share its spelling with a live computation is a case worth
+        // missing rather than a case worth inventing.
+        let rhs_norm: String = rhs.split_whitespace().collect::<Vec<_>>().join(" ");
+        let recomputed = !rhs_norm.is_empty()
+            && lines.iter().enumerate().any(|(j, other)| {
+                j != i && {
+                    let o: String = other.split_whitespace().collect::<Vec<_>>().join(" ");
+                    !o.trim_start().starts_with("--") && o.contains(&rhs_norm)
+                }
+            });
+        if recomputed {
+            continue;
+        }
         reported += 1;
         if reported > 6 {
             continue;
@@ -983,6 +1010,31 @@ print(other)
         assert!(!fires(src), "a base that is never read afterwards proves nothing");
     }
 
+
+    #[test]
+    fn ignores_a_value_that_is_recomputed_inline() {
+        // Condition 4, from 21_ClickToMove: the local is dead, but the same
+        // expression is evaluated again at the use site, so nothing was lost.
+        let src = "local v34 = arg1 + 0.1
+if arg2 < arg1 + 0.1 then
+    x = 1
+end
+print(arg1)
+";
+        assert!(!fires(src), "a recomputed value has not been dropped");
+    }
+
+    #[test]
+    fn still_reports_a_value_computed_only_once() {
+        // 859_StickerPlacer: the expression appears nowhere else, so the
+        // computation really is discarded. This is the case condition 4 must
+        // NOT swallow.
+        let src = "local Size = arg3 + arg2.Size.X / 2
+local id = f(arg2)
+if id then g(arg3) end
+";
+        assert!(fires(src), "a value computed once and never read is still a defect");
+    }
     #[test]
     fn a_word_inside_a_string_is_not_an_identifier() {
         // blank_noncode must hide string contents, or `Lvl3` appearing in a
