@@ -1467,3 +1467,91 @@ SWEEP: grader verdict rule **CLOSED** (false-positive class, rule enforced and
   recorded). name_collision adjudicated as cosmetic BY THE PROMPT'S OWN
   DEFINITION - 388 findings reclassified, not silenced. 147 files remain as the
   real target, unadjudicated.
+
+
+## Rotation 23 - two corrections to my own instruments, and the family they were hiding
+
+### CORRECTION 1: my undefined_register census had 8 false positives
+Wrote an independent mechanical pass for "bare vN read but never assigned" over
+run_r18: 26 names in 23 files, against the checker's 16 in 15. The 8 extra files
+(1024, 1100, 348, 372, 381, 490, 83, 879) all turned out to be lines like
+
+    local v2
+
+appearing EXACTLY ONCE in the whole file - declared, never assigned, never read.
+My pass counted the declaration itself as a read. The checker skips `local`
+lines without `=` and was right; I was wrong. The checker's recall for this
+class is confirmed, not suspect.
+
+Residue worth noting: a `local vN` with zero uses anywhere is still emitter
+noise, present in 8 files. Harmless to run, but the sweep model reads it as
+`undefined_register`, so it manufactures sweep findings.
+
+### CORRECTION 2: dead_store is NOT cosmetic, and I downgraded 18 files wrongly
+Rotation 22 put `dead_store` in COSMETIC_KINDS alongside `name_collision`. That
+was an overreach. `734_StatModifiers_BaseConversionRate`:
+
+    local Op3 = Op .. " Convert Amount"
+    if arg2 then
+        if arg2.Color then
+            local Op4 = ((Op3 .. " (") .. arg2.Color) .. " Bees)"
+        end
+    end
+    return Op3                    -- returns the SHORT string
+
+The original reassigned `Op3`. The dead local IS the visible symptom of a lost
+reassignment and the function returns the wrong value. Removed from the set.
+Measured effect of the correction: broken 147 -> 165, suspect 178 -> 160.
+Only `name_collision` remains cosmetic, and that is the prompt's own wording.
+
+### CORRECTION 3: my first count of the family was over-broad by 7x
+First heuristic - "dead local whose RHS mentions a later-used name" - gave 1,161
+in 367 files. It is junk: `local Players = game:GetService("Players")` matches
+because `game` is read later, and that is an ordinary unused local. Tightening
+to the actual signature - the RHS must EXTEND a base that is still live after
+the line (`^base <op>`) - gives **162 in 89 files**. The 1,161 was never
+reported as a finding and must not be.
+
+### THE FAMILY, verified by hand
+`213_Collectibles_Tornado`:
+
+    local Lvl3 = Lvl2 + GetStacksBySource2 / 3.2
+    if 0 < GetStacksBySource then
+        local Lvl4 = Lvl3 + 2        -- computed, DISCARDED
+    end
+    local Lvl5 = Lvl3 * Multiplier   -- uses Lvl3, never the +2
+
+The `+2` is silently lost. This is CLAUDE.md's 26b3b9f shape - a value assigned
+in a branch arm to a fresh `local`, discarded at the merge - and the sweep's own
+kind enum already has a name reserved for it: `branch_local_discarded`.
+
+### WHY THE TWO MEASURES DISAGREE - the real answer
+The semantic checker has NO CHECK for this shape. Its checks are
+declared_never_assigned, undefined_locals, body_recovered,
+discarded_table_writes, property_called_as_method, name_body_agreement. A value
+computed into a fresh local and dropped is invisible to every one of them.
+
+That is why semantic reads 98.7% while the sweep reads far worse. The sweep is
+not noisier here - it is seeing something the checker is blind to. 98.7% is an
+overstatement of correctness, and the honest move is to make the checker see the
+family even though doing so LOWERS the number.
+
+### truncated_body adjudicated by bytecode size
+All 36 old-sweep `truncated_body` files are >= 300 bytes of bytecode, so none is
+the trivial-script false positive I expected (`153_Indicators` is 44 bytes and
+correctly emits `return {}`; `1003_ServerEffect` is 65 bytes and correctly emits
+an empty function). Bytecode size is an objective arbiter for this class and it
+says the 36 are REAL. Corpus-wide there are 37 `return {}` stubs and 194 empty
+function bodies; the trivial ones among those are correct output.
+
+### State after rotation 23
+SEMANTIC: A, D, E, F, G, H CLOSED. A2 PARKED (2). B PARKED (1). C PARKED (2).
+  16 defects by the current checks - but the checker is BLIND to
+  branch_local_discarded, so this number overstates correctness.
+SWEEP: verdict rule CLOSED with a correction (dead_store restored to
+  correctness). truncated_body ADJUDICATED REAL (36 files, bytecode-size
+  arbiter). undefined_register census validated the checker.
+NEW MECHANISM **I: branch_local_discarded** - 162 sites in 89 files, verified by
+  hand on 213_Tornado and 734_BaseConversionRate. Next action: add the semantic
+  check FIRST so the family is measurable, then fix the lifter. Expect the
+  semantic clean count to FALL when the check lands; that is the check working.

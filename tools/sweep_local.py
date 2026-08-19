@@ -191,7 +191,21 @@ def audit(path: Path, model: str, timeout: int) -> dict:
 # This DOWNGRADES ONLY, and only when every defect is cosmetic. It never
 # silences a finding: the defects stay in the record with their lines intact,
 # and a single correctness kind anywhere in the file keeps "broken".
-COSMETIC_KINDS = {"name_collision", "dead_store"}
+#
+# dead_store WAS in this set and has been REMOVED. It looks like redundancy and
+# is not. In 734_StatModifiers_BaseConversionRate the emitted body is
+#
+#     local Op3 = Op .. " Convert Amount"
+#     if arg2 and arg2.Color then
+#         local Op4 = ((Op3 .. " (") .. arg2.Color) .. " Bees)"   -- dropped
+#     end
+#     return Op3                                    -- returns the short string
+#
+# where the original reassigned `Op3`. The dead local IS the visible symptom of
+# a lost reassignment, and the function returns the wrong value. A dead store is
+# therefore a CORRECTNESS finding until proven otherwise, and 18 files were
+# wrongly downgraded while it sat here.
+COSMETIC_KINDS = {"name_collision"}
 
 
 def enforce_verdict(verdict: str, defects: list) -> str:
