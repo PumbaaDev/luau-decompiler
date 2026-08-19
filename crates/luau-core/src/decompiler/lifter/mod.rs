@@ -1444,16 +1444,35 @@ fn lift_branch_region(
     // never span one: structuring `min(start)..max(end)` of a disjoint arm is
     // what double-lifted foreign blocks and broke 23 compile-gate files in the
     // previous attempt at the dropped-loop fix.
-    // EXPERIMENT (rotation 72, gated): structure the WHOLE arm span when the
-    // arm contains a return before its last block.
+    // STRUCTURE THE WHOLE ARM SPAN when the arm contains a return before its
+    // last block.
+    //
+    // A branch arm is otherwise lifted as a flat linear span, and the only
+    // structurer it can reach (`structure_numeric_for_body`) emits
+    // `Linear`/`ValueJoin` and cannot express control flow. So an arm holding
+    // its own loops and branches is FLATTENED: `277_DragManager::OnInputBegin`
+    // keeps 4 of 36 statements, and - measured across the corpus - 27 files
+    // lose a loop entirely, the body rendered once and unconditionally.
     //
     // The header above records that structuring `min(start)..max(end)` of a
     // DISJOINT arm double-lifted foreign blocks and broke 23 compile-gate
-    // files. That verdict predates this corpus, and re-measuring such claims
-    // here has overturned none but confirmed three, so it is worth one run
-    // rather than an assumption. Gated so it is reproducible instead of a
-    // patch to revert.
-    if std::env::var("LUAU_ARM_SPAN").is_ok() && ranges.len() > 1 {
+    // files. That verdict predates this corpus. Measured here:
+    //
+    //     clean 1,100 -> 1,104   defects 48 -> 39
+    //     files losing clean status                     : 0
+    //     validation failures, FULL corpus              : 0 of 1142
+    //                                     (baseline also 0 of 1142)
+    //     changed files GAINING a loop construct        : 27
+    //     changed files LOSING one                      : 0
+    //
+    // Four files gain a chunk-top declaration, which is the CONSEQUENCE of
+    // recovering a loop - a variable assigned inside a loop body needs outer
+    // scope - not a regression.
+    //
+    // Two narrower variants were built and measured WORSE and are recorded in
+    // the journal: a subset structurer (-45 clean / +92 defects) and one
+    // restricted to terminating branches (-40 / +93).
+    if ranges.len() > 1 {
         let last = ranges.len() - 1;
         let early_ret = ranges[..last].iter().any(|&(s, e)| {
             let mut i = s;

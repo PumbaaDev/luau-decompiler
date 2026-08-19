@@ -4810,3 +4810,65 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
   files LOST clean status, not another implementation.
   Nine measured dead ends plus one gated experiment.
   PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 78 - MECHANISM B: a fix ADOPTED, after correcting my own conflation
+
+### The conflation that hid a working fix for six rotations
+Three different implementations were measured and I attributed one's result to
+another:
+
+    LUAU_ARM_SPAN (rotation 72)          1,104 clean /  39 defects  IMPROVES
+    structure_block_subset (74)          1,055       / 140          regresses
+    structure_terminating_branches (76)  1,060       / 141          regresses
+
+Rotation 77 compared flat against `LUAU_ARM_SPAN` - the IMPROVING one - and I
+discussed the result as though the -45 belonged to it. It never did. Rotation 72
+declined to adopt it for "missing the reproducer" and having "sampled rather
+than verified" effects, and then rotations 74-77 argued about a cost that
+belonged to two other pieces of code.
+
+### Verified properly this rotation
+    files losing clean status                : **0**
+    validation failures, FULL corpus         : **0 of 1142** (baseline: 0 of 1142)
+    changed files GAINING a loop construct   : **27**
+    changed files LOSING one                 : **0**
+
+The compile breakage the source comment warned about ("broke 23 compile-gate
+files") does not occur on this corpus at all - full corpus, not a sample.
+
+### What it actually does
+The flat arm lift FLATTENS LOOPS. `174_ClientStatCache` renders a `while` loop
+as a single `if` with the index hardcoded to `arg2[1]` and writes to the wrong
+target; `302_PromoButton` renders a `while true do` body once, unconditionally;
+`218_Collectors` loses `while v8 == v8 + 1 do`. Structuring the arm recovers
+them - 27 files.
+
+The 4 files that gain a chunk-top declaration are the CONSEQUENCE of that: a
+variable assigned inside a recovered loop body needs outer scope. Rotation 71
+saw this same signature and read it as a regression; with the loop counts beside
+it, it is the opposite.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,100 -> **1,104 clean (96.7%)**, 48 -> **39 defects**
+    949 tests pass; the two pre-existing `opmap_dupclosure_detection` failures
+    are unchanged.
+
+### What this cost, and what it says
+Six rotations were spent arguing about a regression that belonged to code I had
+already reverted. The specific error: recording three experiments under one
+name ("arm structuring") and then reasoning about "it". Distinct implementations
+need distinct names in the journal, or their measurements merge.
+
+Against that, the discipline held where it mattered - nine changes were reverted
+for damaging output the score could not see, and this one was adopted only after
+0/1142 validation, per-file attribution, and a loop-count check that turned the
+apparent regression into its explanation.
+
+### State after rotation 78
+SEMANTIC: **1,104/1,142 (96.7%), 39 defects.**
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
+  CLOSED. **B: PARTIALLY FIXED** - 27 files regain lost loops; the
+  `OnInputBegin` reproducer is NOT among them and still emits 4 of 36
+  statements, so the dropped-body half remains open with its diagnosis intact.
+  Nine measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
