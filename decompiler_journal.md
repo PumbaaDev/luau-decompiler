@@ -6515,3 +6515,53 @@ THE QUESTION: with the chain rule ON so the register IS pinned, trace
 ### State after rotation 104
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_GATE_TRACE`
 kept and verified inert.
+
+
+## Rotation 105 - answered: FirstDecl, because the pinned path is not wired to arithmetic
+
+### r104's question
+"With the register pinned, does `store_complex` emit a Reassign against the
+pinned name, or does `classify_write` still return FirstDecl?"
+
+### The answer, from the code paths rather than a guess
+`pinned_write_consumed` - the function that turns a write into
+`Stat::Assign { targets: [pinned name] }` - is called from exactly THREE places
+(`opcode_handlers.rs`): the `LoadNil` arm, the two `Move` arms, and the table
+arm. `store_complex` is not one of them.
+
+`store_complex` does consult the pin, twice, and both uses are about NOT
+renaming rather than about the assignment target:
+
+    is_pinned_loop_carried   forces materialisation instead of parking
+    do_peek                  suppresses the rebind peek while pinned
+
+So a pinned ARITHMETIC write - `Humanoid / getHeightScale5 or 0.75` in
+`958_Drakkarmon::onRunning` - is materialised (the pin works) and then named by
+`classify_write`, which sees a register whose debug name differs and returns
+**FirstDecl**. Out comes `local WalkSpeed = ...`, discarded at the merge.
+
+That is exactly the branch r104 predicted would implicate
+`pinned_write_consumed`, and it explains r103 cleanly: relaxing the admission
+predicate pinned 28 more files' registers and moved nothing, because for
+arithmetic writes the pin never reaches the naming decision.
+
+### THE FIX SHAPE
+Route `store_complex`'s materialising branch through `pinned_write_consumed`
+(or an equivalent check) before `classify_write` decides, so a pinned register
+with a non-generic binding is REASSIGNED rather than re-declared. The guards
+already in `pinned_write_consumed` carry over unchanged and are load-bearing:
+
+  * the binding must match `locals.current_name(reg)` - otherwise the tracker
+    has moved and the name is not ours to thread;
+  * generic `vN` bindings must be refused - the 551_Shop compile failure.
+
+RISK, stated in advance: this widens the pinned path from three opcode families
+to every complex write, which is the largest blast radius of any change
+attempted on this mechanism. Measure with the full census, not the score - the
+three highest-scoring changes this session all shipped invisible damage, and
+this one touches naming, where 476_BadgeMenu and 551_Shop are the recorded
+casualties.
+
+### State after rotation 105
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. No behaviour changed;
+this rotation is the answer to r104's question and the fix shape it implies.
