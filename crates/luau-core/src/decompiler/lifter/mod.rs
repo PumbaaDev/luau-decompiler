@@ -1431,6 +1431,38 @@ fn lift_branch_region(
     // never span one: structuring `min(start)..max(end)` of a disjoint arm is
     // what double-lifted foreign blocks and broke 23 compile-gate files in the
     // previous attempt at the dropped-loop fix.
+    // EXPERIMENT (rotation 72, gated): structure the WHOLE arm span when the
+    // arm contains a return before its last block.
+    //
+    // The header above records that structuring `min(start)..max(end)` of a
+    // DISJOINT arm double-lifted foreign blocks and broke 23 compile-gate
+    // files. That verdict predates this corpus, and re-measuring such claims
+    // here has overturned none but confirmed three, so it is worth one run
+    // rather than an assumption. Gated so it is reproducible instead of a
+    // patch to revert.
+    if std::env::var("LUAU_ARM_SPAN").is_ok() && ranges.len() > 1 {
+        let last = ranges.len() - 1;
+        let early_ret = ranges[..last].iter().any(|&(s, e)| {
+            let mut i = s;
+            let mut found = false;
+            while i < e && i < proto.code.len() {
+                let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                if matches!(op, LuauOpcode::Return) {
+                    found = true;
+                }
+                i += if op.has_aux() { 2 } else { 1 };
+            }
+            found
+        });
+        if early_ret {
+            let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+            let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, lo, hi, regs, locals, out, in_loop,
+            );
+            return;
+        }
+    }
     let runs = split_contiguous_runs(&ranges);
 
     for &(lo, hi) in &runs {

@@ -4488,3 +4488,54 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   spans. Reproducer unchanged.
   50 protos with unreachable blocks - separate, parked.
   Seven measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 72 - the whole-arm span, re-measured; second fix location, second miss
+
+### The experiment
+`lift_branch_region`'s header records that structuring `min(start)..max(end)` of
+a DISJOINT arm "double-lifted foreign blocks and broke 23 compile-gate files".
+That verdict predates this corpus, and re-measuring such claims here has been
+productive three times, so it got one run behind `LUAU_ARM_SPAN`.
+
+    default        1,100 clean / 48 defects
+    LUAU_ARM_SPAN  **1,104 clean / 39 defects**
+
+And the failure mode the comment warned about did not appear in a 60-file
+sample: **0 of 60 span-mode outputs fail `validate`.** That is a sample, not the
+corpus, and it is not a clearance - but it is enough that the old verdict should
+not be treated as settled here.
+
+### It STILL does not fix the reproducer
+`277_DragManager::OnInputBegin@184` is byte-identical AGAIN. Rotation 71 missed
+it because `split_contiguous_runs` fragments the arm; this attempt bypasses that
+entirely and still misses.
+
+So the +4 comes from other arms both times, and **two different fix locations
+have now failed to touch the diagnosed case.** That is evidence the diagnosis is
+incomplete: something about THIS arm prevents `lift_branch_region` from taking
+either structured path, and I do not yet know what. The guard requires
+`ranges.len() > 1`, which 23 blocks satisfy, so the likeliest explanation is
+that this arm reaches the lifter by a route I have not traced.
+
+### Kept GATED rather than reverted or adopted
+Default behaviour verified unchanged (1,100/48, 949 tests). The code stays
+behind `LUAU_ARM_SPAN` with its numbers in the comment, exactly as
+`LUAU_DECL_HOIST` does, so the next attempt reproduces it in one run.
+
+Adopting it on a +4 would repeat rotation 71's mistake: banking a score gain
+from a change that misses its stated target and whose broad effects are sampled
+rather than verified.
+
+### State after rotation 72
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects by default. 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: diagnosis INCOMPLETE.** Root cause of the truncation is established with
+  an attributable trace (rotation 69-70), but two fix locations have failed to
+  reach the reproducer. NEXT QUESTION: trace which `lift_branch_region`
+  invocation actually receives `OnInputBegin@184`'s else arm - print the
+  `sorted_blocks` it is called with - because both attempts assumed a call that
+  may not be happening.
+  50 protos with unreachable blocks - separate, parked.
+  Seven measured dead ends plus one gated experiment. PARKED: A2/C-residual,
+  UPVAL_NAME.
