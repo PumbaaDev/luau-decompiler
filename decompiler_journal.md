@@ -5532,3 +5532,52 @@ REMAINING: 24 calls_not_emitted, 7 declared_never_assigned, 6
 NEXT: the 24 `calls_not_emitted` are the dropped-body class and are the same
   family - check whether they are spans that stop early for either of these two
   reasons, using `LUAU_PC_WINDOW` against the proto's instruction count.
+
+
+## Rotation 89 - a producer-side instrument for the 24, and it needed correcting twice
+
+### Why build another instrument
+r87 and r88 were both found by printing what a PRODUCER emits. `calls_not_emitted`
+is the dropped-body class: a proto whose body went missing. If it is the same
+family, the walk should be visibly failing to reach part of the proto - so
+measure exactly that, per proto, instead of inferring it from the output.
+
+Added `crates/luau-core/src/decompiler/walk_cover.rs` (`LUAU_WALK_COVER`,
+gated): records every pc `lift_instruction_range` steps over and reports
+coverage per proto. Proto-qualified, for the r86 reason.
+
+### The instrument was wrong the first time, and said so
+First cut compared `walked` against `code.len()`. That is not the denominator:
+an instruction carrying an AUX word occupies two slots but is ONE step, so
+every AUX-heavy proto reads as half-walked. It flagged ten healthy protos in
+`277_DragManager`. Corrected to normalise against the number of steps a
+complete linear walk would take. The comment in the file records the wrong
+version so it is not rebuilt.
+
+Worth stating plainly: the instrument produced a confident, plausible,
+completely spurious list of ten "shortfalls" before the denominator was fixed.
+That is the same failure the corpus-wide model work kept hitting, from a
+different direction.
+
+### First real reading
+`277_DragManager`, normalised:
+
+    OnInputBegin@184           walked=106  steps=150  pct=70
+    DragBegin@414              walked=58   steps=73   pct=79
+    _validateInputIsGamepad    walked=9    steps=12   pct=75
+    Destroy@175                walked=10   steps=12   pct=83
+    endPulling@262             walked=32   steps=36   pct=88
+
+`OnInputBegin` never reaches 30% of its own instructions. The journal's older
+note on this file - "keeps 4 of 36 statements" - now has a mechanism-shaped
+number behind it rather than a statement count.
+
+### State after rotation 89
+SEMANTIC: 1,106/1,142 (96.8%), 37 defects - unchanged; this rotation is an
+instrument, verified inert (corpus re-measured 1,106/37, 949 tests pass).
+REMAINING: 24 calls_not_emitted, 7 declared_never_assigned, 6
+  branch_local_discarded.
+NEXT: for `OnInputBegin`, find where the walk stops - `LUAU_PC_WINDOW` over the
+  gap, then `LUAU_RUNREG_TRACE` for the region that carved the span. Both r87
+  and r88 were one of two things: a span carved past its arm's exit, or a walk
+  that quit at a jump leaving the span. Check those two first, by measurement.

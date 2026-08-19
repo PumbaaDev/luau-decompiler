@@ -1403,6 +1403,11 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // collapse_if_return_bool so bool-specific `return cond` fires first.
     post_passes::collapse_if_return_ternary(&mut stmts);
 
+    crate::decompiler::walk_cover::report(
+        proto.debug_name.as_deref().unwrap_or("?"),
+        proto.line_defined,
+        &proto.code,
+    );
     stmts
 }
 

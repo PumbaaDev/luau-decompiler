@@ -697,6 +697,11 @@ pub(super) fn lift_instruction_range(
         let b = insn_b(insn) as usize;
         let c = insn_c(insn) as usize;
         let d = insn_d(insn);
+        crate::decompiler::walk_cover::note(
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            pc,
+        );
         // LUAU_PC_WINDOW=lo-hi dumps the opcode stream for one pc range, so a
         // value loss localised by LUAU_REG_WATCH can be attributed to the
         // instruction (and therefore the region) that caused it.

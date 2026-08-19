@@ -2,6 +2,7 @@ pub mod emit;
 pub mod free_var_decls;
 pub mod call_recovery;
 pub mod mint_trace;
+pub mod walk_cover;
 pub mod lifter;
 pub mod semantic_check;
 
