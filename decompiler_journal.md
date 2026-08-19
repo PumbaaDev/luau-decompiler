@@ -998,3 +998,87 @@ A1 PARKED (1) - now unblocked by A's closure; the rotation-2 census should be
    re-run to see how many of the 27 READONLY names survive
 B  PARKED (1)   C PARKED (2)   D **CLOSED**   E **CLOSED**
 Remaining: 32 defects across the corpus.
+
+
+## Rotation 17 - the field-access misread, and a discarded classification
+
+### The enumeration that was blocked last rotation
+The probe failed twice on a RELATIVE `PROBE_DIR`: integration tests run with the
+crate directory as cwd, not the workspace root. Absolute path, and all 32
+remaining defects listed - every one of them `declared_never_assigned`.
+
+### F: `math.cos` is not a read of a local called `cos`  **CLOSED**
+The checker's read scanner split each line on every non-alphanumeric character,
+so `math.cos` produced the tokens `math` AND `cos`. A field or method name was
+counted as a read of a same-named local.
+
+PROVEN, not assumed: for each of the 32, occurrences were counted as bare vs
+field position. Five had ZERO bare occurrences anywhere in the file - `cos` in
+306/326/331, `insert` in 313, `sub` in 919. Those files never read those locals
+at all; the checker invented the defect out of a name collision.
+
+Fixed with `bare_idents()`, which skips a token immediately preceded by `.` or
+`:` - and only a SINGLE dot, so `a .. b` stays a real read of `b`.
+
+MUTATION TEST: 32 -> 27. The five named false positives vanished and all 27
+genuine findings survived. The fix discriminates; it does not suppress.
+
+### G: the ValueJoin fallback threw away the answer it asked for  **CLOSED**
+`enumerate_value_paths`' fallback lowering emits `local r; if c then r = v1 ...`.
+It called `locals.classify_write(i, &name)` and then DISCARDED the kind:
+
+    let (_, name) = locals.classify_write(i, &name);   // kind thrown away
+    stmts.push(Stat::Local { names: vec![name], values: vec![] });  // always
+
+`classify_write` documents the exact invariant it was being asked for - "Params
+always reassign - the register IS the parameter, never re-declared" - and returns
+`Reassign` for them. The caller pushed a declaration anyway, so a parameter got
+rebound to nil and every later read in that function evaluated to nil.
+
+Measured damage: `238_EggTypes` re-declared `local arg1` over parameter `arg1`
+(145 bare reads) and `879_BigNum` re-declared `local self` over the receiver
+(134 reads). Two files, 279 corrupted reads.
+
+The sibling site at the split-arm seed (mod.rs:6264) already guards this with
+`is_undeclared_non_param`. This one never got the guard.
+
+Fix: push the declaration only when `kind != WriteKind::Reassign`.
+
+MUTATION TEST at source level, not by count: in `879_BigNum` the fix removed
+`local self` and `local arg2` (already bound) and KEPT `local len5` and
+`local signal8` (genuinely new). A blunt fix would have deleted all four.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+1,118 -> **1,125 clean (97.9% -> 98.5%)**, 32 -> **25 defects**.
+The arithmetic is exact: 5 files whose only defect was the F false positive
+(306, 313, 326, 331, 919) + 2 files repaired by G (238, 879) = 7 newly clean.
+
+### HONESTY: which half of this is real
+F was the INSTRUMENT misreading correct output - 5 false findings, no
+correctness change. G was a REAL defect in emitted code - 2 files repaired,
+279 reads that evaluated to nil now read the parameter. Do not read 7 as 7 bugs.
+
+### Not mine
+`opmap_dupclosure_detection`'s two tests fail at HEAD as well - verified by
+stashing both edits and re-running. Pre-existing, opmap layer, unrelated. Logged
+as its own open item rather than folded into this rotation.
+
+### This is the D/E/A shape for the FOURTH time
+D: "any referenced name" meant "a name that is not my parent".
+E: "any statement" meant "a statement I cannot safely move".
+A: "no `=` in the text" meant "never assigned".
+F: "a token on the line" meant "a bare identifier, not a field name".
+G is the other recurring shape: an answer was computed correctly and then
+discarded at the call site.
+
+### State after rotation 17
+A **CLOSED**   D **CLOSED**   E **CLOSED**   F **CLOSED**   G **CLOSED**
+A1 PARKED (1) - and now the ONLY mechanism left on the semantic measure: all 25
+   remaining defects are `vN` names from `free_var_decls`' READONLY branch,
+   whose own comment concedes they "evaluate to nil". Three sub-shapes already
+   identified in the survivors: dropped multi-return destructuring
+   (`893_Matrix3D`: `self:GetComponents()` emitted as a bare statement while
+   `v1..v12` are returned), an unbound field-write base (`651_Collect_Goo`:
+   `v3.Color = Zone4`), and the plain hoisted-hole case.
+B  PARKED (1)   C PARKED (2)
+Remaining: 25 defects across the corpus. Sweep measure not yet attacked.

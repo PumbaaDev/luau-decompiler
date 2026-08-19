@@ -478,6 +478,41 @@ fn is_generated_name(tok: &str) -> bool {
 // every one of those reads. There is no program for which that is intentional
 // and also correct — if nil were wanted, the read would be of a literal nil.
 // Declared-and-never-read is dead code, not a defect, so it is not flagged.
+/// Identifiers appearing as BARE names, excluding field and method positions.
+///
+/// `math.cos`, `table.insert` and `s:sub()` name fields - they are not reads of
+/// locals called `cos`, `insert` or `sub`. Counting them as reads made five
+/// files report a value the bytecode dropped where in truth the local was
+/// simply never used, which is the checker inventing a defect out of a name
+/// collision.
+///
+/// Only a SINGLE dot binds: `a .. b` is concatenation, so `b` is a real read.
+fn bare_idents(line: &str) -> Vec<&str> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !(b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let is_field = start > 0
+            && match b[start - 1] {
+                b'.' => start < 2 || b[start - 2] != b'.',
+                b':' => start < 2 || b[start - 2] != b':',
+                _ => false,
+            };
+        if !is_field {
+            out.push(&line[start..i]);
+        }
+    }
+    out
+}
+
 fn check_declared_but_never_assigned(source: &str, out: &mut Vec<Finding>) {
     let lines: Vec<&str> = source.lines().collect();
 
@@ -544,10 +579,8 @@ fn check_declared_but_never_assigned(source: &str, out: &mut Vec<Finding>) {
             continue; // the bare declaration itself is not a read
         }
         let _ = i;
-        for tok in t.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-            if !tok.is_empty() {
-                read.insert(tok.to_string());
-            }
+        for tok in bare_idents(t) {
+            read.insert(tok.to_string());
         }
     }
 
@@ -564,8 +597,7 @@ fn check_declared_but_never_assigned(source: &str, out: &mut Vec<Finding>) {
             .iter()
             .filter(|l| {
                 !l.trim_start().starts_with("--")
-                    && l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .any(|tok| tok == name)
+                    && bare_idents(l).into_iter().any(|tok| tok == name)
             })
             .count()
             .saturating_sub(1); // minus the declaration

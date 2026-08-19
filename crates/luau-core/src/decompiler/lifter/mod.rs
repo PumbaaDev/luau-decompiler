@@ -1937,13 +1937,27 @@ fn lift_value_join(
     let mut names: Vec<String> = Vec::new();
     for &i in &divergent {
         let name = ctx.reg_name(proto, i as u8, join_start);
-        let (_, name) = locals.classify_write(i, &name);
+        let (kind, name) = locals.classify_write(i, &name);
         names.push(name.clone());
         regs[i] = RegVal::Expr(Expr::Name(name.clone()));
-        stmts.push(Stat::Local {
-            names: vec![name],
-            values: vec![],
-        });
+        // A register that is ALREADY bound - a parameter, or a local declared
+        // before the branch - must not be re-declared here. `classify_write`
+        // answers exactly that with `Reassign` ("the register IS the
+        // parameter, never re-declared"), and the arms below assign the name
+        // either way, so the declaration is pure damage: `local arg2` over
+        // parameter `arg2` rebinds it to nil and EVERY later read of that
+        // parameter in the function evaluates to nil.
+        //
+        // Measured on the 1,143-file corpus: this destroyed 238_EggTypes
+        // (`arg1`, 145 reads) and 879_BigNum (`self`, 134 reads). The sibling
+        // site at the split-arm seed already guards with
+        // `is_undeclared_non_param`; this one discarded the classification.
+        if kind != WriteKind::Reassign {
+            stmts.push(Stat::Local {
+                names: vec![name],
+                values: vec![],
+            });
+        }
     }
     let assigns = |p: &ValuePath| -> Vec<Stat> {
         divergent
