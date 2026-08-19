@@ -2520,3 +2520,57 @@ SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real after the 3 proven FPs).
   PARKED: B (1, one file, correctly sized). K part-adjudicated.
   NEW: UPVAL_NAME - blocked on a format limitation, not a lifter bug.
 SWEEP: run against run_r32 at ~904/1111.
+
+
+## Rotation 40 - the MULTRET clear re-measured on the right corpus, and kept
+
+### The experiment the code invited
+The CALL handler's comment records that skipping the register clear for MULTRET
+was measured on CoreGui (1699/303 -> 1700/305) and rejected. That is a DIFFERENT
+corpus, and `UNK_CALL_CLEAR` is the largest remaining tag here (5 of 10), so it
+was worth re-running on full1143.
+
+### MEASURED: identical score, 167 files changed, and the changes are harmful
+    1,122 clean (98.2%), 27 defects - EXACTLY unchanged
+    167 files differ
+
+Reading them is what decides it. `1022_Bronze_Star_Amulet_Generator_ServerEffect`:
+
+    before   {
+                 Generate(Value, value4, true)      -- multret expands in tail position
+             }
+    after    local Generate2 = Generate(Value, value4, true)
+             {
+                 Generate2,
+                 Value,
+                 value4,
+                 true                               -- the call's own ARGUMENTS
+             }
+
+The table now collects the call's ARGUMENT registers alongside its result. That
+is precisely the stale-value leak the clear exists to prevent: SETLIST scans
+upward and finds the argument registers still populated.
+
+`533_NPCs` shows the seductive half of the same effect - `value7(Make3)` becomes
+`value7(Make3, "Brown Bear")`, which READS like a correct registration call and
+is indistinguishable, from the emitted text alone, from a leak of the adjacent
+register. Given 1022 proves leakage is happening, the plausible-looking ones
+cannot be trusted either.
+
+REVERTED. The CoreGui verdict holds on this corpus, and now with a concrete
+example of the mechanism rather than a score comparison.
+
+### Why the score could not settle this
+The count was IDENTICAL while 167 files changed, one of them provably for the
+worse. A measure that cannot distinguish 167 changed files from zero is not
+adjudicating this question, which is the same lesson as rotation 38 (a real
+fix the measure could not see) arriving from the opposite direction.
+
+### State after rotation 40
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real).
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip (now on both
+  corpora, with a mechanism).
+  PARKED: B (1, one file). K part-adjudicated. UPVAL_NAME blocked on the
+  format's missing capture information.
+SWEEP: run against run_r32 nearly complete.
