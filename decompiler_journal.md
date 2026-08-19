@@ -2070,3 +2070,64 @@ SEMANTIC: **1,118/1,142 (97.9%), 31 defects** - and 3 of those are the proven
   A2 PARKED (2). B PARKED (1). C PARKED (2).
   K: 3 confirmed FP, 5 candidates, remainder folded into J and now fixed.
 SWEEP: still running against run_r27; it predates rotations 28 and 31.
+
+
+## Rotation 32 - the SWEEP measured against itself: 13% verdict instability
+
+### A controlled experiment fell out for free
+Every decompiler change between `run_r18` and `run_r27` was reverted (rotation
+25's stem rule, rotation 27's accumulate rule), so the two output trees are
+**byte-identical across all 1,111 files**. Two sweep runs, same input, same
+model, same prompt.
+
+    files byte-identical between the builds : 1111
+      same verdict in both runs             :  967   (87.0%)
+      DIFFERENT verdict on identical input  :  144   (13.0%)
+
+      broken  -> suspect  69
+      clean   -> suspect  32
+      clean   -> broken   15
+      broken  -> clean    13
+      suspect -> broken    9
+      suspect -> clean     5
+      error   -> broken    1
+
+### What this invalidates
+The r27 sweep read 774 clean against r18's 803 - on IDENTICAL FILES. That 29
+-file "regression" is noise, and so is any comparison of sweep totals between
+runs unless the delta clears a ~144-file jitter. Every cross-run sweep number in
+this journal before now should be read with that band attached.
+
+It also means a single-run sweep verdict is not evidence. `broken` appearing
+once is a hypothesis; `broken` appearing twice on the same bytes is a finding.
+
+### Adjudicating by intersection
+Two independent runs over identical input give a confirmed set for free:
+
+    broken in BOTH runs   : 147   <- confirmed
+    broken in EITHER run  : 254
+    clean in BOTH runs    : 756   <- confirmed
+
+**107 of 254 broken verdicts - 42% - did not reproduce.** The honest sweep
+target is the 147 confirmed, not the 254, and not either single run's number.
+
+This is the sweep analogue of rotation 17: the instrument was reporting more
+than it could support, and the correction is to require agreement rather than to
+silence anything. No finding was dropped - the 107 remain in the records, marked
+unconfirmed.
+
+### Corrected rule, recorded
+A sweep finding counts as REAL only when it reproduces across runs on the same
+bytes. `tools/sweep_local.py` should gain an N-run vote mode; until it does, run
+it twice and intersect. The deterministic semantic checker needs no such
+treatment - it is the reason both instruments are kept.
+
+### State after rotation 32
+SEMANTIC (deterministic): 1,118/1,142 (97.9%), 31 defects, 3 of them proven
+  checker false positives -> 28 real.
+SWEEP (stochastic, +/-13% per run): 147 files confirmed broken by two-run
+  agreement; 756 confirmed clean; the remainder unconfirmed either way.
+MECHANISMS: A, D, E, F, G, H, I, J CLOSED. MINUS closed as a measured dead end.
+  A2 PARKED (2). B PARKED (1). C PARKED (2). K part-adjudicated.
+NEXT: fresh sweep against run_r32 (which has rotations 28 and 31), run TWICE,
+  and adjudicate the intersection.
