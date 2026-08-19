@@ -3560,3 +3560,65 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
   questions.
 TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH,
   LUAU_PC_WINDOW, LUAU_LEADER_TRACE, LUAU_BODY_REPORT (insns/stmts/calls).
+
+
+## Rotation 57 - duplicate_call CANNOT be adjudicated with the instruments here
+
+### The test I built, and why I am not banking its answer
+"The same call emitted twice into different locals" looks directly decidable
+from the output, so: find identical call text bound to two different locals.
+
+    CONFIRMED duplicate_call files : 5
+      matched the pattern          : 2
+      did not                      : 3
+
+    267_BeequipReqsBox  L129 Position5 / L139 Position8
+                        = UDim2.new(0, result5, 0, result4)
+    277_DragManager     L295 Size8 / L344 Size11 / L361 Size12
+                        = UDim2.new(0, self.PinAbsSize.X, 0, self.PinAbsSize.Y)
+
+I am NOT recording those 2 as real. The occurrences are 10, 49 and 66 lines
+apart - in different branches and different functions - and a GUI script
+legitimately builds the same `UDim2` in several places. **The test detects
+source repetition and decompiler duplication identically**, so a match is not
+evidence for either.
+
+### The alternative test is blocked by a known bias
+The sound version is "the bytecode had ONE call and the output emitted TWO",
+which needs the call counter from rotation 56 - and that counter's emitted side
+is a regex that over-counts (`698_Use_Toy`: bytecode 3, emitted 9). Over-counting
+manufactures exactly the signal this test would look for, so it cannot
+distinguish a duplicated call from a miscounted one.
+
+### Recorded as UNADJUDICATED, with the blocker named
+This is the first kind this session I could not resolve, and saying so is the
+honest outcome. It is NOT "no defects found" and NOT "5 false positives" - it is
+5 findings the available instruments cannot decide.
+
+UNBLOCKING QUESTION: count emitted calls from the AST rather than the text. The
+lifter already returns `Vec<Stat>` per proto in `lift_proto_inner`, so walking
+those statements for `Expr::Call`/`Expr::MethodCall` gives an exact count with no
+regex bias, and the bytecode-vs-emitted comparison then decides both
+`duplicate_call` AND the 7 weak halves of `dropped_call` from rotation 56.
+That is a bounded change to `LUAU_BODY_REPORT`.
+
+### Final sweep ledger, all six kinds
+    truncated_body      42 of 42   FALSE POSITIVE   (per-proto instruction count)
+    undefined_register  68 of 72   FALSE POSITIVE   (bare-vN test, agrees with
+                                                     the semantic checker on 4)
+    name_collision      cosmetic by the grader's own prompt wording
+    dropped_call         7 of 14   REAL (conservative - survives an over-counting
+                                   emitted-side)
+    dead_store          12 files   REAL by rotation 23's hand evidence
+    duplicate_call       5 files   UNADJUDICATED, blocker named above
+
+    honest residual: ~19 demonstrated + 5 undecided, of 1,112 swept
+
+### State after rotation 57
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+SWEEP: ~19 files with a demonstrated defect, 5 undecided; every other finding
+  tested and shown false with its corrected rule recorded.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
+  CLOSED. Six measured dead ends. PARKED with questions: A2/C-residual
+  (path-sensitive dataflow), B (1 file), UPVAL_NAME (format-blocked),
+  duplicate_call (AST-based call counting).
