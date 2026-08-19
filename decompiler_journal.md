@@ -6226,3 +6226,54 @@ THE QUESTION: is the corrected loop detection worth anything on its OWN, with
 
 ### State after rotation 99
 SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Working tree clean.
+
+
+## Rotation 100 - loop detection CLOSED: real, repairable, and worth nothing
+
+### The isolation r99 asked for
+Does correcting `loop_headers` help anything on its own, independent of the r97
+guard-arm gate? Measured all four corners:
+
+    headers   gate   result
+    broken    off    1,123 / 22      (= r93)
+    corrected off    1,123 / 22      (r100b)
+    broken    on     1,123 / 19      (= r97, SHIPPING)
+    corrected on     1,118 / 25      (r99a and r99b, both repairs)
+
+And the decisive check: with the gate off, the corrected-header run is
+**BYTE-IDENTICAL to the broken-header run across all 1,142 files** - 0 files
+differ.
+
+### Verdict
+`find_loops` really does miss every generic for-loop (r98, reproduced, control
+case confirms). Two independent repairs really do fix it (r99). And fixing it
+changes **nothing** in the output except through the r97 gate, where it costs
+5 clean files and 6 defects.
+
+The theory that `find_value_join`'s dead nested-loop-header protection was
+silently costing us was reasonable and is FALSE: turning that protection back on
+for every generic-for proto in the corpus produced not one byte of difference.
+
+CLOSED - adjudicated REAL but not worth fixing, with every number recorded. This
+is not suppression: the mechanism is proven, both repairs are proven to work,
+and the corpus is what says they do not pay.
+
+### And the guard-arm residual, re-framed one last time
+`351_PassiveTile`'s 10 lost call tokens sit inside a transformation (Shape C)
+worth +17 clean files and +324 emitted calls corpus-wide. Six attempts to
+suppress the wraps that hurt it - four arm-shape predicates, one loop-membership
+test, one corrected-header gate - all measured WORSE than leaving it alone. The
+residual is the price of the fix, and the corpus has now said so six times.
+
+### State after rotation 100
+SEMANTIC: **1,123/1,142 (98.3%), 19 defects** - 7 declared_never_assigned,
+6 branch_local_discarded, 6 calls_not_emitted.
+949 tests pass. Working tree clean (only the untracked throwaway probe
+`crates/luau-core/tests/_tmp_rem.rs`, which must not be committed).
+
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops, inline-if-arm-overrun, guard-arms,
+  **generic-for loop detection (real, repaired, measured worthless)**.
+PARKED: UPVAL_NAME (format carries no CAPTURE data); synthetic reproducers
+  (bundled Luau emits v11, parser reads to v9); guard-arm residual (priced, six
+  suppression attempts all worse); the flaky opmap augmenter test (spun out).
