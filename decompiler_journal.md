@@ -3761,3 +3761,92 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K
   CLOSED. Six measured dead ends. PARKED: A2/C-residual (path-sensitive
   dataflow), B (1 file), UPVAL_NAME (format-blocked).
 Behaviour-neutral rotation; 945 tests pass.
+
+
+## Rotation 60 - mechanism B is 29 files, not one, and no checker sees it
+
+### 240_Events: a dropped block, not a dropped call
+`safeInvokeClient@17` loses one call, and the emitted loop shows why:
+
+    local now = os.clock()
+    local now2                          -- declared, never used
+    while true do
+        if 10 >= os.clock() - now then
+            continue                    -- under 10s -> SKIP the wait: busy-spin
+        end
+        task.wait()
+    end
+    return nil                          -- unreachable
+
+An infinite busy-spin with an unreachable return. The source had a completion
+check - `if v3 then return v2 end`, using the flags the spawned closure sets -
+and `now2` is the result local it would have written. A whole conditional block
+was dropped and the missing call was inside it.
+
+### 267 and 277: whole bodies, not scattered calls
+    267_BeequipReqsBox  CreateTypesRow@111   14 bytecode calls ->  1 emitted
+    277_DragManager     OnInputBegin@184     15               ->  0
+
+`OnInputBegin` emits its early-return guard and NOTHING ELSE:
+
+    function tbl:OnInputBegin(arg2)
+        local Size2 = {}
+        if not self.Pulling then
+            ...
+            return
+        end
+    end
+
+Everything after the guard's `return` is gone. That is mechanism B - "RETURN
+abandoning later blocks" - which rotation 39 sized as ONE FILE on the strength
+of `53_PathDisplay` being the only missing-ELSE case. Wrong sub-shape, wrong
+size.
+
+### Sized properly, corpus-wide
+Using the corrected call counter across all 1,143 files:
+
+    protos emitting ZERO calls where bytecode has >=3 :  **8**
+      99_BeequipTypes    _CheckReqs@5246          20 calls -> 0
+      277_DragManager    OnInputBegin@184         15 -> 0
+      256_BadgeMenu      privateInstanceUpdate@366 12 -> 0
+      430/453/469        GrowStar@...              5 -> 0  (three sibling files)
+      438_LocalFlames    DestroyFlame@525          3 -> 0
+      238_EggTypes       OnGive@3476               3 -> 0
+
+    protos emitting under HALF their calls (bc>=4)    : **27**
+      314_RoboBearGui    InitInfoBox@1411         20 -> 3
+      267_BeequipReqsBox CreateTypesRow@111       14 -> 1
+      25_RootCamera      ApplyVRTransform@554      9 -> 2
+
+    **files affected: 29 of 1,143**
+
+### The sixth blind spot, and the biggest
+The semantic checker reports NONE of these. It sits at 19 defects and not one of
+those 29 files is among them, because a dropped body leaves no undefined name,
+no bad call and no discarded value - nothing any existing check looks for. The
+sweep only caught 2 of the 29, and misfiled one of them as `duplicate_call`.
+
+Blind spots found this session: discarded branch values, value collapse,
+argument counts, the branch check's naming, object-clobbering, and now DROPPED
+FUNCTION BODIES - which is the largest of them by damage per file. A function
+that silently does nothing is worse output than one with an undeclared name in
+it, and it scores clean on both instruments.
+
+### The instrument that found it is the contribution
+`bc_calls` vs `ast_calls` per proto needs no ground truth, no model and no
+judgement: the bytecode says how many calls a function makes, the AST says how
+many were emitted, and a function that makes twenty calls and emits none is
+broken by inspection. That check is worth having permanently, and it is the
+natural next semantic check - it would have found this class without the sweep,
+the two-run vote, or six rotations of adjudication.
+
+### State after rotation 60
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects by the CURRENT checks - which are now
+  known to miss a 29-file class. The honest reading is 1,126 minus up to 29.
+SWEEP: ~19 demonstrated of 1,112, all six kinds adjudicated.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B RE-OPENED and RESIZED: 29 files, 8 total body drops, reproducer
+  `277_DragManager::OnInputBegin@184` (15 calls -> 0) and three sibling
+  `GrowStar` files that should decompile identically.**
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+Behaviour-neutral rotation; 945 tests pass.
