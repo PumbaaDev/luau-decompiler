@@ -4303,3 +4303,71 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_DCE_TRACE (per-phase statement and call counts) - needs proto
   identity before its output can be attributed.
+
+
+## Rotation 69 - MECHANISM B: root cause established, with an attributable trace
+
+### First, why rotation 68 could not attribute anything
+`DCE_PROTO` was stamped at the top of `lift_proto_inner_impl`, but NESTED
+CLOSURES are lifted during the region loop and each overwrites it. By the time
+the outer proto reaches `eliminate_dead_code`, the identity names the last
+nested proto. Filtering for `OnInputBegin@184` returned NOTHING - which is
+exactly the symptom, and is why rotation 68's `stmts=2 calls=14` record could
+not honestly be tied to this function.
+
+Fixed by re-stamping immediately before the post-pass sequence. Same class of
+error as rotation 47 (pc windows read from the wrong proto) and rotation 49
+(pc numbering restarts per proto): **a trace without identity is a
+correlation.**
+
+### The attributable trace
+    depth=2 enter                 stmts=36 calls=14
+    depth=2 after_phase1_recurse  stmts=36 calls=14
+    depth=2 after_phase2_truncate stmts=4  calls=0
+    depth=2 after_phase3_remove   stmts=3  calls=0
+
+    DCETRUNC proto=OnInputBegin@184 at_index=3
+             terminator=Return(0 values) dropping=32 stmts
+
+Phase 2 truncates after the first top-level terminator. In the else body a
+**bare `return` sits at index 3 of 36**, so 32 statements carrying all 14 calls
+are discarded.
+
+### `eliminate_dead_code` IS CORRECT
+Everything after an unconditional `return` genuinely is unreachable. `is_terminator`
+is `Return | Break | Continue`; `exits_on_all_paths` correctly returns false for an
+empty body; `is_empty_if` correctly requires every branch empty; Phase 4 already
+inverts an empty-then/populated-else. Four separate suspicions inside this pass,
+all checked, all innocent.
+
+**The fault is upstream: a trailing `return` placed in the MIDDLE of a live
+body.** That return is visible in the emitted output - it is the one inside the
+guard that made the function read as a plausible early-return wrapper.
+
+This ties back to rotation 64: the `if` has `merge=None`, so the structurer put
+every remaining block - INCLUDING the function's trailing RETURN block - into
+the else arm, and `else_sorted.sort_unstable()` ordered that return into
+position 3 rather than last.
+
+### A number I am NOT reporting, again
+107 truncations fire corpus-wide. Truncating after a GENUINE return is correct
+and common, so that is not a defect count. Only truncations where the return is
+misplaced are defects, and separating them needs the block-ordering check below.
+
+### UNBLOCKING QUESTION - now about ordering, not deletion
+For an if/else region with `merge_pc = None`, are the else-arm blocks ordered so
+that the block containing the function's final RETURN sorts last? `else_sorted`
+is a plain ascending sort of block ids; if the RETURN block has a lower id than
+blocks that execute before it, the return lands mid-body. Compare the block ids
+in `else_region` against their pc ranges for `OnInputBegin@184` - one trace.
+
+### State after rotation 69
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: root cause established** - a bare `return` at index 3 of a 36-statement
+  else body causes correct dead-code removal of 32 live statements. Twelve
+  candidates eliminated by measurement across eight rotations.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: LUAU_DCE_TRACE now proto-qualified, + DCETRUNC naming the terminator
+  and the loss.

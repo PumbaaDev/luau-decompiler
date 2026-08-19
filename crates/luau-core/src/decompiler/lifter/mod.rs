@@ -8,6 +8,7 @@ use crate::analysis::structuring::{structure_control_flow, Region};
 use crate::ast::*;
 use crate::decompiler::{analyze_register_usage, constant_to_expr, is_stdlib_shadow_name, DecompileContext};
 use crate::parser::opcodes::LuauOpcode;
+use std::cell::RefCell;
 use crate::parser::types::*;
 
 mod naming;
@@ -954,6 +955,7 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
 }
 
 fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
     if depth >= MAX_DECOMPILE_DEPTH {
         return vec![Stat::Comment("-- max decompile depth reached".to_string())];
     }
@@ -1110,6 +1112,11 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     ctx.proto_stack.pop(); // B0.134b: match the push at entry
     ctx.current_proto_index = prev_proto;
 
+    // Re-stamp the DCE identity: nested closures are lifted DURING the region
+    // loop above and each overwrites it, so by here it names the last nested
+    // proto rather than this one. Rotation 69 found this by getting no trace
+    // output at all for the proto being investigated.
+    set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
     // Post-processing: eliminate dead stores and collapse control flow
     simplify_stmts(&mut stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
@@ -5668,6 +5675,15 @@ fn extract_into(expr: &Expr, out: &mut Vec<Stat>) {
 /// The pass recurses into all nested bodies (if/while/repeat/for/do/function).
 thread_local! {
     static DCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Proto identity for the DCE trace. `eliminate_dead_code` takes only a
+    /// statement vector, and rotation 68 could not attribute its output to a
+    /// proto - the same failure that made rotation 47 read a pc window from the
+    /// wrong function. Set once per proto lift.
+    static DCE_PROTO: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub(super) fn set_dce_proto(name: &str, line: u32) {
+    DCE_PROTO.with(|p| *p.borrow_mut() = format!("{}@{}", name, line));
 }
 
 fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
@@ -5676,11 +5692,19 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
     let dce_top = DCE_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
-        v <= 1
+        let _ = v;
+        true
     }) && std::env::var("LUAU_DCE_TRACE").is_ok();
     let dce_say = |phase: &str, st: &Vec<Stat>| {
         if dce_top {
-            eprintln!("DCE {} stmts={} calls={}", phase, st.len(), count_calls_stats(st));
+            eprintln!(
+                "DCE proto={} depth={} {} stmts={} calls={}",
+                DCE_PROTO.with(|p| p.borrow().clone()),
+                DCE_DEPTH.with(|d| d.get()),
+                phase,
+                st.len(),
+                count_calls_stats(st)
+            );
         }
     };
     dce_say("enter", stmts);
@@ -5729,6 +5753,21 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
         }
     }
     if let Some(idx) = truncate_after {
+        if std::env::var("LUAU_DCE_TRACE").is_ok() && stmts.len() > idx + 1 {
+            let kind = match &stmts[idx] {
+                Stat::Return { values } => format!("Return({} values)", values.len()),
+                Stat::Break => "Break".to_string(),
+                Stat::Continue => "Continue".to_string(),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            };
+            eprintln!(
+                "DCETRUNC proto={} at_index={} terminator={} dropping={} stmts",
+                DCE_PROTO.with(|p| p.borrow().clone()),
+                idx,
+                kind,
+                stmts.len() - idx - 1
+            );
+        }
         stmts.truncate(idx + 1);
     }
 
