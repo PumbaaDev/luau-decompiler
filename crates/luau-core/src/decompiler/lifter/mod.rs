@@ -4040,7 +4040,7 @@ pub(super) fn store_complex(
             // uses to recognise the family - the checker and the fix agree on
             // what the defect is.
             let mut self_mutation =
-                matches!(&value, Expr::BinOp { .. }) && expr_references_name(&value, &name);
+                matches!(&value, Expr::BinOp { .. }) && expr_uses_name_as_operand(&value, &name);
 
             // ACCUMULATE THROUGH AN ALIAS.
             //
@@ -4065,7 +4065,7 @@ pub(super) fn store_complex(
                     if let (Some(Expr::Name(alias)), Some(Expr::Name(src))) =
                         (targets.first(), values.first())
                     {
-                        if src == &name && expr_references_name(&value, alias) {
+                        if src == &name && expr_uses_name_as_operand(&value, alias) {
                             self_mutation = true;
                         }
                     }
@@ -4157,6 +4157,28 @@ pub(super) fn store_complex(
 /// Used by `store_complex` to detect self-mutation (`R1 = R1 + X`) inside
 /// loops. Recursively walks every sub-expression so that deeply-nested reads
 /// still count (e.g. `R1 = (a + R1) * 2`).
+/// Does `expr` use `name` as a DIRECT operand of its arithmetic/concat spine?
+///
+/// `expr_references_name` answers "does this mention the name anywhere", which
+/// is too generous for deciding an accumulate. `self.Name .. " is in a trade"`
+/// mentions `self`, but it READS A FIELD of the object and builds a string; the
+/// object is still live. Rewriting that as `self = self.Name .. "..."`
+/// destroyed the receiver in 356_TradeRequestGui and 388_ItemPackages_Sticker.
+///
+/// A real accumulate has the name itself as an operand - `Lvl3 + 2`,
+/// `Op .. " ("` - so this walks ONLY the BinOp/UnOp spine and refuses to
+/// descend into a field, index, or call.
+pub(super) fn expr_uses_name_as_operand(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n == name,
+        Expr::UnOp { operand, .. } => expr_uses_name_as_operand(operand, name),
+        Expr::BinOp { left, right, .. } => {
+            expr_uses_name_as_operand(left, name) || expr_uses_name_as_operand(right, name)
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn expr_references_name(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Name(n) => n == name,

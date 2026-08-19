@@ -2969,6 +2969,12 @@ pub(super) fn lift_instruction_range(
                 // stale values in registers the VM considers dead. Kept as the
                 // clear it was; the note stands so the next reader does not
                 // re-run the experiment.
+                // NOTE: preserving registers that hold a declared local was
+                // measured (rotation 42) and REVERTED. It raised the score to
+                // 1,125/22 and corrupted loop variables: keeping the binding
+                // alive made later temporaries write THROUGH that local's name,
+                // so 861_StickerPrinterAnimator emitted `i = StickerRoll...`,
+                // `i = i.CFrame` over its own `for` variable.
                 for r in clear_start..regs.len() {
                     regs[r] = RegVal::Unknown;
                     // CORRECT by construction: a call leaves everything above

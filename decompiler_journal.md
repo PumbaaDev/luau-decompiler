@@ -2631,3 +2631,74 @@ SEMANTIC: 1,122/1,142 (98.2%), 27 defects, 24 real.
   format's missing capture data.
 SWEEP: 137 files broken across two consecutive builds; adjudication of those
   is the next block of work, and it needs the N-run vote to be trustworthy.
+
+
+## Rotation 42 - a latent defect I introduced in rotation 28, found by chasing another
+
+### Attempt: preserve declared locals across the CALL clear. REVERTED.
+The clear wipes `clear_start..regs.len()` unconditionally. A register already
+bound to a DECLARED LOCAL is not call scratch, so skipping those looked
+principled - and measured well: **1,122 -> 1,125 clean (98.5%), 27 -> 22**.
+
+Reading the 232 changed files killed it. `861_StickerPrinterAnimator`:
+
+    before   IsAnimating = StickerRoll.PrimaryPart.CFrame
+             v2 = PrintModel.PrimaryPart.CFrame
+    after    i = StickerRoll.PrimaryPart.CFrame     <- `i` is the FOR VARIABLE
+             IsAnimating = i
+             i = PrintModel.PrimaryPart
+             i = i.CFrame
+
+Keeping the binding alive makes later temporaries write THROUGH that local's
+name, so scratch values are assigned over a live loop variable. Reverted; a note
+left at the clear so this is not retried.
+
+Fifth time this session that a score improvement turned out to be the instrument
+losing sight of damage.
+
+### But the chase found something real - in MY OWN rotation-28 rule
+The same run introduced 11 new parameter assignments, including
+
+    self = self.Name .. " is in a trade"          (356_TradeRequestGui)
+    arg3 = (("... " .. arg3.Name) .. " earned the ") .. ...   (388_Sticker)
+
+`self.Name .. "..."` IS a BinOp mentioning `self`, so rotation 28's guard fired -
+but `self` appears only UNDER A FIELD ACCESS. The object is still live; the
+expression merely reads a field of it. The guard's predicate,
+`expr_references_name`, answers "mentioned anywhere", which is too generous.
+
+FIXED with `expr_uses_name_as_operand`, which walks ONLY the BinOp/UnOp spine
+and refuses to descend into a field, index or call. A real accumulate has the
+name as an OPERAND - `Lvl3 + 2`, `Op .. " ("` - not as the base of a lookup.
+Applied to both the rotation-28 guard and the rotation-31 alias arm.
+
+### What that repaired, independent of the reverted experiment
+21 files, all the same shape - an object or table being clobbered by a scalar
+derived from it:
+
+    144_CentralTime   IsDST3 = result9 + (IsDST3 and ...)      -> local IsDST4
+                      a BOOLEAN was being overwritten by a number
+    145_ChallengeTools CentralTime2 = (... CentralTime2[arg2]) .. ...
+                      -> local CentralTime22; a TABLE was being overwritten by
+                      a string
+    276_CubMenu       GetCubInfo2 = GetCubInfo2 and 0 < #GetCubInfo2.Skins
+                      -> local GetCubInfo4; an OBJECT overwritten by a boolean
+
+These were REAL defects that rotations 28 and 31 introduced and that no measure
+reported. The semantic score is IDENTICAL before and after - 1,122/27 - so the
+checker is blind to object-clobbering too. That is the fifth blind spot found.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,122/1,142 (98.2%), 27 defects - unchanged, 21 files repaired
+    943 tests pass; the two pre-existing opmap failures remain
+
+### State after rotation 42
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real).
+  CLOSED: A, D, E, F, G, H, I (now with a corrected predicate), J (same),
+  A2/C, argument-cap.
+  MEASURED DEAD ENDS: MINUS-as-operator, MULTRET-clear-skip,
+  preserve-declared-locals-across-the-clear.
+  PARKED: B (1, one file). K part-adjudicated. UPVAL_NAME format-blocked.
+SWEEP: run 1 of 2 against run_r37 in flight - NOTE it predates this rotation's
+  21-file repair, so a third run against the final build will be needed for the
+  intersection to describe the shipped state.
