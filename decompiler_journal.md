@@ -1892,3 +1892,55 @@ SEMANTIC: **1,115/1,142 (97.6%), 35 defects.**
   A2 PARKED (2). B PARKED (1). C PARKED (2).
 SWEEP: running against run_r27. NOTE it now predates this fix, so its numbers
   will understate the build again; re-run after it lands.
+
+
+## Rotation 29 - what survives mechanism I, split into two sub-families
+
+Remaining 35: **21 branch_local_discarded, 14 declared_never_assigned.**
+
+### J: the accumulator is copied to a scratch register and never written back
+`819_StatReqs_Completed_Quests`, whole function:
+
+    local Name2 = ("Complete " .. require(NumberCommas)(self.Amount or 1)) .. " "
+    local Pool = self.Pool
+    if self.Pool then
+        Pool = Name2                          -- accumulator COPIED to a scratch reg
+        local Name3 = (Pool .. self.Pool) .. " "   -- extended THERE
+    else
+        ... Pool = Name2; local Name4 = (Pool .. self.VisiblePoolName) .. " " ...
+    end
+    Name2 ..= "Quest"                         -- Name2 never received any of it
+
+The source is plainly `desc = desc .. self.Pool .. " "` in each arm. Rotation
+28's guard correctly does NOT fire: the carried name at the write is the scratch
+(`Pool`), not the accumulator (`Name2`), so the value is not built from the
+register's own previous value. The defect is one level up - the copy in and the
+missing copy out.
+
+Same shape at `165_QuestListener` (`Theme5 <- Theme4`), `263_BeeTypeStatsBox`
+(`value35 <- value33`), `919_pprint` (`found8 <- found7`).
+
+UNBLOCKING QUESTION for J: when an arm opens with `scratch = <accumulator>` and
+then writes `scratch` from a BinOp on itself, is the bytecode a MOVE-in without
+a MOVE-out (so the lifter dropped the write-back), or does the CONCAT/ADD target
+the accumulator's register directly and the lifter mis-assigned its destination?
+That is answerable from the instruction stream for one file and decides whether
+the fix belongs in the MOVE handling or in the arithmetic destination.
+
+### K: a value extended off a PARAMETER
+`v34 <- arg1`, `Value7 <- arg2`, `Size <- arg3`, `pow31 <- arg4`, `abs4 <- arg1`
+- 9 of the 21. `local v34 = arg1 + 0.1` where `v34` is never read.
+
+NOT yet adjudicated, and it must not be assumed real: a dead local in the
+ORIGINAL source would look identical. `80_AgeString`'s
+`local floor12 = floor3 * 0x3C` sits beside branches that use `floor3` directly
+and may simply be dead code the game shipped. Deciding this needs the bytecode,
+not the emitted text.
+
+### State after rotation 29
+SEMANTIC: 1,115/1,142 (97.6%), 35 defects.
+  A, D, E, F, G, H, I CLOSED. A2 PARKED (2). B PARKED (1). C PARKED (2).
+  **J PARKED (0)** with the question above. **K UNADJUDICATED (9 sites)** -
+  next action is to read the bytecode for one and decide real vs. shipped dead
+  code, because the emitted text cannot tell them apart.
+SWEEP: still running against run_r27, which predates rotation 28.
