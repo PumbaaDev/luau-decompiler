@@ -784,6 +784,46 @@ fn infer_upval_names_from_setupval(
 }
 
 /// Lift a proto's bytecode into AST statements using structured control flow
+/// Rotation 86: which POST-PASS rewrites a correct `if` condition into a bare
+/// generated name?
+///
+/// `extract_branch_condition` was measured returning
+/// `Field { arg2, "StartReqs" }` for `533_NPCs::AddEvent` pc 176, and the
+/// emitted output still says `if v3 then`. So the rewrite happens after
+/// lifting. Gated on `LUAU_PASS_PROBE`; prints one line per pass with whether
+/// the good condition and the bad condition are present.
+fn pass_probe(tag: &str, stmts: &[Stat]) {
+    if std::env::var("LUAU_PASS_PROBE").is_err() {
+        return;
+    }
+    fn walk(ss: &[Stat], good: &mut bool, bad: &mut bool) {
+        for st in ss {
+            if let Stat::If { condition, then_body, elseif_clauses, else_body } = st {
+                match condition {
+                    Expr::Field { object, field } => {
+                        if field == "StartReqs" && matches!(&**object, Expr::Name(n) if n == "arg2")
+                        {
+                            *good = true;
+                        }
+                    }
+                    Expr::Name(n) if n == "v3" => *bad = true,
+                    _ => {}
+                }
+                walk(then_body, good, bad);
+                for (_, b) in elseif_clauses {
+                    walk(b, good, bad);
+                }
+                if let Some(b) = else_body {
+                    walk(b, good, bad);
+                }
+            }
+        }
+    }
+    let (mut good, mut bad) = (false, false);
+    walk(stmts, &mut good, &mut bad);
+    eprintln!("PASS	{}	startreqs={}	v3={}", tag, good, bad);
+}
+
 pub fn lift_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize) -> Vec<Stat> {
     // Phase C1: reset the proto-wide statement budget at the top-level entry
     // so every fresh proto gets the full allowance. Recursive closure lifts
@@ -1119,18 +1159,21 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
     // Post-processing: eliminate dead stores and collapse control flow
     simplify_stmts(&mut stmts);
+    pass_probe("simplify_stmts", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_simplify_stmts calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
     eliminate_dead_stores(&mut stmts);
+    pass_probe("eliminate_dead_stores", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_stores calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
     eliminate_dead_code(&mut stmts);
+    pass_probe("eliminate_dead_code", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_code calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
@@ -1141,30 +1184,35 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // chains when never read/written downstream.
     // Second dead-code sweep because these drops can leave empty-if shells.
     eliminate_dead_key_eq_value_locals(&mut stmts);
+    pass_probe("eliminate_dead_key_eq_value_locals", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_key_eq_value_locals calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
     eliminate_dead_code(&mut stmts);
+    pass_probe("eliminate_dead_code", &stmts);
     // Phase B0.46A: post-AST repeat-until detection. Catches `repeat ... until`
     // loops that the bytecode-level structuring pass emitted as
     // `while true do <body>; if cond then break end end`. Must run BEFORE
     // `convert_single_pass_loops` so the trailing `if cond then break end`
     // is still present (single-pass collapse would rewrite it into an if/else).
     convert_while_true_break_to_repeat(&mut stmts);
+    pass_probe("convert_while_true_break_to_repeat", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_convert_while_true_break_to_repeat calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
     convert_single_pass_loops(&mut stmts);
+    pass_probe("convert_single_pass_loops", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_convert_single_pass_loops calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
     collapse_elseif_chains(&mut stmts);
+    pass_probe("collapse_elseif_chains", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_collapse_elseif_chains calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
@@ -1181,14 +1229,17 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             count_calls_stats(&stmts));
     }
     post_passes::collapse_if_assign_bool(&mut stmts);
+    pass_probe("collapse_if_assign_bool", &stmts);
 
     collapse_short_circuit_assignments(&mut stmts);
+    pass_probe("collapse_short_circuit_assignments", &stmts);
 
     // Phase B0.89: merge `local x = nil; x = expr` into `local x = expr`.
     // Must run BEFORE B0.87/88 so that `local x = nil; x = expr; if ...`
     // patterns are simplified first (the nil→expr merge may expose a new
     // ternary pattern for B0.87/88).
     post_passes::merge_dead_init_with_assignment(&mut stmts);
+    pass_probe("merge_dead_init_with_assignment", &stmts);
 
     // Phase B0.87/88: collapse `local x = <init>; if cond then x = a [else x = b] end`
     // into `local x = if cond then a else b` (or `... else <init>` without else).
@@ -1196,6 +1247,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // self-referencing `if x then x = a end` shape separately) and BEFORE
     // inline_single_use_temps (which benefits from the reduced read-count).
     collapse_nil_init_conditional(&mut stmts);
+    pass_probe("collapse_nil_init_conditional", &stmts);
 
     rename_upvals(&mut stmts);
 
@@ -1232,10 +1284,12 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
 
     // Clean up decompiler artifacts
     cleanup_stmts(&mut stmts);
+    pass_probe("cleanup_stmts", &stmts);
 
     // Collapse method chains: `local v0 = obj:M1()` + `v0 = v0:M2(args)` → `local v0 = obj:M1():M2(args)`
     // Also collapses different-name chains: `call = X()` + `call2 = call:M()` → `call2 = X():M()`
     collapse_method_chains(&mut stmts);
+    pass_probe("collapse_method_chains", &stmts);
 
     // Phase B0.47: Reconstruct module-style table constructors from the
     // `local M = {}; M.foo = ...; M.bar = ...` pattern.  Must run BEFORE
@@ -1243,6 +1297,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // assignments changes the read-count of `M`, which `inline_single_use_temps`
     // uses to decide whether to inline the table value.
     reconstruct_table_constructors(&mut stmts);
+    pass_probe("reconstruct_table_constructors", &stmts);
 
     // Phase C2: SETLIST / sequential-integer-index coalesce.  Converts
     // `local t = {[1] = a, [2] = b, [3] = c}` (produced by
@@ -4059,6 +4114,22 @@ fn extract_branch_condition(
     let op = LuauOpcode::from_u8(insn_op(insn));
     let a = insn_a(insn) as usize;
     let aux = if op.has_aux() && pc + 1 < code.len() { Some(code[pc + 1]) } else { None };
+
+    // Rotation 86: report the register the condition is actually read from and
+    // what it holds AT THAT MOMENT. Four rotations located this fault four
+    // different wrong places by reasoning about the output; this reports it.
+    if std::env::var("LUAU_COND_TRACE").is_ok() {
+        let v = regs.get(a).map(|r| format!("{:?}", r)).unwrap_or_else(|| "OUT_OF_RANGE".into());
+        eprintln!(
+            "COND	{}	pc={}	{:?}	reg={}	regs_len={}	{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            pc,
+            op,
+            a,
+            regs.len(),
+            &v[..v.len().min(90)]
+        );
+    }
 
     match op {
         LuauOpcode::JumpIf => {

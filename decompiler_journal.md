@@ -5320,3 +5320,72 @@ and inferring - that is what the last four rotations did.
 ### State after rotation 85
 SEMANTIC: 1,104/1,142 (96.7%), 39 defects. 949 tests pass. No behaviour changed
 this rotation; it is diagnosis and a correction.
+
+
+## Rotation 86 - I was tracing the wrong proto, and the real fault is measured
+
+### The mistake, first
+Rotations 82-85 all traced `533_NPCs::AddEvent`. The defect is in
+`AddOverrideEvent`. The two protos are near-duplicates - same constants, same
+" references nil quest " string, same shape - and the emitted `if v3 then` sits
+among `tbl3.OverrideEvents`, which I read past four times.
+
+This repo already carries the warning, in `LUAU_REG_WATCH`'s own comment:
+"Proto identity is REQUIRED here: pc numbering restarts per proto, and
+correlating a WATCH line with a PC dump from a different proto is exactly how
+rotation 47 concluded a table died where it had not." I did precisely that,
+for four rotations, with the note in front of me. Every trace I add from now on
+prints the proto; `pass_probe` was the one that did not, and it is what exposed
+the error - it fired twice with opposite answers.
+
+So the r85 finding stands, but about the WRONG function: in `AddEvent` the
+condition really is correct and that proto is not defective.
+
+### The fault, on the right proto
+    COND  AddOverrideEvent  pc=151  JumpIfNot  reg=3  Unknown
+
+R3 is `Unknown` where the condition is read. That IS the `if v3 then`.
+
+Bytecode:
+
+    129: JUMPIF      R2 -> ...        `if not quest`
+    130: GETIMPORT   R2               error(
+    ...
+    138: CALL        R2 args=1 results=0
+    139: JUMP        ->               <-- UNCONDITIONAL, leaves the span
+    140: GETTABLEKS  R2 R1."Quest"
+    142: GETTABLEKS  R3 R2."Requirements"
+    144: JUMPIF      R3 -> 149
+    145: NEWTABLE    R3
+    147: SETTABLEKS  R2."Requirements" R3
+    149: GETTABLEKS  R3 R1."StartReqs"   <-- the write, never lifted
+    151: JUMPIFNOT   R3
+
+Leaders are CORRECT - `LUAU_LEADER_TRACE` lists 130, 140, 145, 149, 152 - so
+the CFG split the blocks properly. But `LUAU_LIFTPATH` shows the lift as
+
+    flat 115..129
+    flat 130..151      <- ONE span across FOUR blocks and the JUMP at 139
+    flat 152..157
+
+The walk enters at 130, reaches the unconditional JUMP at 139 whose target is
+outside [130,151), and does not come back for 140..150. So pc 149 is never
+lifted, R3 stays `Unknown`, and the condition at 151 renders as the generated
+name that `free_var_decls` then hoists to line 8.
+
+**The fault is a lifted span that crosses an unconditional jump.** Not the
+leaders, not the merge, not the naming, not the walk's AUX stepping.
+
+### The question this leaves
+Which region construction emits a span of 130..151 when the CFG has leaders at
+140, 145 and 149 inside it? Answer that by instrumenting the region builder's
+output for this proto (proto-qualified), not by reading it.
+
+### Instruments added, all gated and verified inert
+`LUAU_LIFTPATH` (r84), `LUAU_COND_TRACE` and `LUAU_PASS_PROBE` (r86). Corpus
+re-measured with everything off: 1,104/39, 949 tests pass.
+
+### State after rotation 86
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects. No behaviour changed.
+The reproducer is now exact: `533_NPCs` proto `AddOverrideEvent`, span 130..151,
+expected to stop at 140.
