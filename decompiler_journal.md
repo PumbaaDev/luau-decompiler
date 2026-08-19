@@ -1944,3 +1944,70 @@ SEMANTIC: 1,115/1,142 (97.6%), 35 defects.
   next action is to read the bytecode for one and decide real vs. shipped dead
   code, because the emitted text cannot tell them apart.
 SWEEP: still running against run_r27, which predates rotation 28.
+
+
+## Rotation 30 - MINUS is genuinely passthrough, and K is half false positive
+
+### The lead
+`885_Utils_Easing` implements Penner easing, whose closed forms are known, so it
+is usable as ground truth. `outExpo` should be
+`c * 1.001 * (-2^(-10t/d) + 1) + b`, and the emitted body reads
+
+    arg3 / 2 * 1.001 * (pow(2, -10 * (arg1 * 2) / arg4) + 1) + arg2
+
+with no negation on the `pow` term. Every file header says
+`minus=passthrough`, and commit 26a191f had already found the probe WRONG about
+LENGTH ("the probe said LENGTH was passthrough, the bytecode said otherwise").
+The DB entry confirms the asymmetry:
+
+    semantics = {unary_length: "operator", unary_minus: "passthrough",
+                 unary_not: "passthrough"}
+
+### MEASURED, and decisively negative
+Flipped `unary_minus` to `operator` in a COPY of the DB and ran the corpus:
+
+    1,115 -> **743 clean (97.6% -> 65.1%)**, 35 -> **1,126 defects**
+
+MINUS as a real operator is catastrophically wrong. B0.73's passthrough decision
+is not an inference artefact - it survives measurement against the current
+MEASURED opmap, which is the strongest test available. The 150 corpus hits it
+cited (`v8.Parent = -v0`, `(-v0):Destroy()`) stand.
+
+Consequence: whatever produces the missing negation in Easing, it is NOT the
+MINUS opcode. Experiment DB deleted; the real DB was never edited.
+
+This is worth the rotation on its own - it converts a decision made under
+inferred opmaps into one verified under a measured opmap, and closes a lead that
+looked compelling.
+
+### K adjudicated: 8 of 20 lose nothing
+`885_Easing`, `outInExpo`:
+
+    if arg1 < arg4 / 2 then          -- d/2 computed HERE
+        local pow31 = arg4 / 2       -- and again, dead
+
+The value is not lost - it is on the line above, and the original source has no
+`d/2` local at all. So this is EMITTER NOISE reported as a dropped value:
+`check_branch_local_discarded` says "the arm's value was written to a fresh
+local instead of back to the base", and here there was no value to write back.
+CONFIRMED false positive for `885_Easing` x3 (pow31, pow34, abs4).
+
+A crude test - does the initialiser's text appear elsewhere in the file? - puts
+**8 of 20 in this class and 12 as unique**. The 12 include `819_StatReqs`,
+`165_QuestListener`, `263_BeeTypeStatsBox`, `859_StickerPlacer`, which are the
+mechanism-J shape and are real.
+
+### The checker is NOT being weakened on this
+Substring matching is not sound evidence, and a rule that suppresses findings on
+a crude test is exactly the mistake rotations 25, 27 and 22 each made in a
+different costume. Recorded as: 3 CONFIRMED false positives, 5 CANDIDATES
+needing per-case confirmation, 12 real. The sound version of the refinement
+needs expression-level comparison, not text.
+
+### State after rotation 30
+SEMANTIC: 1,115/1,142 (97.6%), 35 defects - of which 3 are now proven checker
+  false positives, so the true defect count is 32.
+  A, D, E, F, G, H, I CLOSED. **MINUS lead CLOSED as a measured dead end.**
+  A2 PARKED (2). B PARKED (1). C PARKED (2). J PARKED (0).
+  K PART-ADJUDICATED: 3 confirmed FP, 5 candidates, 12 real (they are J).
+SWEEP: still running against run_r27.
