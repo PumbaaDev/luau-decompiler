@@ -587,6 +587,14 @@ pub(super) fn lift_instruction_range(
     stmts: &mut Vec<Stat>,
     in_loop: bool,
 ) {
+    if std::env::var("LUAU_LIFTPATH").is_ok() {
+        eprintln!(
+            "LIFTPATH	{}	flat	{}..{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            start,
+            end
+        );
+    }
     // Prevent exponential nesting from recursive inline-if lifting
     if depth > 50 {
         stmts.push(Stat::Comment(format!("-- max nesting depth reached at [{}-{})", start, end)));

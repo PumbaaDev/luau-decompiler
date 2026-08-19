@@ -5200,3 +5200,67 @@ SEMANTIC: 1,104/1,142 (96.7%), 39 defects (unchanged - the +1 was rejected).
 GATED, INERT, MEASURED: `LUAU_ARM_COND` (-1 clean), `LUAU_ARM_IF` (+1 clean,
   deletes a guard), `LUAU_DECL_HOIST`, `LUAU_BRANCH_ARMS`.
 NEXT: answer THE QUESTION above by instrumentation, not inference.
+
+
+## Rotation 84 - the path, measured; pc 174 is never lifted by anything
+
+### Answering r83's question by instrumentation
+Two fixes were built on an inference about which path lifts
+`533_NPCs::AddEvent`'s arm, and both left the file byte-identical. Added
+`LUAU_LIFTPATH` (gated, verified inert): one line per lift entry with the proto
+and the range. `AddEvent`, from pc 115 on:
+
+    branch_region    115..210
+    structured_run   115..210      <- it IS structured; both earlier guesses wrong
+    flat             115..176         outer span
+    flat             123..148
+    flat             130..139         the error arm
+    flat             153..174
+    flat             155..159
+    flat             160..174      <- ends AT 174, exclusive
+    flat             177..182      <- resumes AFTER 176
+    flat             183..191
+    flat             193..210
+
+### The fault
+**Nothing lifts pc 174.** Ranges are half-open, so `160..174` stops before it and
+`177..182` starts after the `JUMPIFNOT` at 176. Only the outer `115..176` spans
+it, and that walk does not come back for it: after recursing an inline-if arm it
+resumes at the branch instruction, skipping whatever sits between the end of the
+recursed arm and that branch.
+
+    172: SETTABLEKS  R2."Requirements" R3     <- last instruction of 160..174
+    174: GETTABLEKS  R3 R1."StartReqs"        <- LIFTED BY NOBODY
+    176: JUMPIFNOT   R3 -> +16                <- emitted as `if v3 then`
+
+That is the whole defect. `v3` is not a naming failure, not a dropped write, and
+not a merge-point error - the instruction is skipped by the pc walk. It explains
+the shape exactly: the condition survives (176 is emitted), its definition does
+not (174 is not), and `free_var_decls` then hoists the orphan to line 8.
+
+### What this retires
+    r81  "needs path-sensitive dataflow at joins"     - wrong, not a join
+    r82  "find_merge_point returns the jump target"   - wrong, merge=210 correct
+    r83  "contiguous arm never reaches a structurer"  - wrong, structured_run RUNS
+
+Three inferences, three misses, all from reasoning about the shape of the
+output. One instrumented run settled it. The lesson is cheap to state and was
+expensive to learn: instrument the path before theorising about the path.
+
+### Next
+Fix the resume point in `lift_instruction_range`'s inline-if recursion so the
+walk continues from the end of the recursed arm rather than from the branch,
+and any instruction between them is lifted. Expected to be visible on
+`533_NPCs` (`local v3 = arg2.StartReqs` appears, `if v3 then` becomes
+`if arg2.StartReqs then` or keeps a bound `v3`), and to reach the other four
+`UNK_CALL_CLEAR` files if they share the shape.
+
+Mutation test for the fix: it must NOT change `1125_Supreme_Star_Amulet_
+Generator`, and the whole-corpus construct census (loops/ifs/calls gained vs
+lost per changed file) must show no construct lost anywhere - the standard the
+B-loops fix was adopted on and `LUAU_ARM_IF` failed.
+
+### State after rotation 84
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects. 949 tests pass.
+`LUAU_LIFTPATH` kept: it answered in one run what three rotations of inference
+got wrong, and the next fix needs it to verify.

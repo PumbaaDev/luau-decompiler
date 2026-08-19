@@ -1408,6 +1408,23 @@ fn collect_value_joins_in_span(
     out
 }
 
+/// Rotation 84: which lift path actually handles a given pc?
+///
+/// Two fixes were built on an INFERENCE about the path that lifts
+/// `533_NPCs::AddEvent`'s 14-block arm, and both left the file untouched.
+/// This reports the path instead of inferring it. Gated on `LUAU_LIFTPATH`.
+fn liftpath(proto: &Proto, who: &str, lo: usize, hi: usize) {
+    if std::env::var("LUAU_LIFTPATH").is_ok() {
+        eprintln!(
+            "LIFTPATH	{}	{}	{}..{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            who,
+            lo,
+            hi
+        );
+    }
+}
+
 fn lift_branch_region(
     ctx: &mut DecompileContext,
     proto: &Proto,
@@ -1424,6 +1441,12 @@ fn lift_branch_region(
         .iter()
         .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
         .collect();
+    liftpath(
+        proto,
+        "branch_region",
+        ranges.iter().map(|r| r.0).min().unwrap_or(0),
+        ranges.iter().map(|r| r.1).max().unwrap_or(0),
+    );
     if std::env::var("LUAU_ARM_TRACE").is_ok() {
         // Two fix attempts (rotations 71, 72) assumed this function receives the
         // 23-block else arm of OnInputBegin@184 and both missed it entirely.
@@ -1699,6 +1722,7 @@ fn lift_structured_run(
     out: &mut Vec<Stat>,
     in_loop: bool,
 ) {
+    liftpath(proto, "structured_run", start, end);
     // Loop headers protect `find_value_join` from claiming a nested loop's
     // header as a value-join entry. Same set `structure_control_flow` builds;
     // only computed when a run actually needs structuring, so the dominator
