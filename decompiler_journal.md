@@ -7367,3 +7367,57 @@ THE QUESTION: which registers may safely survive an arm? The restore exists to
 ### State after rotation 120
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_MERGE_WATCH`
 kept and verified inert.
+
+
+## Rotation 121 - the fix WORKS, fixes all three orphans, and is REJECTED on net calls
+
+### Built at the location r120 printed
+Not `merge_regs` - the arm's snapshot restore. `restore_regs_keeping_dead_defs`
+replaces the blanket `*regs = regs_snapshot` at all THREE inline-if sites:
+a slot that was `Unknown` before the branch and DEFINED by the arm keeps the
+arm's value; a slot that already held a value is restored exactly as before, so
+no fall-through view is disturbed.
+
+### It works
+    clean 1,125 -> 1,128   defects 17 -> 14
+    FIXED  22_NewClickToMove, 53_PathDisplay, 85_Badges
+           - EXACTLY the three `UNK_CALL_CLEAR` orphans diagnosed in r117/r118
+    NEW    none
+
+Six rotations of diagnosis (115-120) pointed at one location and the fix landed
+on the first attempt there.
+
+### And it is rejected
+    21_ClickToMove   534 -> 528 calls, 348 -> 344 ifs
+
+It loses an entire auto-jump guard - `doAutoJump()` and its conditions - twice
+over. Two narrowings were measured:
+
+    nil only                    1,125/17   byte-neutral, no benefit at all
+    exclude call-bearing values 1,128/14   SAME damage, exclusion never fires
+
+**The decisive number: total emitted calls 38,460 -> 38,454.** The corpus emits
+FEWER calls than before. r93 was accepted with 9 damaged files because it
+recovered +324 calls; this recovers none and costs six. A checker score that
+improves while the output emits less code is the exact trade this session has
+refused four times (r83, r90, r101, r112), and refusing it is why 1,125 means
+what it says.
+
+Reverted. 1,125/17 re-measured clean, 949 tests pass.
+
+### PARKED - the closest this class has ever been
+MECHANISM: inline-if discards arm register state; a value written only in an arm
+  is lost and the post-branch read mints `vN`.
+PROVED:    the location (r120 print), and that a fix there closes all three
+  `UNK_CALL_CLEAR` orphans with no new findings (r121).
+RULED OUT: merge-lattice rules (r119); nil-only restore (r121, no effect);
+  call-bearing exclusion (r121, no effect on the damage).
+THE QUESTION: why does keeping a dead slot's arm value delete
+  `21_ClickToMove`'s auto-jump guard? Print the register and value kept for that
+  proto, then the condition before and after `collapse_constant_ifs`. If a kept
+  value makes a guard constant-foldable, the restore must exclude registers the
+  guard READS - which is a use-site test, and every predicate tried so far has
+  been a definition-site test.
+
+### State after rotation 121
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
