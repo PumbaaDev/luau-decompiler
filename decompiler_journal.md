@@ -7523,3 +7523,58 @@ semantic checker's precision on this corpus is 14/14 at this point.
 
 ### State after rotation 123
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Adjudication only.
+
+
+## Rotation 124 - 54_Controls located: the receiver is CORRECT, the arm lift is not
+
+### Proto-qualified rejection
+    REJECT METHOD_RECV v3 reg=3 proto=?@74 discarded=Nil
+    REJECT METHOD_RECV v7 reg=7 proto=?@74 discarded=Nil
+
+Both in one proto. `LUAU_REG_WATCH=3` in `?@74`:
+
+    before_pc=16  Expr(MethodCall{ object: result2, method: FindFirstChild })
+    before_pc=17  Expr(Name("SteeringVelocity3"))     <- CORRECT receiver
+    before_pc=18  Expr(Name("SteeringVelocity3"))
+    before_pc=18  Expr(Nil)                           <- clobbered
+    before_pc=22  Unknown
+
+### The bytecode is fine, and the printer nearly fooled me again
+    13: LOADK     R5 K7 ; "SteeringVelocity"
+    14: NAMECALL  R3 R4:"FindFirstChild"
+    16: CALL      R3 args=2 results=1      R3 = the result
+    17: JUMPIFNOT R3 -> +4                 `if sv then`
+    18: NAMECALL  R4 R5:"Destroy"
+
+`NAMECALL A B C` sets `R(A+1) = R(B)` and `R(A) = R(B)[K(C)]`, so the printed
+"R4 R5" is A and A+1 - NOT the receiver. The receiver is R3 and it is correct.
+CLAUDE.md's rule ("never read operands off the disassembler's printer") applies
+here exactly as it did at rotation 110, and reading it naively would have
+produced a fourth wrong diagnosis of this file.
+
+### The actual fault
+TWO watch entries at `before_pc=18`: the arm is lifted twice - once in the
+enclosing pass and once as the inline-if arm - and on the ARM lift R3 arrives
+as `Nil` rather than the receiver. `method_receiver_expr` then correctly refuses
+a nil receiver and mints `v3`.
+
+So this is arm-entry register state, adjacent to what rotation 122 fixed. r122
+addressed what an arm's writes do on the way OUT (the snapshot restore); this is
+what the arm sees on the way IN.
+
+### PARKED, precisely
+MECHANISM: the inline-if arm is lifted with `Nil` in the receiver register where
+  the enclosing pass has the correct value.
+PROVED:    bytecode correct (R3 = FindFirstChild result at pc 16, tested at 17,
+  receiver of the NAMECALL at 18); enclosing pass holds the right value at
+  pc 17; the arm lift sees `Nil`; the rejection is correct behaviour.
+RULED OUT: a bad receiver predicate (`method_receiver_expr` is a reporter -
+  r123); a bytecode/opmap fault (verified above).
+THE QUESTION: what is the arm's register state at ENTRY, and why does R3 differ
+  from the enclosing pass? Print `regs[3]` at the top of the inline-if arm lift
+  and compare with the value at `pc 17`. r122 instrumented the restore; the
+  entry has never been printed.
+
+### State after rotation 124
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Diagnosis only; the
+rejection trace is now proto- and register-qualified and verified inert.

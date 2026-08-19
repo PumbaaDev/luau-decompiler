@@ -8171,7 +8171,16 @@ pub(super) fn method_receiver_expr(regs: &[RegVal], idx: usize) -> Expr {
         let n = format!("v{}", idx);
         crate::decompiler::mint_trace::note("METHOD_RECV_REJECT", &n);
         if crate::decompiler::mint_trace::enabled() {
-            eprintln!("REJECT\tMETHOD_RECV\t{}\tdiscarded={:?}", n, e);
+            // Proto-qualified: rotation 123 could name the discarded value but
+            // not the function it happened in, and every trace in this session
+            // that omitted the proto sent a rotation to the wrong one.
+            eprintln!(
+                "REJECT	METHOD_RECV	{}	reg={}	proto={}	discarded={:?}",
+                n,
+                idx,
+                current_dce_proto(),
+                e
+            );
         }
         return Expr::Name(n);
     }
