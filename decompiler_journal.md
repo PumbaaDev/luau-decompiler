@@ -2466,3 +2466,57 @@ POSSIBLE CHECK, noted not built: a call whose argument count is impossible for a
   known Roblox constructor (`CFrame.new` accepts 1, 3, 7 or 12). That is
   externally-groundable and would have caught this without the corpus read.
 SWEEP: run against run_r32 in flight.
+
+
+## Rotation 39 - the 27 fully classified, and B's footprint is one file
+
+### B does not generalise
+Checked the other `declared_never_assigned` survivors for the missing-else
+shape. None of them have it:
+
+    79_Activatables_Toys   v7 in a concat AND returned  -> a lost STRING
+    85_Badges              `if getTask5.Amount < v13`   -> a lost NUMBER
+    368_HoneycombTools     `v19.Tastes.Treats`          -> a lost OBJECT
+
+`53_PathDisplay` appears to be the only missing-else file in the corpus, so B is
+a one-file mechanism. It stays PARKED (1) and is now correctly sized: fixing it
+would move the measure by one file, and the journal's earlier note that a naive
+fix cost 13 files means the trade is still bad.
+
+### Final classification of the 10 declared_never_assigned
+    UNK_CALL_CLEAR       5   533, 22, 53, 368, 85
+    METHOD_RECV_REJECT   2   54, 21   (symptoms - the receiver really is Nil)
+    UNK_MERGE_COMPOUND   1   79
+    UPVAL_NAME           1   873_Translation  <- NEW mechanism
+
+`873_Translation` emits `GetTranslator3:Translate(upval_2, arg1)` where
+`upval_2` is a captured upvalue that nothing assigns. That is the capture family
+`free_var_decls` was written for, and it runs into a KNOWN structural limit
+recorded earlier in this project: CAPTURE is never detected on Roblox bytecode
+because `child_protos` is always empty. So the upvalue's identity is not
+recoverable from this input at all - the name is a placeholder for information
+the decode does not contain.
+
+### And the 17 computed_value_discarded
+    proven checker false positives   3   885_Easing (rotation 30)
+    top-level dropped computation    ~6  859 x2, 297, 445, 646, 958
+    parameter-extending, unadjudicated ~8  21, 22, 381 ...
+
+### What the remaining 24 actually are
+Every one is a register whose VALUE was lost upstream - at a CALL boundary, at a
+merge, or at a capture the format does not record. Rotation 35 solved the case
+where the lost value is a TABLE, because a table literal is a pure allocation
+and can be materialised before the branch. The rest cannot use that fix: moving
+a `Call` or an arbitrary expression across a branch changes when its side
+effects run.
+
+That is not a reason to stop, but it is a reason to state the shape plainly: the
+remaining work is upstream value tracking, not naming or emission, and several
+cases (the capture one certainly) are information the input does not carry.
+
+### State after rotation 39
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real after the 3 proven FPs).
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap. MINUS: measured dead end.
+  PARKED: B (1, one file, correctly sized). K part-adjudicated.
+  NEW: UPVAL_NAME - blocked on a format limitation, not a lifter bug.
+SWEEP: run against run_r32 at ~904/1111.
