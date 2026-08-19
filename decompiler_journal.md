@@ -7144,3 +7144,59 @@ THE QUESTION, restated safely: instrument `free_var_decls` to print, for each
 ### State after rotation 116
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only;
 nothing changed.
+
+
+## Rotation 117 - r116 CORRECTED, and every orphan now has a proto and a register
+
+### The correction
+r116 concluded that a hoisted `vN` cannot be traced to a register, because
+`free_var_decls` folds same-named orphans chunk-wide. Half right. `reg_expr`
+mints `v{idx}` where **idx IS the register index**, so the register was always
+sound; what the name lacks is the PROTO. r116 mis-stated the gap and blamed the
+wrong half.
+
+### The instrument
+Added `current_dce_proto()` (reusing the DCE proto thread-local, which is
+already set once per proto lift) and a `MINTAT` line at the generic-name mint:
+
+    MINTAT  setData@1163  reg=13  name=v13  held=Unknown
+
+That is the field r116 said was missing, and it settles `85_Badges` outright:
+`v13` is register 13 in `setData@1163`, holding `Unknown` at the read. The
+earlier claim that "the watch does not implicate register 13" was wrong -
+rotation 116's watch was correct and its conclusion was not.
+
+### All five located
+    85   setData@1163      reg=13
+    22   OnTap@607         reg=6
+    53   renderPoint@49    reg=7
+    79   ButtonText@179    reg=7
+    54   (v3 - no MINTAT under this filter; site is METHOD_RECV_REJECT, a
+          different mint path than reg_expr, so it needs its own record)
+
+Four of the five now have an exact (proto, register) pair. Every previous
+attempt on this class began by guessing one or both.
+
+### What that unblocks
+`unknown_origin` already attributes the clear: for 22/53/85 it is
+`UNK_CALL_CLEAR`, documented as "CORRECT by construction - a call leaves
+everything above its results genuinely holding nothing". With the proto and
+register now fixed, the remaining question is answerable by a single watch in
+the RIGHT proto: which pc clears the register, and does the read at the merge
+lie on a path where that call never executed?
+
+If yes, it is a merge defect and the clear is innocent. If the read is on the
+same path as the call, the clear's `clear_start` is too low - a different fix
+entirely. That fork has never been resolved because the proto was never known.
+
+### PARKED, with the guesswork removed
+MECHANISM: 5 orphans. Now: (proto, register) known for 4; `54` needs a MINTAT
+  equivalent on the `METHOD_RECV_REJECT` path.
+RULED OUT: walk abandonment (r114); dropped for-loop (r115); "register
+  unidentifiable" (r117 - it was identifiable all along).
+THE QUESTION: `LUAU_REG_WATCH=<reg>` inside each named proto, paired with the
+  pc of the clearing CALL, to resolve the merge-defect / clear-too-broad fork.
+
+### State after rotation 117
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `MINTAT` verified
+inert.

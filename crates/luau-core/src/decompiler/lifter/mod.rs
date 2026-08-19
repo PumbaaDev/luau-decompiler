@@ -6066,6 +6066,17 @@ pub(super) fn set_dce_proto(name: &str, line: u32) {
     DCE_PROTO.with(|p| *p.borrow_mut() = format!("{}@{}", name, line));
 }
 
+/// The proto currently being lifted, for traces that have no `&Proto` to hand.
+///
+/// `reg_expr` mints `v{idx}` from a register index but never sees the proto, and
+/// `free_var_decls` folds every same-named orphan chunk-wide - so a hoisted
+/// `v13` names register 13 in SOME proto and the output cannot say which.
+/// Rotation 116 lost a probe to that gap (and mis-concluded the register was
+/// unidentifiable; it is the index, it is the PROTO that is missing).
+pub(super) fn current_dce_proto() -> String {
+    DCE_PROTO.with(|p| p.borrow().clone())
+}
+
 fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
     // Outermost-only phase trace: the pass recurses, so nested invocations
     // would drown the signal.
@@ -8037,6 +8048,22 @@ pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
                 if w.parse::<usize>() == Ok(idx) {
                     eprintln!("READ  reg={} MINTED {} (register held {:?})", idx, n, other);
                 }
+            }
+            // PROTO-QUALIFIED mint record. Without it a hoisted `vN` cannot be
+            // traced back to the function that minted it, which is what made
+            // rotation 116's watch land in the wrong proto.
+            if crate::decompiler::mint_trace::enabled() {
+                eprintln!(
+                    "MINTAT	{}	reg={}	name={}	held={}",
+                    current_dce_proto(),
+                    idx,
+                    n,
+                    match other {
+                        None => "OUT_OF_RANGE",
+                        Some(RegVal::Unknown) => "Unknown",
+                        _ => "other",
+                    }
+                );
             }
             crate::decompiler::mint_trace::note(
                 match other {
