@@ -4068,3 +4068,53 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   50 protos with unreachable blocks - separate, parked.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_IF_TRACE (what each if/else absorbs).
+
+
+## Rotation 65 - the else arm IS lifted, and the post-passes are exonerated
+
+### Two decisive traces
+    IFLIFT proto=OnInputBegin@184 else_blocks=23 else_stmts=Some(37) then_blocks=1
+
+The else arm is passed to `lift_branch_region` and comes back with **37
+statements**. The code is recovered. It is not a lifting failure and not an
+empty arm.
+
+    PASS proto=OnInputBegin@184 before_post_passes calls=0
+    PASS proto=OnInputBegin@184 after_post_passes  calls=0
+
+Calls are ALREADY zero before any post-pass runs, so the whole post-pass stage
+is exonerated. I had suspected `collapse_if_assign_bool` after finding it
+rewrites `if` into `return`; it only fires when both arms are a single boolean
+return, and bracketing the stage settled it in one build rather than by reading
+1,900 lines.
+
+### The window, and the two possibilities left inside it
+The loss is between `lift_branch_region` returning 37 statements and the end of
+the region loop. Everything in that window runs on the arms: phi
+reconstruction, `merge_regs`, the B0.116 import-guard propagation,
+`hoist_escaping_locals`, and finally the `Stat::If` push.
+
+Exactly two possibilities remain, and they are distinguishable:
+  1. the 37 statements contain NO CALLS - the calls were dropped INSIDE
+     `lift_branch_region`, and 37 statements of something else survived;
+  2. the `Stat::If` never reaches `stmts` - the else body is built and the
+     statement discarded.
+
+`count_calls_stats(&else_stmts)` at the IFLIFT site separates them in one build.
+That is the next step and it is the last question in this chain.
+
+### Also confirmed: only ONE if/else region for this proto
+Checked, because rotation 47's error was attributing a trace across protos and
+rotation 49's was reading pc numbers that restart per proto. One `IF` line, one
+`IFLIFT` line - the attribution is sound this time.
+
+### State after rotation 65
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: window narrowed to the region loop's arm handling.** Ruled out by
+  measurement across four rotations: unreachable blocks, statement budget,
+  missing regions, region construction, empty else arm, and the entire
+  post-pass stage. Reproducer `277_DragManager::OnInputBegin@184`.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_PASS_TRACE (calls before/after the post-pass stage).

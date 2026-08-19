@@ -1128,6 +1128,11 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // into `X = cond`. MUST run BEFORE collapse_short_circuit_assignments
     // to prevent the short-circuit pass from converting boolean-assignment
     // patterns into `X = cond and true or false` (which doesn't simplify).
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} before_post_passes calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
     post_passes::collapse_if_assign_bool(&mut stmts);
 
     collapse_short_circuit_assignments(&mut stmts);
@@ -1218,6 +1223,11 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // `call7 = chain:Build()` + `call8 = Y:Add(call7)` → `call8 = Y:Add(chain:Build())`
     let arity_pinned = ctx.arity_pinned_temps.clone();
     post_passes::inline_single_use_temps_pinned(&mut stmts, &arity_pinned);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_post_passes calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
 
     // Phase B0.51B: inline pure literal locals at ALL read sites
     // (regardless of read count) up to the next reassignment.  Targets
@@ -2301,6 +2311,20 @@ fn lift_region(
                 None
             };
 
+            if std::env::var("LUAU_IF_TRACE").is_ok() {
+                // Lifted-and-empty vs lifted-and-discarded. The else arm IS
+                // passed to `lift_branch_region`, so if 23 blocks come back as
+                // zero statements the loss is inside that call, not in whether
+                // it was made.
+                eprintln!(
+                    "IFLIFT proto={}@{} else_blocks={} else_stmts={:?} then_blocks={}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    else_sorted.len(),
+                    else_body.as_ref().map(|b| b.len()),
+                    then_sorted.len()
+                );
+            }
             // Save else-path register state before merge for B0.116.
             let regs_after_else = regs.clone();
 
