@@ -6110,3 +6110,63 @@ been aimed at a gate that cannot fire because its input is empty.
 SEMANTIC: **1,123/1,142 (98.3%), 19 defects** (10 -> 7 declared_never_assigned,
 7 -> 6 branch_local_discarded, 5 -> 6 calls_not_emitted).
 949 tests pass on two consecutive runs.
+
+
+## Rotation 98 - `find_loops` misses EVERY generic for-loop, and that is the real bug
+
+### r97's question, answered
+    GUARD codelen=166 blocks=27 maxblk=165 loops=0 headers=0 cond_pc=13 ...
+
+`maxblk=165 < codelen=166` and `blocks=27` matches the 27 leaders traced for
+proto `?@181`. So **`cfg` and `code` AGREE** - there is no cross-proto mismatch.
+`find_loops()` genuinely returns zero for a proto that contains a loop.
+
+### Why it returns zero
+`?@181` (the listener callback in `351_PassiveTile`):
+
+      4: FORGPREP_NEXT R1 -> +158     target 163
+    163: FORGLOOP      R1 -> -159     target 5
+
+`ControlFlowGraph::build` gives FORGPREP two successors - fall-through (5, into
+the body) and its jump target (163, the FORGLOOP) - and FORGLOOP two - its back
+target (5) and the exit (165). So:
+
+    4   -> {5, 163}
+    163 -> {5, 165}
+
+`find_loops` accepts a back edge only when the successor DOMINATES the block:
+for edge 163 -> 5 it needs 5 to dominate 163. It does not, because
+`4 -> 163` reaches the latch WITHOUT passing through 5. No natural loop is
+found, `loop_headers` is empty, and the r97 gate can never fire.
+
+This is the standard Luau generic-for layout, so the miss is not specific to
+this file: **every `for ... in ...` whose FORGPREP jumps straight to its
+FORGLOOP is invisible to `find_loops`**. `?@110 tileCooldownLoop` in the same
+file has `JUMPBACK -> -30` and IS detected (loops=1 on the 87-instruction
+proto), which is the control case - a `while`-shaped back edge dominates fine.
+
+### Why this matters well beyond Shape C
+`loop_headers` is passed to `structure_numeric_for_body` and used by
+`find_value_join` to avoid claiming a nested loop's header as a value-join
+entry. An empty set silently disables that protection for every generic-for
+proto. Four rotations of predicates were aimed at a gate whose input is empty
+for exactly the files that needed it.
+
+### THE FIX SHAPE, for the next rotation
+Either
+
+  (a) treat the FORGLOOP block as the loop header - the body falls into it and
+      it dominates the body, so `body_end -> FORGLOOP` is a proper back edge; or
+  (b) drop the `FORGPREP -> FORGLOOP` skip edge and model the prep as reaching
+      only the body, letting 5 dominate 163 as the header.
+
+(b) changes reachability and risks marking the loop-exit path unreachable, so
+(a) is the safer first attempt. MEASURE both; the census criteria are the same
+as always - defects down, no construct lost in any changed file. Verify first on
+the control case (`tileCooldownLoop`, already detected) that detection does not
+DOUBLE-count once FORGLOOP becomes a header.
+
+### State after rotation 98
+SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Diagnosis only; the
+guard trace now prints `blocks`, `maxblk`, `loops`, `headers` and is verified
+inert.

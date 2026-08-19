@@ -1177,8 +1177,15 @@ pub(crate) fn structure_numeric_for_body(
                             // `351_PassiveTile` and the next question is whether that set is
                             // empty for the proto being structured - which would mean `cfg` and
                             // `code` describe different protos.
-                            "GUARD	codelen={}	headers={}	cond_pc={}	op={:?}	arm={}..{}	arm_op={:?}	body_end={}",
+                            // `blocks` and `maxblk` decide the r97 question: if the CFG's
+                            // highest block start lies beyond this proto's code, `cfg` belongs to
+                            // a DIFFERENT proto than `code` - they are threaded as separate
+                            // parameters and nothing checks they agree.
+                            "GUARD	codelen={}	blocks={}	maxblk={}	loops={}	headers={}	cond_pc={}	op={:?}	arm={}..{}	arm_op={:?}	body_end={}",
                             code.len(),
+                            cfg.blocks.len(),
+                            cfg.blocks.keys().max().copied().unwrap_or(0),
+                            cfg.find_loops().len(),
                             loop_headers.len(),
                             pc,
                             op,
