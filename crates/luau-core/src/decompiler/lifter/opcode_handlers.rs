@@ -2480,7 +2480,9 @@ pub(super) fn lift_instruction_range(
                     // in adjacent registers.
                     let start = a + arg_start;
                     let max_args = (proto.max_stack_size as usize).min(regs.len()).saturating_sub(start);
-                    for i in 0..max_args.min(10) {
+                    // `max_args` is already the frame bound, so the extra
+                    // `.min(10)` was a second guess on top of an exact limit.
+                    for i in 0..max_args {
                         let r = start + i;
                         match regs.get(r) {
                             Some(RegVal::Expr(e)) if !matches!(e, Expr::Nil) => {
@@ -2498,9 +2500,22 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                 } else {
-                    // Cap non-vararg argument count — Luau functions rarely have >10 args.
-                    // Large nargs values indicate corrupted/misdetected bytecode.
-                    let capped_nargs = nargs.min(10);
+                    // Reject an IMPOSSIBLE argument count, not a large one.
+                    //
+                    // A corrupted or misdetected opcode yields a garbage B, and
+                    // believing it collects dozens of registers that were never
+                    // arguments. This used to be a flat `nargs.min(10)` on the
+                    // reasoning that "Luau functions rarely have >10 args" - the
+                    // same guess that, on the RESULT side, decompiled
+                    // `CFrame:GetComponents()` (12 returns) as a bare statement
+                    // and wiped every result register.
+                    //
+                    // The bytecode bounds this exactly: arguments occupy
+                    // R(A+1)..R(A+nargs) and the proto declares its frame. A
+                    // count that does not fit is genuinely impossible; one that
+                    // fits is a real call whatever its size.
+                    let fits_frame = a + nargs <= proto.max_stack_size as usize;
+                    let capped_nargs = if fits_frame { nargs } else { nargs.min(10) };
                     for i in arg_start..=capped_nargs {
                         let reg = a + i;
                         let arg_expr = reg_expr(regs, reg);

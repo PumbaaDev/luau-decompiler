@@ -2405,3 +2405,64 @@ SEMANTIC: 1,122/1,142 (98.2%), 27 defects. Composition now known:
   A, D, E, F, G, H, I, J, A2/C CLOSED. MINUS closed as a measured dead end.
   B PARKED (1). K part-adjudicated.
 SWEEP: run against run_r32 still in flight; r32 predates rotation 35.
+
+
+## Rotation 38 - the argument count was capped at ten, and CFrame.new takes twelve
+
+### Found while reading 859_StickerPlacer
+`PlaceSticker` computes two normalised coordinates and never uses them, so I
+looked at the call that should receive them - and found the same guessed
+constant rotation 18 removed from the RESULT side, still present on the
+ARGUMENT side, in both paths:
+
+    // Cap non-vararg argument count - Luau functions rarely have >10 args.
+    let capped_nargs = nargs.min(10);
+    ...
+    for i in 0..max_args.min(10) {          // and again, on top of a frame bound
+
+### Ground truth settles it
+`CFrame.new` with a full rotation matrix takes **exactly 12** arguments
+(x, y, z, R00..R22). `893_Utils_Matrix3D` was emitting ten:
+
+    before  CFrame.new(arg1[13], arg1[14], arg1[15], arg1[1], ..., arg1[9])
+    after   CFrame.new(arg1[13], arg1[14], arg1[15], arg1[1], ..., arg1[9],
+                       arg1[10], arg1[11])
+
+Truncated at precisely the cap. `910_Utils_TriangleMaker` the same, twice.
+
+Fixed the same way as rotation 18: the bytecode bounds it exactly, since
+arguments occupy R(A+1)..R(A+nargs) and the proto declares its frame. A count
+that does not fit is impossible; one that fits is a real call at any size. The
+vararg path's `max_args` was ALREADY the frame bound, so its `.min(10)` was a
+second guess stacked on an exact limit.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,122 clean (98.2%), 27 defects - UNCHANGED
+
+5 files changed and all five are improvements:
+    893_Matrix3D      CFrame.new 10 -> 12 args
+    910_TriangleMaker CFrame.new 10 -> 12 args, twice
+    177_Beamstorm     `if nil then` -> `if attachment then`,
+                      `GetTags(nil)` -> `GetTags(attachment)`
+    201_PollenBomb, 902_Reflect
+
+943 tests pass; only the two pre-existing failures.
+
+### The measure did not move, and that is the finding
+The semantic checker has NO CHECK for argument count, so a call silently missing
+two arguments scores clean. This is the fourth blind spot found this session
+(the others: discarded branch values, value collapse, and argument counts now).
+**The 98.2% is an upper bound on correctness, not a measurement of it.**
+
+The honest reading of "semantic 1,142/1,142" as a target: it is reachable only
+for the defect classes the checker can see, and this rotation fixed real,
+externally-verifiable output damage while the number stood still.
+
+### State after rotation 38
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real).
+  A, D, E, F, G, H, I, J, A2/C CLOSED. **argument-cap CLOSED.** MINUS closed as
+  a measured dead end. B PARKED (1). K part-adjudicated.
+POSSIBLE CHECK, noted not built: a call whose argument count is impossible for a
+  known Roblox constructor (`CFrame.new` accepts 1, 3, 7 or 12). That is
+  externally-groundable and would have caught this without the corpus read.
+SWEEP: run against run_r32 in flight.
