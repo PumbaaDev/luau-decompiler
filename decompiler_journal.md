@@ -1380,3 +1380,90 @@ register holding `Nil` where the source has a live `FindFirstChild` result. The
 resumed on.
 No code was changed by rotation 21; the instrumentation was reverted.
 Remaining: 16 semantic defects, unchanged. Sweep re-run in progress.
+
+
+## Rotation 22 - the SWEEP measure, first attack: the grader ignores its own rule
+
+### The composition of the sweep gap
+`sweep_full1143.jsonl`: 781 clean, 79 suspect, 246 broken, 5 error, 712 defects.
+
+    name_collision      388  (55%)
+    undefined_register  171
+    dead_store           68
+    dropped_call         39
+    truncated_body       38
+    duplicate_call        8
+
+### Adjudicating name_collision by hand - 6 sampled, 2 real
+    230_DigitalBeeConstants  a bool from a comparison named `...Count8`,
+                             correctly computed and returned      COSMETIC
+    694_Take_Damage          `Amount6` called as a function - Amount is
+                             legitimately number-or-function      COSMETIC
+    12_FuzzyRow              claims `BackgroundColor3` redefined at line 18;
+                             line 18 declares `BackgroundColor34`  MISREAD
+    268_BeequipRow           `game = game.ReplicatedStorage`       REAL
+    699_RBCUpgrades          `local Color3 = ...` after `Color3.fromRGB` on the
+                             line above - Lua scoping resolves both correctly,
+                             fragile but not wrong                 COSMETIC
+    59_LocalCubs             `v4[v4] = {...}` with v4 an Instance - the
+                             `table.remove(tbl4, tbl4)` shape      REAL
+
+### The finding: the grader breaks the rule it was given
+Reading the prompt closes this properly. It DEFINES the kind as cosmetic -
+"Misleading variable names are name_collision, not broken logic, when the
+surrounding code is structurally correct" - and states the verdict rule:
+"suspect if only naming/redundancy issues". So four of the six are not
+mis-CATEGORISED at all; they are correctly categorised cosmetic findings.
+
+The defect is in the VERDICT. Measured across the corpus:
+
+    246 broken files
+      147 carry a correctness kind
+       99 carry NOTHING but name_collision / dead_store   <- 40%
+
+Forty per cent of "broken" is a file graded non-runnable on the strength of an
+ugly name, against the grader's own written rule.
+
+### FIXED at the decoder, not the prompt
+The script already refuses to trust the model on `kind` - the enum is enforced
+at the decoder because free-string kinds produced `Badge Awarding` and
+`RemoteEvent_Execution`. The verdict needed the same treatment for the same
+reason. `enforce_verdict()` downgrades broken -> suspect ONLY when EVERY defect
+in the file is cosmetic, keeps `model_verdict` alongside so the disagreement
+stays auditable, and leaves every defect in the record with its line intact.
+
+MUTATION TEST, 7/7: cosmetic-only downgrades; cosmetic + one correctness kind
+STAYS broken; dropped_call stays broken; clean and suspect are untouched;
+broken with an empty defect list is left alone. It downgrades only, and it
+cannot silence a finding.
+
+Applied to the existing data:
+
+    clean            781 -> 781
+    suspect           79 -> 178
+    broken           246 -> 147
+    clean-or-suspect 860 -> 959   of 1111
+
+### HONESTY: what this is and is not
+This did NOT repair any output. It corrected a grader that was contradicting
+its own instructions, exactly as rotation 17 corrected the semantic checker's
+read scanner. The 99 files still carry their findings; they are now graded as
+what the prompt says they are. Real correctness is unchanged by this commit.
+
+The 147 remaining broken files are the honest sweep target, and they are the
+ones with `undefined_register`, `dropped_call`, `truncated_body` and
+`duplicate_call` - the kinds that describe lost values rather than ugly ones.
+
+### Note on the in-flight run
+The sweep re-run against `run_r18` was launched BEFORE this change and Python
+had already loaded the script, so its output carries un-enforced verdicts.
+Post-process it with `enforce_verdict` before reading its numbers.
+
+### State after rotation 22
+SEMANTIC: A, D, E, F, G, H **CLOSED**; A1d resolved as symptom; A2 PARKED (2),
+  evidence narrowed to 54_Controls v3/v7; B PARKED (1); C PARKED (2).
+  16 defects remain.
+SWEEP: grader verdict rule **CLOSED** (false-positive class, rule enforced and
+  recorded). name_collision adjudicated as cosmetic BY THE PROMPT'S OWN
+  DEFINITION - 388 findings reclassified, not silenced. 147 files remain as the
+  real target, unadjudicated.
