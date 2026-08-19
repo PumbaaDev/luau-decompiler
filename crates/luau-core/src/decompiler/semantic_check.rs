@@ -220,6 +220,30 @@ fn check_name_body_agreement(source: &str, out: &mut Vec<Finding>) {
             if referenced == d.name {
                 continue; // agrees — nothing to report
             }
+            // A NESTED HELPER MAY NAME ITS PARENT, and that is correct code.
+            //
+            // 855_Stickers.lua:342 declares `local function inspectSF(self)`
+            // INSIDE `function tbl.RepairInvalidStickersInBook(arg1)` (:333),
+            // and warns under the enclosing function's name:
+            //
+            //     warn("Stickers.RepairInvalidStickersInBook: there are ...")
+            //
+            // That is what a diagnostic in a nested helper SHOULD say - the
+            // caller-visible operation is the parent's. Proven nested: the
+            // parent is at column 0, the helper is indented, and there is no
+            // top-level `end` between them.
+            //
+            // The rule below was "referenced name is any declared name", which
+            // cannot tell a mis-paired closure from a helper naming its parent.
+            // Enclosure is the discriminant, and `Decl` already carries the
+            // line range needed to test it. A SIBLING sharing a name is still
+            // the mis-pairing shape and is still reported.
+            let referenced_encloses = decls.iter().any(|o| {
+                o.name == referenced && o.start < d.start && o.end >= d.end
+            });
+            if referenced_encloses {
+                continue;
+            }
             // Only a defect if the referenced name is a sibling declaration:
             // that is the shape produced by mis-paired closures.
             if declared.contains(referenced.as_str()) {

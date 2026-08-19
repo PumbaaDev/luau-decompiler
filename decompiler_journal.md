@@ -359,3 +359,53 @@ B  PARKED (1) - naive fix cost 13 files
 C  OPEN - cause named, not attempted
 D  OPEN - name_body_mismatch, 1 file, untouched
 E  OPEN - undefined_local, 1 file, untouched
+
+## 2026-08-19 — ROTATION 5. FIRST MECHANISM CLOSED (D).
+
+### A4 disproved (third hypothesis killed)
+Probe at the `is_capture` site: of 233 CAPTUREs in 623_Beesmas2024BQuests,
+**203 satisfy all three conjuncts** of the materialisation gate
+(`type in {0,1} && cap_idx != a && cap_op == Capture`). Combined with rotation
+4's silent `pending.is_none()` tag, that means `pending` was `Some(..)` every
+time: materialisation IS working. A4 is not the cause. Instrumentation reverted.
+(The 30 remaining are cap_type=2, upvalue re-capture, a different path.)
+
+### Synthetic-reproducer attack: BLOCKED on toolchain
+`tools/luau/luau-compile.exe` emits bytecode **version 11**; the decompiler
+accepts 3-9. So ground-truth compile-and-diff is unavailable with the bundled
+compiler. Not a dead end for the idea - a dead end for this binary. To unblock:
+a v9-era luau-compile, or compile through the game client itself.
+
+### D — CLOSED. Checker false positive, rule corrected.
+`855_Stickers.lua:342` declares `local function inspectSF(self)` INSIDE
+`function tbl.RepairInvalidStickersInBook(arg1)` (:333) and warns under the
+enclosing name:
+
+    warn("Stickers.RepairInvalidStickersInBook: there are multiple stickers ...")
+
+That is correct code - a nested helper naming the caller-visible operation.
+Nesting PROVEN: parent at column 0, helper indented, zero top-level `end`
+between them.
+
+The rule was "referenced name is any declared name", which cannot distinguish a
+mis-paired closure from a helper naming its parent.
+
+CORRECTED RULE (recorded as required): a self-identifying string is only a
+mismatch when the referenced declaration does NOT enclose the one being checked.
+`Decl` already carries start/end, so enclosure is `o.start < d.start &&
+o.end >= d.end`. A SIBLING sharing a name is still the mis-pairing shape and is
+still reported - the check is narrowed, not weakened.
+
+MEASURED, clean out-dir, timestamp-verified binary:
+    before  1097/1142 clean (96.1%), 97 defects
+    after   1098/1142 clean (96.1%), 96 defects
+MUTATION-PROVEN: replacing the guard with `if false` returns exactly 1097/97;
+restoring gives 1098/96.
+Rust suite: 0 failures except the two pre-existing opmap_dupclosure_detection
+tests, verified identical at backup/pre-batch before any edit this session.
+
+### State after rotation 5
+A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
+A2 DISPROVED (no-op measured)   A3 SUPERSEDED (wrong)   A4 DISPROVED (gate passes)
+A  ACTIVE - dominant, ~347 defects, cause still unknown after four hypotheses
+B  PARKED (1)   C OPEN   D **CLOSED**   E OPEN - located, 71_PlaceInfo.lua:53 `v7`
