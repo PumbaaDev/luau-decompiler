@@ -708,3 +708,72 @@ rather than to the table expression, and the key write was lost with it.
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)
 A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
 B  PARKED (1)   C PARKED (1), question above   D **CLOSED**   E **CLOSED**
+
+## 2026-08-19 — ROTATION 12. C's question answered (rotation 11's hypothesis WRONG). All mechanisms now terminal.
+
+Baseline re-verified after reverting the probe: 1101/1142 clean (96.4%), 93 defects.
+
+### C: the register hypothesis is DISPROVED
+Instrumented the SetTableKS handler to report what the table register holds:
+
+    SETTKS pc=305 tableReg=6 key=Rainbow      holds=Expr(complex)   CONDITIONAL
+    SETTKS pc=317 tableReg=6 key=Transparent  holds=Expr(complex)   CONDITIONAL
+    SETTKS pc=324 tableReg=6 key=TreasureID   holds=Expr(complex)   CONDITIONAL
+    SETTKS pc=280 tableReg=6 key=Glow         holds=Expr(complex)   UNCONDITIONAL, SURVIVES
+
+R6 is intact at the conditional writes - not Unknown, not a fresh Name - and the
+UNCONDITIONAL write at pc 280 has the IDENTICAL register state yet survives into
+the literal. So C is NOT the same root as A. Rotation 11's suspicion is dead.
+
+### What C actually is
+R6 holds a table-CONSTRUCTOR expression, not a bound name. A field write to a
+complex expression is not expressible (`{...}.K = v`), so
+`ensure_table_reg_declared` materialises a local for it. For the unconditional
+run that materialisation happens once, at block level, and
+`reconstruct_table_constructors` folds the whole contiguous prefix into a
+literal. The conditional writes sit inside `Stat::If` bodies, so each one
+materialises its OWN local inside its OWN branch - which is why the output shows
+`local Transparent = ...` instead of `SpawnParams.Transparent = ...`.
+
+### C -> PARKED (2). Unblocking question:
+  Can the table register be materialised into ONE named local BEFORE the first
+  branch that writes to it, so every conditional write targets that name?
+  `ensure_table_reg_declared` already does the materialisation; the question is
+  purely WHERE it runs. Hoisting it to the point the register first becomes a
+  constructor - rather than at each write site - would give all writes, in or
+  out of a branch, a single shared target.
+  Risk to measure: materialising earlier changes statement order and could
+  break the contiguous-prefix absorb that currently produces the literal.
+  Measure corpus-wide; keep only if the clean count rises.
+
+### A -> PARKED (1). Unblocking question (was ACTIVE; recorded now):
+  Ruled out by measurement: A2 (merge_regs terminal reset - candidate fix was a
+  corpus no-op), A3 (closure parameter lists - proven intact, getToyCutscene
+  emits all 5 params), A4 (capture materialisation - 203/233 captures pass the
+  gate, so it works).
+  The one question: mechanism E proved that a value join is discarded wholesale
+  when an arm materialises a statement, and fixing that recovered 3 files. E's
+  guard was `!scratch.is_empty()`. Are there OTHER wholesale-rejection guards on
+  the same path - `enumerate_value_paths` MAX_VALUE_JOIN_PATHS, the
+  `p.len() >= 2` acceptance test at the call site, `find_value_join`'s own
+  purity allowlist - that discard a join for a similarly narrow reason?
+  Cheapest test: tag each of those three rejection points exactly as rotation 9
+  tagged the purity guard, run the CORPUS (not one file), and count which fires
+  most. That converts A from "unknown cause" into a ranked list of candidate
+  guards, and E is the proof that this class of fix pays.
+
+### A1 -> PARKED (1). Unblocking question (was OPEN/deferred):
+  A1 is free_var_decls declaring READONLY holes, which masks a dropped value as
+  a silently-nil local instead of leaving it visible to `undefined_local`.
+  Deferred deliberately because fixing it alone RELABELS defects rather than
+  removing them - the clean count would not move.
+  The question that decides it: after A is fixed, how many READONLY names remain?
+  The rotation-2 census measured 27 corpus-wide (563 ASSIGNED / 27 READONLY).
+  If A's fix drives that toward zero, A1 becomes a no-op and closes for free; if
+  the 27 survive, A1 is worth fixing on honesty grounds alone. So A1 is blocked
+  ON A by design, and the census command to re-run it is recorded in rotation 2.
+
+### State after rotation 12 - EVERY MECHANISM TERMINAL
+A  PARKED (1) - question above          A1 PARKED (1) - blocked on A, question above
+B  PARKED (1) - naive fix cost 13 files C  PARKED (2) - question above
+D  **CLOSED**                            E  **CLOSED**
