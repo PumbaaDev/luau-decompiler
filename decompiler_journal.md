@@ -660,3 +660,51 @@ was the conservative reading of "a statement I cannot safely move".
 A  ACTIVE (~347 defects; A2/A3/A4 disproved)
 A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
 B  PARKED (1)   C OPEN   D **CLOSED**   E **CLOSED**
+
+## 2026-08-19 — ROTATION 11. C investigated and PARKED (1).
+
+Confirmed unchanged by the E fix (run_r10): 176_Collectibles still emits the
+SpawnParams literal with 11 keys, missing `Transparent` and `TreasureID`, and
+carrying a stale `Rainbow = true`.
+
+### What the bytecode says (established earlier, re-stated here so it is not re-derived)
+    271-290: SETTABLEKS R6."Color"/"Icon"/"IconColor"/"Glow"/"Sparkles"/"SilentSpawn"
+    294: JUMPIF ...                      <- guard
+    304: LOADB      R7 true
+    305: SETTABLEKS R6."Rainbow"     R7   <- CONDITIONAL
+    317: SETTABLEKS R6."Transparent" R7   <- CONDITIONAL
+    324: SETTABLEKS R6."TreasureID"  R7   <- CONDITIONAL
+    326: SETTABLEKS R2."SpawnParams" R6
+Every UNCONDITIONAL key survives into the literal. Exactly the three CONDITIONAL
+ones are wrong or missing.
+
+### What the pass does
+`reconstruct_table_constructors` (table_reconstruction.rs:70) seeds on
+`local X = {}` and greedily absorbs a CONTIGUOUS PREFIX of `X.K = V`
+statements. A conditional write lives inside a `Stat::If`, which is not that
+shape, so the greedy run stops there. That explains why the literal contains
+only the unconditional keys - and it would be harmless if the conditional
+writes were then emitted AFTER the literal as `X.K = V` inside their `if`.
+
+They are not. The output instead binds a LOCAL:
+    local Transparent = tbl4.TreasureID
+    if tbl4.TreasureID then Transparent = tbl4.TreasureID end
+So the SETTABLEKS TARGET (R6, the table) was resolved to a fresh local name
+rather than to the table expression, and the key write was lost with it.
+`Rainbow = true` in the literal is the stale `LOADB R7 true` from pc 304.
+
+### C -> PARKED (1). Unblocking question:
+  At pc 317, what does the lifter hold in R6 - the table expression, or a name?
+  The three conditional writes are the only ones inside `if` blocks, so the
+  suspicion is that entering the branch loses R6's binding (the same
+  merge/branch-entry family as A and E), and the SETTABLEKS handler then falls
+  back to naming its destination.
+  Cheapest test: eprintln of `regs[6]` at the SETTABLEKS handler for pcs
+  305/317/324 in 176_Collectibles. If R6 is Unknown or a fresh Name at those
+  points, C is the SAME root as A - a register losing its value on a branch
+  edge - and not a table-reconstruction defect at all.
+
+### State after rotation 11
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)
+A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
+B  PARKED (1)   C PARKED (1), question above   D **CLOSED**   E **CLOSED**
