@@ -6984,3 +6984,53 @@ reopens with new machinery, not a new predicate.
 ### State after rotation 113
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_SHAPE_TRACE`
 kept and verified inert.
+
+
+## Rotation 114 - the last 7 declared_never_assigned, sorted by mint site
+
+### The census
+    REG_EXPR_UNKNOWN+UNK_CALL_CLEAR   4   22, 396, 53, 85
+    METHOD_RECV_REJECT                1   54
+    REG_EXPR_UNKNOWN+UNK_MERGE_COMPOUND 1 79
+    UPVAL_NAME                        1   873   BLOCKED ON THE FORMAT
+
+### The hypothesis, and its falsification
+`533_NPCs` and `368_HoneycombTools` were the same mint site and both fell to
+r87/r88 - walk abandonment at a terminator. Natural guess: the remaining four
+are more of the same. They are not.
+
+`396_TadpoleTailInit::?@5` has the worst coverage of the four (41/55 steps,
+74%), and its gaps are:
+
+    (17,20) (25,29) (31,35) (51,54) (59,62) (65,68)
+
+Every one is a single instruction or two - ordinary branch-arm skipping, not a
+93-instruction abandonment like `59_LocalCubs`. And `LUAU_SPANBREAK` prints
+NOTHING for this proto: neither jump path gives up.
+
+So the shortfall is normal, the walk is healthy, and the orphan register comes
+from something else. The r87/r88 family does not extend to these four.
+
+### What that leaves
+`UNK_CALL_CLEAR` is documented in `opcode_handlers.rs` as "CORRECT by
+construction: a call leaves everything above its results genuinely holding
+nothing". So a later read of such a register is a read on a path where the CALL
+did not execute - a genuine merge problem, not a walk problem. Same conclusion
+r82 reached from the other end, now with the walk explanation eliminated.
+
+### PARKED, with the family split
+BLOCKED ON THE FORMAT (1): `873_Translation` `upval_2`. Roblox bytecode carries
+  no CAPTURE data, so the parent register behind a child's upvalue is not
+  recoverable from the input. Not fixable in this decompiler.
+PARKED (6): the register is cleared by a CALL on one path and read on another.
+  RULED OUT: walk abandonment (r114 - coverage healthy, no span-break fires);
+  the r87/r88 terminator family.
+  THE QUESTION: for `396_TadpoleTailInit::?@5`, which pc CLEARS the orphan
+  register and which pc READS it? `LUAU_REG_WATCH=<n>` prints both, and the two
+  pcs together say whether the read is genuinely on a no-call path (a merge
+  defect) or the clear is over-broad (a `clear_start` defect). That single pair
+  of numbers has never been taken for these files.
+
+### State after rotation 114
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only;
+nothing changed.
