@@ -6054,3 +6054,59 @@ predicate was removed, the bisect switch kept (it is what produced the finding).
 PARKED: guard-arm residual, now with a MECHANISM rather than a symptom -
   cumulative fragmentation of a loop-spanning range - and a fix shape keyed on
   the range instead of the wrap.
+
+
+## Rotation 97 - the range gate lands, and the CFG reports ZERO loops for a proto that has one
+
+### The gate r96 asked for
+Shape C now refuses to fire when a loop header lies in `[pc, body_end)` - the
+range the wrap would fragment. A property of the RANGE, not of the wrap, which
+is what r96's bisect proved was needed.
+
+    clean    1,123 -> 1,123  (unchanged)
+    defects     22 -> 19
+    FIXED    381_Eggs: 3 declared_never_assigned + 1 branch_local_discarded
+    NEW      314_RoboBearGui: 1 calls_not_emitted
+    total emitted calls +283 (was +324 ungated)
+    949 tests pass, twice
+
+Those four fixes in `381_Eggs` are FOUR OF THE SIX regressions rotation 93
+introduced. The residual r93 shipped is now down to two findings plus the
+call-token losses. ADOPTED on that basis.
+
+### And it still does not touch 351
+`351_PassiveTile` is unchanged at 72 -> 62, and the trace says why:
+
+    GUARD codelen=87  headers=1  cond_pc=44  ...
+    GUARD codelen=166 headers=0  cond_pc=13  ...
+    GUARD codelen=166 headers=0  cond_pc=74  ...
+
+**`headers=0` for the 166-instruction proto** - a proto whose lost code is a
+`for k, v in pairs(...)` body full of `break`s. The CFG reports NO loop headers
+for a function that demonstrably contains a loop, so `loop_in_rest` is
+permanently false there and the gate cannot fire.
+
+That is a much bigger finding than the guard-arm residual it was chasing. Either
+
+  * `cfg` and `code` describe DIFFERENT protos at this call site - the
+    parameters are threaded separately and nothing checks they agree; or
+  * `find_loops()` genuinely returns nothing for this proto.
+
+Both are worth knowing independently of Shape C: `loop_headers` is also used by
+`find_value_join` to avoid claiming a nested loop's header, so an empty set
+silently disables that protection too.
+
+### THE QUESTION for the next rotation
+Print, for the 166-instruction proto in `351_PassiveTile`, both `cfg.blocks.len()`
+and `find_loops().len()` at the point `lift_structured_run` builds
+`loop_headers`, and compare against the proto's own block count. If the CFG has
+the wrong number of blocks, `cfg` belongs to another proto and the mismatch is
+the bug; if it has the right blocks and still finds no loop, `find_loops` is.
+
+Do not fix Shape C further until that is answered - four predicates have now
+been aimed at a gate that cannot fire because its input is empty.
+
+### State after rotation 97
+SEMANTIC: **1,123/1,142 (98.3%), 19 defects** (10 -> 7 declared_never_assigned,
+7 -> 6 branch_local_discarded, 5 -> 6 calls_not_emitted).
+949 tests pass on two consecutive runs.

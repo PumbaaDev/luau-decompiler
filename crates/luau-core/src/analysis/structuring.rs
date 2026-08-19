@@ -1139,7 +1139,22 @@ pub(crate) fn structure_numeric_for_body(
             .map(|v| v.split(',').any(|x| x.trim().parse::<usize>() == Ok(pc)))
             .unwrap_or(false);
 
-        if !skip_this && std::env::var("LUAU_NO_GUARD_ARM").is_err() {
+        // DO NOT FRAGMENT A RANGE A LOOP SPANS.
+        //
+        // Rotation 96 bisected `351_PassiveTile`: suppressing any ONE of its
+        // five wraps changes nothing, suppressing all five restores every lost
+        // call. No wrap is bad; the SET is. Each wrap ends `pc = target;
+        // linear_start = pc`, so five of them split the body into six pieces
+        // and a loop spanning several is no longer inside any one region.
+        //
+        // So the gate is a property of the RANGE, not of the wrap or its arm -
+        // which is why the three arm-shape predicates in rotations 94-96 all
+        // failed to exclude wraps that were individually blameless.
+        let loop_in_rest = loop_headers
+            .iter()
+            .any(|&h| h > pc && h < body_end);
+
+        if !loop_in_rest && !skip_this && std::env::var("LUAU_NO_GUARD_ARM").is_err() {
             if let Some((jump_next_pc, target)) = forward_conditional_jump(op, pc, insn) {
                 if target > jump_next_pc && target <= body_end && arm_terminates(code, jump_next_pc, target)
                 {
@@ -1157,8 +1172,14 @@ pub(crate) fn structure_numeric_for_body(
                             // this function receives only the code slice, and a
                             // trace without SOME identifier has now misled this
                             // work three times (r47, r86, r92).
-                            "GUARD	codelen={}	cond_pc={}	op={:?}	arm={}..{}	arm_op={:?}	body_end={}",
+                            // `headers` is the count of loop headers the CFG knows about. It
+                            // is here because the loop-header gate (below) did NOT fire for
+                            // `351_PassiveTile` and the next question is whether that set is
+                            // empty for the proto being structured - which would mean `cfg` and
+                            // `code` describe different protos.
+                            "GUARD	codelen={}	headers={}	cond_pc={}	op={:?}	arm={}..{}	arm_op={:?}	body_end={}",
                             code.len(),
+                            loop_headers.len(),
                             pc,
                             op,
                             jump_next_pc,
