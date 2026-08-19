@@ -7159,6 +7159,15 @@ fn premateralize_branch_escapes_spans(
                 .map(|&(s, e)| count_reg_writes(&proto.code, s, e, reg))
                 .sum::<usize>()
                 == 1;
+        if std::env::var("LUAU_PIN_TRACE").is_ok() && carried_identity {
+            eprintln!(
+                "PIN	{}@{}	reg={}	pinned over {:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                reg,
+                arm_ranges
+            );
+        }
 
         let parked_pure = matches!(
             regs.get(reg),

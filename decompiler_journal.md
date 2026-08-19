@@ -6565,3 +6565,64 @@ casualties.
 ### State after rotation 105
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. No behaviour changed;
 this rotation is the answer to r104's question and the fix shape it implies.
+
+
+## Rotation 106 - r105 was WRONG: there is no pin to ignore
+
+### The check
+Added `LUAU_PIN_TRACE`: one line whenever `carried_identity` actually pins a
+register. On `958_Drakkarmon`:
+
+    onRunning pins: 0
+
+**Zero.** The register is never pinned. So r105's conclusion - "the pin is
+applied and `store_complex` ignores it for arithmetic writes" - is FALSE. There
+is nothing to ignore.
+
+Reading the code again with that in hand confirms it from the other side: when a
+register IS pinned, `do_peek` is false, so `rebind_name` is `None` and the final
+`else` branch emits `Stat::Assign` against the carried name. The pinned path
+works for arithmetic. `958` emits `local WalkSpeed = ...`, which is only
+reachable when `rebind_name` is `Some` - i.e. when the register is NOT pinned.
+
+### And it corrects r104 too
+r104 measured 18 candidate registers reaching the gate in `onRunning` and none
+rejected by the use-after-merge filter. That was true, and I over-read it as
+"these registers get pinned". They reach the gate and are then rejected by the
+LATER predicates (`parked_pure`, `carried_identity`). Reaching a gate is not
+passing it - the same distinction rotation 95 got wrong in the opposite
+direction.
+
+### The corrected chain
+    reaches the gate            YES  (r104, measured)
+    passes carried_identity     NO   (r106, measured: 0 pins)
+    therefore pinned            NO
+    therefore r105's fix shape  MOOT
+
+r103 remains the anomaly to explain: its chain rule changed 28 files, so it
+pinned SOMETHING - just not this register. Whatever it admitted, `958` was not
+among the files whose findings moved.
+
+### PARKED, corrected
+MECHANISM: 4 residual `branch_local_discarded`.
+PROVED:    the registers reach the gate (r104) and are rejected before pinning
+           (r106). The pinned path itself is sound for arithmetic writes.
+RULED OUT: gate never fires (r104); one-write restriction alone (r103);
+           arm-shape predicates (r94-r96); "pin applied but ignored" (r106).
+THE QUESTION: which predicate rejects `onRunning`'s register - `parked_pure` or
+  `carried_identity` - and on which clause? Extend `LUAU_GATE_TRACE` to print
+  the outcome of EACH clause per candidate register, not just gate entry. Do not
+  infer it from the code a third time: r105 was derived by reading call sites
+  and was wrong, and r104 by reading a trace and was over-read.
+
+### Honest note on this stretch
+Rotations 101-106 produced ONE shipped fix (r102, +2 clean) and five
+corrections, three of them to my own conclusions from the preceding rotation.
+The pattern is consistent and worth stating: every claim I derived by reading
+code was wrong; every claim I derived by printing a value held. r105 is the
+clearest case - a careful, plausible argument from the call graph, contradicted
+by a single counter.
+
+### State after rotation 106
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_PIN_TRACE` kept
+and verified inert.
