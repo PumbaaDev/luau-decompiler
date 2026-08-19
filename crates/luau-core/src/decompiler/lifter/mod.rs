@@ -1424,6 +1424,19 @@ fn lift_branch_region(
         .iter()
         .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
         .collect();
+    if std::env::var("LUAU_ARM_TRACE").is_ok() {
+        // Two fix attempts (rotations 71, 72) assumed this function receives the
+        // 23-block else arm of OnInputBegin@184 and both missed it entirely.
+        // Print what it is ACTUALLY called with before assuming a third time.
+        eprintln!(
+            "ARM proto={}@{} blocks={} ranges={} first={:?}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            sorted_blocks.len(),
+            ranges.len(),
+            sorted_blocks.iter().take(6).collect::<Vec<_>>()
+        );
+    }
 
     // Split the arm into maximal CONTIGUOUS runs of adjacent block ranges. A
     // gap between two arm blocks is exactly where another region's blocks live

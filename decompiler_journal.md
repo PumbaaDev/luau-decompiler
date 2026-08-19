@@ -4539,3 +4539,57 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   50 protos with unreachable blocks - separate, parked.
   Seven measured dead ends plus one gated experiment. PARKED: A2/C-residual,
   UPVAL_NAME.
+
+
+## Rotation 73 - both fixes were in the right place; the STRUCTURER is wrong
+
+### The trace that ended the guessing
+    ARM proto=OnInputBegin@184 blocks=1  ranges=1  first=[3]
+    ARM proto=OnInputBegin@184 blocks=23 ranges=23 first=[4, 9, 10, 13, 16, 17]
+
+`lift_branch_region` IS called with all 23 else-arm blocks. So rotation 72's
+guard (`ranges.len() > 1` plus an early RETURN in `ranges[..last]`) was
+satisfied, and the structured path WAS taken - it simply produced the same
+output.
+
+### Why: the arm structurer cannot express a branch
+`lift_structured_run` delegates to `structure_numeric_for_body`, and that
+function emits only:
+
+    Region::Linear
+    Region::ValueJoin
+
+**No `Region::IfThenElse`.** It reconstructs for-loops and value joins; it has
+no capacity to rebuild if/else nesting. Structuring a branch-only arm with it
+returns the arm flattened - which is precisely the defect.
+
+So rotations 71 and 72 were not in the wrong place. The gate fired (or would
+have), the structured path ran, and the structurer handed back linear regions.
+Two rotations of "the fix location must be wrong" were chasing the wrong half of
+the call.
+
+### What this makes the fix
+Branch arms need `structure_control_flow`'s if/else matching applied to their
+block subset - not `structure_numeric_for_body`. That function currently takes a
+whole proto and its CFG and walks the reverse postorder; making it operate on a
+block subset (or adding an entry point that does) is the actual change, and it
+is real work rather than a gate adjustment.
+
+That also retires the framing carried since rotation 70 ("recursive structuring
+of branch arms" as if the machinery existed). It does not - the machinery
+handles loops and joins only.
+
+### State after rotation 73
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: complete diagnosis.** A branch arm whose blocks contain their own
+  if/else is lifted flat because the only structurer available to arms emits
+  Linear and ValueJoin. A conditional RETURN therefore becomes unconditional
+  and `eliminate_dead_code` correctly removes everything after it. 29 files;
+  reproducer `277_DragManager::OnInputBegin@184`.
+  REQUIRED CHANGE, stated exactly: an if/else-capable structuring entry point
+  that accepts a block subset.
+  50 protos with unreachable blocks - separate, parked.
+  Seven measured dead ends plus one gated experiment (LUAU_ARM_SPAN, +4/-9,
+  0 of 60 sampled validation failures). PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_ARM_TRACE (what each branch-arm lift receives).
