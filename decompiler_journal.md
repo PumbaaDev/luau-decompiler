@@ -1608,3 +1608,73 @@ MECHANISM **I: branch_local_discarded** - MEASURED (162 sites, 89 files),
   answer (`Reassign`) and the caller discarded it - so the first place to look
   is every remaining site that ignores the returned `WriteKind`.
 SWEEP: re-run against run_r18 still in flight.
+
+
+## Rotation 25 - mechanism I FIXED: `Lvl3` and `Lvl4` were never two variables
+
+### Where it was NOT
+Mechanism G was a site that discarded `classify_write`'s answer, so the first
+move was to audit every call site. All of them destructure `(kind, name)`
+correctly. The fault was in `classify_write` itself.
+
+### The mechanism
+Look at the names in the family: `Lvl3 -> Lvl4`, `Op3 -> Op4`,
+`Theme6 -> Theme7`, `GetStat -> GetStat2`. Those are ONE debug name with
+different uniquifying counter suffixes, handed out by `ctx.reg_name`. The
+shadow gate asks only whether both names are "semantic" (non-`vN`), which they
+are, so it returns `Shadow` and the caller correctly emits a fresh
+`local Lvl4 = Lvl3 + 2` inside the arm. The value then never reaches the `Lvl3`
+the code goes on to use.
+
+Fix: in `classify_write`, when the two names share an alphabetic stem, this is a
+reassignment of one variable, not a new binding.
+
+### THE GROUND TRUTH CAUGHT MY FIRST VERSION
+The first version compared stems only and returned the OLD name. Full suite:
+
+    corescripts_recover_their_published_functions ... FAILED
+    RbxCharacterSounds: recovered 8/9, MISSING `map`
+
+`map` is in the published source, so this is a definite defect, not a matter of
+opinion. The cause: `mapN -> map` also matches on stem, but that direction is
+the lifter RECOVERING the canonical debug name, and answering `Reassign` there
+keeps the numbered variant and deletes the real name.
+
+Narrowed to the direction the counter actually moves - `Reassign` only when the
+new suffix is strictly GREATER than the old. `Lvl3 -> Lvl4` (4 > 3) and
+`GetStat -> GetStat2` (2 > 0) still reassign; `mapN -> map` (0 > N false) falls
+through to Shadow exactly as before.
+
+Re-measured after narrowing: corpus numbers IDENTICAL and ground truth restored.
+The narrowing cost nothing.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,045 -> 1,104 clean   (91.5% -> 96.7%)
+    153   -> 54 defects
+
+Verified at source level, not by count:
+
+    213_Tornado    if 0 < GetStacksBySource then Lvl3 += 2 end
+                   Lvl3 *= Multiplier            -- the +2 now arrives
+    734_BaseConv   Op ..= " Convert Amount"
+                   ... Op = ((Op .. " (") .. arg2.Color) .. " Bees)"
+                   return Op                     -- the appended text arrives
+
+933 unit tests pass; the two `opmap_dupclosure_detection` failures are the same
+pre-existing pair.
+
+### The arc across rotations 23-25, and what it cost
+23 found the family and mis-classified `dead_store` as cosmetic on the way.
+24 added the check and the measure FELL 98.7% -> 91.5%, which was the instrument
+   becoming honest.
+25 fixed the mechanism and it rose to 96.7%.
+Net against the pre-24 baseline: 1,127 -> 1,104 clean. That looks like a
+regression and is not - 1,127 was measured by an instrument blind to 137 real
+defects, 99 of which are now genuinely repaired.
+
+### State after rotation 25
+SEMANTIC: 1,104/1,142 (96.7%), 54 defects, measured honestly.
+  A, D, E, F, G, H, **I** CLOSED. A2 PARKED (2). B PARKED (1). C PARKED (2).
+SWEEP: re-run against run_r18 COMPLETE (1,111 files) - but r18 PREDATES this
+  fix, so its numbers are already stale and understate the current build.
+  Post-process with `enforce_verdict`, then re-run against run_r26.
