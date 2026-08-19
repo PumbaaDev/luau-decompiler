@@ -300,3 +300,62 @@ A4  ACTIVE: capture binding lost when a child proto is instantiated away from
     the closure's upvalue list, and why does it mint a fresh local instead of
     binding to the CALL ARGUMENTS at that site? Look at how NEWCLOSURE/DUPCLOSURE
     handles CAPTURE operands when the captured register holds a call argument.
+
+## 2026-08-19 — ROTATION 4. A4 question answered (negative result, but a sharp one)
+
+Baseline re-verified on a clean out-dir with a timestamp-checked binary:
+1097/1142 clean (96.1%), 97 defects. Unchanged.
+
+### What I instrumented
+opcode_handlers.rs, the capture-name derivation. When a CAPTURE names a register
+that holds a concrete non-Name expression, the code materialises a declaration:
+
+    let pending = match regs.get(cap_idx) {
+        Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_)) => Some(e.clone()),
+        _ => None,
+    };
+    match pending {
+        Some(value) => emit_local_or_assign(...),   // declaration materialised
+        None        => name,                        // bare name, nothing declared
+    }
+
+Tagged every `pending.is_none()` case by reason (CAP_UNKNOWN / CAP_NAME_OK /
+CAP_LOOPVAR / CAP_OUT_OF_RANGE).
+
+### MEASURED RESULT
+No tag fired. Not on 623_Beesmas2024BQuests (which contains 234 CAPTURE
+instructions) and not on 617_PromoCodes. Binary freshness verified by mtime
+(02:38:15 binary vs 02:36:33 source) so this is not the stale-binary trap that
+cost two earlier measurements.
+
+The enclosing gate is:
+
+    matches!(cap_type, 0 | 1) && cap_idx as usize != a && cap_op == LuauOpcode::Capture
+
+So on this corpus that whole branch is DEAD CODE: captured registers holding a
+non-Name value never have a declaration materialised. Which of the three
+conjuncts fails is not yet established - that is the next question.
+
+### Why this matters
+It is consistent with the observed defect: the capture keeps its USE and never
+gets a binding, which is exactly `declared_never_assigned`. It also explains the
+corpus-wide scale, since the gate is bytecode-shape dependent rather than
+file-specific.
+
+### A4 -> PARKED (1). Unblocking question, narrowed to one measurable fact:
+  Of the three conjuncts, WHICH ONE is false on Roblox bytecode?
+  Cheapest test: log cap_type, cap_idx, `a`, and cap_op for the first 20 CAPTUREs
+  in 623 - one eprintln at the `is_capture` site (line ~1934), which IS reached
+  (the structural fallback lives there). That names the failing conjunct, and the
+  fix follows from it: if cap_op is the failure, the materialisation must accept
+  a structurally-detected CAPTURE the same way `is_capture` already does.
+
+### Rotation 4 state
+A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
+A2 DISPROVED as a lever (no-op measured, reverted)
+A3 SUPERSEDED (wrong - parameters are not lost)
+A4 PARKED (1) with the question above
+B  PARKED (1) - naive fix cost 13 files
+C  OPEN - cause named, not attempted
+D  OPEN - name_body_mismatch, 1 file, untouched
+E  OPEN - undefined_local, 1 file, untouched
