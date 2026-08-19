@@ -5581,3 +5581,60 @@ NEXT: for `OnInputBegin`, find where the walk stops - `LUAU_PC_WINDOW` over the
   gap, then `LUAU_RUNREG_TRACE` for the region that carved the span. Both r87
   and r88 were one of two things: a span carved past its arm's exit, or a walk
   that quit at a jump leaving the span. Check those two first, by measurement.
+
+
+## Rotation 90 - the third variant of the same fault, measured NEUTRAL, not adopted
+
+### Locating it
+`LUAU_WALK_COVER` put `277_DragManager::OnInputBegin` at 106 of 150 steps.
+Collecting every walked pc and diffing against the step list gave the gaps:
+
+    (16,49) (58,61) (120,124) (157,166) (170,177) (198,203)
+
+The dominant one is 17..48, inside the span `flat 4..48`, which stops at 16:
+
+    15: JUMPIFNOT R2 -> 17     `if pulling or dragging then`
+    16: RETURN                     return end
+    17: GETTABLEKS R2 R1."UserInputType"
+
+pc 17 is the JUMPIFNOT's OWN target, so it is reachable. The Return arm ends
+with `break; // Return terminates the current block` - the same assumption the
+unconditional-jump arm made in r88, third variant of one fault: **a span whose
+walk stops at a terminator while the instructions after it are still live.**
+
+Also visible in the trace: `flat 127..138` appears TWICE - a double lift, worth
+its own look later.
+
+### The fix works and buys nothing
+Applied the r88 shape (resume when the next pc is a branch target):
+
+    clean 1,106 -> 1,106   defects 37 -> 37
+    defect set BYTE-IDENTICAL: nothing fixed, nothing broken
+    OnInputBegin coverage 70% -> 82% (walked 106 -> 123)
+    30 files changed
+    corpus total 284,717 -> 284,710 lines
+
+So the extra 17 instructions produced no statements - and no duplication
+either, which the line total rules out. The two output changes worth naming are
+both fine: `397_WindyTailInit` turns `local function fn() ... end;
+task.spawn(fn)` into `task.spawn(function() ... end)` and gains a `local Body4 =
+{}`; `277_DragManager` itself changes only register names.
+
+**Not adopted.** r87 and r88 each closed a defect with visible recoveries. This
+changes 30 files to move nothing any check can see. Left gated with the numbers
+in the source, because the mechanism is right and the next attempt on
+`calls_not_emitted` starts here - but a 30-file diff for a neutral measurement
+is not something to ship on the theory that it must be better.
+
+The honest reading: coverage was the wrong proxy. Walking more instructions is
+not the same as emitting the missing calls, and I assumed it would be.
+
+### State after rotation 90
+SEMANTIC: 1,106/1,142 (96.8%), 37 defects. 949 tests pass. Verified inert.
+GATED, MEASURED, INERT: `LUAU_RET_RESUME` (neutral), `LUAU_ARM_IF` (+1 but
+  deletes a guard), `LUAU_ARM_COND` (-1), `LUAU_DECL_HOIST`, `LUAU_BRANCH_ARMS`.
+NEXT: `calls_not_emitted` needs the CALLS located, not the coverage. Count
+  bytecode `Call` per proto against emitted calls per proto (`count_calls_stats`
+  already exists and is exhaustive) and find WHICH call sites are missing -
+  then trace those pcs specifically. Coverage told me where the walk went, not
+  where the calls went.

@@ -3169,6 +3169,44 @@ pub(super) fn lift_instruction_range(
                 if !is_trailing_empty {
                     stmts.push(Stat::Return { values });
                 }
+                // A Return terminates its BLOCK, not necessarily the span.
+                // Same fault as the unconditional-jump arm (rotation 88), third
+                // variant. `277_DragManager::OnInputBegin`:
+                //
+                //     15: JUMPIFNOT R2 -> 17    `if pulling or dragging then`
+                //     16: RETURN                    return end
+                //     17: GETTABLEKS R2 R1."UserInputType"
+                //
+                // pc 17 is the JUMPIFNOT's own target, so it is reachable; but
+                // breaking at 16 abandoned 17..48 and cost the function 30% of
+                // its instructions (`LUAU_WALK_COVER`: walked 106 of 150).
+                //
+                // Resume only when something else in the proto jumps to the
+                // next instruction, which is precisely when the tail is live.
+                //
+                // MEASURED (rotation 90) and NOT adopted - it is the right
+                // mechanism with no demonstrable payoff:
+                //
+                //     clean 1,106 -> 1,106   defects 37 -> 37
+                //     defect set byte-identical: nothing fixed, nothing broken
+                //     OnInputBegin coverage 70% -> 82% (walked 106 -> 123)
+                //     30 files changed; corpus total 284,717 -> 284,710 lines,
+                //     so the extra instructions produced no statements and no
+                //     duplication either
+                //
+                // r87 and r88 each closed a defect with clear recoveries. This
+                // changes 30 files to move nothing the checker can see, so it
+                // stays gated until there is a finding it actually fixes. The
+                // coverage number is kept because the mechanism is right and
+                // the next attempt on `calls_not_emitted` starts here.
+                let next_pc = pc + if op.has_aux() { 2 } else { 1 };
+                if std::env::var("LUAU_RET_RESUME").is_ok()
+                    && next_pc < end
+                    && pc_is_branch_target(code, next_pc)
+                {
+                    pc = next_pc;
+                    continue;
+                }
                 break; // Return terminates the current block
             }
 
