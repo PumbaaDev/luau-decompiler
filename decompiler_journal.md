@@ -5264,3 +5264,59 @@ B-loops fix was adopted on and `LUAU_ARM_IF` failed.
 SEMANTIC: 1,104/1,142 (96.7%), 39 defects. 949 tests pass.
 `LUAU_LIFTPATH` kept: it answered in one run what three rotations of inference
 got wrong, and the next fix needs it to verify.
+
+
+## Rotation 85 - correcting r84: pc 174 IS walked, and its value IS correct
+
+### The correction
+R84 concluded "nothing lifts pc 174", read off `LUAU_LIFTPATH` ranges. Wrong.
+`LUAU_PC_WINDOW=150-182` shows the walk visiting it:
+
+    150 GetTableKS a=3   152 JumpIf a=3    153 GetUpval a=3   154 JumpIf a=3
+    155 NewTable a=3     157 SetTableKS    160 NewTable a=3   162 DupTable a=4
+    163 NewTable a=5     165 GetUpval a=6  166 SetList        168 SetTableKS
+    170 SetList          172 SetTableKS    174 GetTableKS a=3  <-- WALKED
+    177 GetImport a=3    179 GetTableKS a=4  181 Call
+
+and `LUAU_REG_WATCH=3` shows the value arriving and surviving:
+
+    before_pc=174  Expr(Name("NPC2"))
+    before_pc=177  Expr(Field { object: Name("arg2"), field: "StartReqs" })
+
+So R3 holds exactly the right expression at the point the span ends (176), and
+the `for` at 177-181 goes on to resolve `arg2.StartReqs` correctly from R4.
+
+**The instruction is lifted, the register is correct, and the emitted condition
+is still `v3`.** The loss is between that live register state and the
+region-level `IfThenElse` condition built from block 176 - not in the walk, not
+in the naming, not in the merge.
+
+### Why r84 went wrong, and what to trust
+`LUAU_LIFTPATH` reports RANGES. A range tells you what a call was asked to
+cover, not which instructions the walk actually executed - the outer span
+115..176 covers 174 even though no inner span does, and I read the absence of an
+inner span as absence of a lift. Instruction-level instruments
+(`LUAU_PC_WINDOW`, `LUAU_REG_WATCH`) do not have that failure mode and
+contradicted the range reading immediately.
+
+Four rotations, four wrong locations, each one narrower than the last:
+
+    r81  path-sensitive dataflow at joins    (not a join at all)
+    r82  find_merge_point returns the jump   (merge=210 was correct)
+    r83  contiguous arm never structured     (structured_run does run)
+    r84  pc 174 never lifted                 (it is walked, value correct)
+
+Each was falsified by an instrument one level finer than the one that produced
+it. The window is now two functions wide instead of the whole pipeline.
+
+### Next, and how to check it
+Find where the region-level `IfThenElse` condition is built for a block whose
+predecessor is a `Linear` region in the same `lift_structured_run`, and which
+`regs` it reads. The hypothesis to test FIRST, not to act on: the condition is
+evaluated from a snapshot taken before the Linear region was lifted. Confirm by
+watching R3 at the moment the condition is constructed, not by reading the code
+and inferring - that is what the last four rotations did.
+
+### State after rotation 85
+SEMANTIC: 1,104/1,142 (96.7%), 39 defects. 949 tests pass. No behaviour changed
+this rotation; it is diagnosis and a correction.
