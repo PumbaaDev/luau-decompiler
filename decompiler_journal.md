@@ -5874,3 +5874,58 @@ NEXT: the guard-arm residual - `351_PassiveTile`, guard hoisting across a loop
   boundary where arms end in `break`. Find whether the wrap can be suppressed
   when `target` lies outside the enclosing loop body, using `loop_headers`
   (already a parameter) rather than by inspecting the arm.
+
+
+## Rotation 94 - two narrowings of the guard-arm predicate, both measured WORSE
+
+### What was tried
+The r93 residual is nine files losing calls, worst `351_PassiveTile` (72 -> 62
+call tokens). Two predicates were built to suppress the wrap where it hurts.
+
+**(a) straight-line arms only** - reject any arm containing control flow
+(rotation 93, recorded there):
+
+                       r93 wide   straight-line
+    clean               1,123        1,120
+    files losing calls      9           19
+    files losing loops      0            3
+    total emitted calls  +324         +153
+
+**(b) reject arms with an ESCAPING jump** - a `break` compiles to a jump past
+the wrap point, so an arm containing one is not self-contained:
+
+                       r93 wide   escaping-jump
+    clean               1,123        1,123
+    defects                22           22
+    files losing calls      9           12
+    total emitted calls  +324         +285
+    351_PassiveTile     72 -> 62     72 -> 62  (UNCHANGED)
+
+### What (b) proves
+The predicate did not change `351_PassiveTile` at all. So the arm damaging that
+file does NOT contain an escaping jump by this scan, and my model of its failure
+- "hoisting a tail out of an arm whose arms end in `break` crosses a loop
+boundary" - is WRONG, or at least is not what the scan detects. Both narrowings
+also made the corpus worse overall, which is the same order-dependence lesson
+r93 recorded: refusing to wrap at one site lets a worse wrap happen later.
+
+Reverted to the committed r93 form. Re-measured clean: 1,123/22, 949 tests pass.
+
+### PARKED, with what is ruled out
+MECHANISM: guard-arm residual - nine files lose calls under Shape C.
+PROVED:    Shape C causes it. `351_PassiveTile` is unchanged from r92 baseline
+           to r93 except through Shape C, which was r93's only change.
+RULED OUT: (a) the arm containing any control flow - measured, worse on every
+           axis; (b) the arm containing a jump past the wrap point - measured,
+           worse, and does not even touch the reproducer.
+REPRODUCER: `351_ReplicatedStorage_Gui_TileDisplay_PassiveTile`, 72 -> 62 call
+           tokens, plus one new `calls_not_emitted`.
+THE QUESTION: which conditional in `351_PassiveTile` does Shape C wrap, and what
+           does the region list look like before and after? Answer with
+           `LUAU_RUNREG_TRACE` on that file, proto-qualified, diffing the region
+           lists with Shape C on and off - do NOT model the arm's shape and
+           write a predicate for it, which is now 0 for 2.
+
+### State after rotation 94
+SEMANTIC: 1,123/1,142 (98.3%), 22 defects - unchanged; both experiments reverted.
+949 tests pass.
