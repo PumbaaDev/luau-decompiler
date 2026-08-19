@@ -5666,7 +5666,24 @@ fn extract_into(expr: &Expr, out: &mut Vec<Stat>) {
 /// 3. **Empty do-blocks**: `do end` with no body is removed.
 ///
 /// The pass recurses into all nested bodies (if/while/repeat/for/do/function).
+thread_local! {
+    static DCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
+    // Outermost-only phase trace: the pass recurses, so nested invocations
+    // would drown the signal.
+    let dce_top = DCE_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v <= 1
+    }) && std::env::var("LUAU_DCE_TRACE").is_ok();
+    let dce_say = |phase: &str, st: &Vec<Stat>| {
+        if dce_top {
+            eprintln!("DCE {} stmts={} calls={}", phase, st.len(), count_calls_stats(st));
+        }
+    };
+    dce_say("enter", stmts);
     // --- Phase 1: Recurse into nested bodies first (bottom-up) ---
     for stmt in stmts.iter_mut() {
         match stmt {
@@ -5689,6 +5706,7 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
         }
     }
 
+    dce_say("after_phase1_recurse", stmts);
     // --- Phase 2: Truncate after terminators ---
     // Find the first unconditional terminator at the top level.
     let mut truncate_after = None;
@@ -5714,6 +5732,7 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
         stmts.truncate(idx + 1);
     }
 
+    dce_say("after_phase2_truncate", stmts);
     // --- Phase 3: Remove empty if-blocks and empty do-blocks ---
     let mut i = 0;
     while i < stmts.len() {
@@ -5745,6 +5764,7 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
         }
     }
 
+    dce_say("after_phase3_remove", stmts);
     // --- Phase 4: Prune empty branches from if-statements ---
     // If the then-body is empty but there's an else or elseif, we can negate
     // the condition and swap. If an else-body is empty, drop it.
@@ -5768,6 +5788,8 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
             }
         }
     }
+    dce_say("after_phase4_prune", stmts);
+    DCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 }
 
 /// Negate a boolean condition, trying to produce clean output.

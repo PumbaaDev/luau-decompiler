@@ -4244,3 +4244,62 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   not yet applied.
   50 protos with unreachable blocks - separate, parked.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+
+
+## Rotation 68 - CORRECTS ROTATION 67's diagnosis, and the fix was already there
+
+### Rotation 67 over-claimed twice
+It said `eliminate_dead_code` "deletes an if with an empty then-arm and a
+populated else", and proposed inverting instead of deleting. Reading the pass
+properly:
+
+  1. `is_empty_if` (Phase 3) requires the ELSE to be empty as well, so it cannot
+     remove our statement.
+  2. **Phase 4 ALREADY performs exactly the inversion I proposed** -
+     `then_body.is_empty() && !elseif && else non-empty` negates the condition
+     and swaps the body in.
+
+So the fix I "identified" was in the tree already, and the mechanism I named
+inside the pass was wrong. Locating a pass by bisection is not the same as
+knowing what it does; I should have read it before writing the diagnosis.
+
+### What IS established
+Phase-level tracing inside the pass:
+
+    DCE enter                 stmts=2 calls=14
+    DCE after_phase1_recurse  stmts=2 calls=0     <-- here
+    DCE after_phase2_truncate stmts=2 calls=0
+    DCE after_phase3_remove   stmts=2 calls=0
+    DCE after_phase4_prune    stmts=2 calls=0
+
+The statement COUNT is unchanged and the CALLS vanish during **Phase 1, the
+recursion into nested bodies**. Nothing is deleted at this level; a nested
+invocation empties a body in place.
+
+### What is NOT established, and I am not asserting it
+Widening the trace to the first nested level produced NO invocation entering
+with 37 statements, so my assumption about WHICH nested call gutted the body is
+unsupported. The DCE trace carries no proto name, so the `stmts=2 calls=14`
+record cannot even be tied to `OnInputBegin` with certainty - it is consistent
+with it and not proof of it.
+
+Two rotations running I have named a culprit before I could support it. The
+measure has not moved in either.
+
+### UNBLOCKING QUESTION, narrowed and honest
+Give the DCE trace a proto identity (as `LUAU_REG_WATCH` needed in rotation 49,
+for the same reason), then find the nested invocation whose `enter` and
+`after_phase*` counts differ. Until a trace is attributable to a proto, every
+conclusion drawn from it is a correlation.
+
+### State after rotation 68
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: loss occurs during `eliminate_dead_code`'s Phase 1 recursion.** Ten
+  candidates eliminated by measurement; the proposed inversion fix was found
+  already implemented in Phase 4, so that is an eleventh. Reproducer
+  `277_DragManager::OnInputBegin@184` unchanged.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_DCE_TRACE (per-phase statement and call counts) - needs proto
+  identity before its output can be attributed.
