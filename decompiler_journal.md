@@ -6170,3 +6170,59 @@ DOUBLE-count once FORGLOOP becomes a header.
 SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Diagnosis only; the
 guard trace now prints `blocks`, `maxblk`, `loops`, `headers` and is verified
 inert.
+
+
+## Rotation 99 - the loop-detection bug is REAL and fixing it makes the corpus WORSE
+
+### Two independent repairs, same verdict
+r98 established that `find_loops` misses every generic for-loop because
+`CFG::build` gives FORGPREP a spurious fall-through edge, so the body block does
+not dominate the latch. Two ways to repair that were built and measured against
+the r97 baseline of **1,123 / 19**:
+
+  (a) **Remove the spurious edge.** FORGPREP jumps UNCONDITIONALLY to its
+      FORGLOOP; it does not fall through, so the edge is simply wrong. With it
+      gone the graph is 4 -> 163, 163 -> {5,165}, body -> 163, and the loop is
+      found.
+
+          1,118 / 25
+
+  (b) **Leave the graph alone, add the header from the opcode** where
+      `loop_headers` is built, plus the gate boundary the trace exposed
+      (`h <= body_end`, because the FORGLOOP block sits exactly ON `body_end`).
+
+          1,118 / 25
+
+Identical. Both verified to work: `351_PassiveTile`'s proto went from
+`loops=0 headers=0` to `loops=10 headers=1`, and the control case
+`tileCooldownLoop` stayed at `loops=1 headers=1`, so detection did not
+double-count.
+
+### What that actually proves
+The detection was genuinely broken and both repairs genuinely fix it. The cost
+is not in the detection - it is in what the r97 gate then DOES with it: once
+generic-for headers exist, the gate suppresses guard wraps inside for-bodies,
+and **those wraps are net POSITIVE across the corpus**. Suppressing them costs
+5 clean files and 6 defects to save the 10 call tokens in `351_PassiveTile`.
+
+So the guard-arm residual is not a bug to be gated away. `351` is a genuine
+local loss inside a transformation that pays for itself everywhere else, and
+three rotations of predicates were trying to buy a worse trade.
+
+Both reverted. Re-measured clean: 1,123 / 19, 949 tests pass, tree clean.
+
+### PARKED, and re-framed
+MECHANISM: `find_loops` misses every generic for-loop (r98). REAL, reproduced,
+  two working repairs, both measured.
+WHY NOT SHIPPED: neither repair is the problem - the r97 gate consuming the
+  corrected headers is. Shipping either without changing the gate costs
+  5 clean / 6 defects.
+THE QUESTION: is the corrected loop detection worth anything on its OWN, with
+  the guard-arm gate switched off entirely? `find_value_join` also consumes
+  `loop_headers` to avoid claiming a nested loop's header, and that protection
+  has been dead for every generic-for proto. Measure repair (b) together with
+  `LUAU_NO_GUARD_ARM=1` - that isolates the detection fix from the gate, and it
+  is the one combination not yet tried.
+
+### State after rotation 99
+SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Working tree clean.
