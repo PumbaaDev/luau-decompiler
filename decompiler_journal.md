@@ -2355,3 +2355,53 @@ SEMANTIC: **1,122/1,142 (98.2%), 27 defects**, 3 of them proven checker false
   A, D, E, F, G, H, I, J, **A2/C** CLOSED. MINUS closed as a measured dead end.
   B PARKED (1). K: 3 confirmed FP, 5 candidates.
 SWEEP: run 1 of 2 against run_r32 in flight; run_r32 now predates this fix.
+
+
+## Rotation 37 - my own check is misnamed, and the survivors are three families
+
+### The check does not test for a branch
+`check_branch_local_discarded` requires: the local is mentioned once, its
+initialiser EXTENDS a still-live base, and that base outlives the line. Nothing
+in it tests BRANCH CONTEXT. `859_Stickers_StickerPlacer` proves the gap:
+
+    function tbl.PlaceSticker(self, arg2, arg3, arg4, arg5, arg6)
+        local Size  = arg3 + arg2.Size.X / 2      -- top level, no branch
+        local Size2 = arg4 + arg2.Size.Y / 2
+        local CanvasID = PartToCanvasID2(arg2)
+        if CanvasID then ...
+
+Both are normalised sticker coordinates, computed at the TOP of the function and
+never read anywhere in it - the function ends before `LocalToWorldPos` begins.
+The FINDING is right: a computed value is dropped. The MESSAGE is wrong: it says
+"the arm's value was written to a fresh local instead of back to the base", and
+there is no arm.
+
+CORRECTED RULE: what the check actually detects is `computed_value_discarded`.
+The branch cases (mechanisms I and J) are a SUBSET, and they are the ones that
+were fixable by routing the write back to the accumulator. The rest are values
+that never reach their consumer, which is a different mechanism.
+
+Not renaming it this rotation - the name is load-bearing in the journal and in
+two commits, and a rename with no behaviour change is churn better done in one
+pass at the end. Recorded so the message is not mistaken for evidence of a
+branch.
+
+### The 17 survivors are three families, not one
+    A. TOP-LEVEL DROPPED COMPUTATION (859 x2, and probably 297, 445, 646, 958)
+       computed, never read, no branch involved. Real, and mechanism-less so far.
+    B. CONFIRMED CHECKER FALSE POSITIVES (885_Easing x3)
+       `local pow31 = arg4 / 2` duplicates the `d/2` already in the condition
+       above it - nothing is lost. Established in rotation 30.
+    C. PARAMETER-EXTENDING (21, 22, 381 - `v34 <- arg1`, `v33 <- arg1`)
+       still unadjudicated; a dead local in the ORIGINAL source is
+       indistinguishable from a dropped one in the emitted text.
+
+### State after rotation 37
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects. Composition now known:
+    17 computed_value_discarded  = 3 proven FP + ~6 top-level real + ~8 unadjudicated
+    10 declared_never_assigned   = the register-value-lost family, of which
+       53_PathDisplay is mechanism B (missing else arm, and `v6` carrying BOTH
+       the pool counter and a Ray - two live variables on one name)
+  A, D, E, F, G, H, I, J, A2/C CLOSED. MINUS closed as a measured dead end.
+  B PARKED (1). K part-adjudicated.
+SWEEP: run against run_r32 still in flight; r32 predates rotation 35.
