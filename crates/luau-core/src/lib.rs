@@ -620,6 +620,9 @@ pub fn decompile_with_plan(
     bytecode: &[u8],
     plan: &DecodePlan<'_>,
 ) -> Result<(String, Option<[u8; 256]>)> {
+    // Per-chunk counters. Without this the call-recovery totals accumulate
+    // across a batch run and every file after the first reports the corpus.
+    crate::decompiler::call_recovery::reset();
     let cached_opmap = if plan.exact.is_some() { None } else { plan.prior };
     let mut chunk = parser::parse(bytecode)?;
 
@@ -873,6 +876,19 @@ pub fn decompile_with_plan(
             "{}-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
             banner(), mapped, chunk.protos.len(), chunk.main_proto
         );
+        // CALL RECOVERY. A dropped function body leaves no undefined name and
+        // no bad call, so every other check scores it clean; the bytecode's own
+        // call count is the only thing that contradicts it. Emitted into the
+        // header so `semantic_check` can read it the way it reads the proto
+        // count. Measured: 29 files of 1,143 have at least one short proto.
+        let (short_protos, missing_calls) = crate::decompiler::call_recovery::snapshot();
+        if short_protos > 0 {
+            header.push_str(&format!(
+                "-- call recovery: {} proto(s) emitted {} fewer call(s) than the bytecode contains
+",
+                short_protos, missing_calls
+            ));
+        }
         // Evidence line. Deliberately unconditional: the failure mode this
         // guards against is a wholly mis-detected shuffle producing output that
         // is clean, plausible and wrong with no marker of any kind. The

@@ -180,6 +180,7 @@ pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     let mut out = Vec::new();
     // Reads string contents on purpose — must see the ORIGINAL source.
     check_name_body_agreement(source, &mut out);
+    check_call_recovery(source, &mut out);
     let code = blank_noncode(source);
     check_undefined_locals(&code, &mut out);
     check_declared_but_never_assigned(&code, &mut out);
@@ -327,6 +328,51 @@ fn check_branch_local_discarded(code: &str, out: &mut Vec<Finding>) {
             format!("... and {} further discarded branch values", reported - 6),
         ));
     }
+}
+
+
+// ── Check: a function that makes calls but emitted none ───────────────────
+//
+// A dropped function body leaves NO undefined name, NO bad call and NO
+// discarded value, so every other check here scores it clean. Measured on the
+// 1,143-file corpus before this check existed: 8 protos emit ZERO calls where
+// the bytecode has three or more (`99_BeequipTypes::_CheckReqs` loses 20,
+// `277_DragManager::OnInputBegin` loses 15) and 27 more emit under half.
+// Twenty-nine files, reported by nothing.
+//
+// The lifter writes the comparison into the header because it is the only
+// place that holds both the bytecode and the emitted AST. This check reads it
+// back, the same way `check_body_recovered` consumes the proto count.
+//
+// It reads the ORIGINAL source, not the blanked copy, because the evidence is
+// in a comment.
+fn check_call_recovery(source: &str, out: &mut Vec<Finding>) {
+    let Some(line) = source
+        .lines()
+        .take(20)
+        .find(|l| l.trim_start().starts_with("-- call recovery:"))
+    else {
+        return;
+    };
+    let nums: Vec<usize> = line
+        .split_whitespace()
+        .filter_map(|w| w.parse::<usize>().ok())
+        .collect();
+    let (protos, calls) = match nums.as_slice() {
+        [p, c, ..] => (*p, *c),
+        _ => return,
+    };
+    if protos == 0 {
+        return;
+    }
+    out.push(Finding::wrong(
+        "calls_not_emitted",
+        None,
+        format!(
+            "{} function(s) emitted {} fewer call(s) than their bytecode contains              - a body that makes calls and emits none does nothing at runtime,              and leaves no undefined name for any other check to catch",
+            protos, calls
+        ),
+    ));
 }
 
 // ── Check 1: a function's name must match the name it uses for itself ──────
@@ -1050,6 +1096,54 @@ local z = Lvl3 * 2
     }
 
     /// The Events.lua defect: names paired with the wrong bodies.
+
+    // ── calls_not_emitted ────────────────────────────────────────────────
+    //
+    // The header line is written by the lifter, which is the only place that
+    // holds both the bytecode and the emitted AST. These pin the reading of
+    // it, including the case that must stay silent.
+
+    fn fires_calls(src: &str) -> bool {
+        check(src, None).iter().any(|f| f.check == "calls_not_emitted")
+    }
+
+    #[test]
+    fn reports_a_function_that_emitted_no_calls() {
+        let src = "-- call recovery: 1 proto(s) emitted 15 fewer call(s) than the bytecode contains
+local x = 1
+";
+        assert!(fires_calls(src), "a dropped body must be reported");
+    }
+
+    #[test]
+    fn stays_silent_when_no_header_line_is_present() {
+        // The overwhelming majority of files: the lifter only writes the line
+        // when a proto is short, so absence must never fire.
+        let src = "-- Protos: 6 total, main=5
+local x = 1
+";
+        assert!(!fires_calls(src));
+    }
+
+    #[test]
+    fn stays_silent_on_a_zero_count() {
+        let src = "-- call recovery: 0 proto(s) emitted 0 fewer call(s) than the bytecode contains
+local x = 1
+";
+        assert!(!fires_calls(src), "zero short protos is not a defect");
+    }
+
+    #[test]
+    fn ignores_the_line_beyond_the_header() {
+        // Only the first 20 lines are the header; a later line mentioning it
+        // is file content, not evidence.
+        let mut src = String::new();
+        for _ in 0..30 { src.push_str("local a = 1
+"); }
+        src.push_str("-- call recovery: 3 proto(s) emitted 9 fewer call(s) than the bytecode contains
+");
+        assert!(!fires_calls(&src));
+    }
     #[test]
     fn catches_name_body_mismatch() {
         let src = r#"

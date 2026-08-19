@@ -892,6 +892,20 @@ fn count_calls_expr(e: &Expr) -> usize {
 
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    // Always recorded, not gated: this feeds a semantic check, not a trace.
+    {
+        let mut bc = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
+            let insn = proto.code[i];
+            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+            if matches!(op, LuauOpcode::Call) {
+                bc += 1;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        crate::decompiler::call_recovery::record(bc, count_calls_stats(&out));
+    }
     if std::env::var("LUAU_BODY_REPORT").is_ok() {
         // Also count CALL-family opcodes. A `dropped_call` claim - "a call whose
         // result is referenced but the call itself is missing" - is decidable by

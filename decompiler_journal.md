@@ -3850,3 +3850,68 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   `GrowStar` files that should decompile identically.**
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 Behaviour-neutral rotation; 945 tests pass.
+
+
+## Rotation 61 - `calls_not_emitted`: the measure can finally see a dropped body
+
+### The seam
+The checker works on source TEXT and has no bytecode, but the CLI already reads
+`Protos: N total` out of the emitted header - so bytecode facts reach it through
+a comment. `call_recovery` accumulates per-chunk counts during lifting (the one
+place holding both the bytecode and the AST), `lib.rs` writes
+
+    -- call recovery: 1 proto(s) emitted 15 fewer call(s) than the bytecode contains
+
+and `check_call_recovery` reads it back. Reset per chunk, or a batch run has
+every file after the first reporting the corpus.
+
+### THRESHOLDED to what was verified, and the gap recorded
+Any-deficit reporting flagged **95 files**. The shape actually demonstrated by
+inspection is 29. The difference is small shortfalls in large functions -
+`23_Invisicam::Update@395` emits 20 of 21 - which is far likelier a counting
+edge (dead code, a fused builtin, an unreachable path) than a dropped body, and
+I have NOT shown otherwise.
+
+Reporting 95 would assert five times the evidence I hold. The threshold is
+`emitted == 0 && bytecode >= 3` or `bytecode >= 4 && emitted*2 < bytecode`.
+The excluded cases are UNADJUDICATED, not dismissed - the comment says so and
+raising the threshold brings them back.
+
+### Measurement - clean run, empty out-dir, 1142/1142 decodable
+    1,126 -> **1,100 clean (96.3%)**, 19 -> **48 defects**
+
+**The number went DOWN by 26 files and that is the point** - the same shape as
+rotation 24, where adding `branch_local_discarded` cost 82 files and was the
+instrument becoming honest. These 26 files were always broken; nothing looked.
+
+DISCRIMINATION VERIFIED, not assumed:
+    277_DragManager     flagged, 15 calls short   (OnInputBegin emits 0 of 15)
+    99_BeequipTypes     flagged, 20 short         (_CheckReqs)
+    256_BadgeMenu       flagged, 12 short
+    23_Invisicam        NOT flagged               (20 of 21 - unverified shape)
+
+Four unit tests pin the reading, including the two silent cases; 949 pass. The
+two `opmap_dupclosure_detection` failures are the same pre-existing pair.
+
+### Why this check is worth more than the count it costs
+It needs no ground truth, no model and no judgement. The bytecode states how
+many calls a function makes; the AST states how many were emitted. A function
+that makes twenty and emits none is broken by inspection, and it had been
+scoring clean on BOTH instruments for the whole project.
+
+It would have found this class without the sweep, the two-run vote, or six
+rotations of adjudication - which is the argument for preferring checks that
+compare the artefact against its own input over checks that read the output and
+form an opinion.
+
+### State after rotation 61
+SEMANTIC: **1,100/1,142 (96.3%), 48 defects** - a wider and more honest
+  instrument than the 1,126 it replaces.
+    19  the previously-known families
+    ~26 newly visible dropped bodies (mechanism B)
+SWEEP: ~19 demonstrated of 1,112, all six kinds adjudicated.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: now MEASURED and VISIBLE** (was invisible to every instrument), with
+  reproducer `277_DragManager::OnInputBegin@184` and three sibling `GrowStar`
+  files that should decompile identically. NOT yet fixed.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
