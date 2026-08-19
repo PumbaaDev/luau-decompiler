@@ -3465,6 +3465,22 @@ pub(super) fn lift_instruction_range(
                     let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
+                    // Rotation 125: the arm's register state at ENTRY.
+                    // r122 instrumented what an arm's writes do on the way OUT;
+                    // `54_Controls` shows a receiver arriving as `Nil` on the way
+                    // IN, and that has never been printed.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!(
+                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(),
+                                jump_next,
+                                then_end,
+                                w,
+                                regs.get(w)
+                            );
+                        }
+                    }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
 
                     let else_body = if let Some((es, ee)) = else_range {
@@ -3595,6 +3611,22 @@ pub(super) fn lift_instruction_range(
                     let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
+                    // Rotation 125: the arm's register state at ENTRY.
+                    // r122 instrumented what an arm's writes do on the way OUT;
+                    // `54_Controls` shows a receiver arriving as `Nil` on the way
+                    // IN, and that has never been printed.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!(
+                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(),
+                                jump_next,
+                                then_end,
+                                w,
+                                regs.get(w)
+                            );
+                        }
+                    }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
 
                     let else_body = if let Some((es, ee)) = else_range {
@@ -3706,6 +3738,22 @@ pub(super) fn lift_instruction_range(
                     let regs_snapshot = regs.clone();
 
                     let mut then_stmts = Vec::new();
+                    // Rotation 125: the arm's register state at ENTRY.
+                    // r122 instrumented what an arm's writes do on the way OUT;
+                    // `54_Controls` shows a receiver arriving as `Nil` on the way
+                    // IN, and that has never been printed.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!(
+                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(),
+                                jump_next,
+                                then_end,
+                                w,
+                                regs.get(w)
+                            );
+                        }
+                    }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
 
                     let else_body = if let Some((es, ee)) = else_range {

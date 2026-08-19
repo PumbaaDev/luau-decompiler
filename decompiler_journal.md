@@ -7578,3 +7578,49 @@ THE QUESTION: what is the arm's register state at ENTRY, and why does R3 differ
 ### State after rotation 124
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Diagnosis only; the
 rejection trace is now proto- and register-qualified and verified inert.
+
+
+## Rotation 125 - the arm ENTERS with Nil; the clobber is between the condition and the lift
+
+### The print r124 asked for
+`LUAU_ARM_ENTRY=3` on `54_Controls`, proto `?@74`:
+
+    ARMENTRY ?@74 arm=8..22   reg=3 value=Some(Unknown)
+    ARMENTRY ?@74 arm=18..22  reg=3 value=Some(Expr(Nil))
+    ARMENTRY ?@74 arm=50..54  reg=3 value=Some(Expr(Field{arg2,"EquippedParachute"}))
+
+Two nested arms. The OUTER (8..22) enters with `Unknown`, walks to pc 16 where
+`CALL R3` lands the `FindFirstChild` result, and holds
+`Name("SteeringVelocity3")` at pc 17 (r124's watch). The INNER arm (18..22) then
+enters with `Expr(Nil)`.
+
+### What that narrows to
+The arm is lifted with `regs` DIRECTLY - no copy is taken before the call - so
+the clobber happens between `extract_branch_condition` reading R3 at pc 17 and
+`lift_instruction_range` being invoked for 18..22. The candidates in that window
+are small and named: the `regs_snapshot` clone, and
+`premateralize_branch_escapes_split`, which runs at both inline-if sites
+(opcode_handlers 3457, 3605) and exists precisely to materialise registers the
+arms overwrite.
+
+That is a two-suspect window, reached from a four-file class that began this
+session as "seven orphans, mechanism unknown".
+
+### PARKED
+MECHANISM: the inline-if arm receives `Nil` in a register the enclosing pass
+  holds correctly; `method_receiver_expr` then rightly refuses a nil receiver
+  and mints `vN`.
+PROVED:    bytecode correct (r124); enclosing state correct at pc 17 (r124);
+  arm entry state wrong (r125); the arm shares `regs` with the caller, so the
+  write is in the pre-lift window.
+RULED OUT: bad receiver predicate (r123 - it is a reporter); opmap/bytecode
+  fault (r124); arm-exit restore (r122 fixed that direction and this is the
+  other one).
+THE QUESTION: print `regs[3]` immediately before and after
+  `premateralize_branch_escapes_split` at the inline-if site. If it is `Name`
+  before and `Nil` after, that function is writing the nil; if it is already
+  `Nil` before, the write is in the condition handling at pc 17.
+
+### State after rotation 125
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. `LUAU_ARM_ENTRY`
+added at all three inline-if sites and verified inert.
