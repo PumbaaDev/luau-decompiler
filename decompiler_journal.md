@@ -2898,3 +2898,53 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
   PARKED: UNK_CALL_CLEAR - reclassified from mechanism to TAG, with the real
     question named; B (1, one file); UPVAL_NAME (format-blocked).
 SWEEP: run against run_r37 in flight.
+
+
+## Rotation 46 - the parked question, answered as far as one trace can
+
+### Tooling: LUAU_REG_WATCH
+Added a register watch at the DISPATCH BOUNDARY of `lift_instruction_range`, so
+it observes writes from every handler rather than one site. `LUAU_REG_WATCH=13`
+prints each change to `regs[13]` with the pc that produced it. Env-gated and
+verified behaviour-neutral: clean run still 1,126/19, 945 tests pass.
+
+### What it shows at 85_Badges' call
+    pc=436  reg13 = Expr(Name("Value2"))   -- a MATERIALISED LOCAL
+    pc=437  reg13 = Unknown                -- the call at A=12 scrubbed it
+    pc=442  reg13 = Expr(String("+1%"))    -- and it IS written again after
+
+Two things follow, and the second corrects an assumption I was carrying.
+
+FIRST: at the call the register held `Name("Value2")` - a local the emitter had
+already declared. So the clear does destroy a NAME BINDING that is still in
+scope as a Lua variable, even though the bytecode register is legitimately
+scratch. That is the asymmetry rotation 45 identified, now seen directly.
+
+SECOND, and the correction: register 13 IS rewritten immediately afterwards
+(`"+1%"` at pc=442) and repeatedly through the proto - the full trace shows it
+cycling through tables, strings, numbers and names dozens of times. So the
+emitted `v13` is NOT a read of a scrubbed-and-never-rewritten register. Some
+LATER read resolves to Unknown, and its own preceding write is the thing that
+was lost.
+
+### Why that matters for how this gets attacked next
+I had been treating "the call scrubbed it" as the whole story for four
+rotations. It is not: the scrub is real, immediately repaired by the next write,
+and the defect is a DIFFERENT read further on. Pairing the write trace with a
+READ-side trace - which pc resolves `regs[13]` to Unknown, and what wrote it
+last before that - is the remaining step, and it is one more instrument away
+rather than one more hypothesis away.
+
+### State after rotation 46
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values.
+  PARKED: UNK_CALL_CLEAR (tag, not mechanism; question narrowed to a read-side
+    trace, tooling half-built); B (1); UPVAL_NAME (format-blocked).
+TOOLING now in the tree, all env-gated and zero-cost when unset:
+    LUAU_MINT_TRACE   which names were minted and at which sites
+    LUAU_SEED_TRACE   which gate rejected a table seed
+    LUAU_FRAME_TRACE  declared registers above a call base
+    LUAU_REG_WATCH    every change to one register, with pc
+SWEEP: run against run_r37 in flight.

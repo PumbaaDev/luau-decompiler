@@ -619,6 +619,7 @@ pub(super) fn lift_instruction_range(
     // this dispatch loop appended since the previous tick, and stops early
     // once the proto-wide cap has been hit.
     let mut last_len = stmts.len();
+    let mut watch_prev: Option<String> = None;
     while pc < end && pc < code.len() {
         // Charge the budget for whatever got appended during the previous
         // instruction. `note_stmts_pushed` stamps the sentinel comment and
@@ -633,6 +634,20 @@ pub(super) fn lift_instruction_range(
         last_len = stmts.len();
         // Consume (and thereby clear) any multret CALL recorded by the
         // PREVIOUS instruction. Only the Return arm looks at this.
+        // Register watch: LUAU_REG_WATCH=<n> reports every change to regs[n]
+        // with the pc that produced it. Placed at the loop boundary so it sees
+        // writes from EVERY handler rather than one site.
+        if let Ok(w) = std::env::var("LUAU_REG_WATCH") {
+            if let Ok(w) = w.parse::<usize>() {
+                if w < regs.len() {
+                    let now = format!("{:?}", regs[w]);
+                    if Some(&now) != watch_prev.as_ref() {
+                        eprintln!("WATCH reg={} before_pc={} value={}", w, pc, &now[..now.len().min(90)]);
+                        watch_prev = Some(now);
+                    }
+                }
+            }
+        }
         let multret_from_prev = pending_multret.take();
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
