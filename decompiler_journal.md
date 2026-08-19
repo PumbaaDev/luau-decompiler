@@ -6818,3 +6818,51 @@ r87/r88 walk family, which is what four rotations of guard-arm work had assumed.
 ### State after rotation 110
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_SPANBREAK`
 (both jump paths) kept and verified inert.
+
+
+## Rotation 111 - it is a GenericFor BODY, and the skipped arm is inside it
+
+### The region, found
+    RUNREG ? run=49..175 Linear 49..54
+    RUNREG ? run=49..175 GenericFor 55..162      <-- covers the skipped range
+    RUNREG ? run=49..175 InlineIfThenInLoop
+
+    IF proto=?@40 cond_block=0  then=7  else=0 merge=Some(47)  has_else=false
+    IF proto=?@40 cond_block=47 then=15 else=0 merge=Some(175) has_else=false
+
+So pcs 72..161 are NOT an unlifted arm sitting loose in a Linear span, as r110
+supposed. They are INSIDE the body of a `GenericFor` spanning 55..162.
+
+### What that makes pc 71
+`71: JUMP -> 162` targets 162, which is the GenericFor's own end - the loop
+latch. An unconditional jump to the latch from inside the body is an
+end-of-iteration jump. The flat walk over the body hits it, `target <= end`
+holds, `pc = 162`, the loop test fails and it exits. Everything 72..161 is
+skipped.
+
+That range is a conditional ARM inside the loop body, and the body's structuring
+never lifts it. All ten of the proto's missing CALL sites are in it.
+
+### The family, corrected AGAIN
+    r109  jump-terminated guard arm            WRONG (measured -2 clean)
+    r110  walk abandons an out-of-range jump   WRONG (that path never fires)
+    r111  arm skipped inside a GenericFor body
+
+This is the same flattening rotation 87 fixed for `InlineIfThenInLoop` arms -
+an arm lifted as a flat span drops its interior structure - one construct over,
+in loop bodies. `range_contains_nested_for` and `structure_numeric_for_body`
+exist for exactly this shape, so the question is why they do not reach here.
+
+### THE QUESTION
+`LUAU_RUNREG_TRACE` prints only the TOP-LEVEL regions of each run, so the
+GenericFor's interior is invisible. Extend it to recurse into
+`NumericFor`/`GenericFor` bodies and print their nested region lists. If
+`55..162`'s body is a single Linear region, the loop-body structurer is not
+running on it and that is the target; if it holds sub-regions that simply omit
+72..161, the omission is in how the arm's blocks are collected.
+
+Do not attempt a fix before that print. Rotations 109 and 110 both proposed one
+from an unverified model of this proto, and both were wrong.
+
+### State after rotation 111
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
