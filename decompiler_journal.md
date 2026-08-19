@@ -888,3 +888,55 @@ NEW ATTACK - stop searching the source, instrument the AST instead:
 A  PARKED (3) - new attack above    A1 PARKED (1) - blocked on A by design
 B  PARKED (1)                        C  PARKED (2)
 D  **CLOSED**                        E  **CLOSED**
+
+## 2026-08-19 — ROTATION 15. MECHANISM A'S EMITTER FOUND. There was never a bare local in the AST.
+
+Baseline re-verified after reverting instrumentation: 1101/1142, 93 defects.
+
+### The chokepoint attack worked
+Instrumented emit.rs at the ONE arm that renders `Stat::Local` (emit.rs:51).
+Every bare local in the output must pass through it, so a source grep cannot
+miss what this catches.
+
+First run tagged `values.is_empty()` and printed ZERO markers for 623 - while the
+file visibly contains `local tbl2` at line 159. Binary freshness verified by
+mtime (04:10:11 binary vs 04:08:34 source), so not the stale-binary trap.
+
+### The answer: Phase B0.94b strips trailing nil
+emit.rs:78-84 - "strip trailing nil values from local declarations:
+`local x = nil` -> `local x`". So the AST holds
+    Stat::Local { names: [x], values: [Expr::Nil] }
+which is NOT empty, and the emitter renders it bare.
+
+Re-tagged to separate the two cases, on 623:
+    EMIT_BARE_EMPTY   0
+    EMIT_BARE_NIL   110
+    INTERSECTION with the checker's flagged names:
+        tbl11 tbl14 tbl8 v14 v15 v16   <- ALL SIX
+Complete intersection. 623's every flagged name is a nil-strip.
+
+### Why 14 rotations of searching failed
+There was NEVER a bare local in the AST to find. Every emitter hypothesis - the
+value-join fallback, hoist_loop_locals, free_var_decls, capture materialisation -
+was hunting a construction that does not exist for this shape. The bare local is
+created at RENDER time, not at lift time.
+
+### THE ADJUDICATION QUESTION (this decides ~110 instances, ~1/3 of all defects)
+`local x = nil` and `local x` are semantically IDENTICAL in Lua. So:
+  * if the bytecode genuinely carried LOADNIL for that register, the output is
+    CORRECT and the checker's `declared_never_assigned` is a FALSE POSITIVE -
+    the fix is to the CHECKER (record the corrected rule), not the decompiler;
+  * if the `Expr::Nil` is a placeholder the lifter substituted for a value it
+    dropped, the output is WRONG and the checker is right.
+Decided by reading the bytecode for ONE of the six names in 623.
+NEXT ACTION: disassemble 623, find the register behind `v14`, and check whether
+a LOADNIL writes it. That single read settles a third of the remaining defects.
+
+Note this is exactly the D/E shape again if it resolves as a false positive: a
+check that cannot tell "assigned nil" from "never assigned".
+
+### State after rotation 15 - all mechanisms terminal
+A  PARKED (3) - emitter FOUND, adjudication question above (this is progress:
+   the question is no longer "where does it come from" but "is it wrong at all")
+A1 PARKED (1) - blocked on A by design
+B  PARKED (1)   C PARKED (2)   D **CLOSED**   E **CLOSED**
