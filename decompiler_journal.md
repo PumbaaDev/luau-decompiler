@@ -4699,3 +4699,56 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   PARKED: A2/C-residual (path-sensitive dataflow), UPVAL_NAME (format-blocked).
 TOOLING: LUAU_RPO_TRACE now reports orphan predecessors, which is what made the
   adjudication a one-line question.
+
+
+## Rotation 76 - the merge explanation is FALSIFIED
+
+### The narrowing, and why it should have worked
+Rotation 74 measured general arm structuring at -45 clean / +92 defects and
+explained it: an `IfThenElse` splits the register state, `merge_regs` resets
+whatever the arms disagree on, and structuring therefore imports every
+merge-loss mechanism into arms that previously lifted linearly.
+
+If that explanation were right, restricting structuring to branches whose arms
+TERMINATE should cost nothing - a branch with no join has nothing to reconcile.
+`OnInputBegin`'s guards are exactly that shape.
+
+Built `structure_terminating_branches`, gated on `blocks_all_terminate`, with
+the confinement and strict-decrease guards from rotation 74 retained.
+
+### MEASURED: essentially the same damage
+    baseline                 1,100 clean /  48 defects
+    general structuring (74) 1,055       / 140
+    terminating-only (76)    **1,060     / 141**
+
+Restricting to merge-free branches recovered 5 files out of 45 lost. The cost is
+NOT the merges.
+
+**Rotation 74's explanation is falsified.** It was a plausible mechanism,
+consistent with everything this project has documented about `merge_regs`, and
+it is wrong - or at most a small part of the cost. I recorded it as the reason;
+it was a hypothesis wearing a reason's clothes.
+
+### What that leaves
+Something about routing an arm through `Region::IfThenElse` rather than a flat
+`lift_instruction_range` is itself expensive, independently of joins. Candidates
+not yet separated: register threading through `lift_region`'s arm setup, name
+allocation differences (`classify_write` sees a different write order), the
+B0.57 hoists that run per-branch, or `regs_before` snapshots taken at a
+different point.
+
+Isolating that needs the same treatment mechanism B's diagnosis got - a
+before/after count on ONE file across the structured and flat paths - rather
+than another whole-corpus attempt.
+
+### State after rotation 76
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Baseline restored and verified;
+  949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks
+  CLOSED.
+  **B: two implementations measured, both net-negative, and the explanation for
+  WHY is now known to be wrong.** The honest next step is not a third
+  implementation but a per-file comparison of the structured and flat paths on
+  the reproducer.
+  **Nine measured dead ends** plus one gated experiment.
+  PARKED: A2/C-residual, UPVAL_NAME.
