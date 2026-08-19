@@ -1,9 +1,8 @@
 # luau-decompiler — working notes
 
 A Luau bytecode decompiler, disassembler and obfuscator in Rust. Fully offline.
-This file is read by Claude Code and by the local model, so work can continue on
-either. Keep it short — it is loaded into every session, and the local model only
-has an 8192-token window.
+Read by Claude Code and by the local model, so work can continue on either.
+Keep it short: it loads into every session.
 
 ## Layout
 
@@ -42,107 +41,177 @@ Windows, or the link step fails on a locked file.
   `R{a+1}`. Go to the bytecode.
 - Tag a backup (`git tag backup/pre-<phase>`) before lifter/opmap/emitter edits.
 
-## Local model tier
+## THE fix list (this is the actual work)
 
-For the days the Claude quota is exhausted. Free, uncapped, runs on the RTX 5060 Ti.
+REBASED 19 Aug 2026 ONTO THE REAL CORPUS. The list below used to be built from
+`bc/`, which holds **628** files - roughly half of `target/full1143`'s 1,143,
+and skewed: 575 ReplicatedStorage against **1 Workspace script out of 224**.
+`617_PromoCodes` is not in `bc/` at all. Every proportion it implied was wrong.
+
+`sweep_full1143.jsonl` — 1,111 files, **712 defects with exact line
+citations**: 246 broken, 79 suspect, 781 clean, 5 error.
+
+| Kind | Count | was, on `bc/` |
+|---|---|---|
+| `name_collision` — one debug name reused for unrelated values | **388 (54%)** | 177 |
+| `undefined_register` — bare `vN` used, never assigned | 171 (24%) | 368 (59%) |
+| `dead_store` — assigned, never read | 68 | 21 |
+| `dropped_call` — result referenced, call missing | 39 | 50 |
+| `truncated_body` — body missing or `return {}` stub | 38 | 8 |
+| `duplicate_call` | 8 | - |
+
+**THE DOMINANT FAMILY FLIPPED.** `undefined_register` was 59% of the old list
+and is 24% of the real one; `name_collision` is now the majority at 54%. The
+old advice to start with `undefined_register` was an artefact of the half
+corpus, not a fact about the decompiler.
+
+The broken rate fell with it: 246 of 1,111 (22%) against 271 of 605 (45%). That
+is consistent with `bc/` being a decompiler TEST corpus - deliberately hard
+files - rather than a sample of what the game actually ships.
+
+Densest now: `350_..._BuffTile` (18), `373_ItemPackages_Accessory` (17),
+`438_LocalFX_LocalFlames` (15), `282_Gui_GuiGrid` (13).
+
+The semantic checker disagrees with the sweep by design and both are kept: it
+reports 97 defects across 1,142 files (96.1% clean) because it reports only what
+is PROVABLY wrong, where the sweep reports what looks wrong. Trust `broken`,
+never trust `clean`.
+
+PREVIOUS LIST, kept for comparison — densest files were: `220_..._RootCamera_Follow` (22), `352_MonsterTypes` (15),
+`10_PlayerAbilities` (13), `597_..._MasterControl` (10).
+
+Verified by hand, all real: `return tbl[math.min(arg1, tbl)]` (the `#` was
+dropped), `return v3 .. "."` where `v3` is declared line 7 and never assigned,
+`local value2` declared inside an `if` then used after it, `if 0 < tbl2` in
+`368_Orbiter.lua`, `table.remove(tbl4, tbl4)` in `456_TradeRequestGui.lua`.
+
+SUPERSEDED 19 Aug 2026: `undefined_register` at 59% was true of `bc/` only. On
+the full corpus it is 24% and `name_collision` dominates at 54%. The link to
+commit 26b3b9f (a value assigned in every branch arm, each to a fresh `local`,
+all discarded at the merge) is still worth checking, but it is no longer the
+biggest lever - it is the second.
+
+**Trust `broken`, never trust `clean`** — recall is roughly half. Use the sweep
+to add candidates, never to rule a file out.
+
+## Local tier — free, unlimited
 
 ```sh
-ollama run local-coder                              # chat
-ollama launch claude --model local-coder            # Claude Code harness, local model
-python tools/sweep_local.py bc --out sweep_local.jsonl   # corpus triage
+.\tools\local-claude.ps1                                 # Claude Code, local model
+ollama run local-coder                                   # chat
+python tools/sweep_local.py target/full1143/decompiled/<run> --out sweep_full1143.jsonl   # corpus triage (NOT bc/ - it is half the corpus)
+python tools/index_all.py --out index_all.jsonl           # read corpus + vault
 ```
 
-`local-coder` is `gemma4:12b-it-q4_K_M` with `num_ctx 8192` baked in
-(`tools/Modelfile.local-coder`). It won a matched benchmark against
-`gemma4:26b`, `qwen3-coder:30b-a3b` and `nemotron-3.5-lightning`: most correct
-code, ~1478 tok/s prefill, the only one with zero hallucinations when auditing,
-and the only one that fits entirely on the fast GPU.
+Desktop shortcuts exist: **AI - Local (free)**, **AI - Cloud Fast**,
+**AI - Cloud Heavy**.
+
+`local-coder` = `gemma4:12b-it-q4_K_M` + `num_ctx 65536`
+(`tools/Modelfile.local-coder`). It beat **nine** local models on executed
+coding tasks (7/7) with zero invented defects: `gemma4:26b`, `qwen3-coder:30b`,
+`nemotron-3.5-lightning`, `gpt-oss:20b`, `qwen3.5:9b`, `ornith:9b`,
+`qwen3.6:27b`, `qwen3.8:27b`, `gemma4:e4b`.
+
+Persisted config (User scope): `OLLAMA_NUM_PARALLEL=4`, `OLLAMA_KEEP_ALIVE=30m`,
+`OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_MODELS=C:\Projects\ML\_model-cache\...`.
+
+### Speed is maxed; stop tuning it
+
+~43 tok/s single-request = **84% of the card's theoretical ceiling**
+(448 GB/s ÷ 8.5GB ≈ 52 tok/s). Nothing in software moves this.
+
+Measured and rejected: driver update (flat), `NUM_PARALLEL=8` (**worse** on real
+work — 10.7 vs 11.6 files/min, despite winning a synthetic benchmark), NVFP4
+(macOS-gated by Ollama), `q8_0` (spills, 3x slower), higher effort settings
+(dramatically slower). Only win was 4-worker parallelism: **5.9 → 11.6
+files/min** on batch jobs. Real speedup now needs more memory bandwidth.
 
 ### Hard-won gotchas
 
-- **Always set `num_ctx`.** The default is 262144, which builds a KV cache large
-  enough to push even a 17GB model half into system RAM. Capping it at 8192 took
-  `gemma4:26b` from 19.3 to 42.1 tok/s. This one setting invalidated several
-  early benchmark runs.
-- **`think: false` is required for gemma4** — without it the response comes back
-  empty, with the whole token budget spent on reasoning traces.
-- **`think` crashes `qwen3-coder`.** Not a 400 — it kills llama-server with
-  `0xc0000409` (stack buffer overrun), taking down every loaded model. Send the
-  field only to gemma-family models.
-- **PowerShell 5.1 `ConvertTo-Json` mangles source text**, and
-  `[Text.Encoding]::UTF8` writes a BOM the API rejects. Build Ollama requests in
-  Python, not PowerShell.
-- Two GPUs: the GTX 1650 (4GB) only activates for models over ~15GB. A model that
-  fits on the 5060 Ti staying there is correct, not a fault.
+- **Always set `num_ctx`.** Default 262144 builds a KV cache big enough to push
+  a 17GB model half into system RAM. This one setting invalidated several early
+  benchmarks. 65536 costs under 1GB more than 8192 and is no slower.
+- **Anything over ~14.2GB spills and becomes unusable.** That is the 5060 Ti's
+  16GB minus Windows. Measured: `qwen3.8` 5 min/task, `qwen3.6` 6.5 tok/s,
+  `nemotron` 4 hallucinations. The GTX 1650's 4GB only activates above ~15GB and
+  never rescued anything.
+- **`think` is per-model and getting it wrong is not a soft failure.** gemma4
+  returns an EMPTY response without `think:false`; `qwen3-coder` **crashes
+  llama-server** with `0xc0000409` if you send the field at all, killing every
+  loaded model.
+- **Constrain `kind` fields to a schema enum.** Free-string kinds produced 35
+  categories including `Badge Awarding` and `RemoteEvent_Execution` — the model
+  describing the *game* rather than the decompiler. The enum cut 892 findings to
+  624 and 35 kinds to 5. **~30% of the old defect map was category noise.**
+- **`num_predict` starvation looks like incapability.** Four cloud models scored
+  0/3 at 3000 and 3/3 at 16000. Never lower it to go faster.
+- **PowerShell 5.1**: `ConvertTo-Json` mangles source text, `[Text.Encoding]::UTF8`
+  writes a BOM the API rejects, `Start-Process` has no `-Environment`. Build
+  Ollama requests in Python.
+- Do not leave scripts named after stdlib modules in `%TEMP%` — a stray
+  `inspect.py` shadowed the standard library and broke every later script.
 
-### Ollama Pro cloud tier
+## Cloud tier — Ollama Pro
 
-18 cloud models, driven through the local daemon with the signed key in
-`~/.ollama` — no API key, no separate endpoint, no local VRAM.
+**22 models verified working.** Every one needs the `:cloud` suffix; bare names
+404. `kimi-k3:cloud` is 402 payment-gated.
 
 ```sh
-python tools/ollama_fanout.py tasks.jsonl --out results.jsonl \
-    --model gpt-oss:120b-cloud -j 14        # 12 concurrent calls in 6.3s
+.\tools\cloud-claude.ps1                                 # gemma4:cloud (default)
+.\tools\cloud-claude.ps1 -Model deepseek-v4-pro:cloud    # heavy jobs only
+python tools/ask_cloud.py --list                         # benchmarked models
+python tools/ask_cloud.py --file some.rs "explain this"
 ```
 
-`tools/ollama_fanout.py` takes a JSONL of `{id, prompt, schema?}` and fans it
-out; resumes by id, retries with backoff, caps `num_ctx` for local models only
-(capping a cloud model just truncates the prompt).
+15 of 22 score 3/3 on executed coding tasks. Best points:
 
-- **`gpt-oss:120b-cloud` is the workhorse.** Measured on a 52-task structured
-  merge: 34/35 ok. Same lesson as the local tier — the biggest model is not the
-  best one.
-- **`qwen3.5:397b-cloud` returned an empty body on all 17 tasks it was given.**
-  It spends the whole `num_predict` budget on reasoning before emitting
-  anything. `think: false` is not the fix — sending `think` to qwen crashes
-  llama-server. Raise `num_predict` hard or do not use it for JSON.
-- **`deepseek-v4-flash` truncates schema-constrained output** at
-  `num_predict 1200`; 3000 was enough. Same failure `sweep_local.py` hit at 800.
-- A schema-constrained model can still return an **array where an object was
-  asked for** — 13 of 52 did. Coerce, do not crash.
-- **The cloud tier has a concurrency ceiling around 16.** `-j 14` and `-j 16`
-  ran 0 failures at ~35s median. Raising to `-j 40` produced **HTTP 429 Too
-  Many Requests on 41 tasks and pushed median latency 35s → 110s** — slower AND
-  lossier. Concurrency is not the speed lever.
-- **The speed lever is FEWER, LARGER tasks.** Same bytes, fewer round-trips:
-  raising the chunk from 20K to 52K chars took one job from 562 tasks to 221
-  with no extra failures. Latency is per-request, not per-byte.
-- Do not lower `num_predict` to go faster. Dropping 3500 → 1600 on a
-  schema-constrained job returned **52 empty bodies**; the budget is consumed
-  before the JSON is emitted.
+| Model | Score | Wall | tok/s | Note |
+|---|---|---|---|---|
+| `gemma4:cloud` | 3/3 | **21.5s** | 43.1 | fastest, low quota — default |
+| `deepseek-v4-flash:cloud` | 3/3 | 97.1s | **181.4** | needs `think=low` |
+| `deepseek-v4-pro:cloud` | 3/3 | 60.3s | 132.6 | 1.65T, 1M ctx, **extra high** quota |
+| `glm-5.2:cloud` | 2/3 | 100.8s | **223.9** | fastest tokens, fails `find_undefined` |
 
-### The operating rule
+- **Cloud cannot do structured outputs.** Ollama's docs say so and it was
+  confirmed: a schema-constrained request came back as markdown. So
+  `sweep_local.py` and `index_all.py` are permanently local-only.
+- **Size predicted nothing.** `gemma4:cloud` beat 675B Mistral, 756B GLM and
+  397B Qwen on wall clock. `glm-5.1` (756B) managed 1/3 even at max settings.
+- Watch the **usage tier**: `deepseek-v4-pro` is rated "extra high" and scored
+  the same 3/3 as `gemma4:cloud` in 3x the time. Quota is metered on GPU time.
 
-**Execute everything the model writes.** Across four models and four coding
-tasks, every single one produced plausible, well-formatted, confidently-presented
-code containing a real bug — a `ValueError`, a truncated string, `None` where an
-int belonged. Fluency carried no signal at all. The strictness of the test was
-the only thing that determined whether the bug was visible: loosening one
-assertion from 5 fields to 4 turned a genuine failure into a "pass".
+## The operating rule
 
-The same applies to defect audits. Every model except `local-coder` invented
-defects — most often claiming Roblox child-instance lookups like
-`game.ReplicatedFirst.PlaceType` are invalid property accesses. They are valid.
+**Execute everything the model writes.** Across every model tested, each one
+produced plausible, well-formatted, confidently-presented code containing a real
+bug — a `ValueError`, a truncated string, `None` where an int belonged. Fluency
+carried no signal. Only test strictness determined whether the bug was visible:
+loosening one assertion from 5 fields to 4 turned a genuine failure into a
+"pass", and `gemma4:e4b` looked 77% faster while calling **37 of 40 known-broken
+files clean**.
 
-## Corpus triage findings
+For defect audits: Roblox child-instance lookups like
+`game.ReplicatedFirst.PlaceType` or `script.IsHiveHub` are **valid** and are not
+bugs. Three separate models invented that defect.
 
-`tools/sweep_local.py` over `bc/` (605 files, 85 min, free):
+## Tooling
 
-- 306 broken, 63 suspect, 171 clean, 788 defects with line citations → `sweep_local.jsonl`
-- **406 of 788 defects are the `local`-declared-inside-a-branch shape** — over
-  half. A value is assigned in every arm, each to a fresh `local`, and all are
-  discarded at the merge. Same family as commit 26b3b9f; either that fix does not
-  cover this shape or it regressed.
-- Clearest example: `110_..._Collect_Tokens.lua` builds `Amount2`…`Amount8` in
-  branches, discards them all, then returns a never-assigned `v3`.
-- Densest file: `427_ReplicatedFirst_PlaceInfo.lua`, 11 defects.
-- Trust `broken` verdicts, **never trust `clean`** — recall is roughly half, so
-  use the sweep to add candidates, never to rule a file out.
+`sweep_local.py` (defect triage) · `index_all.py` (corpus + vault knowledge map)
+· `bench_models.py` · `bench_cloud.py` · `bench_parallel.ps1` ·
+`ollama_inventory.py` · `ollama_model_stats.py` · `ask_cloud.py` ·
+`style_profile.py` · `local-claude.ps1` · `cloud-claude.ps1`
+
+Data: `sweep_full1143.jsonl` (1,111 files, the real corpus), `sweep_local.jsonl` (+ `.prev`, bc/ only - half the corpus), `index_all.jsonl` (+ `.prev`, 728 files),
+`cloud_bench_combined.json`, `ollama_inventory.json`, `ollama_model_stats.json`.
 
 ## Open
 
-- 65 files of the sweep never ran (server was OOM-killed at file 549). The script
-  retries and resumes: re-run the same command.
-- `nemotron-3.5-lightning` (25GB), `qwen3-coder` (18GB), `gemma4:26b` (17GB) are
-  on disk and all measured worse than the 7.6GB `local-coder`. `ollama rm` when
-  the disk is wanted. Keep `gemma4:12b-it-q4_K_M` — `local-coder` layers on it.
+- **The 712 defects are unfixed.** Start with `name_collision` (388, 54%) - it
+  is the majority on the real corpus. `undefined_register` (171, 24%) is second
+  and is the one related to commit 26b3b9f (a value assigned in every branch
+  arm, each to a fresh `local`, all discarded at the merge).
+- 5 files error in the full-corpus sweep - content-specific.
+- `index_all.jsonl` under-reports defects by design (its prompt asks what files
+  *do*). Use `sweep_full1143.jsonl` for defects, `index_all.jsonl` for knowledge.
+- Vault notes are largely Claude-written, so they are not a source for
+  `style_profile.py` if the goal is Jep's own voice.
