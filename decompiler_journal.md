@@ -6763,3 +6763,58 @@ THE QUESTION: at pc 71 the jump target is 90, which is INSIDE the proto but
 
 ### State after rotation 109
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean.
+
+
+## Rotation 110 - the arm is SKIPPED, not abandoned; and r109 read the printer
+
+### The measurement r109 asked for
+Instrumented BOTH jump paths in `lift_instruction_range`. The out-of-range break
+path printed NOTHING for `59_LocalCubs::?@40`, which ruled out the whole
+"walk gives up" story. The in-range path gives it:
+
+    SPANJUMP ?@40 pc=71 target=162 span=55..162 exits=true
+
+### r109 was wrong, and the repo warned about exactly this
+r109 recorded `71: JUMP -> 90`, read off the disassembler's listing. The real
+target is **162**. CLAUDE.md says, in as many words: *"Never read operands off
+the disassembler's printer - it invents names like `R{a+1}`. Go to the
+bytecode."* I did precisely that, and it produced a wrong diagnosis that a
+jump-terminated guard rule was then built on (r109, measured -2 clean).
+
+Fifth cross-check this session that overturned my own conclusion, and the only
+one the project's own written rule had already named in advance.
+
+### The corrected mechanism
+pc 71 jumps to 162, which IS the span end (`span=55..162`), so the walk sets
+`pc = 162`, the `while pc < end` test fails, and it exits CLEANLY - no break, no
+abandonment. Instructions **72..161 are SKIPPED**, jumped over by design.
+
+That range is a branch ARM reachable only from an earlier conditional, and
+nothing ever lifts it as its own region. All ten of the proto's missing CALL
+sites (77, 89, 102, 115, 118, 137, 139, 148, 156, 159) are inside it.
+
+So `calls_not_emitted` here is NOT walk-abandonment at a terminator - the family
+r87/r88/r90 belong to. It is a region that was never constructed: the arm is
+correctly skipped by the linear walk and never picked up by the structurer.
+
+### PARKED, re-aimed
+MECHANISM: 6 `calls_not_emitted`. For `59_LocalCubs::?@40` it is an unlifted
+  branch arm, not an abandoned walk.
+PROVED:    pc 71 -> 162 = span end; walk exits cleanly; 72..161 skipped; all 10
+  missing CALLs inside that range.
+RULED OUT: walk gives up on an out-of-range jump (r110 - that path never fires
+  here); jump-terminated guard arms (r109, -2 clean).
+THE QUESTION: which region does the structurer emit for span 55..162? Run
+  `LUAU_RUNREG_TRACE` on this proto and look for a region covering 72..161. If
+  none exists, the conditional at/above pc 55 is not being matched as an
+  if-region at all, and `structure_control_flow`'s handling of THAT conditional
+  is the target - not the walk, and not Shape C.
+
+### Method note
+Three rotations (108-110) produced no score movement and one reverted fix. What
+they produced instead: the `calls_not_emitted` family is now known NOT to be the
+r87/r88 walk family, which is what four rotations of guard-arm work had assumed.
+
+### State after rotation 110
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_SPANBREAK`
+(both jump paths) kept and verified inert.

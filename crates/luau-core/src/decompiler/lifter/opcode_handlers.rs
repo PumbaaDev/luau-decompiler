@@ -3219,6 +3219,18 @@ pub(super) fn lift_instruction_range(
                 };
                 if target > pc && target <= end {
                     // Forward jump within our range → skip to target (else branch of previous if)
+                    if std::env::var("LUAU_SPANBREAK").is_ok() {
+                        eprintln!(
+                            "SPANJUMP	{}@{}	pc={}	target={}	span={}..{}	exits={}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined,
+                            pc,
+                            target,
+                            start,
+                            end,
+                            target >= end
+                        );
+                    }
                     pc = target;
                     continue;
                 } else if target > pc {
@@ -3253,6 +3265,23 @@ pub(super) fn lift_instruction_range(
                     if next_pc < end && pc_is_branch_target(code, next_pc) {
                         pc = next_pc;
                         continue;
+                    }
+                    // Rotation 110: the span bounds at the moment the walk
+                    // gives up on an out-of-range jump. This family has been
+                    // diagnosed four times without ever printing the ONE number
+                    // that says whose span is too short.
+                    if std::env::var("LUAU_SPANBREAK").is_ok() {
+                        eprintln!(
+                            "SPANBREAK	{}@{}	pc={}	target={}	span={}..{}	next={}	is_target={}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined,
+                            pc,
+                            target,
+                            start,
+                            end,
+                            next_pc,
+                            pc_is_branch_target(code, next_pc)
+                        );
                     }
                     // Unconditional jump — remaining instructions are dead code
                     break;
