@@ -7624,3 +7624,48 @@ THE QUESTION: print `regs[3]` immediately before and after
 ### State after rotation 125
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. `LUAU_ARM_ENTRY`
 added at all three inline-if sites and verified inert.
+
+
+## Rotation 126 - premateralization CLEARED; the write is inside the JUMPIFNOT handler
+
+### The print r125 specified
+    PREMAT BEFORE ?@74 pc=17 reg=3 value=Some(Expr(Nil))
+    PREMAT AFTER  ?@74 pc=17 reg=3 value=Some(Expr(Nil))
+
+R3 is ALREADY `Nil` before `premateralize_branch_escapes_split` runs, and
+unchanged after. **That suspect is cleared.**
+
+Against r124's watch, which had `before_pc=17 value=Expr(Name("SteeringVelocity3"))`
+at the TOP of pc 17, the window closes to a single handler: the write happens
+INSIDE the `JumpIfNot` arm at pc 17, before it reaches premateralization.
+
+The control lines confirm the print is meaningful rather than vacuous - the same
+register at other branch points carries a real value through untouched:
+
+    PREMAT BEFORE/AFTER ?@74 pc=49 reg=3 Expr(Field{arg2,"EquippedParachute"})
+    PREMAT BEFORE/AFTER ?@74 pc=70 reg=3 Expr(Field{arg2,"EquippedParachute"})
+
+### What is left in that window
+The `JumpIf`/`JumpIfNot` handler runs two recognizers before anything else:
+`recognize_bool_idiom` (opcode_handlers 3364) and `recognize_or_and_chain`. The
+bool-idiom path ends in
+`store_complex(..., idiom.dest, pc, value)` - a WRITE, to a register the idiom
+picked. If `idiom.dest` resolves to R3 here, that is the clobber, and the
+emitted `v13 = nil` sitting just above the defect in the output is consistent
+with a bool idiom being recognised where none exists.
+
+### PARKED, one suspect left
+MECHANISM: R3 holds the correct receiver at the top of pc 17 and `Nil` by the
+  time the arm is lifted; `method_receiver_expr` then rightly refuses it.
+PROVED:    bytecode correct (r124); receiver correct at pc 17 top (r124); arm
+  entry wrong (r125); premateralization innocent (r126, printed both sides).
+RULED OUT: receiver predicate (r123); opmap/bytecode (r124); arm-exit restore
+  (r122, opposite direction); premateralization (r126).
+THE QUESTION: does `recognize_bool_idiom(code, 17)` return `Some` for this
+  proto, and what is `idiom.dest`? One print at opcode_handlers 3364. If it
+  matches R3, a bool idiom is being recognised across a real branch and its
+  `store_complex` is writing the nil.
+
+### State after rotation 126
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Both prints verified
+inert.

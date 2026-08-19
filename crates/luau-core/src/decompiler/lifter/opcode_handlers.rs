@@ -3454,11 +3454,26 @@ pub(super) fn lift_instruction_range(
                     // 162_Badges proto 10, whose diamond sits INSIDE the outer
                     // `if arg2.Badges` arm and lifts through this inline path.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    // Rotation 126: the two-suspect window from r125. Name before and
+                    // Nil after implicates premateralization; Nil already before puts
+                    // the write in the pc-17 condition handling.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                        }
+                    }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
                         (jump_next, then_end), else_range, construct_end, end, pc,
                     );
 
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!("PREMAT	AFTER	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                        }
+                    }
                     // Lift the guarded block with isolated register state so
                     // assignments inside the then-body don't corrupt the
                     // fall-through path's register view.
@@ -3602,6 +3617,15 @@ pub(super) fn lift_instruction_range(
                     // reads the stale pre-branch literal. Split arms (round 4):
                     // see the JumpIf arm.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    // Rotation 126: the two-suspect window from r125. Name before and
+                    // Nil after implicates premateralization; Nil already before puts
+                    // the write in the pc-17 condition handling.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                        }
+                    }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
                         (jump_next, then_end), else_range, construct_end, end, pc,
@@ -3729,6 +3753,15 @@ pub(super) fn lift_instruction_range(
                     // JumpIfEq-family arm. Split arms (round 4): see the
                     // JumpIf arm.
                     let construct_end = else_range.map_or(target, |(_, ee)| ee);
+                    // Rotation 126: the two-suspect window from r125. Name before and
+                    // Nil after implicates premateralization; Nil already before puts
+                    // the write in the pc-17 condition handling.
+                    if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
+                        if let Ok(w) = w.parse::<usize>() {
+                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                        }
+                    }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
                         (jump_next, then_end), else_range, construct_end, end, pc,
