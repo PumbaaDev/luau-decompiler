@@ -1791,7 +1791,58 @@ fn lift_structured_run(
     // Rotation 87: what does the run structurer actually emit? Proto-qualified,
     // because rotation 86 spent four rotations on the wrong near-duplicate
     // proto for want of exactly this field.
+    // Rotation 112: RECURSE into loop bodies. The top-level print showed
+    // `GenericFor 55..162` covering `59_LocalCubs`'s skipped range and stopped
+    // there, so whether that body is structured at all was invisible.
+    fn runreg_nested(proto: &Proto, run: (usize, usize), regs_: &[Region], depth: usize) {
+        for r in regs_ {
+            let (kind, lo, hi, nested): (&str, usize, usize, Option<&Vec<Region>>) = match r {
+                Region::Linear { start, end } => ("Linear", *start, *end, None),
+                Region::IfThenElse { cond_pc, merge_pc, .. } => {
+                    ("IfThenElse", *cond_pc, merge_pc.unwrap_or(0), None)
+                }
+                Region::ValueJoin { entry, join, .. } => ("ValueJoin", *entry, *join, None),
+                Region::NumericFor { body_start, body_end, body, .. } => {
+                    ("NumericFor", *body_start, *body_end, Some(body))
+                }
+                Region::GenericFor { body_start, body_end, body, .. } => {
+                    ("GenericFor", *body_start, *body_end, Some(body))
+                }
+                Region::WhileDo { header, .. } => ("WhileDo", *header, 0, None),
+                Region::WhileTrue { header, .. } => ("WhileTrue", *header, 0, None),
+                Region::RepeatUntil { header, cond_pc, .. } => {
+                    ("RepeatUntil", *header, *cond_pc, None)
+                }
+                Region::InlineLoopInLoop { body_start, latch_pc, .. } => {
+                    ("InlineLoopInLoop", *body_start, *latch_pc, None)
+                }
+                Region::InlineIfThenInLoop { cond_pc, body, .. } => {
+                    ("InlineIfThenInLoop", *cond_pc, 0, Some(body))
+                }
+            };
+            eprintln!(
+                "RUNREG	{}@{}	run={}..{}	{}{}	{}..{}	nested={}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                run.0,
+                run.1,
+                "  ".repeat(depth),
+                kind,
+                lo,
+                hi,
+                nested.map(|v| v.len()).unwrap_or(0)
+            );
+            if let Some(v) = nested {
+                if depth < 4 {
+                    runreg_nested(proto, run, v, depth + 1);
+                }
+            }
+        }
+    }
     if std::env::var("LUAU_RUNREG_TRACE").is_ok() {
+        runreg_nested(proto, (start, end), &regions, 0);
+    }
+    if false {
         for r in &regions {
             let (kind, lo, hi) = match r {
                 Region::Linear { start, end } => ("Linear", *start, *end),

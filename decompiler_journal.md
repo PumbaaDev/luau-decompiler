@@ -6866,3 +6866,54 @@ from an unverified model of this proto, and both were wrong.
 
 ### State after rotation 111
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Diagnosis only.
+
+
+## Rotation 112 - the loop body is ONE flat Linear region, and the obvious fix is far too broad
+
+### The print r111 required
+`LUAU_RUNREG_TRACE` now recurses into loop bodies. On `59_LocalCubs::?@40`,
+with a healthy loop in the SAME proto as the control:
+
+    GenericFor 27..45   nested=2      ValueJoin 27..42 + Linear 42..45   HEALTHY
+    GenericFor 55..162  nested=1      Linear 55..162                     FLAT
+
+The failing loop's body is a single Linear region covering itself. So
+`structure_numeric_for_body` found NO structure in it, the interior conditional
+at pc 71 was never recognised, and the arm at 72..161 - holding all ten of the
+proto's missing CALL sites - is skipped by the flat walk.
+
+That is the answer, and it is mechanical: Shape B fires only when the arm
+`range_contains_nested_for`, Shape C only when the arm ends in `RETURN`. A plain
+conditional whose arm is jumped over matches NEITHER, so the body stays flat.
+
+### The obvious fix, measured
+Dropped the nested-for requirement so a plain conditional in a loop body is
+wrapped too:
+
+    clean 1,125 -> 1,106   defects 17 -> 37
+
+Catastrophically worse - a bigger regression than any single change this
+session. Reverted. Wrapping EVERY conditional in EVERY loop body is not a
+relaxation of Shape B, it is a different transformation, and it confirms from a
+third direction what r93 and r109 each found: this wrap pays only where the arm
+genuinely does not rejoin, and mis-fires everywhere else.
+
+### PARKED
+MECHANISM: 6 `calls_not_emitted`. For `59_LocalCubs::?@40` the loop body is
+  emitted as one flat Linear region and its interior conditional is never
+  structured.
+PROVED:    the body IS the region `GenericFor 55..162` with a single nested
+  `Linear 55..162`; a sibling loop in the same proto structures correctly
+  (nested=2), so the machinery works and this shape defeats it.
+RULED OUT: jump-terminated guard arms (r109, -2); walk-abandonment (r110, that
+  path never fires); wrapping every plain conditional in a loop body (r112, -19).
+THE QUESTION: what distinguishes `GenericFor 27..45`, which structures, from
+  `GenericFor 55..162`, which does not? Both are generic-for bodies in the same
+  proto. Print the shape decision inside `structure_numeric_for_body` for BOTH
+  ranges - which shapes it tests and which it rejects, per pc - and compare. The
+  healthy one produces a ValueJoin, so the scan clearly can find structure; the
+  difference between the two is the whole answer and has never been printed.
+
+### State after rotation 112
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. Reverted clean; the
+recursive RUNREG trace is kept and verified inert.
