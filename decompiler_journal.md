@@ -3367,3 +3367,74 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K CLOSED
   Six measured dead ends, each with corpus and file.
   PARKED with questions: A2/C-residual (needs path-sensitive dataflow);
   B (1 file); UPVAL_NAME (format-blocked).
+
+
+## Rotation 54 - all 42 confirmed truncated_body findings are FALSE POSITIVES
+
+### CORRECTS ROTATION 30
+Rotation 30 adjudicated this family by the FILE's bytecode size - "all 36 are
+>= 300 bytes, so none is the trivial-script case, therefore REAL". That is the
+wrong granularity. A 1,263-byte file can contain a one-instruction proto.
+
+### The in-file contrast that exposed it
+`889_Utils_Invisibility` ends with a pair of sibling wrappers:
+
+    local function MakeInvisible(arg1)
+        makeInvisible(arg1)      -- correct
+    end
+    local function MakeVisible(arg1)
+    end                          -- empty, flagged as truncated
+
+Same construct, same file, one works. The bytecode settles it:
+
+    MakeInvisible@50   GetUpval / Move / Call / Return   (4 instructions)
+    MakeVisible@54     Return                            (1 instruction)
+
+There is NO CALL in `MakeVisible`'s proto. The shipped game function is empty -
+someone wrote the wrapper and never filled it in. The decompiler is right and
+the finding is wrong.
+
+### The sound adjudicator, and it is now a tool
+`LUAU_BODY_REPORT` prints, per proto, INSTRUCTIONS against emitted STATEMENTS.
+A real truncation is a proto with substantial code and no statements; a
+correctly-empty function is a proto with one `Return`.
+
+Applied to all 42 confirmed files:
+
+    protos with >2 instructions emitting 0 statements : **0**
+    files where every empty body has <=2 instructions : **42**
+
+Not one real truncation among them. `truncated_body` is a FALSE POSITIVE class
+in its entirety on this corpus, and the corrected rule is recorded: adjudicate
+an empty body against its PROTO's instruction count, never the file's size.
+
+### What this does to the sweep number
+The two-run confirmed set was 134 files. Forty-two of them are confirmed
+false positives by mechanical test, so the honest confirmed-broken figure is
+**at most 92**, and the remaining kinds still need the same treatment:
+
+    undefined_register  61   the semantic checker's deterministic version of
+                             this reports only 10, so most are likely the
+                             emitter-noise shape rotation 43 closed
+    name_collision      27   cosmetic by the grader's own prompt (rotation 22)
+    dropped_call        14   not yet adjudicated
+    dead_store          11   real by rotation 23's evidence
+    duplicate_call       3   not yet adjudicated
+
+### The pattern across three adjudications now
+K: 8 of 17 false positive. The verdict rule: 99 files misgraded. truncated_body:
+42 of 42. Every time a defect class has been adjudicated MECHANICALLY against
+the bytecode or the emitter's own state, a large fraction turned out not to be
+defects. The sweep's raw counts have consistently overstated, and the two-run
+vote removes only the UNSTABLE findings - not the STABLE-but-wrong ones. Both
+corrections are needed.
+
+### State after rotation 54
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral rotation; 945 tests
+  pass.
+SWEEP: 134 two-run-confirmed, of which 42 now PROVEN false positive ->
+  <= 92 real, with three kinds still to adjudicate the same way.
+TOOLING: + LUAU_BODY_REPORT (per-proto instructions vs statements).
+MECHANISMS unchanged: A, D, E, F, G, H, I, J, A2/C(if-else/tables),
+  argument-cap, K CLOSED; six measured dead ends; A2/C-residual, B and
+  UPVAL_NAME parked with questions.

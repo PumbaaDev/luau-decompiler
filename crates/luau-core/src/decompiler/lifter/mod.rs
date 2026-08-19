@@ -793,7 +793,30 @@ pub fn lift_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize)
     lift_proto_inner(ctx, proto, proto_index, 0)
 }
 
+/// LUAU_BODY_REPORT prints, per proto, how many INSTRUCTIONS it has against how
+/// many STATEMENTS were emitted for it.
+///
+/// This is the sound adjudicator for `truncated_body` findings. Rotation 30
+/// used the FILE's bytecode size, which is far too coarse: 889_Utils_Invisibility
+/// is 1,263 bytes and its `MakeVisible` proto is a single `Return`, so the empty
+/// body the sweep flagged as truncated is CORRECT output for an empty shipped
+/// function. Only the per-proto instruction count can tell a real truncation
+/// from a function that genuinely does nothing.
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    if std::env::var("LUAU_BODY_REPORT").is_ok() {
+        eprintln!(
+            "BODY proto={}@{} insns={} stmts={}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            proto.code.len(),
+            out.len()
+        );
+    }
+    out
+}
+
+fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     if depth >= MAX_DECOMPILE_DEPTH {
         return vec![Stat::Comment("-- max decompile depth reached".to_string())];
     }
