@@ -6679,3 +6679,46 @@ dataflow, not another predicate.
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects - 7 declared_never_assigned,
 4 branch_local_discarded (closed above), 6 calls_not_emitted.
 949 tests pass. `LUAU_GATE_TRACE` extended and verified inert.
+
+
+## Rotation 108 - SWEEP is BLOCKED, and the sweep tool is itself broken
+
+### Blocked by an explicit user constraint
+Jep asked, directly, to stop the local model: it was consuming enough system
+resources to make the machine lag. `sweep_local.py` runs every file through
+`local-coder` (gemma4:12b, 7.5GB resident), so the Sweep measure cannot be taken
+without doing the thing he just asked me to stop. Killed 5 python processes and
+unloaded the model (`/api/ps` -> none loaded).
+
+**Sweep is therefore PARKED ON AN EXTERNAL CONSTRAINT, not on a technical
+question.** It resumes the moment the machine is free; nothing about the
+decompiler blocks it.
+
+### And the tool is broken independently
+Before stopping, an unbuffered two-file probe ran clean and produced NOTHING:
+
+    skipping 30 file(s) over 60000 bytes
+    2 file(s) to process with gemma4:12b-it-q4_K_M
+    (0 findings written, exit 0)
+
+Zero findings for two files, exit code 0, empty log. So the earlier full run -
+6 minutes, 4 workers, 0 output lines - was not slow, it was silently doing
+nothing while holding the model in memory. That is a real defect in
+`sweep_local.py` (or in its model call), it is SEPARATE from the decompiler, and
+it means any future Sweep number must be validated against a file with a KNOWN
+defect before the run is trusted.
+
+Worth stating plainly: the previous Sweep adjudication in this journal
+(truncated_body 42/42 FALSE, undefined_register 68/72 FALSE, duplicate_call 5/5
+FALSE, dropped_call 1/14 REAL, dead_store 12 REAL, ~19 real of 1,112) predates
+r87/r88/r93/r102 and is STALE. It should not be quoted as current.
+
+### The measures, stated honestly
+    DECODE    1,142/1,142   100%
+    SEMANTIC  1,125/1,142   98.5%, 17 defects
+    SWEEP     unmeasured this session - blocked on the user's machine, and the
+              instrument is producing no findings even when run
+
+### State after rotation 108
+Nothing changed in the decompiler. 1,125/17, 949 tests pass, tree clean apart
+from the untracked probe. Semantic work continues; it needs no model.
