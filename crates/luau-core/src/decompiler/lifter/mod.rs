@@ -2317,11 +2317,14 @@ fn lift_region(
                 // zero statements the loss is inside that call, not in whether
                 // it was made.
                 eprintln!(
-                    "IFLIFT proto={}@{} else_blocks={} else_stmts={:?} then_blocks={}",
+                    "IFLIFT proto={}@{} else_blocks={} else_stmts={:?} else_calls={:?} then_stmts={} then_calls={} then_blocks={}",
                     proto.debug_name.as_deref().unwrap_or("?"),
                     proto.line_defined,
                     else_sorted.len(),
                     else_body.as_ref().map(|b| b.len()),
+                    else_body.as_ref().map(|b| count_calls_stats(b)),
+                    then_stmts.len(),
+                    count_calls_stats(&then_stmts),
                     then_sorted.len()
                 );
             }
@@ -2588,6 +2591,16 @@ fn lift_region(
                     stmts.extend(else_stmts);
                 }
             } else {
+                if std::env::var("LUAU_IF_TRACE").is_ok() {
+                    eprintln!(
+                        "IFPUSH proto={}@{} then_stmts={} else_stmts={:?} else_calls={:?}",
+                        proto.debug_name.as_deref().unwrap_or("?"),
+                        proto.line_defined,
+                        then_stmts.len(),
+                        else_body.as_ref().map(|b| b.len()),
+                        else_body.as_ref().map(|b| count_calls_stats(b))
+                    );
+                }
                 stmts.push(Stat::If {
                     condition,
                     then_body: then_stmts,

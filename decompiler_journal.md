@@ -4118,3 +4118,63 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   50 protos with unreachable blocks - separate, parked.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_PASS_TRACE (calls before/after the post-pass stage).
+
+
+## Rotation 66 - the statement is BUILT COMPLETE and never arrives
+
+### The three traces, in order
+    IF     ... cond_block=0 then=1 else=23 merge=None has_else=true
+    IFLIFT ... else_stmts=Some(37) else_calls=Some(14) then_stmts=0
+    IFPUSH ... then_stmts=0 else_stmts=Some(37) else_calls=Some(14)
+
+The else arm lifts to 37 statements carrying **14 of the function's 15 calls**,
+and the `Stat::If` is pushed into `stmts` with that body INTACT. Possibility 1
+from rotation 65 (calls dropped inside `lift_branch_region`) is dead: nothing is
+lost during lifting at all.
+
+### Where it goes
+    PASS proto=OnInputBegin@184 before_post_passes calls=0
+
+`IFPUSH` is in `lift_region` (mod.rs:2156). The `PASS` bracket is in
+`lift_proto_inner_impl` (mod.rs:956). They are DIFFERENT FUNCTIONS, and by the
+time control reaches the second one the body has zero calls.
+
+So the complete statement that `lift_region` builds does not reach the proto
+body. Nothing damages it; it simply never arrives.
+
+`is_empty_if` was the obvious suspect and is INNOCENT - it requires the else
+body to be empty as well (`else_body.map_or(true, |b| b.is_empty())`), so a
+37-statement else is safe from it. Checked before accusing it.
+
+### What this closes off
+Eliminated by measurement across five rotations, each in one build:
+    unreachable blocks (62)      statement budget (62)
+    missing regions (63)         region construction (64)
+    empty else arm (65)          the whole post-pass stage (65)
+    loss inside lift_branch_region (66)   is_empty_if (66)
+
+### UNBLOCKING QUESTION - the narrowest yet
+`lift_proto_inner_impl` calls `lift_region` for each region. For
+`OnInputBegin@184` that call produces an `If` holding 14 calls and the caller
+ends up with none. So: which `stmts` vector does `lift_region` push into for
+this proto, and why is it discarded rather than appended? One trace on the
+CALLER side - counting calls in the caller's accumulator immediately after each
+`lift_region` return - answers it, and it is the last question in a chain that
+has narrowed for five rotations.
+
+Note the shape: this is the same "an answer is computed correctly and then
+discarded at the call site" as mechanism G (rotation 17), where
+`classify_write` returned the right `WriteKind` and the caller threw it away.
+That precedent is the reason to look at the caller rather than re-examine the
+producer.
+
+### State after rotation 66
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: the statement is built complete and lost between `lift_region` and its
+  caller.** Reproducer `277_DragManager::OnInputBegin@184`; eight candidates
+  eliminated by measurement.
+  50 protos with unreachable blocks - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: LUAU_IF_TRACE now reports IF / IFLIFT / IFPUSH with per-arm statement
+  and call counts.
