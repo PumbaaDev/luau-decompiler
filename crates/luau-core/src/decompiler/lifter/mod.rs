@@ -1472,6 +1472,24 @@ fn lift_branch_region(
     // Two narrower variants were built and measured WORSE and are recorded in
     // the journal: a subset structurer (-45 clean / +92 defects) and one
     // restricted to terminating branches (-40 / +93).
+    if std::env::var("LUAU_BRANCH_ARMS").is_ok() && sorted_blocks.len() > 1 {
+        let regions = crate::analysis::structuring::structure_block_subset(
+            cfg, proto, sorted_blocks,
+        );
+        let n = sorted_blocks.len();
+        let smaller = regions.iter().all(|r| match r {
+            Region::IfThenElse { then_region, else_region, .. } => {
+                then_region.len() < n && else_region.len() < n
+            }
+            _ => true,
+        });
+        if smaller && regions.iter().any(|r| matches!(r, Region::IfThenElse { .. })) {
+            lift_structured_regions(
+                ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
+            );
+            return;
+        }
+    }
     if ranges.len() > 1 {
         let last = ranges.len() - 1;
         let early_ret = ranges[..last].iter().any(|&(s, e)| {

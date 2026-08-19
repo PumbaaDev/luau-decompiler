@@ -151,6 +151,70 @@ pub enum Region {
 }
 
 /// Analyze CFG and produce ordered regions
+
+/// Structure a BLOCK SUBSET with if/else matching. GATED on LUAU_BRANCH_ARMS.
+///
+/// Rebuilt for attribution (rotation 80): rotation 74 measured this at
+/// -45 clean / +92 defects and rotation 76's narrowing at -40 / +93, and
+/// rotation 76 falsified the merge explanation for that cost. The cost is
+/// real, reproducible and unexplained, so this exists to be measured per file
+/// rather than adopted.
+pub(crate) fn structure_block_subset(
+    cfg: &ControlFlowGraph,
+    proto: &Proto,
+    subset: &[usize],
+) -> Vec<Region> {
+    let _ = proto;
+    let member: BTreeSet<usize> = subset.iter().copied().collect();
+    let mut regions = Vec::new();
+    let mut handled: BTreeSet<usize> = BTreeSet::new();
+    for &block_id in subset {
+        if handled.contains(&block_id) {
+            continue;
+        }
+        let Some(block) = cfg.blocks.get(&block_id) else { continue };
+        if block.successors.len() == 2 {
+            let fallthrough = block.successors[0];
+            let branch = block.successors[1];
+            let merge = cfg.find_merge_point(fallthrough, branch);
+            let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
+            let else_blocks = collect_region_blocks(cfg, branch, merge, &handled);
+            let ok = !then_blocks.is_empty()
+                && then_blocks.iter().all(|b| member.contains(b))
+                && else_blocks.iter().all(|b| member.contains(b))
+                && then_blocks.len() < subset.len()
+                && else_blocks.len() < subset.len();
+            if ok {
+                let has_else =
+                    !else_blocks.is_empty() && merge.map_or(true, |m| branch != m);
+                regions.push(Region::IfThenElse {
+                    cond_pc: block_id,
+                    then_region: then_blocks.iter().copied().collect(),
+                    else_region: if has_else {
+                        else_blocks.iter().copied().collect()
+                    } else {
+                        vec![]
+                    },
+                    merge_pc: merge,
+                });
+                handled.insert(block_id);
+                for &b in &then_blocks {
+                    handled.insert(b);
+                }
+                if has_else {
+                    for &b in &else_blocks {
+                        handled.insert(b);
+                    }
+                }
+                continue;
+            }
+        }
+        regions.push(Region::Linear { start: block.start, end: block.end });
+        handled.insert(block_id);
+    }
+    regions
+}
+
 pub fn structure_control_flow(
     cfg: &ControlFlowGraph,
     proto: &Proto,

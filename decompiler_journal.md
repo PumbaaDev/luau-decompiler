@@ -4933,3 +4933,59 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K, unreachable-blocks,
   Nine measured dead ends, each with its numbers and the file that killed it.
 SWEEP: 6 kinds adjudicated mechanically; ~19 files carry a demonstrated defect
   of 1,112, none silenced.
+
+
+## Rotation 80 - B-branches ANSWERED: it is blocked on A2/C
+
+### The recorded question, executed
+Rotation 79 wrote down: "which specific files lose clean status under
+`structure_block_subset`, and what changes in them?" - and noted that rotation
+78's per-file attribution had never been applied to the branch build.
+
+Rebuilt it behind `LUAU_BRANCH_ARMS` (gated, for measurement, not adoption) and
+ran the corpus: 915/1142 clean, 517 defects. Worse than rotation 74's -45
+because it now stacks on the adopted arm-span fix.
+
+### The attribution, and it is one kind
+    new findings introduced, by kind
+      **204  declared_never_assigned**
+        6  undefined_local
+        6  branch_local_discarded
+        3  calls_not_emitted
+
+204 of 219 are a SINGLE kind. `declared_never_assigned` is the signature of a
+register losing its value and `free_var_decls` declaring the name at chunk top
+with nothing ever assigning it - the A2/C family, documented since rotation 33.
+
+### What that resolves
+The cost was called "real, reproducible and UNEXPLAINED" for four rotations.
+It is now explained and it is not a new mechanism: **structuring branch arms
+makes A2/C fire 204 more times.**
+
+Rotation 76's terminating-arms narrowing failed because it confined the fix to
+the branch being matched, while the register losses land on code DOWNSTREAM of
+it - so removing the local join changed almost nothing.
+
+**B-branches is blocked on A2/C**, which is already parked as needing
+path-sensitive dataflow, with both peephole repairs measured and rejected
+(rotations 35 and 52). Fixing branch-arm structuring first would emit 204 more
+of exactly the defect A2/C describes.
+
+That is a DEPENDENCY, not a fourth failed attempt: the two parked mechanisms are
+ordered, and the order is A2/C first.
+
+### State after rotation 80
+SEMANTIC: **1,104/1,142 (96.7%), 39 defects.** Default verified unchanged;
+  949 tests pass. `LUAU_BRANCH_ARMS` left gated with its numbers, as
+  `LUAU_DECL_HOIST` is.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C(if-else/tables), argument-cap, K,
+  unreachable-blocks, **B-loops** CLOSED.
+  **B-branches: question ANSWERED, now BLOCKED ON A2/C** with the measurement
+  that establishes the dependency.
+  **A2/C-residual** is therefore the single next target, and its own question
+  stands: emit the declaration only where the register is genuinely assigned on
+  every path reaching the join - which needs the paths, not the arms.
+  UPVAL_NAME BLOCKED on the format (no CAPTURE data in Roblox bytecode).
+  Nine measured dead ends plus two gated experiments.
+SWEEP: six kinds adjudicated mechanically; ~19 of 1,112 files carry a
+  demonstrated defect; nothing silenced.
