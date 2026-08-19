@@ -48,6 +48,26 @@ REBASED 19 Aug 2026 ONTO THE REAL CORPUS. The list below used to be built from
 and skewed: 575 ReplicatedStorage against **1 Workspace script out of 224**.
 `617_PromoCodes` is not in `bc/` at all. Every proportion it implied was wrong.
 
+COMPLETED 19 Aug 2026 - the first sweep covered 1,111 of 1,142 because a 60KB
+cap skipped the 31 LARGEST files. That is a biased 31, not a random one, and it
+moved the answer. `sweep_corpus_merged.jsonl` is the whole corpus, with the 8
+files too big for one context pass swept in 110KB chunks and their line numbers
+mapped back to the originals.
+
+| Kind | whole corpus | ordinary files | the 31 biggest |
+|---|---|---|---|
+| `name_collision` | **388 (47%)** | 388 (54%) | 0 |
+| `undefined_register` | **289 (35%)** | 171 (24%) | **118 (97%)** |
+| `dead_store` | 71 | 68 | 3 |
+| `dropped_call` | 39 | 39 | 0 |
+| `truncated_body` | 38 | 38 | 0 |
+| `duplicate_call` | 9 | 8 | 1 |
+
+**THE TWO FAMILIES SORT BY FILE SIZE.** `name_collision` is absent from the big
+files entirely; `undefined_register` is 97% of what is in them and 24% of
+everything else. So "start with X" is the wrong shape of advice: pick the family
+by the file you are holding. 834 defects total, and the densest single file is
+`623_Beesmas2024BQuests` at 35 - which the 60KB cap had hidden completely.
 `sweep_full1143.jsonl` — 1,111 files, **712 defects with exact line
 citations**: 246 broken, 79 suspect, 781 clean, 5 error.
 
