@@ -2211,3 +2211,76 @@ SEMANTIC: 1,118/1,142 (97.9%), 31 defects (28 real).
   should be resumed together. A2 PARKED (2). B PARKED (1).
 SWEEP: two-run intersection on run_r27 gives 147 confirmed broken, 756 confirmed
   clean. Run 1 of 2 against run_r32 in flight.
+
+
+## Rotation 34 - mechanism C's cause CONFIRMED, and its fix REJECTED on principle
+
+### The cause, measured
+Instrumented `ensure_table_reg_declared` to log which gate rejects. On
+`654_Collect_Pollen`:
+
+    SEED reg=3 REJECT gate=is_undeclared_non_param
+         current_name=Some("Amount4") holds=Unknown
+
+Confirmed exactly as predicted in rotation 33. Register 3 was declared earlier
+as `Amount4`, a merge reset its value to `Unknown`, and the seeder declined
+because the register is "declared" - while `table_expr`, which only sees the
+Unknown value, emitted an UNDECLARED `v3.Color = ...`. Two predicates
+disagreeing about the same register, which is this repo's recurring shape.
+
+(The other rejections in the trace are correct: those registers hold real
+`Expr::Table` values and must not be clobbered.)
+
+### The obvious fix works, measures well, and is WRONG
+Relaxed the gate so a declared-but-`Unknown` register seeds anyway:
+
+    1,118 -> 1,121 clean (98.2%), 31 -> 28 defects
+
+Then read the six changed files, and every one of them says the same thing:
+
+    53_PathDisplay   v7.CFrame = CFrame3      ->  return { CFrame = ..., Parent = ... }
+                     v7.Parent = Parent
+                     return v7
+    215_Animator     v6.Transparency = 0.7    ->  local Parent53 = { Transparency = 0.7 }
+    533_NPCs         v2.NPC = NPC4            ->  Type6 = { NPC = NPC4 }
+                     arg2.Quest = v2.Name     ->  arg2.Quest = Type6.Name   (nil)
+    544_BlackBear    v1.Rewards = DisplayName ->  local Quest2 = { Rewards = ... }
+
+In every case the register held a game INSTANCE - a pooled part, an animated
+collectible, an NPC - not an empty table. Seeding `= {}` FABRICATES a table the
+source never had. `53_PathDisplay` stops returning a pooled Instance and starts
+returning a literal table.
+
+### Why this is a revert and not a trade
+Before: `v7.CFrame = ...` errors at runtime and is visibly broken.
+After: a fabricated table that looks plausible and is silently wrong.
+
+`free_var_decls` already states the principle in its own comment: "Declaring
+holes hides them. Leaving them undeclared keeps them visible to
+`undefined_local`, which is the honest outcome: still broken, but broken in a
+way the tooling reports."
+
+The clean count rose BECAUSE the defect became invisible to the checker. That is
+rotation 25's trap in a new costume, and it is the fourth time in this session
+that a score improvement turned out to be the instrument losing sight of
+something. Reverted; `53_PathDisplay` confirmed restored at 1,118 / 31.
+
+### What this means for the 100% target
+Some of the remaining 28 defects are HONEST REPORTS OF INFORMATION THAT IS NOT
+IN THE DECOMPILE. The register's value was lost upstream; no naming or seeding
+decision at the write site can recover which Instance it held. Driving the
+checker to clean on these would require inventing data, and inventing data is
+worse output than an undeclared name.
+
+The only sound fix is upstream: stop losing the register's value at the merge -
+which is mechanism A2, PARKED (2), and is the same root cause. C and A2 are one
+mechanism seen from two ends.
+
+### State after rotation 34
+SEMANTIC: 1,118/1,142 (97.9%), 31 defects (3 proven checker FPs -> 28 real).
+  A, D, E, F, G, H, I, J CLOSED. MINUS closed as a measured dead end.
+  **C: cause CONFIRMED, local fix REJECTED as unsound, merged into A2.**
+  A2 PARKED (2) and now carries C's evidence: the fix must restore the
+  register's value at the merge, not paper over the symptom at the write.
+  B PARKED (1).
+SWEEP: run 1 of 2 against run_r32 in flight.
