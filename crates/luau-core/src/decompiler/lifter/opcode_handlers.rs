@@ -2975,6 +2975,21 @@ pub(super) fn lift_instruction_range(
                 // alive made later temporaries write THROUGH that local's name,
                 // so 861_StickerPrinterAnimator emitted `i = StickerRoll...`,
                 // `i = i.CFrame` over its own `for` variable.
+                if std::env::var("LUAU_FRAME_TRACE").is_ok() {
+                    let hi = locals.declared.iter().copied().max().unwrap_or(0);
+                    let live_above: Vec<usize> = locals
+                        .declared
+                        .iter()
+                        .copied()
+                        .filter(|&r| r >= clear_start)
+                        .collect();
+                    if !live_above.is_empty() {
+                        eprintln!(
+                            "FRAME pc={} A={} clear_start={} maxstack={} highest_declared={} DECLARED_ABOVE={:?}",
+                            pc, a, clear_start, proto.max_stack_size, hi, live_above
+                        );
+                    }
+                }
                 for r in clear_start..regs.len() {
                     regs[r] = RegVal::Unknown;
                     // CORRECT by construction: a call leaves everything above

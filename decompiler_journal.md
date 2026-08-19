@@ -2829,3 +2829,72 @@ SEMANTIC: **1,126/1,142 (98.6%), 19 defects**, no known false positives among
     B (1, one file); UPVAL_NAME (format-blocked - Roblox bytecode carries no
     CAPTURE, so the identity is not in the input).
 SWEEP: run against run_r37 in flight.
+
+
+## Rotation 45 - the attack changed, and it dissolved the framing
+
+### The check the escalation rule called for
+Parked three times, so no fourth preservation variant. Instead: instrument the
+clear to report whether any DECLARED register sits above the call base, since a
+Luau frame is allocated above every live local and such a register should be
+impossible.
+
+`85_Badges`:
+
+    FRAME pc=436 A=12 clear_start=13 maxstack=19 highest_declared=13
+          DECLARED_ABOVE=[13]
+
+A call based at 12 with a declared local at 13. In valid Luau the compiler would
+have placed that call at 14.
+
+### But it is not rare, and that is the answer
+    85_Badges         66 such calls
+    368_HoneycombTools 95
+    533_NPCs          118
+    22_ClickToMove    213
+
+A systematically low `A` would wreck the entire corpus, not 19 files. So the
+contradiction is not a decode fault - it is my premise.
+
+`locals.declared` MIXES real source locals with EMITTER-CREATED TEMPORARIES.
+`store_complex` materialises scratch values as named locals by design, so a
+register can be genuine call scratch in the bytecode while being a live Lua
+local in the emitted text. Frame reasoning applies to the bytecode's locals and
+says nothing about the emitter's.
+
+### This retroactively explains rotation 42
+"Preserve registers holding a declared local" sounded principled and failed
+because `declared` is not the set I thought it was: it includes temporaries
+whose registers ARE legitimately scratch, so preserving them kept dead bindings
+alive and 861 wrote through its own loop variable. The failure was not a tuning
+problem - the predicate was measuring the wrong thing.
+
+### Where UNK_CALL_CLEAR actually stands
+The clear is CORRECT. Three preservation strategies failed because none of them
+was addressing the defect. A read of register 13 after a call that legitimately
+scrubbed it means the WRITE the source performed between the call and the read
+was lost - and the surviving candidates for losing it are the merge
+(`UNK_MERGE_COMPOUND`, the A2/C family, whose TABLE case rotation 35 fixed) and
+the branch structuring.
+
+So `UNK_CALL_CLEAR` is a TAG, not a mechanism - consistent with rotation 20's
+finding that `note_unknown` is register-keyed and overwriting, and it should
+never have been treated as a cause. That is the second time this session the
+tags misdirected me; the corrected rule from rotation 20 ("use the tags to GROUP
+candidates, never to name a cause") applies and I did not follow it here.
+
+### UNBLOCKING QUESTION, restated for the last time
+For `85_Badges` register 13: which instruction between the call at pc=436 and
+the read writes it, and what does the lifter do with that write? The
+`LUAU_FRAME_TRACE` instrumentation is left in place (env-gated, zero cost when
+unset) because it is the tool the next attempt needs.
+
+### State after rotation 45
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values - all four with the file that
+    killed them.
+  PARKED: UNK_CALL_CLEAR - reclassified from mechanism to TAG, with the real
+    question named; B (1, one file); UPVAL_NAME (format-blocked).
+SWEEP: run against run_r37 in flight.
