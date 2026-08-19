@@ -5989,3 +5989,68 @@ THE QUESTION: with `LUAU_NO_GUARD_ARM` toggling one file, diff the two OUTPUTS
 ### State after rotation 95
 SEMANTIC: 1,123/1,142 (98.3%), 22 defects. 949 tests pass. Nothing adopted this
 rotation; two instruments kept, one theory falsified and its code removed.
+
+
+## Rotation 96 - the damage is CUMULATIVE, which is why every predicate failed
+
+### Starting from the output, not the bytecode
+r95 parked with: diff the two outputs and find the FIRST divergence. Doing that:
+
+    100,102d99
+    <             if self.Obj then
+    <                 break
+    <             end
+    137,193c134,149
+    <             if v.Action == "Add" then ... elseif "Remove" ... elseif "Update"
+
+The deleted code is all inside a `for` body - the `break`s prove it.
+
+### A fourth predicate, and a bisect instead
+Suppressing the wrap when a loop encloses it (backward-branch scan, no
+dominators needed) changed NOTHING: same 9 files, same 351 at 72 -> 62, same six
+wraps in the trace. Three predicates now, all failing to exclude the same six
+wraps.
+
+So rather than invent a fifth rule, added `LUAU_GUARD_SKIP_PC=<pc>[,<pc>]` and
+bisected:
+
+    skip=none                 calls=62
+    skip=13                   calls=62
+    skip=74                   calls=62
+    skip=92                   calls=62
+    skip=102                  calls=62
+    skip=119                  calls=62
+    skip=13,74,92,102,119     calls=72   <-- all five
+    LUAU_NO_GUARD_ARM=1       calls=72
+
+### THE MECHANISM
+**No single wrap causes the loss; the SET does.** Each wrap ends with
+`pc = target; linear_start = pc`, so five wraps split the body range into six
+pieces. A loop spanning several of those pieces is no longer inside any one
+region and cannot be recognised.
+
+That is why every predicate failed: they all asked "is THIS wrap bad?" and no
+wrap is bad. The arm shape is irrelevant; so is whether one wrap sits in a loop.
+The fault is FRAGMENTATION OF A RANGE A LOOP SPANS.
+
+Corrected fix shape, for the next attempt: gate Shape C on whether a loop header
+lies within `[pc, body_end)` - the range the wrap would fragment - rather than
+on anything about the wrap or its arm. `loop_headers` is already a parameter.
+That is a property of the RANGE, which is the thing actually being damaged.
+
+### A pre-existing FLAKY TEST, found by accident
+`parser::opmap::tests::augmenter_keeps_unary_byte_when_format_consistent` fails
+intermittently: one full-suite run FAILED (948/1), the next passed (949/0). It
+passes 3/3 in isolation and on a stashed clean tree, so it is a parallel-
+execution flake and NOT caused by this work.
+
+This matters beyond itself. Every rotation in this session has read "949 tests
+pass" as a clean signal, and that signal is not deterministic. Recorded here so
+a future red run is not attributed to whatever change is in flight at the time.
+
+### State after rotation 96
+SEMANTIC: 1,123/1,142 (98.3%), 22 defects. Nothing adopted; the in-loop
+predicate was removed, the bisect switch kept (it is what produced the finding).
+PARKED: guard-arm residual, now with a MECHANISM rather than a symptom -
+  cumulative fragmentation of a loop-spanning range - and a fix shape keyed on
+  the range instead of the wrap.

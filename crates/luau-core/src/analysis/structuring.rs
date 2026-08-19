@@ -1129,7 +1129,17 @@ pub(crate) fn structure_numeric_for_body(
         // switch: the residual above is diagnosed by diffing the region lists
         // with it on and off, and rotation 94 wasted two attempts writing
         // predicates from a MODEL of the arm instead of from that diff.
-        if std::env::var("LUAU_NO_GUARD_ARM").is_err() {
+        // `LUAU_GUARD_SKIP_PC=<pc>[,<pc>]` suppresses individual wraps, so the
+        // culprit among several in one file can be BISECTED instead of
+        // guessed. Rotation 96: three predicates in a row failed to exclude the
+        // six wraps in `351_PassiveTile`, so the next step is to find which one
+        // matters rather than invent a fourth rule.
+        let skip_this = std::env::var("LUAU_GUARD_SKIP_PC")
+            .ok()
+            .map(|v| v.split(',').any(|x| x.trim().parse::<usize>() == Ok(pc)))
+            .unwrap_or(false);
+
+        if !skip_this && std::env::var("LUAU_NO_GUARD_ARM").is_err() {
             if let Some((jump_next_pc, target)) = forward_conditional_jump(op, pc, insn) {
                 if target > jump_next_pc && target <= body_end && arm_terminates(code, jump_next_pc, target)
                 {
