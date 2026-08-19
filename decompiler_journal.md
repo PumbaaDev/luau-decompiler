@@ -7473,3 +7473,53 @@ CLOSED (21): ..., **inline-if arm-value discard**.
 REMAINING declared_never_assigned (4): `396` (dropped for-loop, needs r113's
   machinery), `873` (blocked on the format), `79` (`UNK_MERGE_COMPOUND`),
   `54` (`METHOD_RECV_REJECT`) - two distinct mint sites still unexamined.
+
+
+## Rotation 123 - the last two mint sites adjudicated REAL, and one is not where it looks
+
+### 54_Controls - METHOD_RECV_REJECT
+    local SteeringVelocity3 = Character.PrimaryPart:FindFirstChild("SteeringVelocity")
+    if SteeringVelocity3 then
+        v3:Destroy()          -- should be SteeringVelocity3:Destroy()
+    end
+
+REAL. The receiver is bound one line above and the call names an orphan instead.
+
+But the rejection is NOT the bug. `LUAU_MINT_TRACE` prints what was thrown away:
+
+    REJECT METHOD_RECV v3 discarded=Nil
+    REJECT METHOD_RECV v7 discarded=Nil
+
+Register 3 held `Expr::Nil` at the NAMECALL, and `method_receiver_expr` rejects
+a nil receiver deliberately - you cannot call a method on nil, and its doc
+comment lists exactly the types no metamethod can rescue. Minting `v3` there is
+the honest outcome: it keeps the defect VISIBLE rather than emitting
+`nil:Destroy()`.
+
+So the fault is upstream - the receiver register holds nil where it should hold
+the `FindFirstChild` result. `method_receiver_expr` is a reporter, not a cause,
+and any fix aimed at it would be suppressing the symptom. Note the emitted
+`v13 = nil` immediately above: a LOADNIL is reaching that slot.
+
+### 79_Toys - UNK_MERGE_COMPOUND
+    local result26 = (v7 .. " (") .. value14(TimeString2)
+    ...
+    Desc = Desc and (Desc .. " to ") .. v7
+
+REAL. `v7` is a label concatenated into two user-visible strings and never
+assigned, so both render with a nil in them.
+
+### Both classes now fully adjudicated
+Every one of the 14 remaining findings has been read and classified. NONE is a
+false positive - no checker rule needs correcting, which is itself a result: the
+semantic checker's precision on this corpus is 14/14 at this point.
+
+    declared_never_assigned  4   396 (dropped for-loop, needs r113 machinery)
+                                 873 (blocked on the format - no CAPTURE data)
+                                 79  (UNK_MERGE_COMPOUND, real)
+                                 54  (upstream of METHOD_RECV_REJECT, real)
+    branch_local_discarded   4   closed at boundary (r107)
+    calls_not_emitted        6   closed at boundary (r113)
+
+### State after rotation 123
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Adjudication only.
