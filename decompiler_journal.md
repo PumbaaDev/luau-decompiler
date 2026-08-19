@@ -5638,3 +5638,81 @@ NEXT: `calls_not_emitted` needs the CALLS located, not the coverage. Count
   already exists and is exhaustive) and find WHICH call sites are missing -
   then trace those pcs specifically. Coverage told me where the walk went, not
   where the calls went.
+
+
+## Rotation 91 - I overturned r90 on a bad metric, then overturned myself back
+
+### The instrument
+Extended `walk_cover` to answer the question `calls_not_emitted` actually poses:
+of the CALL sites the bytecode contains, which pcs did the walk never reach?
+
+    603_Orbiter::Update@182      missed 4/5   pcs [42, 46, 51, 58]
+    146_CharacterGui::Make@59    missed 3/5   pcs [20, 25, 43]
+    277_DragManager::OnInputBegin missed 1/15 pcs [45]
+    99_BeequipTypes              NO GAP - r87 closed it
+
+The `call_recovery.rs` docstring is now stale: it says `_CheckReqs` loses 20 and
+`OnInputBegin` loses 15. r87/r88 fixed both; `OnInputBegin` is down to one.
+
+### The overclaim
+`LUAU_RET_RESUME` (r90, measured neutral and left gated) closes every one of
+those gaps. Corpus-wide:
+
+    base            77 protos with a gap, 243 CALL pcs never reached
+    ret_resume      16 protos,             60 CALL pcs never reached
+
+I read that as "183 call sites recovered" and concluded r90's verdict had been
+wrong - that the thresholded `calls_not_emitted` check simply could not see the
+gain.
+
+### The correction
+It could not see a gain because there is none. Emitted call tokens across the
+full corpus:
+
+    base        38,177
+    ret_resume  38,177
+
+Byte-identical. `603_Orbiter` output is byte-identical too. **Reaching a CALL pc
+is not emitting a call**, and CALLGAP measures walk-reach - exactly the mistake
+r90 named one level up ("coverage was the wrong proxy") repeated one level down.
+r90's original verdict stands: `LUAU_RET_RESUME` stays gated.
+
+Twice now a metric of my own construction has produced a confident number
+pointing the wrong way, and both times the check that caught it was comparing
+the OUTPUT rather than an intermediate.
+
+### What the episode did establish
+`603_Orbiter::Update` is a real dropped body, and now a minimal one. Bytecode
+has five CALL sites (14, 42, 46, 51, 58); the emitted body has one:
+
+    function tbl:Update(arg2)
+        if self.Active then
+            self:Destroy(false)
+            return false
+        else
+            return false          -- pcs 42..58 belong HERE
+        end
+    end
+
+With `LUAU_RET_RESUME` the walk REACHES 42..58 and the output is unchanged. So
+there are two faults stacked:
+
+    1. the walk stops at the `return` (r90's mechanism, fix measured, gated)
+    2. the statements lifted from 42..58 are DISCARDED downstream
+
+Fixing (1) alone changes nothing, which is why it measured neutral. Fixing (2)
+alone cannot work either, because the instructions are not reached. **They must
+land together**, and that is why every single-sided attempt so far has scored
+zero.
+
+### THE QUESTION
+Where do the statements lifted from 42..58 go? Lift `Update@182` with
+`LUAU_RET_RESUME=1` and instrument the `stmts` vector at each level - the else
+arm is being built and then dropped, or built into a vector nobody splices.
+Answer by printing statement counts at each nesting level, NOT by reading the
+structurer.
+
+### State after rotation 91
+SEMANTIC: 1,106/1,142 (96.8%), 37 defects. Unchanged; this rotation is an
+instrument plus a retraction. Verified inert.
+REPRODUCER, minimal: `603_Orbiter` proto `Update@182`, 5 CALL sites, 1 emitted.

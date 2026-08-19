@@ -59,4 +59,39 @@ pub fn report(proto: &str, line_defined: u32, code: &[u32]) {
     }
     let pct = if steps == 0 { 100 } else { n * 100 / steps };
     eprintln!("COVER	{}	walked={}	steps={}	pct={}", key, n, steps, pct);
+
+    // WHICH CALLS WENT MISSING.
+    //
+    // Rotation 90 measured coverage and adopted nothing, because walking more
+    // instructions is not the same as emitting the missing calls. This asks the
+    // question `calls_not_emitted` actually poses: of the CALL sites the
+    // bytecode contains, which ones did the walk never reach? A missing call
+    // whose pc WAS walked is a different defect from one whose pc was not, and
+    // the two need different fixes.
+    let walked = SEEN.with(|s| s.borrow().get(&key).cloned().unwrap_or_default());
+    let mut missed = Vec::new();
+    let mut total = 0usize;
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = crate::parser::opcodes::LuauOpcode::from_u8((code[pc] & 0xFF) as u8);
+        if matches!(op, crate::parser::opcodes::LuauOpcode::Call) {
+            total += 1;
+            if !walked.contains(&pc) {
+                missed.push(pc);
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if !missed.is_empty() {
+        eprintln!(
+            "CALLGAP	{}	missed={}/{}	pcs={:?}",
+            key,
+            missed.len(),
+            total,
+            &missed[..missed.len().min(12)]
+        );
+    }
+    SEEN.with(|s| {
+        s.borrow_mut().remove(&key);
+    });
 }
