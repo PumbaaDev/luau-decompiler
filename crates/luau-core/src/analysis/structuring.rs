@@ -393,6 +393,20 @@ pub fn structure_control_flow(
         handled.insert(block_id);
     }
 
+    if std::env::var("LUAU_REGION_TRACE").is_ok() {
+        // How much of the proto did structuring actually claim? A body that
+        // vanishes with every block REACHABLE (rotation 62) must be losing its
+        // code between region production and region lifting, and this is the
+        // first of those two numbers.
+        eprintln!(
+            "REGIONS proto={}@{} blocks={} regions={}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            cfg.blocks.len(),
+            regions.len()
+        );
+    }
+
     regions
 }
 

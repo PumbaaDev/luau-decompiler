@@ -3967,3 +3967,51 @@ MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
   builder.
   Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
 TOOLING: + LUAU_RPO_TRACE (blocks the structurer will never visit).
+
+
+## Rotation 63 - B localised to the structurer, and a number I am NOT reporting
+
+### The datum
+`LUAU_REGION_TRACE` reports what `structure_control_flow` produced:
+
+    REGIONS proto=OnInputBegin@184 blocks=25 regions=1
+
+Twenty-five blocks, ONE region. Combined with rotation 62 (every block
+REACHABLE, budget intact) and rotation 61 (0 of 15 calls emitted), the loss is
+inside that single region's construction and lifting - not in reachability, not
+in the budget, and not in the lifter's consumption of a region list that never
+contained the rest.
+
+That is mechanism B's shape as the journal first named it: the guard's `if`
+claims blocks to the end of the proto as `handled`, so the code AFTER the `if`
+never gets a region of its own, and the region that swallowed it emits only the
+arm.
+
+### The number I am NOT reporting
+Corpus-wide, 797 protos have >= 8 blocks and <= 2 regions, with
+`GenerateModifiers@403` at 98 blocks in 1 region.
+
+**That is not a defect count and I am not presenting it as one.** Regions NEST:
+a single `IfThenElse` legitimately covers dozens of blocks through its arms, so
+a low region count is an ordinary structural fact. Reporting 797 would be the
+same error as rotation 58's 10 "dropped calls" - a plausible ratio mistaken for
+evidence.
+
+The signal that survives scrutiny is the CALL DEFICIT (29 files, verified by
+inspection). For `OnInputBegin` the two coincide, and it is the coincidence that
+localises the fault, not the region count alone.
+
+### State after rotation 63
+SEMANTIC: 1,100/1,142 (96.3%), 48 defects. Behaviour-neutral; 949 tests pass.
+MECHANISMS: A, D, E, F, G, H, I, J, A2/C, argument-cap, K CLOSED.
+  **B: localised to region construction.** Ruled out across three rotations:
+  unreachable blocks (62), statement budget (62), missing regions in the
+  lifter's input (63). Reproducer `277_DragManager::OnInputBegin@184` -
+  25 blocks, 1 region, 0 of 15 calls.
+  UNBLOCKING QUESTION: in `structure_control_flow`'s RPO loop, which blocks does
+  the `handled` set absorb when the first `IfThenElse` is built, and does the
+  arm ending in RETURN cause the join blocks to be marked handled without ever
+  being lifted? That is one trace on the `handled` insertions for this proto.
+  **50 protos with unreachable blocks** - separate, parked.
+  Six measured dead ends. PARKED: A2/C-residual, UPVAL_NAME.
+TOOLING: + LUAU_REGION_TRACE (blocks vs regions produced).
