@@ -2574,3 +2574,60 @@ SEMANTIC: 1,122/1,142 (98.2%), 27 defects (24 real).
   PARKED: B (1, one file). K part-adjudicated. UPVAL_NAME blocked on the
   format's missing capture information.
 SWEEP: run against run_r32 nearly complete.
+
+
+## Rotation 41 - the sweep on run_r32, and what it cannot prove
+
+### The numbers
+    SWEEP vs run_r32 (1,111 files)
+      clean            779
+      suspect          168
+      broken           161
+      error              3
+      clean-or-suspect 947
+
+    vs the run_r27 sweep: 1,009 of 1,111 files agree (90.8%)
+    broken in BOTH the r27 and r32 sweeps: 137
+
+### What this does NOT establish
+`run_r32` carries rotations 28 and 31, which `run_r27` does not, so a real
+improvement should show. It does not, and it cannot:
+
+  * two sweeps of the SAME bytes agreed on only 87.0% of files (rotation 32),
+    so the 90.8% here is INSIDE the instrument's own jitter;
+  * confirmed-broken went 147 (r18 n r27, identical builds) -> 137 (r27 n r32,
+    improved build) - a 10-file move against a band where 144 files flip on
+    identical input.
+
+So: the sweep cannot resolve the effect of this session's fixes. Not "the fixes
+did not help" - the instrument is too noisy to say either way at this effect
+size. Stating it as an improvement would be exactly the overclaim rotation 32
+was written to prevent.
+
+### What would settle it
+N-run voting per build. Three runs per build over 1,111 files is ~3.5 hours at
+the measured 16-33 files/min, and the confirmed set is the intersection. The
+single-run numbers in this journal - including 793/1,142 in the original goal -
+should all be read with the +/-13% band attached.
+
+### The two measures now say different things, on purpose
+    SEMANTIC (deterministic)  1,122/1,142 (98.2%), 27 defects, repeatable
+                              exactly, and blind to at least four defect
+                              classes found this session.
+    SWEEP (stochastic)        947/1,111 clean-or-suspect, 13% per-run jitter,
+                              sees classes the checker cannot, cannot resolve
+                              small deltas.
+
+Neither is the truth on its own. The semantic checker under-reports because its
+checks are narrow; the sweep over-reports because it is unstable. Keeping both,
+and never letting either alone adjudicate, is the working conclusion of this
+session.
+
+### State after rotation 41
+SEMANTIC: 1,122/1,142 (98.2%), 27 defects, 24 real.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C, argument-cap.
+  MEASURED DEAD ENDS: MINUS-as-operator, MULTRET-clear-skip.
+  PARKED: B (1, one file). K part-adjudicated. UPVAL_NAME blocked on the
+  format's missing capture data.
+SWEEP: 137 files broken across two consecutive builds; adjudication of those
+  is the next block of work, and it needs the N-run vote to be trustworthy.
