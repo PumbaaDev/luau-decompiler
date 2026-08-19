@@ -3047,3 +3047,76 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
     narrowed to "neither if/else nor loop"; B (1 file); UPVAL_NAME
     (format-blocked).
 SWEEP: run B against run_r37 in flight.
+
+
+## Rotation 49 - CORRECTION to rotation 47, and the real site at last
+
+### Rotation 47's conclusion was wrong
+It claimed `85_Badges` lost a table between pc=145 and pc=152. Dumping the
+opcode stream there shows nothing of the kind:
+
+    PC 143 SetList     a=13 b=14 c=6     -- fills the table in reg13
+    PC 145 SetTableKS  a=13 b=12 c=225   -- STORES reg13's table into reg12
+    PC 150 NewTable    a=13 b=0  c=0     -- reg13 = a fresh empty table
+    WATCH before_pc=152 value=Table { fields: [] }
+
+The register was never lost: its table was stored into a parent and the next
+literal began. At pc=152 the value is `Table {}`, not `Unknown`.
+
+**PC NUMBERING RESTARTS PER PROTO.** The `Unknown` at pc=152 I matched against
+this stream came from a DIFFERENT proto. I correlated across protos and drew a
+conclusion from it - the same class of error as trusting the register-keyed
+tag, and the second time in three rotations that a correlation, not a
+measurement, misled me.
+
+Fixed at the source: `LUAU_REG_WATCH` and `LUAU_PC_WINDOW` now print
+`proto=<debug_name>@<line_defined>` on every line, so the two cannot be matched
+across protos again.
+
+### The real site, in proto `setData@1163`
+    WATCH before_pc=121 value=BinOp { left: Name("LastTier"), op: Add,
+                                      right: Number(1.0) }
+    PC    118 GetUpval a=11 b=5     -- callee into R11
+    PC    119 Move     a=12 b=0     -- argument 1
+    PC    120 Move     a=13 b=7     -- argument 2  <- `LastTier + 1`
+    PC    121 Call     a=11 b=3 c=2 -- f(R12, R13)
+    WATCH before_pc=122 value=Unknown
+
+Register 13 holds `LastTier + 1`, is MOVED into an ARGUMENT SLOT, and the call
+at pc=121 consumes it. The clear wipes from 12 upward, which is exactly right -
+those are argument registers and the VM considers them dead.
+
+The emitted defect is `if getTask5.Amount < v13`, where the source plainly reads
+`LastTier + 1`. Rotation 42's experiment produced exactly that string, which is
+why it looked like a fix.
+
+### So what the defect actually is
+Not a clear bug. Not a merge bug. Something LATER reads register 13 and expects
+the value that was consumed as a call argument - a register the VM itself treats
+as dead. The lifter is reading a stale register when reconstructing a condition.
+
+That reframes it a third time and finally makes it specific:
+`extract_branch_condition` (or whatever reconstructs the `<` comparison here)
+resolves an operand from `regs` at a pc where that register no longer holds the
+value the ORIGINAL comparison used. The source's `LastTier + 1` was passed to
+the call AND used in the comparison; the compiler kept it in R7 (`Move a=13 b=7`
+copies FROM R7), so the comparison should read **R7**, not R13.
+
+### UNBLOCKING QUESTION, now concrete enough to act on
+Which register does the comparison instruction actually name, and does the
+lifter resolve it through the argument copy at R13 instead of the source at R7?
+`Move a=13 b=7` is the copy; if the condition extraction follows the
+destination rather than the source, that is the bug and it is a one-line
+locality.
+
+### State after rotation 49
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral this rotation
+  (traces are env-gated); 945 tests pass.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C (if/else), argument-cap, K.
+  MEASURED DEAD ENDS: MINUS-as-operator; MULTRET-clear-skip;
+    preserve-declared-locals; preserve-pure-values; loop-join materialisation.
+  PARKED: A2/C-residual - RE-DIAGNOSED as a stale-register read in condition
+    reconstruction, with the question above; B (1 file); UPVAL_NAME
+    (format-blocked).
+TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH
+  (write+read halves), LUAU_PC_WINDOW - all env-gated, all proto-qualified.

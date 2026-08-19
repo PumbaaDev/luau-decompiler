@@ -642,7 +642,18 @@ pub(super) fn lift_instruction_range(
                 if w < regs.len() {
                     let now = format!("{:?}", regs[w]);
                     if Some(&now) != watch_prev.as_ref() {
-                        eprintln!("WATCH reg={} before_pc={} value={}", w, pc, &now[..now.len().min(90)]);
+                        // Proto identity is REQUIRED here: pc numbering restarts
+                        // per proto, and correlating a WATCH line with a PC dump
+                        // from a different proto is exactly how rotation 47
+                        // concluded a table died where it had not.
+                        eprintln!(
+                            "WATCH proto={}@{} reg={} before_pc={} value={}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined,
+                            w,
+                            pc,
+                            &now[..now.len().min(80)]
+                        );
                         watch_prev = Some(now);
                     }
                 }
@@ -655,6 +666,22 @@ pub(super) fn lift_instruction_range(
         let b = insn_b(insn) as usize;
         let c = insn_c(insn) as usize;
         let d = insn_d(insn);
+        // LUAU_PC_WINDOW=lo-hi dumps the opcode stream for one pc range, so a
+        // value loss localised by LUAU_REG_WATCH can be attributed to the
+        // instruction (and therefore the region) that caused it.
+        if let Ok(win) = std::env::var("LUAU_PC_WINDOW") {
+            if let Some((lo, hi)) = win.split_once('-') {
+                if let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
+                    if pc >= lo && pc <= hi {
+                        eprintln!(
+                            "PC proto={}@{} {:>4} {:?} a={} b={} c={}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined, pc, op, a, b, c
+                        );
+                    }
+                }
+            }
+        }
         let e = insn_e(insn);
         let aux = if op.has_aux() && pc + 1 < code.len() { Some(code[pc + 1]) } else { None };
 
