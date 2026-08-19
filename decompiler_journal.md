@@ -409,3 +409,63 @@ A1 OPEN (deferred - fixing alone relabels, does not raise the clean rate)
 A2 DISPROVED (no-op measured)   A3 SUPERSEDED (wrong)   A4 DISPROVED (gate passes)
 A  ACTIVE - dominant, ~347 defects, cause still unknown after four hypotheses
 B  PARKED (1)   C OPEN   D **CLOSED**   E OPEN - located, 71_PlaceInfo.lua:53 `v7`
+
+## 2026-08-19 — ROTATION 6. E adjudicated REAL, mechanism named.
+
+### E is NOT the known false-positive class
+71_ReplicatedFirst_PlaceInfo sits in ReplicatedFirst, so I checked it against the
+recorded false positive (`game.ReplicatedFirst.PlaceType` child lookups are
+VALID). It is not that shape. It is a real dropped value.
+
+### Bytecode evidence (main proto tail, --opmap AND --opmap-db)
+    121: DUPCLOSURE  R5 K35 ; proto(0)
+    122: GETIMPORT   R8 ; game
+    124: GETTABLEKS  R8 R8."PrivateServerId"
+    126: JUMPXEQKS   R8 == ""  -> +11
+    134: LOADK       R7 K40 ; "VIPServer"
+    136: LOADK       R7 K41 ; "ReservedServer"
+    138: LOADK       R7 K42 ; "StandardServer"
+    139: JUMPXEQKS   R7 == K42 -> +2 ; "StandardServer"
+    141: LOADB       R6 false +1
+    142: LOADB       R6 true
+    143: SETTABLEKS  R0."IsPublicServer" R6
+
+THERE IS NO CALL INSTRUCTION. The compiler INLINED the server-type logic into the
+main proto: three branch arms each LOADK a constant into R7, then R7 is compared
+at 139. R7 is assigned three times and read once, all in the main proto.
+
+### Emitted output (57 lines total)
+    local function getServerType()
+        ... return "VIPServer" / "ReservedServer" / "StandardServer" ...
+    end
+    local PrivateServerId2 = game.PrivateServerId
+    tbl.IsPublicServer = v7 == "StandardServer"     <- v7 never assigned
+
+So the SAME instructions were emitted twice over: once as a reconstructed
+function body whose arms became `return`s, and once as the comparison - which
+then had nothing to compare, because the value the arms produced was consumed by
+the function reconstruction rather than bound to a local.
+
+MECHANISM (E, and it is the same family as A): a register written by several
+branch arms and read after the join is being structured as a FUNCTION BODY with
+returns instead of as a value join. The arms' writes become `return` statements,
+so the post-join read finds nothing and mints an unassigned name.
+
+Note this is a THREE-arm selection (VIPServer / ReservedServer / StandardServer),
+not a two-arm diamond. Both phi paths in mod.rs are written against a
+then/else pair; `Region::ValueJoin` + `fold_register_paths` handle N paths, so
+the question is why this region was not classified as a ValueJoin.
+
+### E -> PARKED (1). Unblocking question:
+  For 71_PlaceInfo's main proto, what Region does `structure_control_flow`
+  produce for the span 122..143? Reuse the rotation-1 probe (it already dumps
+  CFG blocks and regions for a chosen proto - PROBE_BIN/PROBE_PROTO). If it is
+  IfThenElse rather than ValueJoin, the classifier is the target; if it IS a
+  ValueJoin, then `fold_register_paths` returned None and the fallback emitted
+  returns.
+  This is a 57-line file with a 22-instruction span - by far the smallest
+  reproducer found for this family, and much cheaper than 623 or CameraModule.
+
+### State after rotation 6
+A  ACTIVE (~347 defects; A2/A3/A4 disproved)      A1 OPEN (deferred, would relabel)
+B  PARKED (1)   C OPEN   D **CLOSED**   E PARKED (1) with question above
