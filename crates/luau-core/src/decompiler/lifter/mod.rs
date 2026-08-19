@@ -3313,6 +3313,29 @@ fn hoist_escaping_locals(
             // principle; measured on CoreGui it went 1699/303 -> 1674/335, so
             // it costs 25 clean files. Declaring more names does not make more
             // of them assigned on every path.
+            //
+            // RE-MEASURED on full1143 (rotation 52) because that number came
+            // from CoreGui, and this session had already found two CoreGui
+            // verdicts worth re-testing here. It agrees:
+            //
+            //     1,126 clean / 19 defects  ->  1,120 clean / 25 defects
+            //
+            // and for exactly the reason stated above - the extra `local x`
+            // turns an `undefined_register` into a `declared_never_assigned`,
+            // which is a different label on the same missing value. BOTH
+            // corpora now reject this. Left gated behind LUAU_DECL_HOIST so the
+            // next reader can reproduce it in one run instead of rebuilding it.
+            if std::env::var("LUAU_DECL_HOIST").is_ok() {
+                hoisted_out.push(Stat::Local {
+                    names: vec![name.clone()],
+                    values: vec![],
+                });
+                hoisted_names.insert(name.clone());
+                *stmt = Stat::Assign {
+                    targets: vec![Expr::Name(name)],
+                    values: vec![init],
+                };
+            }
             continue;
         }
         hoisted_out.push(Stat::Local {

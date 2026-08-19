@@ -3250,3 +3250,62 @@ SEMANTIC: 1,126/1,142 (98.6%), 19 defects. Behaviour-neutral rotation; 945 tests
     fix shape and the named risk; B (1 file); UPVAL_NAME (format-blocked).
 TOOLING: LUAU_MINT_TRACE, LUAU_SEED_TRACE, LUAU_FRAME_TRACE, LUAU_REG_WATCH,
   LUAU_PC_WINDOW, LUAU_LEADER_TRACE - all env-gated, all proto-qualified.
+
+
+## Rotation 52 - the diagnosed fix was already rejected, and now on both corpora
+
+### The code had the answer before I wrote it
+Rotation 51's proposed fix - declare `local X` before the branch, leave the
+arm's `X = init` in place - is documented verbatim inside
+`hoist_escaping_locals`, marked TESTED AND REJECTED:
+
+    "Hoisting the DECLARATION alone ... evaluates once, needs no safety test,
+     and would make the binding lexically live at the join -- exactly what
+     merge_regs looks for before resetting a register to Unknown. Sound in
+     principle; measured on CoreGui it went 1699/303 -> 1674/335 ...
+     Declaring more names does not make more of them assigned on every path."
+
+I derived that proposal from first principles over two rotations. It was
+already written down, with its measurement, in the function I was about to
+change. Reading the target function completely BEFORE designing the fix would
+have saved both rotations.
+
+### Re-measured anyway, because the number came from CoreGui
+This session has already re-tested two CoreGui verdicts here (MULTRET-clear-skip,
+and MINUS via the DB). Implemented behind `LUAU_DECL_HOIST` and run on full1143:
+
+    1,126 clean / 19 defects  ->  **1,120 clean / 25 defects**
+
+Both corpora reject it, and for the stated reason: the extra `local x` converts
+an `undefined_register` into a `declared_never_assigned` - a different label on
+the same missing value. My own `branch_local_discarded` and
+`declared_never_assigned` checks now make that trade visible as a REGRESSION,
+where a marker-counting checker might have scored it as an improvement.
+
+Left gated rather than deleted, with the full1143 numbers written into the
+comment beside the CoreGui ones, so the next reader reproduces it in one run.
+Default behaviour verified unchanged: 1,126/19, 945 tests pass.
+
+### What this settles about A2/C-residual
+The single-arm binding lost at a join is now FULLY DIAGNOSED and its two
+obvious repairs are both measured and rejected:
+
+    materialise before the arms   works for TABLES (rotation 35, kept),
+                                  impossible for a call result - it cannot move
+    declare before the arms       rejected on CoreGui AND full1143 - it relabels
+                                  the defect instead of fixing it
+
+What remains is the harder version: emit the declaration ONLY when the register
+is genuinely assigned on every path reaching the join, which requires knowing
+the paths rather than the arms. That is a dataflow question, not a peephole, and
+it is the honest boundary of this mechanism.
+
+### State after rotation 52
+SEMANTIC: 1,126/1,142 (98.6%), 19 defects, no known false positives.
+  CLOSED: A, D, E, F, G, H, I, J, A2/C (if/else, tables), argument-cap, K.
+  MEASURED DEAD ENDS (each with the corpus and the file): MINUS-as-operator;
+    MULTRET-clear-skip; preserve-declared-locals; preserve-pure-values;
+    loop-join materialisation; declaration-only hoisting.
+  PARKED: A2/C-residual - diagnosed, both peephole repairs rejected, remaining
+    fix identified as requiring path-sensitive dataflow; B (1 file);
+    UPVAL_NAME (format-blocked).
