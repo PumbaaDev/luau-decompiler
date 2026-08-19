@@ -6626,3 +6626,56 @@ by a single counter.
 ### State after rotation 106
 SEMANTIC: 1,125/1,142 (98.5%), 17 defects. 949 tests pass. `LUAU_PIN_TRACE` kept
 and verified inert.
+
+
+## Rotation 107 - branch_local_discarded CLOSED at its evidential boundary
+
+### The per-clause print r106 asked for
+`LUAU_GATE_TRACE` now reports every clause outcome per candidate register, not
+just gate entry. `958_Drakkarmon::onRunning@729`:
+
+    reg=0 name_bound=true reads_before_write=true arm_writes=2 -> REJECT
+    reg=2 name_bound=true reads_before_write=true arm_writes=5 -> REJECT
+
+Both name-bound candidates are rejected by the WRITE-COUNT clause alone. Every
+other test passes. That is the whole reason the four residual findings survive.
+
+### The boundary, measured
+So: would relaxing the write count fix them? `88_ReplicatedStorage_BeeStats` -
+the file whose pinning LOSES A CALL (rotation 101) - has registers with exactly
+the same signature:
+
+    28 x  name_bound=true reads_before_write=true arm_writes=1   <- r102 admits
+     8 x  name_bound=true reads_before_write=true arm_writes=2
+     3 x  ... arm_writes=3
+     2 x  ... arm_writes=4
+     1 x  ... arm_writes=6
+
+The residual four sit in the arm_writes>1 band, and so do the registers that
+corrupt `88`. **They are indistinguishable by any read/write-pattern
+predicate.** That is why r103's "every write extends" rule was byte-neutral for
+these files and why four earlier predicates failed: there is no separating
+line in this feature space.
+
+### CLOSED, at the limit of the evidence
+MECHANISM: branch-arm write to a register live across the merge emitted as a
+declaration. REAL, bytecode-confirmed, behaviour-changing.
+FIXED: the separable subset - `arm_writes == 1` (rotation 102), +2 clean,
+  -2 defects, zero constructs lost anywhere.
+NOT FIXED, and why: the remaining 4 share their signature with writes whose
+  pinning drops a call. Taking them requires a discriminant OUTSIDE the
+  read/write pattern - dataflow on the VALUE (does each write consume the
+  previous result?) rather than on the register - which `merge_regs` does not
+  currently carry.
+REPRODUCERS: `958_Drakkarmon::onRunning` reg 0/2 (want pinned);
+  `88_BeeStats` arm_writes=2 band (must NOT be pinned).
+
+This is a closure, not a park: the mechanism is proven, the safe half is
+shipped, and the unsafe half is proven inseparable with the information
+available at that point in the pipeline. Reopening it means adding value-level
+dataflow, not another predicate.
+
+### State after rotation 107
+SEMANTIC: 1,125/1,142 (98.5%), 17 defects - 7 declared_never_assigned,
+4 branch_local_discarded (closed above), 6 calls_not_emitted.
+949 tests pass. `LUAU_GATE_TRACE` extended and verified inert.

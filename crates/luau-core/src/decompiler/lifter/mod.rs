@@ -7174,6 +7174,32 @@ fn premateralize_branch_escapes_spans(
             Some(RegVal::Expr(e)) if expr_is_inlinable(e)
                 && !matches!(e, Expr::Name(_))
         );
+        // Rotation 107: the outcome of EVERY clause, per candidate register.
+        // r104 printed gate ENTRY and I read it as admission; r105 inferred the
+        // rest from call sites and was wrong. This prints what each test
+        // actually returns so neither mistake is available.
+        if gate_trace {
+            let is_name = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))));
+            let reads_first = arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg));
+            let writes: usize = arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .map(|&(s, e)| count_reg_writes(&proto.code, s, e, reg))
+                .sum();
+            eprintln!(
+                "GATE	  reg={} name_bound={} reads_before_write={} arm_writes={} parked_pure={} carried={} -> {}",
+                reg,
+                is_name,
+                reads_first,
+                writes,
+                parked_pure,
+                carried_identity,
+                if parked_pure || carried_identity { "ADMIT" } else { "REJECT" }
+            );
+        }
         if !parked_pure && !carried_identity {
             continue;
         }
