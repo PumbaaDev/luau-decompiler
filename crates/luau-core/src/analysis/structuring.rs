@@ -1124,12 +1124,38 @@ pub(crate) fn structure_numeric_for_body(
         //     KNOWN RESIDUAL, recorded not suppressed: 9 files lose calls and
         //     6 new findings appear in 3 files (381_Eggs, 396_TadpoleTailInit,
         //     351_PassiveTile). See the journal, rotation 93.
-        {
+        //
+        // `LUAU_NO_GUARD_ARM` turns Shape C OFF. Kept as a permanent bisect
+        // switch: the residual above is diagnosed by diffing the region lists
+        // with it on and off, and rotation 94 wasted two attempts writing
+        // predicates from a MODEL of the arm instead of from that diff.
+        if std::env::var("LUAU_NO_GUARD_ARM").is_err() {
             if let Some((jump_next_pc, target)) = forward_conditional_jump(op, pc, insn) {
                 if target > jump_next_pc && target <= body_end && arm_terminates(code, jump_next_pc, target)
                 {
                     if linear_start < pc {
                         regions.push(Region::Linear { start: linear_start, end: pc });
+                    }
+                    // Rotation 95: report every wrap. `LUAU_RUNREG_TRACE` only
+                    // covers `lift_structured_run`, and Shape C also fires from
+                    // recursive calls it never prints - measured on
+                    // `351_PassiveTile`, whose region lists are IDENTICAL with
+                    // Shape C on and off while its output loses ten calls.
+                    if std::env::var("LUAU_GUARD_TRACE").is_ok() {
+                        eprintln!(
+                            // `code.len()` stands in for proto identity:
+                            // this function receives only the code slice, and a
+                            // trace without SOME identifier has now misled this
+                            // work three times (r47, r86, r92).
+                            "GUARD	codelen={}	cond_pc={}	op={:?}	arm={}..{}	arm_op={:?}	body_end={}",
+                            code.len(),
+                            pc,
+                            op,
+                            jump_next_pc,
+                            target,
+                            LuauOpcode::from_u8(insn_op(code[jump_next_pc])),
+                            body_end
+                        );
                     }
                     let then_body =
                         structure_numeric_for_body(code, jump_next_pc, target, cfg, loop_headers);

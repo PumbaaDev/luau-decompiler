@@ -5929,3 +5929,63 @@ THE QUESTION: which conditional in `351_PassiveTile` does Shape C wrap, and what
 ### State after rotation 94
 SEMANTIC: 1,123/1,142 (98.3%), 22 defects - unchanged; both experiments reverted.
 949 tests pass.
+
+
+## Rotation 95 - the RUNREG blind spot, a falsified theory, and a fourth cross-proto error
+
+### The blind spot (real, and worth keeping)
+`LUAU_RUNREG_TRACE` prints region lists for `351_PassiveTile` that are BYTE-
+IDENTICAL with Shape C on and off - while the output differs by ten calls
+(72 -> 62). RUNREG only covers `lift_structured_run`; Shape C also fires from
+recursive `structure_numeric_for_body` calls it never prints. An instrument
+showing "no difference" where a difference exists is worse than none, so:
+
+  * added `LUAU_NO_GUARD_ARM`, a permanent switch to turn Shape C OFF, so any
+    future claim about it can be A/B'd directly;
+  * added `LUAU_GUARD_TRACE`, printing every wrap with its opcode and arm
+    opcode.
+
+### The theory, and its falsification
+Disassembling `351` showed pc 12-17 of `RegisterListeners` as NEWCLOSURE
+followed by five CAPTURE pseudo-instructions, and the guard trace showed wraps
+at cond_pc 13, 74, 92, 102, 119. Conclusion drawn: Shape C was decoding CAPTURE
+words as conditionals, which would have explained everything - the identical
+region lists, and why rotation 94's two predicates both failed (they modelled
+real arms, and these would not have been code at all).
+
+Two fixes were written for it. Neither changed anything. Printing the opcodes
+settled it:
+
+    GUARD codelen=166 cond_pc=13  op=JumpIfNot arm=14..15 arm_op=Return
+    GUARD codelen=166 cond_pc=74  op=JumpIf    arm=75..76 arm_op=Return
+    ...
+
+**Genuine conditionals with genuine single-instruction RETURN arms.** The
+CAPTURE theory is FALSE. The proto being wrapped has 166 instructions;
+`RegisterListeners`, the one I disassembled, is a different proto. I matched pcs
+across protos again - the FOURTH time this session (r47's lesson, then r86, r92,
+now r95), and this time within minutes of writing a comment about that exact
+hazard into the trace itself. The experiment was removed rather than kept.
+
+### Where that leaves the residual
+The wraps in `351` are LEGITIMATE guards doing what Shape C intends. So the ten
+lost calls are not a bogus wrap - they are the downstream consequence of a
+correct one. That is a different problem from the one three rotations have been
+attacking, and it invalidates the framing, not just the predicates.
+
+PARKED. MECHANISM: guard-arm residual, 9 files losing calls.
+PROVED:    the wraps are real conditionals with real RETURN arms
+           (`op`/`arm_op` printed); region lists are unchanged, so the damage is
+           downstream of region construction, not in it.
+RULED OUT: arms containing any control flow (r94, worse); arms with an escaping
+           jump (r94, worse and does not touch the reproducer); CAPTURE
+           misdecoding (r95, falsified by opcode printing).
+THE QUESTION: with `LUAU_NO_GUARD_ARM` toggling one file, diff the two OUTPUTS
+           of `351` statement by statement and find the first divergence, then
+           work backwards from that statement. Every attempt so far has started
+           from the bytecode and reasoned forward, and has been wrong four
+           times; start from the observable difference instead.
+
+### State after rotation 95
+SEMANTIC: 1,123/1,142 (98.3%), 22 defects. 949 tests pass. Nothing adopted this
+rotation; two instruments kept, one theory falsified and its code removed.
