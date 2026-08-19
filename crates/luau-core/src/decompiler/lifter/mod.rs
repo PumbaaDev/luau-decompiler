@@ -7088,12 +7088,68 @@ fn premateralize_branch_escapes_spans(
         // name-seeded rebind is a real residual, but pin-only threading is the
         // wrong cure; left for a pass that can distinguish a carried identity
         // from a repurposed register.
+        // CARRIED IDENTITY.
+        //
+        // The exclusion below rejects every register already bound to a declared
+        // local, because pin-only threading repurposed scratch slots and cost 2
+        // previously-clean files. Its comment names the missing piece - "a pass
+        // that can distinguish a carried identity from a repurposed register" -
+        // and the bytecode supplies it. `646_Capture_Chicks::Description`:
+        //
+        //     31: CONCAT    R5 R6..R9    R5 = "Capture " .. n .. " " .. name
+        //     34: JUMPIFNOT R6 -> 40
+        //     35: MOVE      R6 R5        the arm READS R5 ...
+        //     39: CONCAT    R5 R6..R8    ... then REASSIGNS it, ONCE
+        //     40: MOVE      R7 R5        post-merge read
+        //
+        // An arm that reads the register before writing it is EXTENDING what it
+        // held, and doing so exactly once. A repurposed slot has nothing to read
+        // and is overwritten repeatedly. Both halves are load-bearing - measured
+        // (rotation 102):
+        //
+        //     reads-B/C-on-every-opcode   1,126/16 but corrupts 284 and 88
+        //     + real-register operands    1,126/16 but still corrupts 88
+        //     + written EXACTLY ONCE      1,125/17, 81 files changed,
+        //                                 calls/loops/ifs lost: 0 anywhere
+        //
+        // The middle row scored higher and shipped a dropped call, so the
+        // one-write rule is not a refinement of the score - it is what makes the
+        // change honest.
+        let carried_identity = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+            && arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg))
+            // EXTENDED ONCE, not reused. A carried identity is written a single
+            // time in the arm (`R5 = R5 .. " from the " .. zone`); a scratch
+            // slot is overwritten again and again. `88_BeeStats` is the latter -
+            // threading its name produced `x = tbl`, `x = x._ApplyBeequipMul`,
+            // `x = arg3`, `x = x("ConversionAtHive")`, `x = x and x * x`, losing
+            // a whole call.
+            && arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .map(|&(s, e)| count_reg_writes(&proto.code, s, e, reg))
+                .sum::<usize>()
+                == 1;
+
         let parked_pure = matches!(
             regs.get(reg),
             Some(RegVal::Expr(e)) if expr_is_inlinable(e)
                 && !matches!(e, Expr::Name(_))
         );
-        if !parked_pure {
+        if !parked_pure && !carried_identity {
+            continue;
+        }
+        if carried_identity && !parked_pure {
+            if let Some(RegVal::Expr(Expr::Name(n))) = regs.get(reg) {
+                let name = n.clone();
+                for &(s, e) in arm_ranges {
+                    if e > s {
+                        ctx.pin_reg_name(reg as u8, &name, s, e);
+                    }
+                }
+            }
             continue;
         }
         let value = reg_expr(regs, reg);
@@ -7112,6 +7168,137 @@ fn premateralize_branch_escapes_spans(
 /// Does ANY span in `ranges` contain an instruction writing `reg`?
 /// Same opcode write-set as `collect_body_writes` — kept in terms of it so the
 /// two can never disagree about what counts as a write.
+/// Does `[start, end)` READ `reg` before any write to it?
+///
+/// The discriminant between a carried identity (the arm extends the value the
+/// register already holds) and a repurposed slot (the arm overwrites it with
+/// something unrelated). A repurpose has nothing to read.
+///
+/// `LUAU_CARRY_TRACE` prints the instruction it counts as the read, because
+/// rotation 101 could not tell why this returned true for `284_GuiTile`'s
+/// scratch slot and three of that session's four predicate attempts failed for
+/// want of exactly this print.
+fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    if end <= start || end > code.len() {
+        return false;
+    }
+    let trace = std::env::var("LUAU_CARRY_TRACE").is_ok();
+    let mut pc = start;
+    while pc < end {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let step = if op.has_aux() { 2 } else { 1 };
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        // ONLY where B/C ARE REGISTERS.
+        //
+        // Rotation 102, from `LUAU_CARRY_TRACE`: the previous form read B and C
+        // as registers on EVERY opcode and so matched integers, not reads -
+        //
+        //     CARRY READ reg=0 pc=1 op=NewTable  a=0 b=0 c=0
+        //     CARRY READ reg=1 pc=6 op=FastCall1 a=40 b=1 c=3
+        //
+        // NEWTABLE's B is an array-size hint and FASTCALL1's A is a builtin id.
+        // That is why the predicate admitted repurposed scratch slots and cost
+        // `284_GuiTile` and `88_BeeStats` (rotation 101).
+        //
+        // `reg_used_in_range` has the same flaw deliberately: it over-
+        // approximates "is this used", where a false positive is the SAFE
+        // direction. Here it is the dangerous one, so this allowlists the
+        // opcodes whose B/C genuinely name registers. Anything unlisted counts
+        // as NO read, which merely declines to pin - the status quo.
+        let reads = match op {
+            LuauOpcode::Concat => reg >= b && reg <= c,
+            LuauOpcode::Move
+            | LuauOpcode::GetTable
+            | LuauOpcode::SetTable
+            | LuauOpcode::GetTableN
+            | LuauOpcode::SetTableN
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::SetTableKS
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::And
+            | LuauOpcode::Or
+            | LuauOpcode::AndK
+            | LuauOpcode::OrK
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::NameCall
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::SetGlobal
+            | LuauOpcode::SetUpval => b == reg || c == reg,
+            // A/B/C name nothing readable, or B/C are counts, hints and ids.
+            _ => false,
+        };
+        if reads {
+            if trace {
+                eprintln!(
+                    "CARRY	READ	reg={}	pc={}	op={:?}	a={} b={} c={}	range={}..{}",
+                    reg, pc, op, a, b, c, start, end
+                );
+            }
+            return true;
+        }
+        if a == reg && !matches!(op, LuauOpcode::SetTableKS | LuauOpcode::SetGlobal) {
+            if trace {
+                eprintln!(
+                    "CARRY	WRITE-FIRST	reg={}	pc={}	op={:?}	range={}..{}",
+                    reg, pc, op, start, end
+                );
+            }
+            return false;
+        }
+        pc += step;
+    }
+    false
+}
+
+/// How many times does `[start, end)` write `reg`?
+fn count_reg_writes(code: &[u32], start: usize, end: usize, reg: usize) -> usize {
+    if end <= start || end > code.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut pc = start;
+    while pc < end {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg
+            && !matches!(
+                op,
+                LuauOpcode::SetTableKS
+                    | LuauOpcode::SetTable
+                    | LuauOpcode::SetTableN
+                    | LuauOpcode::SetGlobal
+                    | LuauOpcode::SetUpval
+                    | LuauOpcode::SetList
+            )
+        {
+            n += 1;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    n
+}
+
 fn ranges_write_reg(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool {
     ranges
         .iter()

@@ -6348,3 +6348,61 @@ THE QUESTION: `reg_read_before_write` returns true for `284_GuiTile`'s scratch
 ### State after rotation 101
 SEMANTIC: 1,123/1,142 (98.3%), 19 defects. 949 tests pass. Tree clean apart
 from the untracked throwaway probe.
+
+
+## Rotation 102 - carried identity ADOPTED, after the print r101 asked for
+
+### The print
+r101 parked with: print which instruction `reg_read_before_write` counts as the
+read in `284_GuiTile`. Doing that:
+
+    CARRY READ reg=0 pc=1 op=NewTable  a=0 b=0 c=0
+    CARRY READ reg=1 pc=6 op=FastCall1 a=40 b=1 c=3
+
+NEWTABLE's B is an ARRAY-SIZE HINT. FASTCALL1's A is a BUILTIN ID. The predicate
+read B and C as registers on EVERY opcode, so it was not detecting reads at all -
+it was matching integers. That is why it admitted repurposed scratch slots.
+
+`reg_used_in_range` has the same flaw deliberately: it over-approximates "is
+this used", where a false positive is the SAFE direction. Here it is the
+dangerous one.
+
+### Two corrections, both load-bearing
+    (1) count B/C only for opcodes whose B/C genuinely name registers
+    (2) require the arm to write the register EXACTLY ONCE
+
+Measured:
+
+    reads B/C on every opcode      1,126/16   corrupts 284 AND 88
+    + real-register operands       1,126/16   corrupts 88 - `x = tbl`,
+                                   `x = x._ApplyBeequipMul`, `x = arg3`,
+                                   `x = x(...)`, `x = x and x * x`, a call LOST
+    + written exactly once         1,125/17   81 files changed
+                                   calls lost 0, loops lost 0, ifs lost 0
+                                   total emitted calls UNCHANGED (38,460)
+
+The higher-scoring row ships a dropped call. The one-write rule costs a point
+and makes the change honest, which is the trade this session has been wrong
+about in both directions before.
+
+### ADOPTED
+    clean   1,123 -> 1,125   defects 19 -> 17
+    FIXED   263_BeeTypeStatsBox, 646_Capture_Chicks (branch_local_discarded)
+    NEW     none
+    949 tests pass on two consecutive runs
+
+`646_Capture_Chicks::Description` now appends the zone instead of returning the
+pre-branch string - a real behavioural repair, not a cosmetic one.
+
+### State after rotation 102
+SEMANTIC: **1,125/1,142 (98.5%), 17 defects** - 7 declared_never_assigned,
+4 branch_local_discarded, 6 calls_not_emitted.
+CLOSED: A, D, E, F, G, H, I(predicates), J, A2/C(if-else/tables), argument-cap,
+  K, unreachable-blocks, B-loops, inline-if-arm-overrun, guard-arms,
+  generic-for loop detection (real, repaired, measured worthless),
+  **branch-arm carried identity**.
+REMAINING branch_local_discarded (4): the arms that write their register more
+  than once, deliberately excluded above. Same mechanism, and the one-write rule
+  is what keeps them out; widening it needs a way to tell a multi-step
+  extension from scratch reuse - `88_BeeStats` is the reproducer for the wrong
+  side of that line.
