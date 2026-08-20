@@ -7923,3 +7923,56 @@ diagnosis - the honest next target.
 ### State after rotation 131
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Audit only; no code
 changed.
+
+
+## Rotation 132 - 79_Toys diagnosed: a two-arm join of two distinct non-Name values
+
+### The last undiagnosed finding, traced
+`MINTAT` gives the site, `LUAU_MERGE_WATCH=7` gives the join:
+
+    MERGE ButtonText@179 reg=7
+      before = Expr(Name("UseMessage"))
+      self   = Expr(BinOp{ String("Use the "), Concat, ... })
+      other  = Expr(String("Error, tell Onett"))
+
+Both arms define a value, the values DIFFER, and neither is a bare `Name`.
+
+`merge_regs` handles `Name` asymmetries explicitly (`self_name && !other_name`
+keeps self; the reverse takes other; both-Name falls to the pre-branch-binding
+rule). A `BinOp` against a `String` matches none of those, so it falls through
+to the reset and the register becomes `Unknown` - losing BOTH arms. The
+post-join read mints `v7`, which is then concatenated into two user-visible
+strings:
+
+    local result26 = (v7 .. " (") .. value14(TimeString2)
+    Desc = Desc and (Desc .. " to ") .. v7
+
+So a button label and a requirement description both render with a nil in them.
+
+### What it should be
+This is exactly `Region::ValueJoin` - "a branch region whose only result is the
+value some register carries where control flow reconverges". The arms select
+between two strings; the correct output is an if/else assigning one local, or a
+ternary. The question is why the structurer did not emit a `ValueJoin` here,
+NOT how to patch `merge_regs` - collapsing to `Unknown` is the honest fallback
+once the region has already been mis-structured, and r119 measured that
+patching the lattice directly costs more than it gains.
+
+### PARKED
+MECHANISM: a two-arm value join with distinct non-`Name` values on each arm is
+  reset to `Unknown`, losing both.
+PROVED:    the exact join, with both arm values and the pre-branch binding,
+  printed above; the emitted consequence read in the output.
+RULED OUT: merge-lattice patches as the fix (r119: no benefit, 2 files damaged).
+THE QUESTION: does `structure_control_flow` emit a `ValueJoin` for this branch?
+  `LUAU_RUNREG_TRACE` on `ButtonText@179` answers it. If it does, the ValueJoin
+  lifter is dropping the arms; if it does not, the region matcher is the target
+  and this joins the same family as the `calls_not_emitted` boundary (r113) -
+  a branch shape no implemented region recognises.
+
+### Every finding now has a diagnosis
+With this, all 12 remaining defects have a located mechanism, a proven boundary,
+or a named external blocker. None is unexamined.
+
+### State after rotation 132
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only.
