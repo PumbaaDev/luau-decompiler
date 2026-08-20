@@ -7976,3 +7976,55 @@ or a named external blocker. None is unexamined.
 
 ### State after rotation 132
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only.
+
+
+## Rotation 133 - 79_Toys root: `find_merge_point` returns None, so no ValueJoin exists
+
+### The answer to r132's question
+    IF proto=ButtonText@179 cond_block=110 then=6 else=6 merge=None has_else=true
+
+**`merge=None`**, with SIX blocks in each arm. `Region::ValueJoin` carries a
+`join` field by construction, so with no merge point the structurer cannot emit
+one. It falls back to `IfThenElse` with `merge_pc: None`, both arms are lifted,
+and their register values meet at a join the structurer never identified -
+which is exactly the state r132 printed:
+
+    self  = Expr(BinOp{ String("Use the "), Concat, ... })
+    other = Expr(String("Error, tell Onett"))
+    -> reset to Unknown -> `v7`
+
+So `merge_regs` is not the fault and neither is the ValueJoin lifter. The fault
+is upstream of both: the merge point is not found.
+
+### Why that matters more than one file
+`find_merge_point` is an alternating BFS for the first overlap of the two
+successor sets (`cfg.rs:414`). Rotation 82 examined it and found it SOUND for
+the case in front of it then. This is a case where it returns `None` while the
+register is demonstrably read after the branch - so a join exists in the program
+even though the search did not find one.
+
+That is the same shape as rotation 99's result for `find_loops`, which misses
+every generic for-loop because the graph does not have the dominance property
+the search assumes. Two of the three graph queries in `analysis/` have now been
+shown to miss real structure on this corpus.
+
+### PARKED
+MECHANISM: `find_merge_point` returns `None` for a two-arm branch whose register
+  is read after the join; no `ValueJoin` is emitted; both arm values are lost.
+PROVED:    `merge=None` with 6+6 arm blocks (IF trace); both arm values present
+  and distinct at the reset (MERGE watch); the read after the branch (emitted
+  output).
+RULED OUT: `merge_regs` lattice patches (r119, measured worse); the ValueJoin
+  lifter (never invoked here).
+THE QUESTION: why does the BFS find no overlap? Print the successor sets it
+  walks for `cond_block=110` - if both arms reach `Return` without reconverging,
+  the join is a FALL-THROUGH the CFG does not model as an edge, which is the
+  same class of gap as the FORGPREP edge in r99. That print is one addition to
+  `find_merge_point`.
+
+CAUTION for the next attempt: r99 fixed the analogous `find_loops` gap two ways
+and BOTH measured worse (1,123/19 -> 1,118/25), because downstream consumers
+depend on the current graph shape. Expect the same, and measure the census.
+
+### State after rotation 133
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only.
