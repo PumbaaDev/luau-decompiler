@@ -6101,6 +6101,30 @@ pub(super) fn set_dce_proto(name: &str, line: u32) {
 /// `v13` names register 13 in SOME proto and the output cannot say which.
 /// Rotation 116 lost a probe to that gap (and mis-concluded the register was
 /// unidentifiable; it is the index, it is the PROTO that is missing).
+/// A monotonic id for each `lift_instruction_range` invocation.
+///
+/// Rotation 127: one pc range is lifted TWICE with different register states,
+/// and every trace in this session is pc-qualified but not pass-qualified - so
+/// `PREMAT pc=17` and `WATCH before_pc=18` looked like one timeline running
+/// backwards when they came from different passes. Three rotations read them
+/// that way. Same lesson as proto-qualification (r47, r86, r95, r110, r116),
+/// one level down.
+pub(crate) fn next_pass_id() -> usize {
+    PASS_ID.with(|p| {
+        let v = p.get() + 1;
+        p.set(v);
+        v
+    })
+}
+
+pub(crate) fn current_pass_id() -> usize {
+    PASS_ID.with(|p| p.get())
+}
+
+thread_local! {
+    static PASS_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn current_dce_proto() -> String {
     DCE_PROTO.with(|p| p.borrow().clone())
 }

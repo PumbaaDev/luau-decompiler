@@ -669,9 +669,10 @@ pub(super) fn lift_instruction_range(
     stmts: &mut Vec<Stat>,
     in_loop: bool,
 ) {
+    let pass_id = crate::decompiler::lifter::next_pass_id();
     if std::env::var("LUAU_LIFTPATH").is_ok() {
         eprintln!(
-            "LIFTPATH	{}	flat	{}..{}",
+            "LIFTPATH	pass={pass_id}	{}	flat	{}..{}",
             proto.debug_name.as_deref().unwrap_or("?"),
             start,
             end
@@ -737,7 +738,8 @@ pub(super) fn lift_instruction_range(
                         // from a different proto is exactly how rotation 47
                         // concluded a table died where it had not.
                         eprintln!(
-                            "WATCH proto={}@{} reg={} before_pc={} value={}",
+                            "WATCH pass={} proto={}@{} reg={} before_pc={} value={}",
+                            pass_id,
                             proto.debug_name.as_deref().unwrap_or("?"),
                             proto.line_defined,
                             w,
@@ -3469,8 +3471,9 @@ pub(super) fn lift_instruction_range(
                     // the write in the pc-17 condition handling.
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
-                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                            eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
+                            crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
                     premateralize_branch_escapes_split(
@@ -3480,8 +3483,9 @@ pub(super) fn lift_instruction_range(
 
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
-                            eprintln!("PREMAT	AFTER	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                            eprintln!("PREMAT	AFTER	pass={}	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
+                            crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
                     // Lift the guarded block with isolated register state so
@@ -3497,7 +3501,8 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
-                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,
@@ -3642,8 +3647,9 @@ pub(super) fn lift_instruction_range(
                     // the write in the pc-17 condition handling.
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
-                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                            eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
+                            crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
                     premateralize_branch_escapes_split(
@@ -3662,7 +3668,8 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
-                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,
@@ -3788,8 +3795,9 @@ pub(super) fn lift_instruction_range(
                     // the write in the pc-17 condition handling.
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
-                            eprintln!("PREMAT	BEFORE	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
+                            eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
+                            crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
                     premateralize_branch_escapes_split(
@@ -3808,7 +3816,8 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
-                                "ARMENTRY	{}	arm={}..{}	reg={}	value={:?}",
+                                "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
+                                crate::decompiler::lifter::current_pass_id(),
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,

@@ -7721,3 +7721,53 @@ THE QUESTION: WHICH two passes, and why does the second start with pre-13 state?
 ### State after rotation 127
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. `LUAU_IDIOM_TRACE`
 added at all three sites and verified inert.
+
+
+## Rotation 128 - pass counter added; pc 18 is lifted TWICE and the second is stale
+
+### The instrument r127 specified
+A monotonic `next_pass_id()` stamped per `lift_instruction_range` invocation.
+
+### And a flaw in it, stated before any conclusion is drawn from it
+`WATCH` captures `pass_id` as a LOCAL at function entry, so its stamp is sound.
+`PREMAT` and `ARMENTRY` call `current_pass_id()`, which returns the LATEST
+global counter - by the time they print, nested lifts have already incremented
+it. Their pass labels are therefore WRONG and must not be read as ownership.
+That is visible in the output itself: `PREMAT pass=21 pc=17` alongside
+`WATCH pass=21 before_pc=18`, i.e. a pass appearing to run pc 17 after pc 18.
+
+Fixing them means threading the local `pass_id` into both call sites. Recorded
+rather than done, because reading an unsound stamp is exactly how rotations
+123-126 built on a false timeline.
+
+### Reading only the sound instrument
+    pass=20  pcs 8,10,13,16,17   ends Name("SteeringVelocity3")   CORRECT
+    pass=21  pc 18               Name("SteeringVelocity3")        CORRECT
+    pass=22  pc 18               Expr(Nil)                        STALE
+    pass=23  pc 22               Unknown
+
+**pc 18 is lifted TWICE, by passes 21 and 22, and the second carries the pc-10
+nil.** Pass 22 never executed pcs 13..16, where `FindFirstChild` lands, so it
+arrives with the register as `LOADNIL` left it.
+
+The emitted `v3:Destroy()` is built from pass 22.
+
+### PARKED
+MECHANISM: pc 18 is lifted by two passes with different register states; the
+  emitted arm comes from the stale one, so the receiver is the pc-10 nil and
+  `method_receiver_expr` rightly refuses it.
+PROVED:    two distinct passes lift pc 18 (pass-stamped WATCH); the earlier
+  carries the correct receiver and the later the stale nil; no instruction
+  writes the nil in between (five suspects eliminated, r122-r127).
+RULED OUT: receiver predicate, opmap/bytecode, arm-exit restore,
+  premateralization, bool idiom - each by print.
+THE QUESTION: what invokes pass 22, and why does it start from pre-pc-13 state?
+  `LUAU_LIFTPATH` is now pass-stamped - dump it for this proto and read which
+  call site opens pass 22 and with what range. That is one command and it names
+  the caller.
+FIRST, though: thread the local `pass_id` into `PREMAT`/`ARMENTRY` so their
+  stamps stop lying.
+
+### State after rotation 128
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Pass counter verified
+inert.
