@@ -2746,6 +2746,7 @@ fn lift_region(
             // reset to Unknown where they diverge. This is conservative
             // but correct — after an if/else, only values that are the
             // same on both paths are guaranteed to hold.
+            set_merge_site(*cond_pc, *merge_pc);
             merge_regs(regs, &regs_after_then, &regs_before);
 
             // B0.116: Import-guard MethodCall propagation.
@@ -4109,9 +4110,12 @@ fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) 
                     }
                     Some(_) => "other".to_string(),
                 };
+                let (mc, mm) = merge_site();
                 eprintln!(
-                    "MERGE	{}	reg={}	before={}	self={}	other={}",
+                    "MERGE	{}	cond_pc={}	merge_pc={}	reg={}	before={}	self={}	other={}",
                     current_dce_proto(),
+                    mc as i64,
+                    if mm == usize::MAX { -1 } else { mm as i64 },
                     i,
                     d(regs_before.get(i)),
                     d(Some(&*slot)),
@@ -6109,6 +6113,28 @@ pub(super) fn set_dce_proto(name: &str, line: u32) {
 /// backwards when they came from different passes. Three rotations read them
 /// that way. Same lesson as proto-qualification (r47, r86, r95, r110, r116),
 /// one level down.
+thread_local! {
+    /// The branch whose arms are currently being merged: `(cond_pc, merge_pc)`.
+    ///
+    /// `merge_regs` takes only register slices, so `LUAU_MERGE_WATCH` could
+    /// print the VALUES it collapses but not WHICH branch collapsed them.
+    /// Rotation 134 paired a `MERGE` line with an `IF` line by proto and
+    /// register alone and got the wrong site; rotation 135 measured that error
+    /// (the fix built on it was byte-neutral). This carries the identity the
+    /// print was missing.
+    static MERGE_SITE: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((usize::MAX, usize::MAX))
+    };
+}
+
+pub(crate) fn set_merge_site(cond_pc: usize, merge_pc: Option<usize>) {
+    MERGE_SITE.with(|m| m.set((cond_pc, merge_pc.unwrap_or(usize::MAX))));
+}
+
+fn merge_site() -> (usize, usize) {
+    MERGE_SITE.with(|m| m.get())
+}
+
 pub(crate) fn next_pass_id() -> usize {
     PASS_ID.with(|p| {
         let v = p.get() + 1;

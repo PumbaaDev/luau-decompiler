@@ -8121,3 +8121,58 @@ THE QUESTION: WHICH merge? `LUAU_MERGE_WATCH` prints values but not the site.
 
 ### State after rotation 135
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Reverted clean.
+
+
+## Rotation 136 - the merge site NAMED, and r134's pairing confirmed wrong
+
+### The missing identifier, supplied
+`merge_regs` takes only register slices, so `LUAU_MERGE_WATCH` printed the
+VALUES it collapsed but never WHICH branch collapsed them. Added a
+`MERGE_SITE` thread-local set at the call site (where `cond_pc`/`merge_pc` are
+in scope) and threaded it into the print:
+
+    MERGE ButtonText@179 cond_pc=0   merge_pc=23  reg=7 ... all Unknown
+    MERGE ButtonText@179 cond_pc=110 merge_pc=-1  reg=7 other=Name("result26")
+    MERGE ButtonText@179 cond_pc=23  merge_pc=62  reg=7 ... all Unknown
+    MERGE ButtonText@179 cond_pc=62  merge_pc=110 reg=7
+        before = Name("UseMessage")
+        self   = BinOp{ String("Use the "), Concat, ... }
+        other  = String("Error, tell Onett")
+
+**The collapse is at `cond_pc=62`, which HAS a merge point (110).** r134 blamed
+`cond_pc=110`, the `merge_pc: None` branch - the wrong site, matched by proto
+and register alone. r135 measured that error directly: skipping the merge for
+every `merge_pc: None` branch left the file byte-identical.
+
+Fifth instance this session of an identifier supplied by assumption, and the
+fix is the same every time: put the field in the print.
+
+### Where that leaves 79_Toys
+The branch at `cond_pc=62` selects between two STRINGS - a `BinOp` concat and a
+literal - and writes the result to one register that is read after the join.
+That is the textbook `Region::ValueJoin` shape, and the IF trace confirms the
+region exists with a merge:
+
+    IF proto=ButtonText@179 cond_block=62 then=6 else=1 merge=Some(110) has_else=true
+
+So the region has everything a ValueJoin needs and is emitted as a plain
+`IfThenElse` instead. `merge_regs` then has no asymmetry rule for
+`BinOp` vs `String` (its rules cover `Name` cases) and resets both.
+
+### PARKED
+MECHANISM: a two-arm value selection with a merge point is structured as
+  `IfThenElse` rather than `ValueJoin`; the arms' distinct non-`Name` values are
+  then reset to `Unknown` and `v7` is minted into a button label and a
+  requirement description.
+PROVED:    the exact site (`cond_pc=62`, `merge_pc=110`), both arm values, the
+  pre-branch binding, and that the region carries a merge - all printed.
+RULED OUT: `find_merge_point` (r134, correct here); the `merge_pc: None` branch
+  (r135, measured byte-neutral); merge-lattice patches (r119, measured worse).
+THE QUESTION: does `find_value_join` even consider block 62, and if so which of
+  its conditions rejects it? Print the entry/arms/join it computes for this
+  proto. Do NOT patch `merge_regs` - r119 measured that path and it cost 2 files
+  for no gain.
+
+### State after rotation 136
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. `MERGE_SITE` verified
+inert.
