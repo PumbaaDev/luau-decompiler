@@ -8075,3 +8075,49 @@ this case. One graph query is at fault, not two.
 ### State after rotation 134
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only;
 `LUAU_MERGEPT_TRACE` added and verified inert.
+
+
+## Rotation 135 - the merge-skip is NEUTRAL, and r134's attribution was wrong
+
+### Built and measured
+Skipped `merge_regs` when the `IfThenElse` carries `merge_pc: None`, which r134
+argued was the fault.
+
+    clean 1,130 -> 1,130   defects 12 -> 12
+    79_Toys `v7`: 3 occurrences before, 3 after   NOT FIXED
+    21 files changed; calls lost 0, loops lost 0, ifs lost 0
+    total emitted calls 38,461 -> 38,461
+
+No fix, no damage, 21 files moved. Reverted per the r90 rule: a diff that moves
+files and no measurement does not ship.
+
+### The attribution error
+r134 paired two prints:
+
+    IF    ... cond_block=110 ... merge=None          (the branch)
+    MERGE ... reg=7 self=BinOp other=String          (the collapse)
+
+and concluded they were the same site. They are not. Skipping the merge for
+every `merge_pc: None` branch leaves `79_Toys` byte-identical, so the collapse
+that destroys `v7` happens at a DIFFERENT merge - one that does have a merge
+point.
+
+Matched by proto and register without confirming the SITE. That is the same
+class of error as matching a pc across protos (r47, r86, r95, r110), a name to
+a register (r116), and a trace line to a pass (r127) - an identifier the print
+does not carry, supplied by assumption. Fifth occurrence, in a session that has
+recorded the lesson four times.
+
+### PARKED
+MECHANISM: two arm values (`BinOp` vs `String`) collapse to `Unknown` at SOME
+  merge in `ButtonText@179`, minting `v7` into a button label and a requirement
+  description. REAL, and the values are known.
+RULED OUT: `find_merge_point` (r134 - correct here); the `merge_pc: None` branch
+  (r135 - skipping it changes nothing); merge-lattice patches (r119 - measured
+  worse); the ValueJoin lifter (r133 - never invoked).
+THE QUESTION: WHICH merge? `LUAU_MERGE_WATCH` prints values but not the site.
+  Add `cond_pc`/`merge_pc` to that print, then the branch is named rather than
+  inferred. Do not pair it with an `IF` line by proto and register again.
+
+### State after rotation 135
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Reverted clean.
