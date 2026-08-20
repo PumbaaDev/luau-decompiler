@@ -128,7 +128,7 @@ This figure is measured out of tree: the round trip needs a Luau interpreter bin
 execute both the original and the recovered source, and neither that binary nor the corpus
 ships in this repository, so a fresh clone cannot reproduce the number directly. What CI and
 `cargo test` do exercise is the in-repo suite (parser, lifter, disassembler and obfuscator
-unit tests, 900+ of them); the interpreter round-trip test skips cleanly when the binary is
+unit tests, 949 of them); the interpreter round-trip test skips cleanly when the binary is
 absent.
 
 A known limitation: when the operands of a nested short-circuit are themselves function
@@ -205,34 +205,41 @@ than having no check.
 
 ### Measured state on real shuffled bytecode
 
-A whole Roblox game, not a sample: **1,310 bytecode files pulled from a live
+A whole Roblox game, not a sample: **1,143 bytecode files pulled from a live
 client** (Bee Swarm Simulator, `PlaceId 1537690962`), decompiled in one clean
-batch run.
+batch run against a measured opcode map.
 
 | | |
 |---|---|
-| Decoded | **1,309 / 1,309** (the 1 exclusion ships a compiler error, not a program) |
-| Parses as valid Luau | **1,309 / 1,309 (100%)** |
-| Semantically clean | **1,255 / 1,309 (95.9%)**, 115 defects |
+| Decoded | **1,142 / 1,142** (the 1 exclusion ships a compiler error, not a program) |
+| Parses as valid Luau | **1,142 / 1,142 (100%)** |
+| Semantically clean | **1,130 / 1,142 (98.9%)**, 12 defects |
 
 Syntax validity is cross-checked against the real `luau-compile`, not just our
 own checker — see below for why that mattered.
 
-The 115 remaining defects are not spread evenly. They are almost one thing:
+The 12 remaining defects are three mechanisms, all adjudicated by hand — none
+is a checker false positive:
 
-| check | files | defects |
-|---|---:|---:|
-| `declared_never_assigned` | 52 | **113** |
-| `undefined_local` | 1 | 1 |
-| `name_body_mismatch` | 1 | 1 |
+| check | files | what it costs |
+|---|---:|---|
+| `calls_not_emitted` | 6 | a body emits fewer calls than its bytecode contains |
+| `branch_local_discarded` | 3 | a branch arm's value is bound to a fresh local and dropped |
+| `declared_never_assigned` | 3 | a name is declared and read but never assigned |
 
-**98% of what is left is a single mechanism.** A value the bytecode computes
-inside a branch is parked in the register file rather than emitted as a
-statement; the merge then discards it, the hoisted declaration survives, and
-every later read is `nil`. Traced end to end in `BeeStats.GetGatherAmounts`,
-where `MUL R10 R10 * R14` behind a `JUMPXEQKNIL` guard produces a `v10` that is
-declared once and never assigned. Fixing it means binding the pre-branch value
-*and* emitting the in-branch write — not one of the two.
+One of the three `declared_never_assigned` is **not fixable from the input**:
+Roblox bytecode carries no `CAPTURE` records, so the parent register behind a
+child closure's upvalue is simply absent. The rest are bounded by measurement —
+every candidate fix tried so far costs more than it recovers, and the numbers
+are recorded rather than the attempts silently dropped.
+
+**The measure that decides a fix is not the defect count.** Six changes during
+this work scored *better* on the semantic checker while quietly deleting
+output — among them a purchase guard and an auto-jump guard, each removed
+because a constant kept in a dead register let the branch fold away. All six
+were reverted. The arbiter that caught them is total emitted calls across the
+corpus: a fix that raises the clean count while the corpus emits fewer calls is
+buying a number with invisible damage.
 
 Recent fixes, each verified by that harness rather than by eye:
 
@@ -253,7 +260,8 @@ deliberately failing — it documents a real defect and stays red until fixed.
 
 ### A tool that lies is worse than no tool
 
-`validate` used to reject **106 of those 1,309 files**, reporting a `function`
+`validate` used to reject **106 files from an earlier 1,309-file run**,
+reporting a `function`
 left unclosed hundreds of lines from anything wrong.
 
 Every one of them was valid. `tools/luau/luau-compile` — the real Luau compiler
