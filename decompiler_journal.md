@@ -7822,3 +7822,60 @@ the same discipline here - score first, census second, and the census decides.
 ### State after rotation 129
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. All stamps corrected
 and verified inert.
+
+
+## Rotation 130 - ADOPTED. A speculative lift was not undone when it was rejected
+
+### The call site, named by the pass-stamped trace
+    LIFTPATH pass=20 ? flat 8..22      the enclosing arm
+    LIFTPATH pass=21 ? flat 18..22     SPECULATIVE
+    LIFTPATH pass=22 ? flat 18..22     the real arm lift
+
+Two lifts of one range inside pass 20. Pass 21 is
+`recognize_or_and_chain`'s segment lift.
+
+### The bug
+That recogniser lifts candidate segments into the SHARED `regs` before deciding
+whether the chain is real:
+
+    for &(seg_start, seg_end) in &chain.segments {
+        lift_instruction_range(..., seg_start, seg_end, regs, ...);
+        ... => { ok = false; break; }
+    }
+    if ok { ... }
+    // falls through with regs STILL MUTATED
+
+When the chain is rejected, control falls through to the inline-if path with the
+speculative writes still in place. On `54_Controls::?@74` that left R3 holding
+the `LOADNIL` from pc 10 - the speculative pass never executed pcs 13..16 where
+`FindFirstChild` lands - so the arm was built with a nil receiver and
+`method_receiver_expr` correctly refused it, emitting `v3:Destroy()`: a method
+call on nothing.
+
+Fix: snapshot before the segment loop, restore on the reject path only. The
+accept path keeps its writes deliberately.
+
+### Measured, ADOPTED
+    clean 1,128 -> 1,130   defects 14 -> 12
+    FIXED  54_Controls (the diagnosed reproducer) and 958_Drakkarmon
+    NEW    none
+    121 files changed; calls lost 0, loops lost 0
+    total emitted calls 38,459 -> 38,461  (+2, net POSITIVE)
+    949 tests pass on two consecutive runs
+
+Two files show one fewer `if` and BOTH are recoveries, verified by reading:
+`388_Sticker` collapses a flattened short-circuit into
+`x and (self.Amount or 1) <= #x` - the previously DISCARDED comparison is now
+assigned - and `464_LocalFlyingEntity` gains a 17-line table constructor and
+corrects `v43.Movespeed` to `arg4.Movespeed`.
+
+### The trail
+Fifteen rotations (r115-r130), five suspects eliminated by print, two framing
+errors corrected (a false timeline at r127, my own unsound pass stamps at r128),
+and one instrument fixed before it was trusted. Every step that advanced came
+from printing a value; every step that stalled came from reasoning about one.
+
+### State after rotation 130
+SEMANTIC: **1,130/1,142 (98.9%), 12 defects** - 3 declared_never_assigned,
+3 branch_local_discarded, 6 calls_not_emitted.
+CLOSED (22): ..., **speculative-chain register leak**.

@@ -3394,6 +3394,23 @@ pub(super) fn lift_instruction_range(
                 // register. Rebuild the expression rather than lowering it to
                 // control flow, which loses every operand but the first.
                 if let Some(chain) = recognize_or_and_chain(code, pc) {
+                    // SPECULATIVE. The segment lifts below write into the SHARED
+                    // register file, and when the chain is rejected (`ok = false`)
+                    // control falls through to the inline-if path with those
+                    // writes still in place.
+                    //
+                    // Measured on `54_Controls::?@74` (rotations 124-129, all
+                    // pass-stamped): R3 holds `Name("SteeringVelocity3")` at the
+                    // top of pc 17, a speculative lift of 18..22 runs, and the
+                    // enclosing pass then builds its arm with R3 = `Expr(Nil)` -
+                    // the value LOADNIL left at pc 10, because the speculative
+                    // pass never executed pcs 13..16. `method_receiver_expr`
+                    // then correctly refuses a nil receiver and mints `v3`, so
+                    // the output calls a method on nothing.
+                    //
+                    // Snapshot and restore on the reject path only; the accept
+                    // path deliberately keeps its writes.
+                    let chain_snapshot = regs.clone();
                     let mut acc = reg_expr(regs, chain.dest);
                     let mut ok = true;
                     for &(seg_start, seg_end) in &chain.segments {
@@ -3433,6 +3450,21 @@ pub(super) fn lift_instruction_range(
                         pc = chain.end_pc;
                         continue;
                     }
+                    // Rejected: undo the speculation.
+                    //
+                    // MEASURED (rotation 130), ADOPTED:
+                    //     clean 1,128 -> 1,130   defects 14 -> 12
+                    //     FIXES 54_Controls (the diagnosed reproducer) and
+                    //           958_Drakkarmon. NO new findings.
+                    //     121 files changed; calls lost 0, loops lost 0;
+                    //     total emitted calls 38,459 -> 38,461.
+                    //     Two files show one fewer `if` and BOTH are recoveries:
+                    //     `388_Sticker` collapses a flattened short-circuit into
+                    //     `x and (self.Amount or 1) <= #x` (the discarded value
+                    //     is now assigned), and `464_LocalFlyingEntity` gains a
+                    //     17-line table constructor.
+                    regs.clear();
+                    regs.extend_from_slice(&chain_snapshot);
                 }
 
                 // A jump that reaches the END of the enclosing loop leaves it,
