@@ -3472,7 +3472,7 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                             crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
@@ -3484,7 +3484,7 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!("PREMAT	AFTER	pass={}	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                             crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
@@ -3502,7 +3502,7 @@ pub(super) fn lift_instruction_range(
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
                                 "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,
@@ -3648,7 +3648,7 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                             crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
@@ -3669,7 +3669,7 @@ pub(super) fn lift_instruction_range(
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
                                 "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,
@@ -3796,7 +3796,7 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!("PREMAT	BEFORE	pass={}	{}	pc={}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                             crate::decompiler::lifter::current_dce_proto(), pc, w, regs.get(w));
                         }
                     }
@@ -3817,7 +3817,7 @@ pub(super) fn lift_instruction_range(
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
                                 "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
-                                crate::decompiler::lifter::current_pass_id(),
+                                pass_id,
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
                                 then_end,

@@ -7771,3 +7771,54 @@ FIRST, though: thread the local `pass_id` into `PREMAT`/`ARMENTRY` so their
 ### State after rotation 128
 SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. Pass counter verified
 inert.
+
+
+## Rotation 129 - stamps corrected, and the mechanism is a NESTED LIFT LEAKING REGISTER STATE
+
+### The instrument fixed first
+r128 recorded that `PREMAT`/`ARMENTRY` stamped `current_pass_id()` - the latest
+GLOBAL counter - rather than their own pass. Threaded the local `pass_id` into
+all 7 sites. Only after that was the ordering read.
+
+### The ordering, with honest stamps
+    WATCH   pass=20  before_pc=17  Name("SteeringVelocity3")   correct
+    WATCH   pass=21  before_pc=18  Name("SteeringVelocity3")   nested pass runs
+    PREMAT  pass=20  pc=17         Expr(Nil)                   back in 20: NIL
+    ARMENTRY pass=20 arm=18..22    Expr(Nil)
+    WATCH   pass=22  before_pc=18  Expr(Nil)
+
+Within ONE pass (20), R3 is `Name(...)` at the top of pc 17 and `Nil` a moment
+later. The only thing between the two prints is nested **pass 21**.
+
+### The mechanism
+`lift_instruction_range` takes `regs: &mut Vec<RegVal>` and passes that SAME
+vector to nested lifts. A nested lift's register writes therefore persist into
+the caller. Pass 21 read R3 correctly at pc 18 and left the register file
+holding `Nil`, so the enclosing pass 20 built its arm from a corrupted view and
+`method_receiver_expr` correctly refused the nil receiver.
+
+Note the shape: this is the SAME family as rotation 122's fix (arm register
+state on the way out) and rotation 125's finding (arm state on the way in), and
+it is the third face of one issue - **the register file is shared across nested
+lifts with no discipline about who may write it.** r122 fixed one crossing by
+adding a restore; this is a crossing with no restore at all.
+
+### PARKED, fully characterised
+MECHANISM: a nested lift mutates the caller's register file; the enclosing pass
+  then builds an arm from the corrupted state.
+PROVED:    correct value at pc 17 in pass 20; nested pass 21 runs; `Nil` in pass
+  20 immediately after (all pass-stamped after the stamps were corrected).
+RULED OUT: receiver predicate (r123), opmap/bytecode (r124), arm-exit restore
+  (r122 - different crossing), premateralization (r126), bool idiom (r127).
+THE QUESTION: which call site opens pass 21? `LUAU_LIFTPATH` is pass-stamped -
+  one dump names it and its range. Then the fix is a snapshot/restore around
+  THAT nested lift, exactly as r122 did for the arm-exit crossing, measured with
+  the full census.
+
+RISK to state in advance: r122's equivalent change needed a constant exclusion
+to avoid deleting a guard, and was rejected twice before that was found. Expect
+the same discipline here - score first, census second, and the census decides.
+
+### State after rotation 129
+SEMANTIC: 1,128/1,142 (98.8%), 14 defects. 949 tests pass. All stamps corrected
+and verified inert.
