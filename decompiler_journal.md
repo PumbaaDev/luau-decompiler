@@ -8028,3 +8028,50 @@ depend on the current graph shape. Expect the same, and measure the census.
 
 ### State after rotation 133
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only.
+
+
+## Rotation 134 - merge_regs runs on a branch that HAS no merge
+
+### The successor sets
+`LUAU_MERGEPT_TRACE=110` on `79_Toys::ButtonText@179`:
+
+    MERGEPT true=111 succ=[116, 144]   false=149 succ=[152, 176]
+
+The two arms lead to DISJOINT successor sets and never reconverge, so
+`find_merge_point` returning `None` is CORRECT - both arms terminate. r133's
+reading, that a join existed which the search failed to reach, was wrong. The
+search is sound here; rotation 82's verdict on it stands.
+
+### The real fault
+And yet `merge_regs` RAN on those two arms - r132 printed it:
+
+    self  = Expr(BinOp{ String("Use the "), Concat, ... })
+    other = Expr(String("Error, tell Onett"))
+    -> reset to Unknown -> `v7`
+
+So the states of two arms that never meet in the program were merged anyway, and
+the reset destroyed both. The `IfThenElse` region carries `merge_pc: None`, and
+that field is the signal that no merge should happen - it is being ignored.
+
+### PARKED, with the fix shape
+MECHANISM: `merge_regs` is invoked for an `IfThenElse` whose `merge_pc` is
+  `None`; two arm states that never converge are collapsed and both values lost.
+PROVED:    successor sets disjoint (printed); `merge=None` (IF trace); the merge
+  nevertheless performed on those exact values (MERGE watch); the emitted `v7`.
+RULED OUT: `find_merge_point` being at fault (r134 - it is correct here);
+  merge-lattice patches (r119, measured worse); the ValueJoin lifter (never
+  invoked, r133).
+THE FIX SHAPE: skip the merge when `merge_pc` is `None`, keeping each arm's
+  state on its own path. Gate it, and measure the census - `merge_regs` is
+  reached from several lift paths and its callers may rely on the current
+  collapse for unrelated shapes.
+
+### A correction to r133
+r133 concluded "two of the three graph queries in `analysis/` miss real
+structure". That over-generalised from one file: `find_loops` genuinely does
+miss generic-for loops (r99, reproduced), but `find_merge_point` is CORRECT on
+this case. One graph query is at fault, not two.
+
+### State after rotation 134
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Diagnosis only;
+`LUAU_MERGEPT_TRACE` added and verified inert.

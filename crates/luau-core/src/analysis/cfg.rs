@@ -428,6 +428,26 @@ impl ControlFlowGraph {
             return Some(true_target);
         }
 
+        // Rotation 134: why does this find no overlap? `LUAU_MERGEPT_TRACE=<blk>`
+        // prints the successor sets for one conditional. r133 showed
+        // `merge=None` for a two-arm branch whose register IS read afterwards,
+        // so a join exists that this search does not reach.
+        let mp_trace = std::env::var("LUAU_MERGEPT_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if mp_trace.is_some() {
+            let succ = |b: usize| -> Vec<usize> {
+                self.blocks.get(&b).map(|x| x.successors.clone()).unwrap_or_default()
+            };
+            eprintln!(
+                "MERGEPT	true={} succ={:?}	false={} succ={:?}",
+                true_target,
+                succ(true_target),
+                false_target,
+                succ(false_target)
+            );
+        }
+
         // Alternating BFS
         for _ in 0..self.blocks.len() * 2 {
             if let Some(node) = queue_true.pop_front() {
