@@ -7879,3 +7879,47 @@ from printing a value; every step that stalled came from reasoning about one.
 SEMANTIC: **1,130/1,142 (98.9%), 12 defects** - 3 declared_never_assigned,
 3 branch_local_discarded, 6 calls_not_emitted.
 CLOSED (22): ..., **speculative-chain register leak**.
+
+
+## Rotation 131 - the r130 bug class does NOT recur; the 12 re-enumerated
+
+### Generalisation checked, and it is negative
+r130 fixed a speculative lift whose register writes were not undone on the
+reject path. The obvious follow-up is whether other recognisers do the same.
+Audited every `lift_instruction_range` call site in `opcode_handlers.rs`:
+
+    3418  the or/and segment lift          FIXED in r130
+    3546/3551, 3713/3718, 3861/3866       inline-if then/else arms - these
+          bracket their lifts with `regs_snapshot` and restore, and r122
+          refined that restore
+    mod.rs 2199  the value-join trial      lifts into `&mut regs` (a LOCAL) with
+          a cloned `trial_locals` - properly isolated
+
+So the leak was unique to the one recogniser. No sibling fix to make, and that
+is worth recording as a negative result rather than leaving the question open.
+
+### The 12 remaining, by file
+    branch_local_discarded  21_ClickToMove, 317_ScreenParticles, 445_PluckedPetal
+    calls_not_emitted       174_ClientStatCache, 286_LeaderboardsGui,
+                            314_RoboBearGui, 351_PassiveTile, 532_MusicPlayer,
+                            59_LocalCubs
+    declared_never_assigned 396_TadpoleTailInit, 79_Toys, 873_Translation
+
+Status of each is already recorded above:
+  * `branch_local_discarded` (3) - CLOSED at boundary (r107): the safe subset
+    ships, the rest is proven inseparable from a call-dropping regression by
+    any read/write-pattern predicate.
+  * `calls_not_emitted` (6) - CLOSED at boundary (r113): a plain if/elseif chain
+    in a loop body matches no implemented shape, and four naive fills each
+    measured worse (r83 -1 guard, r109 -2, r112 -19, plus r93's boundary).
+  * `396` - dropped generic-for inside a `while` body, needs r113's machinery.
+  * `873` - BLOCKED ON THE FORMAT: Roblox bytecode carries no CAPTURE data, so
+    the parent register behind a child's upvalue is not in the input.
+  * `79` - `UNK_MERGE_COMPOUND`, REAL, mechanism not yet traced.
+
+`79_Toys` is the one remaining finding with no boundary, no blocker and no
+diagnosis - the honest next target.
+
+### State after rotation 131
+SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. Audit only; no code
+changed.
