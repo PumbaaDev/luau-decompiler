@@ -8439,3 +8439,27 @@ binary reproduces 1,297 / 33 exactly.
 
 **The next attempt must fix the arm STRUCTURER, not its trigger.** Four gate
 variants have now been measured and all four lose more than they recover.
+
+### FIFTH rejection: merge-containment in `structure_block_subset`
+`structure_block_subset` checks that `then_blocks` and `else_blocks` are all
+members of the subset, but never checks `merge`. A region whose join lies
+OUTSIDE the arm is emitted with a `merge_pc` past the arm boundary, and the
+lifter then lifts up to it and claims code the arm does not own - which reads
+exactly like the "double-lifted foreign blocks" failure recorded against every
+earlier attempt. Adding `merge.map_or(true, |m| member.contains(&m))`:
+
+    baseline                                   1,297 / 1,323   33 defects
+    narrowed gate only                         1,213 / 1,323  170 defects
+    narrowed gate + merge containment          1,210 / 1,323  173 defects
+
+Marginally WORSE than the gate alone, so an escaping merge is not where the
+damage comes from either. Reverted; baseline reproduced exactly.
+
+FIVE measured attempts now: three historical (r82 ARM_COND, r83 ARM_IF, the
+BRANCH_ARMS flag) and two today (truncation-gated, and that plus merge
+containment). Every one loses far more than it recovers. The conclusion is not
+"try a sixth gate": `structure_block_subset` emits regions the arm lifter
+cannot consume safely, and the next attempt has to establish WHAT it emits that
+is wrong - region-by-region, against a proto whose correct structure is known -
+rather than adjusting when it runs. `LifterProbe.luau` exists for exactly that
+and has never been run; it needs a live client (25 Aug).
