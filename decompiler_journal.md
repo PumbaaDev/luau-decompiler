@@ -9939,3 +9939,44 @@ measured against files that already rely on the current reading.
 
 Neither defect is fixed. `lv_0756` and `rc_0030` are both dispatch-shaped, so
 the chain is worth roughly half of what remains.
+
+### GenericFor never set `current_loop_end` - 214 wrong `break`s across 93 files
+Fixed the second defect the `lv_0756` traces exposed. A generic-for lifted its
+body without ever setting `ctx.current_loop_end`, so the Break/Continue choice
+had nothing to test and ALWAYS chose `Break`. Every forward jump that left a
+lifted range inside a `for ... in pairs(..)` came out as `break`, including
+jumps to the FORGLOOP itself, which are continues.
+
+The value is the EXCLUSIVE end of the construct - one past the back edge - so a
+jump TO the back edge reads as continue under the existing `target < le` test,
+and only a jump past the whole construct reads as break. That leaves the other
+three loop kinds untouched.
+
+WHY THIS IS SOUND, not just different: a genuine `break` must LEAVE the loop, so
+its target is past the FORGLOOP and still reads as Break. The only jumps that
+flipped are those targeting inside the loop, and a target inside the loop is
+never a break. The change cannot turn a correct break into an incorrect
+continue - it can only turn incorrect breaks into continues.
+
+Measured: 501 -> 287 `break`s, 93 files changed, 0 losing structure. Corpus
+totals do not move at all (1307 clean, 19 defects, 41 missing calls) because
+break-vs-continue is invisible to every counter I have. Probes 9/9 13/13 8/8;
+tests 1037 pass, 1 pre-existing fail.
+
+Hand-verified rather than trusted. `lv_0002 BeeTypes`:
+
+    local MaxForce2 = FaceColor2:FindFirstChild("BodyColor")
+    if MaxForce2 then
+        v2.GiftedBodyColor = FaceColor2.BodyColor.Value
+        continue                    -- was `break`
+    end
+    -- otherwise fall through to the 2D-colour path
+
+With `break` that abandoned every remaining bee after the first one carrying a
+`BodyColor`. These were real semantic bugs in shipped output, and no metric in
+the repo could see them - the only reason they surfaced is that a trace was
+added instead of another guess.
+
+`lv_0756`'s dispatch is still broken; its `if v.Action ~= "Add" then` now says
+`continue` instead of `break`, which is closer but still wrong. The chain itself
+remains unfixed.

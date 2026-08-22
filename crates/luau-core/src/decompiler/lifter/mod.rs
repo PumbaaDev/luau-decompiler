@@ -3673,6 +3673,22 @@ fn lift_region(
             // `lift_region` passes `false` for Linear regions, so we call
             // `lift_instruction_range` directly for Linear children here.
             let mut body_stmts = Vec::new();
+            // A generic-for never set this, so every forward jump that left a
+            // lifted range inside one fell to `Break` - including jumps to the
+            // FORGLOOP itself, which are CONTINUES. `lv_0756 PassiveTile` shows
+            // it as `if not New3 then break end`, abandoning the whole loop
+            // where the bytecode skips a single item.
+            //
+            // The value is the EXCLUSIVE end of the loop construct - one past
+            // the back edge - so that a jump TO the back edge reads as continue
+            // under the existing `target < le` test, and only a jump past the
+            // whole construct reads as break.
+            let prev_loop_end = ctx.current_loop_end;
+            {
+                let lop = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
+                ctx.current_loop_end =
+                    Some(*loop_pc + if lop.has_aux() { 2 } else { 1 });
+            }
             if nested_body.is_empty() {
                 lift_instruction_range(
                     ctx, proto, proto_index, depth,
@@ -3698,6 +3714,7 @@ fn lift_region(
                     }
                 }
             }
+            ctx.current_loop_end = prev_loop_end;
             remove_trailing_jump(&mut body_stmts);
 
             // Phase C4: lifter corruption guard — reject GenericFor whose
