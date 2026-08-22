@@ -9793,3 +9793,44 @@ lies beyond the arm's end but inside the enclosing range, the arm end is wrong -
 extend the construct to that target before lifting. That is a change to arm
 DETECTION, and every previous attempt in this journal touched arm STRUCTURING or
 the seed instead, which is why none of them reached this file.
+
+### The arm-boundary fix, and the loose version that looked better
+Implemented the extension the previous entry named, and the first version was
+WRONG in a way the corpus total actively hid.
+
+LOOSE VERSION - extend the arm whenever any conditional jump inside it targets
+past its end. Corpus went 1305 -> 1309 clean, 22 -> 17 defects, and missing
+calls 80 -> 49. Three separate totals all improving; it looked finished.
+
+`structure_diff` said REJECT: 16 files lost calls, `rc_0104` alone losing 13.
+Checked that file's own marker and it was decisive - `rc_0104` carried NO call
+recovery marker in the control and reported 23 MISSING CALLS after the patch.
+A file that was perfect became one of the worst in the corpus.
+
+So the -31 net was a REDISTRIBUTION, not a gain: large wins in two files paying
+for a new break in a third. Every headline number moved the right way while the
+change was making the decompiler worse at files it already handled. This is the
+third time in this session a corpus total has concealed a regression, and the
+per-file check has caught it every time.
+
+NARROW VERSION - extend only when the swallowed region is TERMINAL, ending in a
+`Return`. That is the guard-failure-body shape the fix was written for: a region
+that does not rejoin. Anything that rejoins is ordinary following code and must
+stay outside the arm.
+
+| | control | loose | narrow |
+|---|---|---|---|
+| clean | 1305 | 1309 | **1307** |
+| defects | 22 | 17 | **19** |
+| missing calls | 80 | 49 | **41** |
+| `rc_0104` | clean | **23 missing** | clean |
+| structure_diff | - | **16 files lose** | **0 lose** |
+
+The narrow version scores WORSE on clean files than the loose one and is the
+correct change - fewer files fixed, but nothing broken to pay for them. It also
+ends up with FEWER missing calls than the loose version, because the loose one
+was spending 23 of its own winnings on `rc_0104`.
+
+Fixes `rc_0055` outright: 22 missing calls -> 0. Also `lv_0791` (17 -> 0) and
+`rc_0102`. Three files touched, three files improved, nothing else moved.
+Probes hold 9/9, 13/13, 8/8.

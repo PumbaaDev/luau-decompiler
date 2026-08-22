@@ -3485,7 +3485,64 @@ pub(super) fn lift_instruction_range(
                     }
                 }
                 let cond = reg_expr(regs, a);
-                let target = (pc as i32 + d as i32 + 1) as usize;
+                let mut target = (pc as i32 + d as i32 + 1) as usize;
+
+                // THE ARM ENDS WHERE THE CONSTRUCT ENDS, NOT AT THE FIRST
+                // TARGET SEEN.
+                //
+                // A conditional jump inside the arm whose target lies BEYOND
+                // the arm's end is the construct's own exit - the guard's PASS
+                // path, jumping over the failure body. `lift_instruction_range`
+                // only lifts a jump when `target <= end`, so cutting the arm at
+                // the first target strands it, nothing guards the failure body,
+                // and DCE then truncates everything after its `return`.
+                //
+                // `rc_0055 ShopLayout` proto #6 loses 21 of 34 calls this way:
+                //
+                //     73: JUMPIFNOT R8  -> 80     arm cut at 80
+                //     78: JUMPIFNOT R10 -> 80     inside, fine
+                //     79: JUMPIF    R9  -> 85     PAST 80 -> stranded
+                //     80..84: warn(..) ; return   <- becomes unconditional
+                //
+                // The construct really spans 73..85 and 80..84 is its failure
+                // body. Extend to the furthest such target, which is where the
+                // guard actually rejoins.
+                if target > pc && target <= end {
+                    let mut w = pc + 1 + if op.has_aux() { 1 } else { 0 };
+                    let mut furthest = target;
+                    while w < target && w < code.len() {
+                        let wop = LuauOpcode::from_u8(insn_op(code[w]));
+                        if matches!(wop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+                            let t = (w as i64 + insn_d(code[w]) as i64 + 1) as usize;
+                            if t > furthest && t <= end {
+                                furthest = t;
+                            }
+                        }
+                        w += if wop.has_aux() { 2 } else { 1 };
+                    }
+                    // ONLY when the swallowed region is a TERMINAL failure
+                    // body. Extending on any inner jump is far too loose: it
+                    // swallows code that legitimately follows the arm, and
+                    // measured as +31 net missing calls hiding a regression
+                    // that broke `rc_0104` from 0 missing to 23.
+                    //
+                    // The guard-failure shape is specific - the region between
+                    // the old end and the new one does not rejoin, it RETURNS.
+                    // Require that and the extension applies to the shape it
+                    // was written for and nothing else.
+                    if furthest > target {
+                        let mut k = target;
+                        let mut last = None;
+                        while k < furthest && k < code.len() {
+                            let kop = LuauOpcode::from_u8(insn_op(code[k]));
+                            last = Some(kop);
+                            k += if kop.has_aux() { 2 } else { 1 };
+                        }
+                        if matches!(last, Some(LuauOpcode::Return)) {
+                            target = furthest;
+                        }
+                    }
+                }
 
                 // `local x = <cond>` compiles to a branch over a LOADB pair.
                 // Store the predicate as a value instead of lowering it to
