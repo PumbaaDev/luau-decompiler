@@ -9422,3 +9422,46 @@ different variants. What is not yet found is a discriminator that saves
 characterised at the bytecode level, and the seed trace (`LUAU_SEED_TRACE`)
 prints reg/pc/arms for every seed, so the next attempt starts with the two
 counterexamples in hand rather than with a corpus score.
+
+## SHIPPED (59e44d0): 1,298 -> 1,305 / 1,323, defects 30 -> 22
+
+    declared_never_assigned  11 -> 5      undefined_local  2 -> 0  (eliminated)
+    corpus missing calls    165 -> 165    parse 1,323/1,323
+    tests 1,039 pass, unchanged           probes unchanged
+
+Two changes, and the second is the one that took five attempts to find.
+
+**1. Seed declared-but-Unknown registers.** `unknown_seed` needs the register
+UNDECLARED; `bound_seed` needs it to hold a NAME. One used earlier in the proto
+(so declared) that now holds `Unknown` falls between them, even when both arms
+write it and the merge reads it - the argument both seeds already rest on.
+
+**2. Withhold the PIN, not the SEED.** Widening alone dropped a raycast in
+`rc_0100 Popper` because the arm contains a nested `or` on the pinned register:
+pinning one name over `f(a) or f(b)` makes both operands assign it and the chain
+collapses. FOUR attempts to suppress the seed for that shape each cost
+`lv_0922 TransparencyController` its tool-ancestor guard, because its arms carry
+the same short-circuit flag - the flag cannot separate them.
+
+The seed was never the problem. Seeding is correct (both arms write); only the
+PIN is unsafe across a short-circuit, and only for that arm. Withholding just
+the pin satisfies both counterexamples at once: rc_0100 Raycast 5 -> 5,
+lv_0922 guard intact, and the full +7 files is kept.
+
+### Two verification lessons, both earned the hard way
+* `structure_diff` flagged `lv_0922` at `if -3` and `rc_0266` at `if -1`. BOTH
+  ARE RECOVERIES. lv_0922 folds three `if not X then` inner guards into `or`
+  expressions (`or HasToolAncestor` 1 -> 4) with `HasToolAncestor(` and
+  `IsA("Tool")` both 5 -> 5; LemonSignal rescues an orphaned closure as
+  `task and function`. A flagged file must be READ, never counted.
+* I first "confirmed" the lv_0922 regression by comparing `sed -n '54,76p'` of
+  one file against `sed -n '54,74p'` of another - FIXED LINE WINDOWS across
+  outputs of different lengths. Comparing the SORTED SET of conditions is what
+  finally showed the truth. Eighth instance in this journal of an identifier
+  supplied by assumption.
+
+### State
+    clean 1,305 / 1,323 = 98.6%     defects 22
+      false-positive only    1      format-blocked only 2      FIXABLE 15
+    TRUE     1,306 / 1,323 = 98.7%
+    CEILING  1,321 / 1,323 = 99.85%   -- 100% is not reachable
