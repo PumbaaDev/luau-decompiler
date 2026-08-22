@@ -10073,3 +10073,54 @@ structuring inside its arms never recovers the loop body.
 
 Remaining: `lv_0905` (10), `rc_0030` (9), `lv_0351` (5), `lv_0124` (5),
 `rc_0084` (3) = 32 calls across 5 files.
+
+### The dominant remaining mechanism: a non-loop out-of-range jump is SILENTLY DROPPED
+Traced the last three files. Two of them share `rc_0030`'s shape exactly:
+
+    rc_0030 Cleanup@188      26 blocks -> IfThenElse{cond_pc:0} + Linear{124,125}
+    rc_0084 ComputePath@376  13 blocks -> IfThenElse{cond_pc:0} + Linear{112,113}
+    lv_0124 Update@62        10 blocks -> IfThenElse{cond_pc:0} + Linear{50,63} + IfThenElse{cond_pc:5}
+
+`rc_0084` is the smallest instance and shows the mechanism cleanly:
+
+    20: JUMPIFNOT R1 -> 108
+    24: JUMPIFNOT R1 -> 60
+    25..59: arm A, 2 calls, ends JUMP -> 108
+    60..107: arm B, 3 calls          <- LOST
+    108..111: common tail ; 112: RETURN
+
+A textbook if/else. The traces give the reason:
+
+    OOR pc=20 target=108 end=25 in_loop=false loop_end=None
+    OOR pc=24 target=60  end=25 in_loop=false loop_end=None
+
+Both branches are lifted with `end=25` - a ONE-INSTRUCTION range - so the target
+is out of range. And in a non-loop context the handler does nothing at all; the
+code says so: "In non-loop context, out-of-range forward jumps are skipped." No
+`break`, no `continue`, no `if` - the branch is DISCARDED, and the arm it
+guarded is never lifted.
+
+Inside a loop the same situation at least emits a break or continue, which is
+why the loop-shaped failures were visible as wrong control flow while these are
+invisible: the code simply is not there.
+
+HOW COMMON, measured honestly: 12 of 60 sampled files contain at least one such
+drop, 37 drops in total. That does NOT mean 37 defects. A drop only loses code
+when the target's region is not lifted by some other region, and usually it is -
+only 5 files in the whole corpus have missing calls. So this is a latent hazard
+that bites when the structuring has already failed, not a defect on every hit.
+Do not extrapolate 37/60 into a corpus-wide defect count; that would be the same
+mistake as trusting the totals.
+
+`lv_0351 UpdateLoop@558` is a `WhileTrue`, not this shape, but shows the same
+non-loop drops at pcs 16, 23, 32, 72, 117, 122, 135 - all with tiny `end`s.
+
+FIX SHAPE, and the plumbing it needs: for pc 24 the resolution already exists -
+the instruction ending at 60 is pc 59, `JUMP -> 108`, so `detect_else_skip` with
+a bound of 112 yields then=[25,59), else=[60,108) - the correct if/else. What is
+missing is CONSUMPTION SIGNALLING: lifting past `end` means the caller iterating
+blocks would lift [25,108) a second time. The generic-for fix solved exactly
+this by consuming to the body end and breaking out of the region loop; there is
+no equivalent path in `lift_branch_region`, and adding one is the next real
+piece of work. Attempting the extension without it would duplicate code, which
+no counter in this repo would catch either.
