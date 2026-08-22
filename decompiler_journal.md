@@ -9564,3 +9564,39 @@ taking it away costs more than the truncation does.
 
 Reverted. `rc_0047`'s 30 missing calls stay, and the reason is now recorded
 rather than open.
+
+### rc_0047's 30 missing calls: a MULTI-TERM short-circuit guard, not a lost range
+Ruled out the obvious causes by measurement, in order:
+
+* the arm IS fully lifted - `LUAU_LIFTPATH` gives 95 flat ranges covering
+  26..372 with only 1-2 word gaps, and those are the branch instructions
+  themselves (structure, not statements);
+* the guards ARE recovered individually - `pass=6 flat 104..109` is the arm of
+  the `JUMPIF R12 -> 108` guard;
+* the loss is at `eliminate_dead_code`, calls 47 -> 22, after `IFLIFT` reports
+  the arm at 62 statements and 43 calls.
+
+The bytecode says what it is:
+
+    136: JUMPIFNOT R13 -> +3      lifted as pass=10 flat 137..140
+    137: JUMPIFNOT R14 -> +2      lifted as pass=11 flat 138..140
+    138: JUMPIFNOT R15 -> +1      lifted as pass=12 flat 139..140
+    139: JUMPIF    R16 -> +5
+    144: RETURN
+
+Four conditional jumps CONVERGING ON ONE TARGET - the source is
+`if not (a and b and c and d) then warn(..) return end`. Each term is lifted as
+its own tiny range, so no single `if` ever owns the guarded body: the
+`warn(); return` ends up at the OUTER level, and DCE then correctly truncates
+everything after it. The emitted file shows exactly that - an unconditional
+`warn` and `return` where the source has a guard.
+
+This is a DIFFERENT mechanism from `rc_0274`'s, which was a branch stranded by a
+loop split and is now fixed. Widening that fix to cover this case was measured
+and is worse (missing calls 125 -> 130): the flat path handles ordinary
+truncating branches better than a region does.
+
+What this one needs is CONDITION COMPOSITION - folding consecutive conditional
+jumps that converge on the same target into one compound `and`/`or` condition,
+so the guarded body has an owner. That is new machinery, not a gate change, and
+it is the single largest remaining item (30 of the 125 missing calls).
