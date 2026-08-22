@@ -9834,3 +9834,58 @@ was spending 23 of its own winnings on `rc_0104`.
 Fixes `rc_0055` outright: 22 missing calls -> 0. Also `lv_0791` (17 -> 0) and
 `rc_0102`. Three files touched, three files improved, nothing else moved.
 Probes hold 9/9, 13/13, 8/8.
+
+### lv_0905: located exactly, generalization REJECTED
+`lv_0905 LocalCubs` proto 0 emits 7 of 17 calls. The 10 missing are pcs 77-159,
+one contiguous block, and the mechanism is fully traced:
+
+    54: FORGPREP_NEXT R2 -> 162        loop body 55..161
+    57: JUMPIFNOT    R7 -> 63          arm cut at 63
+    62: JUMPIF       R8 -> 72          past 63 -> stranded
+    63..71: cloud:Destroy() ; mark ; JUMP -> 162
+    72..161: the real work, ALL 10 missing calls
+
+Source shape:
+
+    for cloud, data in pairs(v4) do
+        if data.Attachment and data.Attachment:IsDescendantOf(workspace) then
+            <work>            -- 72..161, laid out SECOND
+        else
+            cloud:Destroy() ; toRemove[cloud] = true   -- 63..71, laid out FIRST
+        end
+    end
+
+The then-body is placed AFTER the else-body. The jump at 62 escapes the arm
+(58..62) that the `if` at 57 opened, fails `target <= end`, and falls through to
+the out-of-range handler, which in a loop emits a bare `break`. 72..161 is then
+never lifted at all.
+
+This is the SAME stranding as `rc_0055`, with a different terminator: there the
+swallowed region ended in `Return`, here it ends in `JUMP -> 162`. The shipped
+fix requires `Return`, so it correctly declines.
+
+TRIED AND REJECTED: extend to the terminating JUMP's target, so the arm holds
+the whole diamond and `detect_else_skip` resolves it. It works - `lv_0905` goes
+10 -> 0, corpus 1307 -> 1308 clean, 19 -> 18 defects, 41 -> 31 missing calls.
+It also breaks `rc_0089`, turning
+
+    if (CurrentCamera and CurrentCamera.CameraSubject):IsA("BasePart") then
+
+into an `if` on an unrelated register with the `:IsA` result demoted to a
+discarded local. THE CALL STILL PRINTS. Only the guard is gone, so every call
+counter and every corpus total reads clean - `structure_diff` caught it and
+nothing else would have.
+
+Tried gating on the escaping jump being the arm's LAST instruction, on the
+theory that this marks a short-circuit condition rather than a body. Measured a
+NO-OP: `rc_0089` is byte-identical with and without the gate, so its escaping
+jump is also arm-final. That discriminator is wrong and the corpus says so.
+
+Reverted. State stands at 1307/1323, 19 defects, 41 missing calls.
+
+NEXT ATTEMPT should discriminate on the ARMS, not the jump: in `lv_0905` the two
+regions [63,71] and [72,161] are genuine siblings meeting at 162, whereas in
+`rc_0089` the extension invents an outer `if` that was never there. A soundness
+test on the resulting diamond - both arms reaching the same merge, neither
+re-entered from outside - is the shape to try, and it must be checked BEFORE
+committing to the extension rather than after.
