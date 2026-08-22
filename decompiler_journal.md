@@ -8511,3 +8511,36 @@ computed into fresh arm-locals and discarded, plus an unbound `clamp = v4`),
 `bodies_dropped` REAL (`rc_0047` is 46 lines with ZERO functions for a 10-proto
 chunk), `undefined_local` REAL, `calls_not_emitted` REAL (traced to DCE
 truncation). Only `name_body_mismatch` is false. **30 of 33 are genuine.**
+
+### EIGHTH: teach the RUN structurer to emit branches (the closest attempt yet)
+`structure_numeric_for_body` recognised value joins and loops and nothing else,
+so a plain `if` inside a run fell through to the trailing Linear flush. It
+already COMPUTED `forward_conditional_jump` for `LUAU_SHAPE_TRACE` and threw the
+result away. Acting on it, bounded to the range the call owns:
+
+    control                       1,297 / 1,323   33 defects
+    if-then only                  1,267 / 1,323   66 defects
+    + if-then-ELSE discrimination 1,269 / 1,323   64 defects
+
+**It fixed the right files** - `rc_0274 Packet_Types` (the 72-block exhibit),
+`lv_0351 MusicPlayer`, `lv_0756 PassiveTile`, `lv_0786 ScreenParticles`,
+`rc_0037 GateController` - and broke 35 others, taking `calls_not_emitted` from
+11 to 29. So the mechanism is right and the DISCRIMINATION is wrong: most
+forward conditional jumps in this corpus are not the bare `if` this treats them
+as. Adding the standard if/else test (then-arm ends in an unconditional forward
+JUMP, so the conditional target is the ELSE start and the merge is that jump's
+destination) recovered only 2 of the 30 lost files.
+
+Reverted. Baseline reproduced (1,297 / 33).
+
+### Where this leaves the structural family
+Eight measured attempts: three historical, five today. Every one loses between
+28 and 253 files. The consistent shape of the failures - right files fixed,
+many more broken - says the missing thing is not another predicate but a way to
+tell a real branch from a short-circuit, a guard, and a loop exit at this level.
+Blind corpus tuning cannot supply it; eight runs have now demonstrated that.
+
+`LifterProbe.luau` is the instrument: eight hand-written control-flow shapes,
+every branch carrying a distinct `MARKER_*` string, so a missing marker IS the
+measurement and the correct structure is known in advance rather than inferred
+from a score. It has never been run. It needs a live client.
