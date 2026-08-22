@@ -9633,3 +9633,29 @@ without payoff.
 30 of the 125 missing calls are in this one proto, so the payoff for the FULL
 version is real and measurable, and `probes/` plus `tools/structure_diff.py`
 can judge it in seconds once written.
+
+## SHIPPED (eb730f2): multi-term short-circuit guards - 30 more calls
+
+    corpus missing calls  125 -> 95     calls_not_emitted 9 -> 8
+    bodies_dropped          2 ->  1     defects          23 -> 22
+    structure_diff: 1 file changed, ZERO lose an if, a call or a loop
+
+`rc_0047 IndexController` goes from **46 lines to 304** - the whole index build
+was being truncated - and the guard comes back verbatim:
+
+    if not IndexUI2 or not IndexUI3 or not MainScrollingFrame2 or not Holder then
+        warn("[IndexController] expected IndexUI.MainScrollingFrame.Holder.Item ...")
+
+### Session arc on the call-loss family
+    165 missing calls  ->  125 (b1a0f94, loop-spanning branch)  ->  95 (eb730f2)
+
+Two different mechanisms, found by tracing two different files to the bytecode,
+and NEITHER was reachable by tuning the other's gate - widening b1a0f94 to cover
+rc_0047 was measured at 130 missing calls, WORSE than leaving it alone.
+
+### What made both possible
+Neither fix would have shipped on the semantic score. `b1a0f94` is score-neutral
+on files and +1 on defects; this one is +0 files. Both were judged on
+`corpus missing calls`, which is the decompiler's own count of code it dropped,
+and on `probes/` + `tools/structure_diff.py`. The score alone would have called
+the first one a regression and the second one noise.
