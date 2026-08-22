@@ -586,8 +586,57 @@ pub fn check_source_size_bail(source_len: usize) -> Result<()> {
     Ok(())
 }
 
+/// The measured permutation bundled with this crate, parsed once.
+///
+/// WHY THIS IS IN THE LIBRARY. The bundled-database default used to live only
+/// in the CLI (`bundled_db_path()`), which finds the JSON relative to the
+/// working directory or the executable. A library cannot rely on either, so
+/// `luau-wasm` and `luau-server` - which call [`decompile`] - silently took the
+/// detector-only path and produced DIFFERENT, worse output than the binary for
+/// the same bytes. Measured on the 1,324-file union corpus:
+///
+/// ```text
+/// detector-only          891 / 1,323 clean (67.3%), 1,112 defects
+/// measured entry       1,297 / 1,323 clean (98.0%),    33 defects
+/// ```
+///
+/// A 31-point gap that every library consumer paid and nothing recorded. The
+/// file is ~3 KB, so compiling it in costs nothing and removes the filesystem
+/// dependency entirely - which is what makes it usable from WASM at all.
+fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
+    static DB: std::sync::OnceLock<Option<parser::opmap_db::OpmapDb>> =
+        std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        const JSON: &str = include_str!("../../../opmap_db/roblox_v9_live.json");
+        parser::opmap_db::OpmapDb::parse(JSON).ok().map(|(db, _warnings)| db)
+    })
+    .as_ref()
+}
+
 /// High-level API: decompile raw bytecode into Luau source
+///
+/// Consults the bundled measured permutation first. `lookup` returns `Hit`
+/// only after checking the chunk against the entry's fingerprint, so bytecode
+/// from any other build falls through to detection byte-for-byte as before -
+/// this can only replace INFERENCE with MEASUREMENT, never override a chunk
+/// the entry does not fit.
 pub fn decompile(bytecode: &[u8]) -> Result<String> {
+    if let Some(db) = bundled_db() {
+        if let Ok(chunk) = parser::parse(bytecode) {
+            if let parser::opmap_db::DbLookup::Hit { ref entry_id, .. } = db.lookup(&chunk) {
+                if let Some(entry) = db.get(entry_id) {
+                    // A plan failure is not fatal: fall through to detection
+                    // rather than turn a decodable chunk into an error.
+                    if let Ok((source, _)) = decompile_with_plan(
+                        bytecode,
+                        &DecodePlan { prior: None, exact: Some(entry) },
+                    ) {
+                        return Ok(source);
+                    }
+                }
+            }
+        }
+    }
     decompile_with_opmap(bytecode, None).map(|(source, _)| source)
 }
 

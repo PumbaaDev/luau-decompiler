@@ -92,6 +92,19 @@ fn repeated_unbound_field_value(src: &str) -> Option<(String, usize)> {
                     assigned.insert(n.trim().to_string());
                 }
             }
+        } else if let Some(rest) = t.strip_prefix("for ") {
+            // A LOOP VARIABLE IS A BINDING. `for k2, v2 in pairs(arg2) do`
+            // binds `v2`, and every `part.Anchored = v2` in the body is then
+            // correct code - not the closure-opcode defect this helper hunts.
+            // Missing this made `40_ReplicatedStorage_Welder` the last
+            // "failure" of a test whose real subject was already fixed, and it
+            // would have gone on flagging a decode that is right.
+            // Both loop forms bind: split off `in ...` first, then `= ...`.
+            let names = rest.split(" in ").next().unwrap_or(rest);
+            let names = names.split('=').next().unwrap_or(names);
+            for n in names.split(',') {
+                assigned.insert(n.trim().to_string());
+            }
         } else if let Some((lhs, _)) = t.split_once(" = ") {
             if !lhs.contains('.') && !lhs.contains('[') {
                 assigned.insert(lhs.trim().to_string());
