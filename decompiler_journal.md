@@ -9188,3 +9188,40 @@ gap between there and here is **23 files**, not 26 and not "13 defects".
 
 That is the number to work against. Quoting 100% as the target sets a bar the
 bytecode format forbids, and quoting 98.3% overstated where we already are.
+
+## SHIPPED: the merge seed was asking "used after?" of the wrong range (7abd696)
+
+    clean        1,297 -> 1,298 / 1,323        defects 33 -> 30
+    call recovery  165 -> 165 missing calls    ZERO regression
+    parse          1,323 / 1,323               tests 1,039 pass, unchanged
+
+    declared_never_assigned 12 -> 11   branch_local_discarded 3 -> 2
+    undefined_local          3 ->  2   every other class unchanged
+
+`premateralize_branch_escapes_split` will not seed a shared local unless the
+register is read after the merge - right, since seeding one nothing reads is
+noise. But the three call sites in `opcode_handlers` passed `end`: the end of
+the range CURRENTLY BEING LIFTED, an arm or a run. A read past that window was
+invisible, so the gate rejected the seed as pointless while the semantic checker
+could see the read perfectly well.
+
+`reject reg=N : not used after merge` was SEVEN of the thirteen `vN`
+declared-never-assigned defects. The usage question is about the proto, so it is
+now asked of the proto.
+
+### How it was found, and why it took so long
+By asking, for every remaining `vN` defect, WHICH gate condition rejected it -
+one table, thirteen rows - instead of reasoning about any single file. Seven
+rows said the same thing and the answer was in the call site.
+
+That is the measurement I should have run before the eighteen structuring
+attempts, not after. Every one of those tuned a predicate against a corpus
+score; this read the rejection reason off the gate that was already printing it.
+
+### State
+    clean 1,298 / 1,323 = 98.1%      defects 30
+      false-positive only    1  (rc_0270, checker bug, decompiler CORRECT)
+      format-blocked only    2  (upval_N; Roblox bytecode has no CAPTURE data)
+      GENUINELY FIXABLE     22
+    TRUE quality  1,299 / 1,323 = 98.2%
+    CEILING       1,321 / 1,323 = 99.85%   -- 100% is not reachable
