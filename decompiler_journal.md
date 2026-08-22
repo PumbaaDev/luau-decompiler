@@ -9257,3 +9257,47 @@ suggestive.
         shapes, and seeding one-arm was MEASURED to manufacture the defect (r6)
     1   no gate trace at all - the register never becomes a candidate
     11  calls_not_emitted / bodies_dropped - the structural family, 18 attempts
+
+## The remaining `vN` defects are TWO-ARM, and the seed cannot see it (22 Aug)
+
+With the read site recorded (cf10bfe) every defect of this class resolves to a
+real proto, and `rc_0065 repaint@120` - which carries two of them - shows what
+the class actually is. Its bytecode:
+
+    37: GETIMPORT R3          <- tostring
+    39: CALL      R3          <- THEN arm: R3 = tostring(Text)
+    41: LOADK     R3 K10 "?"  <- ELSE arm: R3 = "?"
+    42: CONCAT    R1 R2..R3   <- the merge read
+
+**Both arms write R3.** The source is `cond and tostring(Text) or "?"`. This is
+NOT the one-arm shape that r6 measured as unsound to seed - it is exactly the
+two-arm shape `unknown_seed` exists for, and the output still says
+`Price.Text = StarterPlayer2 .. v3`.
+
+### Why the seed cannot fire
+Two things have to both be true, and neither is:
+
+1. `find_value_join` REJECTS the region, correctly - `CALL` is not in the purity
+   allowlist, and a value join may evaluate a member block once per path, so a
+   call can never be admitted.
+2. The path it falls to reaches `premateralize_branch_escapes`, the NON-SPLIT
+   wrapper, which passes `split_arms: None`. `unknown_seed` is guarded by
+   `if let Some((then_ranges, else_ranges)) = split_arms`, so with `None` it is
+   unreachable by construction - the gate never even asks whether both arms
+   write.
+
+The trace shows the consequence exactly: `arm_writes=3` (GETIMPORT, CALL, LOADK
+across the two arms) and `-> REJECT`, because with no arm split the only gates
+left are `parked_pure` (false - the register is Unknown, nothing is parked) and
+`carried_identity` (false - nothing is read before write).
+
+### So the fix is not another predicate
+It is to give that call site the arm split it already has the information to
+compute. A two-arm value selection whose arms are not pure is a real and common
+shape - `x = cond and f(y) or default` - and it currently falls between
+`ValueJoin` (which must refuse it) and `unknown_seed` (which never sees it).
+
+This is the first mechanism-level statement about this class that rests on the
+bytecode rather than on the shape of the output, and it was only reachable once
+the report carried the read site so the defect could be pinned to `repaint@120`
+instead of to a register number that means something different in every proto.
