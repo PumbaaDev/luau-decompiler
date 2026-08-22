@@ -960,6 +960,37 @@ fn run_batch(
     Ok(())
 }
 
+/// The function a 1-based output line sits inside: the nearest preceding
+/// declaration. Emitted Luau uses `function tbl.Name(`, `local function Name(`
+/// and `Name = function(`, and nested closures mean NEAREST is the right
+/// answer, not outermost.
+fn enclosing_function(src: &str, line: Option<usize>) -> Option<String> {
+    let line = line?;
+    let lines: Vec<&str> = src.lines().collect();
+    if line == 0 || line > lines.len() {
+        return None;
+    }
+    for raw in lines[..line - 1].iter().rev() {
+        let t = raw.trim_start();
+        let rest = t
+            .strip_prefix("local function ")
+            .or_else(|| t.strip_prefix("function "));
+        if let Some(r) = rest {
+            let n: String = r.chars().take_while(|c| *c != '(').collect();
+            if !n.trim().is_empty() {
+                return Some(n.trim().to_string());
+            }
+        }
+        if let Some(eq) = t.find(" = function(") {
+            let n = t[..eq].trim().trim_start_matches("local ").trim();
+            if !n.is_empty() && !n.contains(' ') {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Run the semantic checker over every .lua file just written.
 ///
 /// Also writes `SEMANTIC_REPORT.tsv` beside the output: one row per defect,
@@ -986,7 +1017,7 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
     let mut total = 0usize;
     let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     // One row per defect: file / check / line / detail.
-    let mut report = String::from("file\tcheck\tline\tdetail\n");
+    let mut report = String::from("file\tproto\tcheck\tline\tdetail\n");
 
     for p in &entries {
         let Ok(src) = fs::read_to_string(p) else { continue };
@@ -1016,7 +1047,19 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
             // rows, so a malformed message cannot corrupt the table.
             let detail = f.detail.replace(['\t', '\n', '\r'], " ");
             let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
-            report.push_str(&format!("{}\t{}\t{}\t{}\n", name, f.check, line, detail));
+            // WHICH FUNCTION. Without it a defect can only be joined to a
+            // lifter trace by FILE and REGISTER NUMBER, and register numbers
+            // repeat across protos: rc_0243 has a reg 3 in `playerTrace` the
+            // gate ADMITS and a different reg 3 elsewhere that is the actual
+            // defect, which reads as "admitted and still broken" - a
+            // contradiction that does not exist. Pairing by an identifier the
+            // print does not carry is the most repeated mistake in this
+            // project's journal.
+            let proto = enclosing_function(&src, f.line).unwrap_or_else(|| "-".to_string());
+            report.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                name, proto, f.check, line, detail
+            ));
         }
         for (k, n) in seen {
             let e = counts.entry(k.to_string()).or_insert((0, 0));
