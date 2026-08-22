@@ -9659,3 +9659,37 @@ on files and +1 on defects; this one is +0 files. Both were judged on
 `corpus missing calls`, which is the decompiler's own count of code it dropped,
 and on `probes/` + `tools/structure_diff.py`. The score alone would have called
 the first one a regression and the second one noise.
+
+### `calls_not_emitted` COUNTS CALLS IN PROVABLY-DEAD CODE
+`rc_0030 Janitor::AddPromise@103` reports 10 of 10 calls missing and emits
+
+    local function AddPromise(self, arg2)
+        return arg2
+    end
+
+for a 57-instruction body. That looks like the worst possible collapse. It is
+correct output:
+
+    0: LOADB     R2 false      <- R2 IS false
+    1: JUMPIFNOT R2 -> 56      <- so this ALWAYS jumps, over the whole body
+    2..55: the body, 10 calls
+
+R2 is loaded with `false` and never written before the test, so the branch is
+provably always taken and the body is unreachable. This is a bundled copy of
+evaera's Janitor with `FoundPromiseLibrary` stubbed to false at bundle time -
+the Promise library is not in the bundle, so the compiler kept a branch that can
+never run. Dropping it is right.
+
+`call_recovery::record` counts CALL opcodes in `proto.code` without asking
+whether they are reachable, so every one of those ten is charged as a defect.
+
+**The 95 remaining missing calls are therefore an UPPER BOUND, not a count of
+lost code.** At least 10 of them - and everything else behind a
+`LOADB Rn false` / `JUMPIFNOT Rn` pair - are calls the decompiler is correct to
+omit. `Cleanup@188` in the same file emits a real body, so its 9 are a separate
+question and not this.
+
+The metric was built to catch dropped bodies and it does that well - it found
+both mechanisms fixed today. But a proto whose guard is a compile-time constant
+will sit in its list forever, and no lifter change can or should remove it.
+A reachability check on the CALL scan would make the number mean what it says.
