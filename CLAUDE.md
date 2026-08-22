@@ -43,6 +43,60 @@ Windows, or the link step fails on a locked file.
 
 ## THE fix list (this is the actual work)
 
+### REMEASURED 22 Aug 2026 — THE NUMBERS BELOW THIS BLOCK ARE STALE
+
+The list further down is dated 19 Aug and was swept against an older opmap
+source. Measured today against a clean `batch` of all 1,143 inputs with the
+CURRENT binary (`1142 ok, 0 failed, 1 not a program, 82s — 1142/1142
+decodable`), using deterministic counters rather than a model sweep:
+
+| Defect | 19 Aug sweep | measured 22 Aug | how measured |
+|---|---|---|---|
+| `undefined_register` | 171 | **9** (in 8 files) | a `local vN` declared, used, never assigned |
+| `name_collision` | 388 | 26,919 suffixed locals of 44,804 (60.1%) | `local Name<digits> =` |
+
+**`undefined_register` is ~91% gone and nobody recorded it.** The 18 Aug run
+had 104 unassigned vars across 25 files; today it is 9 across 8. The cause is
+the probe-aligned opmap DB (`roblox_v9_live`, 77 opcodes measured against the
+client's own compiler), not any lifter change. `Utils_RefCounter` — the file
+`tests/opmap_dupclosure_detection.rs` documents as emitting seven methods all
+assigned to an unbound `v1` — now decompiles to seven real functions with zero
+unresolved markers.
+
+**So the two red tests are not tracking a live defect.** `cargo test` shows
+965 pass / 2 fail; both failures are in `opmap_dupclosure_detection`, which
+exercises the DETECTOR-FALLBACK path. The shipping binary reports `opmap
+evidence: not applicable; no detector or bijection completion contributed to
+this decode` — it resolves from the DB and never runs those detectors. The
+tests still guard the fallback; they just do not describe normal operation.
+
+**`name_collision` is the remaining real class, and it is READABILITY, not
+correctness** — `local Exists4 = tbl.Exists; local Exists5 = Exists4(self)` is
+valid Lua that reads badly. Root cause located: register hints in
+`decompiler/mod.rs` are APPEND-ONLY and never cleared when a register is
+overwritten, so a dead name outlives its value. **Reordering hint PRIORITY is
+not the fix** — tried on 22 Aug in `select_hint` (prefer the newest hint over a
+stale `Named`) and measured a NO-OP: patched and unpatched binaries produce
+byte-identical output on the sample file and identical corpus totals
+(26,919 / 9 both ways). Reverted; `backup/pre-naming-fix` holds it. The next
+attempt should clear or scope hints at the write, not re-rank them.
+
+**Measuring rules learned the hard way, 22 Aug:**
+* Compare against an UNPATCHED CONTROL BUILD, never against an old run dir. A
+  stale baseline made one no-op change look first like a win, then like a 3.2pt
+  regression. Both readings were wrong.
+* `cargo build` leaves the OLD binary in place until it finishes — a
+  measurement taken right after a revert can still be running the patched code.
+* `batch` DELETES old run directories (83 in one run). A baseline stored under
+  the default run folder is destroyed by the run measuring against it; the
+  19 Aug reference survived only because it sits under `run_verify/`.
+* `OPMAP_TRACE` is inert for integration tests — `#[cfg(test)]` in the library
+  does not activate for anything under `tests/`.
+* `pgrep` cannot see Windows processes from Git Bash, so `until ! pgrep ...`
+  exits instantly and yields a confident "0 files" measurement. Use `tasklist`.
+
+
+
 REBASED 19 Aug 2026 ONTO THE REAL CORPUS. The list below used to be built from
 `bc/`, which holds **628** files - roughly half of `target/full1143`'s 1,143,
 and skewed: 575 ReplicatedStorage against **1 Workspace script out of 224**.
