@@ -9051,3 +9051,28 @@ it would imply a guarantee it has not earned.
 
 Five instruments today. Four wrong, one right-but-silent. The scoreboard on
 hypotheses is worse than the scoreboard on code, and that is worth writing down.
+
+### The residue is register SIX, and no pass is responsible
+`LUAU_PASS_PROBE` on `GiveStickerToPlayerStats@779` under the near-miss variant,
+every pass from `simplify_stmts` to `reconstruct_table_constructors`:
+
+    stmts=6 calls=9   stmts=6 calls=9   stmts=6 calls=9   ... unchanged throughout
+
+**No pass drops anything.** The proto lifts to six statements and stays there,
+so the loss is in the LIFT, not in dead-store elimination, DCE, or any later
+collapse. That rules out the whole post-pass pipeline, which is where the
+`rc_0274` truncation lived and where I would otherwise have looked next.
+
+And it explains the shape completely. `MOVE R9 R6` is COPY PROPAGATION - a plain
+`MOVE` deliberately emits no statement, it just makes R9 carry R6's expression.
+So nothing dropped the write; there was never a statement to drop. `v9` appears
+because **R6 held no known value at pc 20**, and R9 inherited that.
+
+The lost value is register **SIX**. Every previous reading of this defect - the
+one-arm merge, the coverage gap, the downstream pass - was chasing register 9,
+which is a symptom two instructions removed from the cause. Three refutations
+and one misattributed register, all from reading an absence in the output and
+inferring backwards instead of asking the register file what it held.
+
+FOR THE NEXT ATTEMPT: `LUAU_REG_WATCH` / `LUAU_MERGE_WATCH` on R6 across
+`GiveStickerToPlayerStats@779`, not R9, and not on the statement list at all.
