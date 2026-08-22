@@ -8986,3 +8986,33 @@ Four instruments built today, three of them wrong and caught before shipping
 survived - `tools/structure_diff.py` - is the one comparing two RUNS of the same
 decompiler, where the modelling error cancels on both sides. That is the pattern
 worth keeping: compare like with like, never source with output.
+
+### The narrow check is SOUND but looks in the wrong place
+Built the check the previous entry called for: not every pc, only every
+REGISTER-WRITING instruction, with the jump and FASTCALL families excluded by
+opcode (`writes_a_register`, a positive allowlist).
+
+    baseline, 60 corpus files:  0 unclaimed writes, 0 files
+
+Zero. After three cuts that reported 349, 183 and 79 false gaps, this one is
+quiet on correct output - which is what a usable invariant looks like.
+
+**But it does not catch the case it was built for.** Re-applied the near-miss
+structuring variant, where `lv_0648_Stickers::GiveStickerToPlayerStats` emits
+`return true, v9` with `v9` undeclared, and the check reported NOTHING.
+
+The reason is placement, and it corrects the previous entry: the check sits in
+`structure_numeric_for_body`, the RUN structurer, while that proto's top-level
+regions come from `structure_control_flow`. It never sees them.
+
+So two things are now known that were not:
+* a sound unclaimed-write invariant exists and is quiet at baseline;
+* the `MOVE R9 R6` diagnosis is still INFERRED, not proven - the write exists in
+  the bytecode and is absent from the output, but nothing has yet shown which
+  region does or does not claim it.
+
+Reverted rather than shipped: a detector that has never fired on a known defect
+is not evidence of anything, and the honest next step is to run the same
+invariant inside `structure_control_flow` where the regions for these protos are
+actually built. Fifth instrument today; the fourth was wrong, and this one is
+right but aimed at the wrong function.
