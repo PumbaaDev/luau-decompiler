@@ -8684,3 +8684,39 @@ a deleted call, or a deleted loop.
 The remaining work is to make the branch case keep its 9/9 without touching the
 146. That is now an iterable problem with a fast, honest test, rather than a
 corpus score to guess against.
+
+### THIRTEENTH, and it ISOLATES the weak link
+With the probe suite in place, the branch case was retried with a TILING
+CHECK: the scan resumes at `merge`, so every instruction between the branch and
+the merge must be carried by a block in one of the arms, or that code is
+skipped and never emitted. The arms must tile `[then_start, merge)` exactly -
+first block starting at `then_start`, last ending at `merge`, no gaps.
+
+    probes    DispatchProbe 2/9 -> 9/9    ModuleProbe 6/8 -> 8/8
+              GuardProbe 13/13 held
+    corpus    1,297 -> 1,269 clean, 33 -> 64 defects
+    structure 130 files LOSE structure (worst: -18 ifs)
+
+**Every probe now passes and the corpus is damaged exactly as much as before.**
+That is the finding. The tiling gap was not the cause, and the structuring is
+not the problem: what regresses is what happens AFTER a region is emitted.
+
+Emitting `Region::IfThenElse` routes the arm through `lift_branch_region`,
+which takes a BLOCK LIST, splits it into contiguous runs and lifts each. The
+flat path it replaces hands `lift_instruction_range` ONE range, and that is the
+only code that turns a nested conditional jump into a `Stat::If` (gated on
+`target > pc && target <= end`). Shrinking one range into several arms strands
+every nested jump that spanned them - which is why real files lose up to 18
+`if`s each while three purpose-built probes are perfect.
+
+**So the next attempt must not add another structuring predicate.** The
+question is now specific: make an arm lift preserve the nested-branch recovery
+that a flat range gets. Either lift the arm as a RANGE rather than a block
+list, or teach `lift_branch_region` the nested-jump handling
+`lift_instruction_range` already has.
+
+### Correction to r9/r11 readings
+`grep -c MARKER_` counts matching LINES, not distinct markers. Reading it as a
+marker count made `GuardProbe` look like a 6/13 failure when it was 13/13
+intact, and made r11 look like it "fixed" a probe it never broke. Only
+`tools/run_probes.sh`, which tests each marker once, is a marker count.
