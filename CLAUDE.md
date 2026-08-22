@@ -43,6 +43,56 @@ Windows, or the link step fails on a locked file.
 
 ## THE fix list (this is the actual work)
 
+### MEASURE ON `target/union1324` — 22 Aug 2026, EVERYTHING BELOW IS OLDER
+
+**The corpus is 1,324 unique files, not the ~15,000 the directory listing
+suggests.** Hash-deduped every `.bin` across 20 dirs: `bc/`, `target/full`,
+`vz`, `rf`, `fresh`, `live`, `r*lv`, `r*bc`, `p1run`..`p4run` add **ZERO** new
+files — every one is a strict SUBSET of `target/live_20260820`. Only
+`target/roomclean_139191806727638` adds anything: **179 files never measured
+before** (Roblox CoreScripts, PlayerModule, topbarplus/Janitor/evaera-promise).
+Built as `target/union1324` with `rc_`/`lv_`/`fz_` provenance prefixes.
+
+Those 179 are **10x worse** than the tuned corpus (10.1% of files defective vs
+1.05%), which is what overfitting to one corpus looks like when it is finally
+measured.
+
+```sh
+./target/release/luau-decompiler batch target/union1324   --out-dir target/<fresh> --opmap-db opmap_db/roblox_v9_live.json
+```
+
+| measured 22 Aug on union1324 | |
+|---|---|
+| decodable | 1,323 / 1,323, 0 failed, 1 not a program |
+| semantic | **1,297 / 1,323 clean (98.0%), 33 defects** |
+| of which FALSE POSITIVES | 3 (`rc_0270` name_body_mismatch) → true **98.3%** |
+| outputs that parse | 1,323 / 1,323 |
+| tests | 1,035 pass |
+
+**`batch` now writes `SEMANTIC_REPORT.tsv`** into the run dir: one row per
+defect with FILE and LINE. Use it. Every defect ledger in this project that
+lacked file-level evidence went stale and was then quoted as current.
+
+**DO NOT enable `LUAU_BRANCH_ARMS`.** Its own comment records "clean 1,100 →
+1,104, defects 48 → 39, files losing clean status: 0". That measurement is
+STALE. Measured today: **1,044/1,323 (78.9%), 639 defects** — it destroys a
+fifth of the corpus. Other gated flags: `LUAU_ARM_COND`/`LUAU_ARM_IF` +2 files
+but REGRESS one (net +1, not shipped); `LUAU_RET_RESUME` neutral;
+`LUAU_DECL_HOIST` worse. A comment recording a measurement is not a
+measurement; re-run it against a control build.
+
+**The CLI and the library produce DIFFERENT output.** `bundled_db_path()` makes
+the CLI silently load `opmap_db/roblox_v9_live.json`; `luau_core::decompile()`
+does NOT, so `luau-wasm` and `luau-server` get the weaker detector-only path.
+Measured on `16_StickerPlacer`: CLI correct, library emits the artifact.
+
+**A red test can be asserting a FALSE invariant.** `settablekS_self_assign`
+claimed "a real SETTABLEKS never has A == B" and was red forever.
+`SETTABLEKS R0."__index" R0` under the PROBE-MEASURED map is A == B and is
+correct — `tbl.__index = tbl`. "Fixing" the detector to satisfy it would have
+stopped every class table decoding. Check the premise against ground truth
+before treating red as a defect.
+
 ### REMEASURED 22 Aug 2026 — THE NUMBERS BELOW THIS BLOCK ARE STALE
 
 The list further down is dated 19 Aug and was swept against an older opmap

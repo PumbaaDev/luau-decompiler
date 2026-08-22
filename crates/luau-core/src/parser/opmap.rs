@@ -1792,7 +1792,9 @@ fn detect_getupval_by_upvalue_bound(chunk: &Chunk, ctx: &mut DetectCtx) {
 /// This detector is not circular. Every closure creation is followed by exactly
 /// `child.num_upvalues` CAPTURE words, so for any proto:
 ///
-///     count(CAPTURE byte in proto.code) == sum(child.num_upvalues)
+/// ```text
+/// count(CAPTURE byte in proto.code) == sum(child.num_upvalues)
+/// ```
 ///
 /// Both sides come from length-prefixed metadata, so the test runs without
 /// knowing a single opcode's meaning. Measured on the 1880-file v7 CoreGui set,

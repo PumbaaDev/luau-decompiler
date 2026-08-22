@@ -8176,3 +8176,153 @@ THE QUESTION: does `find_value_join` even consider block 62, and if so which of
 ### State after rotation 136
 SEMANTIC: 1,130/1,142 (98.9%), 12 defects. 949 tests pass. `MERGE_SITE` verified
 inert.
+
+## Live run, 20 Aug 2026 — fresh corpus off a NEW client build
+
+Roblox rolled to `version-ce0bcd0fbd484804` at 02:49 (Potassium 2.4.3 updated for
+it). That put the measured map in question: `opmap_db/roblox_v9_live.json` was
+probe-aligned on 16 Aug against `ff6341faef444107`.
+
+**Falsifier run first, not the decompile.** Dumped 8 scripts from the live client
+and forced the entry with `--opmap-db-entry roblox_v9_live`, which errors rather
+than falling back when an entry does not fit. All 8 decoded, and every header
+read `opmap source: database entry "roblox_v9_live"` with `opmap evidence: not
+applicable; no detector or bijection completion contributed to this decode`.
+**The client rollover did not reshuffle the opcodes.** The console's "LENGTH
+rescue" lines are the pooling store taking independent readings; they did not
+touch the decode path, which the per-file headers state explicitly.
+
+**Full live run.** 1,762 code instances walked, 1,310 yielded bytecode, 452
+empty (server-side `Script`s — the client never receives them; the known wall).
+Output dir emptied first, so resumed=0 by construction.
+
+| | |
+|---|---|
+| decoded | **1,309 / 1,309 (100%)**, 1 input not a program |
+| semantic | **1,295 / 1,309 clean (98.9%)**, 14 defects |
+| output | 310,719 lines, 16 MB, 422.7s |
+
+Defects: `calls_not_emitted` 7, `branch_local_discarded` 4,
+`declared_never_assigned` 3 — the same three families left on the frozen corpus,
+no new class.
+
+**Why this matters more than the frozen number.** `target/full1143` is bytecode
+dumped weeks ago under an older client; a decompiler can overfit to a corpus it
+has been tuned against. This is a different corpus (1,310 files vs 1,142),
+dumped today off a different client build, and it lands on **98.9% — the same
+rate as the frozen corpus (1,130/1,142)**. That is an independent confirmation,
+not a re-measurement.
+
+MANIFEST's "uncommitted changes" banner fired on `tools/ollama_fanout.py` (a
+Python tool) and untracked `crates/luau-core/tests/_tmp_rem.rs` (a test file).
+Neither is linked into the release binary, which was built 02:25 from HEAD
+3715cb4. The banner is correct to be conservative; the binary is reproducible.
+
+## Union corpus, 22 Aug 2026 — every unique bytecode file we hold
+
+### The corpus is a fifth the size the directory listing suggests
+Hash-deduped every `.bin` across 20 directories. **1,324 unique files** out of
+~15,000 on disk:
+
+| root | files | NEW unique |
+|---|---:|---:|
+| `target/live_20260820/bytecode` | 1310 | 1143 |
+| `target/roomclean_139191806727638/bytecode` | 312 | **179** |
+| `target/full1143` | 1143 | 2 |
+| `bc`, `target/{full,vz,rf,fresh,live,r1lv,r2lv,bc,rb,r0bc,r1bc,r2bc,p1run..p4run}` | 9,000+ | **0** |
+
+`bc/` and every `p*run` are strict SUBSETS of the live dump; measuring on them
+adds nothing. `roomclean` is a DIFFERENT PlaceId and contributes 179 files that
+have never appeared in any measured run: Roblox CoreScripts, PlayerModule, and
+third-party packages (topbarplus, Janitor, evaera promise). Materialised as
+`target/union1324` with `rc_`/`lv_`/`fz_` provenance prefixes.
+
+### The never-measured 179 are 10x worse than the tuned corpus
+First clean run: **1,293/1,323 (97.7%), 39 defects.** Not the 98.9% previously
+reported, because that number never saw these files.
+
+    defects by origin:  lv (1,143 files) 12   |   rc (179 files) 27
+    defective files:    lv 12 (1.05%)         |   rc 18 (10.1%)
+
+A decompiler tuned against one corpus overfits to it. This is the measurement
+that shows by how much.
+
+### `batch` now writes SEMANTIC_REPORT.tsv
+One row per defect naming the FILE and LINE. The summary counted defects
+without saying where they were, and every defect ledger in this project that
+lacked file-level evidence went stale and was then quoted as current.
+
+### FIXED: both branch arms write a NAME-BOUND register (1,293 -> 1,297)
+`declared_never_assigned` 17 -> 11, files losing clean status 0, all 1,323
+outputs parse. Mechanism and reasoning in commit 480df57. The short version:
+`premateralize_branch_escapes_spans` already seeded a shared local for this
+shape but only for an UNKNOWN register; `carried_identity` could not reach it
+because `Color3.fromRGB(...)` writes the result register TWICE per arm
+(GETIMPORT parks the callee there, CALL overwrites it), so a plain two-arm
+diamond reads `arm_writes=4` and trips the exactly-once rule.
+
+### call recovery counted a proto once PER LIFT
+`lv_0905_LocalCubs` lifts proto #0 three times; the header read "3 proto(s)
+emitted 30 fewer call(s)" for ONE function losing 10. Corpus short-protos
+15 -> 13 after deduping by proto index. `LUAU_CALL_SHORT` now NAMES the proto.
+
+### `LUAU_BRANCH_ARMS` — the comment is STALE and the flag is catastrophic
+Its own comment records "clean 1,100 -> 1,104, defects 48 -> 39, files losing
+clean status: 0". Measured today on the union corpus:
+
+    baseline            1,297/1,323 (98.0%)   33 defects
+    LUAU_BRANCH_ARMS=1  1,044/1,323 (78.9%)  639 defects
+
+The flag is correctly OFF. Anyone enabling it on the strength of that comment
+would lose a fifth of the corpus. Other gated flags, same run:
+
+    LUAU_ARM_COND / LUAU_ARM_IF   1,298 / 32   (+2 files fixed, 1 REGRESSED)
+    LUAU_RET_RESUME               1,297 / 33   neutral
+    LUAU_DECL_HOIST               1,291 / 39   worse
+
+ARM_COND and ARM_IF fix the same two files (`lv_0806` recovers a dropped call,
+`lv_0883`) and break `lv_0943_Camera_Controllers_Shop`, which was clean. Two of
+the four "fixes" in the naive diff are the same finding at a shifted LINE, not
+a fix. Net +1, not shipped on that evidence.
+
+### 3 of the 33 defects are FALSE POSITIVES
+`rc_0270` (evaera promise) reports `name_body_mismatch` three times. The
+bytecode's own debug table settles it:
+
+    [22] _new  line 230      [40] _all line 486   [41] all line 591
+    [117] retry line 1934    [119] retryWithDelay line 1962
+
+Every name the decompiler emitted matches a real proto, and `mod.rs:1163`
+prefers the child proto's `debug_name`, so nothing was reconstructed. The check
+infers identity from a STRING LITERAL in the body, and this library's error
+text in `_new`/`_all`/`retryWithDelay` legitimately names the public wrappers
+`new`/`all`/`retry`. True state is therefore **1,300/1,323 (98.3%)**.
+
+### The bundled DB is a CLI default, not a library one
+`bundled_db_path()` in the CLI silently loads `opmap_db/roblox_v9_live.json`
+from the CWD or beside the exe. `luau_core::decompile()` does not. So the
+binary and the library produce DIFFERENT output for the same bytes, and
+`luau-wasm` / `luau-server`, which call the library, get the weaker
+detector-only path. Measured on `16_StickerPlacer`: the CLI emits the correct
+field read, the library emits the `{GetCanvasTouchPoint = "..."}` artifact.
+
+### `settablekS_self_assign` asserted an invariant that is FALSE
+The test claimed "a real SETTABLEKS never has A == B". Refuted by ground truth
+- decoding `BeequipTypes` under the probe-measured permutation gives
+
+    ;   0x30 -> 16 SETTABLEKS
+         3: [0x10] SETTABLEKS  R0."__index" R0      <- A == B, and CORRECT
+
+`tbl.__index = tbl` is the ordinary metatable idiom. 69 of the 70 `x.field = x`
+lines in the union output are `__index`; the constructor form `X = "X"` is an
+ordinary ENUM (a CoreScript event-name table, two shop enums). Had anyone
+"fixed" the detector to satisfy this test, class tables would have stopped
+decoding. The StickerPlacer defect it documents is FIXED on the shipping path.
+Rewritten as (a) that concrete regression and (b) a MUTATION GUARD asserting
+`x.__index = x` still survives — ban A == B and it reds.
+
+### Still open
+`opmap_dupclosure_detection` (2 tests) reports a REAL gap on the bare-library
+path: 2 chunks map no closure opcode, 59 assign one unbound register to 3+
+table fields. Both invariants are TRUE, unlike the settablekS one, so pointing
+them at the DB would hide a defect rather than correct a false premise.
