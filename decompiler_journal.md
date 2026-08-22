@@ -8463,3 +8463,25 @@ cannot consume safely, and the next attempt has to establish WHAT it emits that
 is wrong - region-by-region, against a proto whose correct structure is known -
 rather than adjusting when it runs. `LifterProbe.luau` exists for exactly that
 and has never been run; it needs a live client (25 Aug).
+
+### SIXTH rejection: the one-arm nil seed
+The two-arm seed is sound because both arms write, so the merge read can never
+observe the entry value. The one-arm case was left unfixed because seeding
+`local x` asserts NIL on the path that does not write. This tried the narrow
+slice that looked sound: seed only when the register has NO WRITE ANYWHERE
+before the branch, so there is nothing for the untaken path to carry, and the
+thing being replaced is a bare `vN` the file never declares - a GLOBAL read,
+nil at runtime too, so no use could observe a different value.
+
+    baseline    1,297 / 1,323   33 defects
+    nil_seed    1,295 / 1,323   35 defects
+
+    fixed:  NOTHING
+    broke:  rc_0266 LemonSignal, rc_0271 Packet  (both declared_never_assigned)
+
+Zero fixed, two broken - a pure loss, and the reason is plain in the defect
+name. With TWO arms writing, the seeded local is assigned on every path. With
+ONE, if the arm write does not land on the pinned name, the seed is a `local`
+that is declared and never assigned: the change manufactures exactly the defect
+it was meant to remove. The one-arm shape stays unfixed, and now for a measured
+reason rather than an argued one. Reverted; baseline reproduced.
