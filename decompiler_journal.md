@@ -9980,3 +9980,54 @@ added instead of another guess.
 `lv_0756`'s dispatch is still broken; its `if v.Action ~= "Add" then` now says
 `continue` instead of `break`, which is closer but still wrong. The chain itself
 remains unfixed.
+
+### lv_0756 FIXED: a Linear region was holding a branch that escaped it
+The region trace (extended to print each region's shape, not just a count)
+showed proto 7's generic-for body structured as:
+
+    Linear { 5, 13 }      <- JUMPXEQKS at 7 targets 66
+    InlineIfThenInLoop { cond_pc: 13, body: [Linear { 14, 15 }] }
+    Linear { 15, 74 }     <- JUMPXEQKS at 68 targets 84
+    InlineIfThenInLoop { cond_pc: 74, .. }
+    Linear { 76, 92 }     <- JUMPXEQKS at 86 targets 111
+    ...
+
+Structuring matched only the small `if X then return end` guards and dropped
+everything else into Linear spans - and those spans CONTAIN the dispatch
+branches. A Linear region is meant to be straight-line code, so
+`lift_instruction_range` gets `end=13` for a branch at pc 7 whose arm runs to
+65, sees the target as out of range, and degrades it to `break`. Only the first
+arm of a four-arm dispatch survived.
+
+Fix: when a Linear child of a generic-for body contains a branch escaping it,
+lift to the END OF THE LOOP BODY instead, then stop iterating (that lift has
+consumed the rest). The branch is then in range and `detect_else_skip` resolves
+the whole chain recursively.
+
+TWO GATES, both forced by measurement, not by reasoning:
+
+1. `JumpXEqK*` ONLY, not the general `JumpIf*` family. Including the general
+   family recovered the same 9 calls but produced an `undefined_local` in
+   `lv_0005` - output the checker says "would error at runtime" - plus dropped
+   values in `lv_0358` and `rc_0060`, because extending past the structured
+   sub-regions discards the register state they establish. 1307 -> 1305 clean.
+
+2. The arm must END IN AN UNCONDITIONAL JUMP over the next case - the else-skip
+   shape. Without it the extension fires on ordinary guards: in
+   `rc_0054 TutorialController` it collapsed a three-way if/elseif/else that
+   honoured an `arg1` override into an unconditional default. The override was
+   simply gone, and every corpus total still improved. `structure_diff` was the
+   only thing that saw it, again.
+
+Result: 1307 -> 1308 clean, 19 -> 18 defects, 41 -> 32 missing calls. ONE file
+changed, 0 losing structure, and it emits the chain properly:
+
+    if v.Action == "Add" then ...
+    elseif v.Action == "Remove" then ...
+    elseif v.Action == "Update" then ...
+    elseif v.Action == "Use" then ...
+
+probes 9/9 13/13 8/8; tests 1037 pass, 1 pre-existing fail.
+
+Worth stating plainly: of the three variants tried here, TWO improved the
+headline totals while destroying real logic. The totals are not a safety net.

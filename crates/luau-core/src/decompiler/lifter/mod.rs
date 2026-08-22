@@ -3699,11 +3699,22 @@ fn lift_region(
                 for sub_region in nested_body {
                     match sub_region {
                         Region::Linear { start, end } => {
+                            // A Linear span holding a branch that escapes it is
+                            // a structuring miss, not straight-line code. Lift
+                            // to the end of the loop body so the branch is in
+                            // range and `detect_else_skip` can resolve the arms
+                            // it was cutting through. That consumes the rest of
+                            // the body, so stop iterating rather than lift any
+                            // of it twice.
+                            let esc = linear_branch_escapes(code, *start, *end, *body_end);
                             lift_instruction_range(
                                 ctx, proto, proto_index, depth,
-                                *start, *end,
+                                *start, if esc { *body_end } else { *end },
                                 regs, locals, &mut body_stmts, true,
                             );
+                            if esc {
+                                break;
+                            }
                         }
                         _ => {
                             lift_region(
@@ -4441,6 +4452,67 @@ fn block_branch_pc(block: &crate::analysis::cfg::BasicBlock) -> usize {
             block.end.saturating_sub(1)
         }
     }
+}
+
+/// Does a conditional branch inside `[start, end)` jump PAST `end` but stay
+/// inside `limit`?
+///
+/// A `Linear` region is meant to be straight-line code. Where structuring
+/// cannot match a construct it falls back to Linear spans, and those spans can
+/// end up CONTAINING a branch, which `lift_instruction_range` then sees as
+/// out-of-range and degrades to `break`. `lv_0756 PassiveTile` proto 7 is a
+/// four-arm string dispatch that structures as
+///
+///     Linear { 5, 13 }      <- JUMPXEQKS at 7 targets 66
+///     InlineIfThenInLoop { cond_pc: 13, .. }
+///     Linear { 15, 74 }     <- JUMPXEQKS at 68 targets 84
+///     ...
+///
+/// so every "try the next case" jump escapes its own Linear span and only the
+/// first arm of the dispatch survives.
+fn linear_branch_escapes(code: &[u32], start: usize, end: usize, limit: usize) -> bool {
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        // The JumpXEqK* family ONLY - a constant-equality test, which is what
+        // a dispatch chain is built from. Including the general JumpIf* family
+        // measured worse than the calls it recovered: it produced an
+        // `undefined_local` in `lv_0005` ("would error at runtime") plus
+        // dropped values in `lv_0358` and `rc_0060`, because extending past the
+        // structured sub-regions discards the register state they establish.
+        let is_cond = matches!(
+            op,
+            LuauOpcode::JumpXEqKNil
+                | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN
+                | LuauOpcode::JumpXEqKS
+        );
+        if is_cond {
+            let t = (pc as i64 + insn_d(code[pc]) as i64 + 1) as usize;
+            if t > end && t <= limit && t > 0 {
+                // Require the arm to END IN AN UNCONDITIONAL JUMP over the next
+                // case - the else-skip shape `detect_else_skip` matches. That
+                // is what makes the chain resolve recursively, and without it
+                // this fires on an ordinary guard and destroys it: in
+                // `rc_0054 TutorialController` it collapsed a three-way
+                // if/elseif/else that honoured an `arg1` override into an
+                // unconditional default, losing the override entirely while
+                // every corpus total still improved.
+                let prev = t - 1;
+                let pop = LuauOpcode::from_u8(insn_op(code[prev]));
+                let jt = match pop {
+                    LuauOpcode::Jump => Some((prev as i64 + insn_d(code[prev]) as i64 + 1) as usize),
+                    LuauOpcode::JumpX => Some((prev as i64 + insn_e(code[prev]) as i64 + 1) as usize),
+                    _ => None,
+                };
+                if jt.map_or(false, |j| j > t && j <= limit) {
+                    return true;
+                }
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 fn remove_trailing_jump(stmts: &mut Vec<Stat>) {

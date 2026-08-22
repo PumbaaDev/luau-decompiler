@@ -502,6 +502,14 @@ pub fn structure_control_flow(
             cfg.blocks.len(),
             regions.len()
         );
+        // Which regions, and how far each reaches. `blocks >> regions` means
+        // structuring claimed the proto with a few coarse spans instead of
+        // nesting it, and this shows WHICH span swallowed the rest.
+        for (i, r) in regions.iter().enumerate() {
+            let d = format!("{:?}", r);
+            let head = d.chars().take(1600).collect::<String>();
+            eprintln!("  REGION[{}] {}", i, head);
+        }
     }
 
     regions
