@@ -3510,7 +3510,19 @@ pub(super) fn lift_instruction_range(
                     }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        (jump_next, then_end), else_range, construct_end, end, pc,
+                        // AFTER-RANGE IS THE PROTO, NOT THIS LIFT WINDOW.
+                        //
+                        // `end` is the end of the range currently being lifted -
+                        // an arm, a run - so a register read AFTER that window
+                        // was invisible here and the seed was rejected as
+                        // "not used after merge" even though the read plainly
+                        // exists. That rejection is 7 of the 13 `vN`
+                        // declared-never-assigned defects on the union corpus
+                        // (lv_0883 v5, lv_0934 v3, rc_0037 v19, rc_0046 v11,
+                        // rc_0065 v3 and v9, rc_0100 v15) - the gate declined to
+                        // seed a register the semantic checker can see being
+                        // read. The usage question is about the whole proto.
+                        (jump_next, then_end), else_range, construct_end, proto.code.len(), pc,
                     );
 
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
@@ -3686,7 +3698,19 @@ pub(super) fn lift_instruction_range(
                     }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        (jump_next, then_end), else_range, construct_end, end, pc,
+                        // AFTER-RANGE IS THE PROTO, NOT THIS LIFT WINDOW.
+                        //
+                        // `end` is the end of the range currently being lifted -
+                        // an arm, a run - so a register read AFTER that window
+                        // was invisible here and the seed was rejected as
+                        // "not used after merge" even though the read plainly
+                        // exists. That rejection is 7 of the 13 `vN`
+                        // declared-never-assigned defects on the union corpus
+                        // (lv_0883 v5, lv_0934 v3, rc_0037 v19, rc_0046 v11,
+                        // rc_0065 v3 and v9, rc_0100 v15) - the gate declined to
+                        // seed a register the semantic checker can see being
+                        // read. The usage question is about the whole proto.
+                        (jump_next, then_end), else_range, construct_end, proto.code.len(), pc,
                     );
 
                     // Isolate register state so then-body doesn't corrupt fall-through.
@@ -3834,7 +3858,19 @@ pub(super) fn lift_instruction_range(
                     }
                     premateralize_branch_escapes_split(
                         ctx, proto, regs, locals, stmts,
-                        (jump_next, then_end), else_range, construct_end, end, pc,
+                        // AFTER-RANGE IS THE PROTO, NOT THIS LIFT WINDOW.
+                        //
+                        // `end` is the end of the range currently being lifted -
+                        // an arm, a run - so a register read AFTER that window
+                        // was invisible here and the seed was rejected as
+                        // "not used after merge" even though the read plainly
+                        // exists. That rejection is 7 of the 13 `vN`
+                        // declared-never-assigned defects on the union corpus
+                        // (lv_0883 v5, lv_0934 v3, rc_0037 v19, rc_0046 v11,
+                        // rc_0065 v3 and v9, rc_0100 v15) - the gate declined to
+                        // seed a register the semantic checker can see being
+                        // read. The usage question is about the whole proto.
+                        (jump_next, then_end), else_range, construct_end, proto.code.len(), pc,
                     );
 
                     // Isolate register state so then-body doesn't corrupt fall-through.
