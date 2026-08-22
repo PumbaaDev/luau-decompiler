@@ -9099,3 +9099,32 @@ pattern across all of them is the same and is the durable lesson of this
 session - **an absence in the output never names its own cause**, and every time
 this session read one as if it did (one-arm merge, coverage gap, downstream
 pass, register 6) the next measurement refuted it.
+
+### R6 refuted too - and the whole line was debugging UNSHIPPED code
+`MOVE`'s handler opens with `let src_expr = reg_expr(regs, b);`, and `reg_expr`
+IS the minting path the read-side watch hooks. So `LUAU_REG_WATCH=6` printing
+nothing is not an instrument limit after all: **R6 was not Unknown**. The
+previous entry's caveat was wrong in the other direction, and the register-6
+reading is refuted - the fifth consecutive diagnosis of this defect to die on
+the next measurement (one-arm merge, coverage gap, downstream pass, register 6,
+instrument-limit).
+
+The chain that survives measurement is now: R6 holds a known value, `MOVE R9 R6`
+copies it, and R9 is nonetheless Unknown when the `RETURN` reads it two
+instructions later. Something between the copy and the read resets R9, which
+points at `merge_regs` and is what `LUAU_MERGE_WATCH` exists for.
+
+**But that work has no value, and noticing why matters more than the finding.**
+`lv_0648_Stickers` is CLEAN at baseline. This defect exists only inside the
+near-miss structuring variant, which is not shipped and - even with Stickers
+fixed - would still be +1 file (`rc_0274`) against -1 (`lv_0129_Eggs`), i.e.
+net zero, for a large behavioural change. Five rounds of measurement went into
+a defect in code that is not in the product and cannot move the corpus number by
+a single file.
+
+That is the real lesson of the tail of this session, and it is worth more than
+the register: **check that the thing you are debugging is SHIPPED before you
+debug it.** The instruments were sound, the measurements were honest, every
+refutation was correct - and the whole sequence was still misdirected effort,
+because the target was chosen by momentum rather than by what would change the
+delivered artifact.
