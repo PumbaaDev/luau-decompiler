@@ -9225,3 +9225,35 @@ score; this read the rejection reason off the gate that was already printing it.
       GENUINELY FIXABLE     22
     TRUE quality  1,299 / 1,323 = 98.2%
     CEILING       1,321 / 1,323 = 99.85%   -- 100% is not reachable
+
+### CAVEAT on the gate table: it pairs by REGISTER, not by proto
+The table that found the after-range bug matched each `vN` defect to a
+`GATE reg=N` line anywhere in the file. That conflates protos. `rc_0243`
+exposes it: the trace shows reg=3 twice in `playerTrace@107` (one ADMIT, one
+REJECT) while the defective `v3` at output line 709 belongs to a DIFFERENT
+proto whose reg 3 never reaches the gate at all. Read naively, that file looks
+like "admitted and still broken", which is a contradiction that does not exist.
+
+This is the same mistake the journal records at rotations 47, 86, 95, 110, 116
+and 127 - an identifier the print does not carry, supplied by assumption.
+Seventh occurrence, and this time in a table I built to avoid exactly that.
+
+The FIX it produced is still real and still measured (+1 file, -3 defects, zero
+call regressions, tests unchanged) - the after-range argument was wrong at those
+call sites regardless of which defect motivated looking. But "7 of 13 defects
+are this rejection" was stated with more confidence than the pairing supports.
+Three defects went away; the other four rejections were correct.
+
+To do this properly the table needs the PROTO from the defect, which the
+semantic report does not carry - it records file and line, not proto. Adding the
+proto name to `SEMANTIC_REPORT.tsv` would make the join sound, and is the
+cheapest way to make this whole line of attack trustworthy rather than
+suggestive.
+
+### Remaining 22 fixable files, by what the gate actually says
+    5   "not used after merge" and CORRECT - the merge is the last instruction
+        of the proto (lv_0883 `?@54` is 16 insns, after=15..16)
+    5   name_bound=false, arm_writes 2-3, carried=false - the one-arm/multi-write
+        shapes, and seeding one-arm was MEASURED to manufacture the defect (r6)
+    1   no gate trace at all - the register never becomes a candidate
+    11  calls_not_emitted / bodies_dropped - the structural family, 18 attempts
