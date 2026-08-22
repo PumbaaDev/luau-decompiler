@@ -8326,3 +8326,55 @@ Rewritten as (a) that concrete regression and (b) a MUTATION GUARD asserting
 path: 2 chunks map no closure opcode, 59 assign one unbound register to 3+
 table fields. Both invariants are TRUE, unlike the settablekS one, so pointing
 them at the DB would hide a defect rather than correct a false premise.
+
+## The library was shipping a 67% decompiler, 22 Aug 2026
+
+### The measured map was a CLI feature
+`bundled_db_path()` resolves `opmap_db/roblox_v9_live.json` from the CWD or
+beside the exe. A library can use neither, so `luau_core::decompile()` never
+consulted it. Measured on the union corpus, same binary, same bytes:
+
+    CLI / measured entry      1,297 / 1,323 clean (98.0%),    33 defects
+    library / detector-only     891 / 1,323 clean (67.3%), 1,112 defects
+
+`luau-wasm` and `luau-server` call the library. Fixed by `include_str!`-ing the
+3 KB entry into `luau-core` and consulting it in `decompile()`. `lookup`
+returns `Hit` only after a fingerprint check, so a chunk from another build
+falls through to detection byte-for-byte - the change can only replace
+INFERENCE with MEASUREMENT. The CLI path is byte-unchanged (1,297 both sides).
+
+### Two "detector" tests were reporting exactly this, unread
+    closure_opcode_is_mapped_for_multi_proto_chunks    2 chunks -> 0
+    table_fields_are_not_all_the_same_unbound_register 59 chunks -> 1
+
+The residual 1 was a FALSE POSITIVE in the test's own helper: it collected
+bindings from `local` and from plain assignment but never from `for`, so the
+`v2` of `for k2, v2 in pairs(arg2) do` counted as never-assigned and every
+`part.Anchored = v2` inside the loop scored as the closure-opcode defect.
+`40_ReplicatedStorage_Welder` is correct code.
+
+### MEASURED AND REVERTED: whole-proto SETTABLEKS/GETTABLEKS discriminator
+`SETTABLEKS A B K` READS R(A) (it is the value stored) so R(A) must already
+hold one; `GETTABLEKS A B K` WRITES R(A). The existing rule only looked at the
+instruction at pc-1, which one scheduling accident hides. Widening it to "does
+any earlier already-mapped producer write R(A), or is A a parameter":
+
+    bc/ test (single-file, no pooling)   59 -> 43 chunks   BETTER
+    union corpus, same path             891 -> 882 clean  WORSE
+                                      1,112 -> 1,159 defects
+
+Reverted; the rebuilt binary reproduces the control exactly (891 / 1,112). One
+test improving is not evidence a change is right - the corpus is the arbiter,
+and it disagreed. Do not retry this without measuring the corpus first.
+
+### State
+Tests 1,039 pass, 1 fail. The remaining failure,
+`settableks_is_detected_wherever_its_byte_occurs`, is the honest one: it drives
+the detection machinery directly rather than decompiling, so the embedded map
+cannot help it. 59 of 603 chunks that execute byte 0x30 lose SETTABLEKS, and in
+40 of them GETTABLEKS holds the byte.
+
+Shipping corpus: **1,297 / 1,323 (98.0%), 33 defects**, of which 3 are the
+`rc_0270` false positives, so 1,300 / 1,323 (98.3%) is the true figure.
+Remaining real classes: calls_not_emitted 11, declared_never_assigned 11,
+branch_local_discarded 3, undefined_local 3, bodies_dropped 2.
