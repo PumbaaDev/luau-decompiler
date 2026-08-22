@@ -10162,3 +10162,33 @@ So the family now has two candidate roots and they are NOT the same:
 * the then-arm's own blocks lose their code during the run lift.
 Fixing the second without the first would still emit arm B unconditionally
 rather than as an else. The structuring failure is the one to attack.
+
+### The `JumpXEqK` restriction is load-bearing, not conservatism
+Answered the open question from the previous entry: `lift_branch_region` takes
+its `early_ret || cond_arm` path for `ComputePath` - the arm contains a RETURN -
+and calls `lift_structured_run` over the whole arm span, then returns. That is
+why `LUAU_RUN_TRACE` printed no line for the proto despite `IFLIFT` proving the
+call happened. Not a mystery, just a path that never reaches the run split.
+
+So the `lv_0756` fix is the right SHAPE for this family but in the wrong PLACE:
+the loss happens inside `lift_structured_run`'s own sub-structuring, which
+produces the same narrow `Linear` spans holding escaping branches.
+
+Then tested a combination never tried before. The two earlier failures of the
+general `JumpIf*` family both PREDATE the else-skip gate, so it was open whether
+that gate was the real safety property and the opcode restriction merely
+incidental. Measured, with the gate retained:
+
+| | shipped (`JumpXEqK` only) | widened to all `JumpIf*` |
+|---|---|---|
+| clean | **1308** | 1307 |
+| defects | **18** | 19 |
+| missing calls | 32 | 32 |
+
+It recovers NOTHING and costs a file. The opcode restriction is doing real work
+on its own; the else-skip gate does not subsume it. Reverted, 0 files differing.
+
+That also means widening the family is not the route to `rc_0084`/`rc_0030`/
+`lv_0124`. The route is applying the extension inside `lift_structured_run`,
+where their loss actually happens, and it will need its own gate measured from
+scratch rather than inherited from this one.
