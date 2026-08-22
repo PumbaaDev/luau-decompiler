@@ -9384,3 +9384,41 @@ change that makes a program test the wrong thing. `structure_diff` flagged it
 only as `if -3`, which is why every flagged file has to be READ and not counted:
 two of the three flags on this run were genuine improvements (`LemonSignal`
 recovers a lost closure as `task and function`), and the third was this.
+
+### The declared-but-Unknown seed: two variants, each trading one invisible defect
+Isolated properly by removing ONE clause at a time:
+
+    control                              1,298 / 1,323   30   both files correct
+    widening only                        1,305 / 1,323   22   rc_0100 drops a Raycast
+    widening + short-circuit guard       1,304 / 1,323   23   lv_0922 tests wrong predicate
+    everything EXCEPT the widening       1,298 / 1,323   30   lv_0922 STILL wrong
+
+That last row is the one that matters and it corrected three wrong readings in a
+row. The score returns to control while `lv_0922` is still broken - so the
+regression is NOT the widening. It is the SHORT-CIRCUIT GUARD, which suppresses
+seeds in `lv_0922` that were previously fine. The guard added to save
+`rc_0100`'s raycast costs `lv_0922` its guard.
+
+`declared_never_assigned` 11 -> 6 and `undefined_local` 2 -> 0 in both variants,
+with corpus missing-calls flat at 165. The gain is real; so is each regression.
+
+### And a methodological correction worth more than the result
+I first read `lv_0922` as broken by comparing `sed -n '54,76p'` of one file
+against `sed -n '54,74p'` of the other - FIXED LINE RANGES across two files with
+different line counts. The `if isType5 then` / `if isType3 then` pair I read as
+a corrupted guard were partly different statements at coincidentally similar
+positions. The regression turned out to be real, but my evidence for it was not,
+and I nearly rejected the widening for it.
+
+Diff whole files, or grep for the construct by name. Never eyeball equal line
+windows across outputs whose lengths differ - it is the same class of error as
+pairing a defect to a gate line by register number, which this journal has now
+recorded eight times.
+
+### Where this leaves the class
+`declared_never_assigned` is reachable - 11 -> 6 is measured, twice, by two
+different variants. What is not yet found is a discriminator that saves
+`rc_0100` without costing `lv_0922`. Both files are named, both regressions are
+characterised at the bytecode level, and the seed trace (`LUAU_SEED_TRACE`)
+prints reg/pc/arms for every seed, so the next attempt starts with the two
+counterexamples in hand rather than with a corpus score.
