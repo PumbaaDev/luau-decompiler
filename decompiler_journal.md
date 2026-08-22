@@ -8585,3 +8585,42 @@ semantic score alone.** Count `if`/`elseif`/`for`/`while`/calls per changed file
 against the control build and require ZERO losses. Every one of the nine
 attempts so far would have been caught faster by that check than by reading the
 score, and the ninth would have shipped without it.
+
+### TENTH: a stranded-branch acceptance test, and why splitting is not the enemy
+Sharper diagnosis first. Nested `if`s inside a flat span are recovered by
+`lift_instruction_range`, which lifts a conditional jump only when its target
+lands inside the range it was handed. So every split this scan makes - at a
+loop, a value join, a for-pair - strands any conditional jump crossing the new
+boundary. `rc_0274 ?@514` splits into `Linear 3..14`, `InlineLoopInLoop 17..20`,
+`Linear 21..68`, ... around the buffer-growth `while` loops, and the range
+dispatch's own jumps span those boundaries.
+
+That also explains r9's guard loss from the other side: emitting an
+`IfThenElse` SHRINKS the ranges, so jumps that were liftable stop being so -
+`lv_0910 VRCamera` lost `if arg1 == "offtrack"`, `if not v11` and
+`if arg1 == "force"` that way.
+
+So: refuse a split that strands a branch, and fall back to one Linear.
+
+    control                      1,297 / 1,323    33 defects
+    stranded-branch fallback     1,052 / 1,323   628 defects
+
+Catastrophic. Almost every range has some conditional jump crossing some
+boundary, so the test fires nearly everywhere and collapses the loop regions
+that were doing useful work. Splitting is not the enemy; splitting where the
+branch matters is. Reverted; baseline reproduced.
+
+### Ten attempts, and the shape of the wall
+Three historical, seven today. Scores: 1,044 · 1,052 · 1,210 · 1,213 · 1,267 ·
+1,269 · 1,295 · 1,296 · **1,298** · 1,297(control). The single positive was r9,
+and it deletes guards.
+
+Every attempt has adjusted WHEN to structure. None could adjust WHAT correct
+structure looks like, because nothing in this loop knows it - the score is the
+only feedback, and the score cannot see a deleted `if`. That is the wall, and
+ten runs is enough evidence that another predicate will not clear it.
+
+`LifterProbe.luau` is the missing feedback: eight control-flow shapes, every
+branch carrying a distinct `MARKER_*`, so the correct structure is known BEFORE
+the run and a missing marker names the arm that was dropped. Compile-gated,
+never run, needs a live client.
