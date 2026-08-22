@@ -8544,3 +8544,44 @@ Blind corpus tuning cannot supply it; eight runs have now demonstrated that.
 every branch carrying a distinct `MARKER_*` string, so a missing marker IS the
 measurement and the correct structure is known in advance rather than inferred
 from a score. It has never been run. It needs a live client.
+
+### NINTH: the first attempt that SCORES POSITIVE, and it is a TRAP
+Gating the run-structurer branch case (r8 above) tightened in two steps:
+
+    control                                     1,297 / 1,323   33 defects
+    branch case, ungated                        1,269 / 1,323   64 defects
+    + fires only where truncation is CERTAIN    1,296 / 1,323   34 defects
+    + requires TWO OR MORE returns in range     1,298 / 1,323   32 defects  <-- BETTER
+
+The last row is the first positive result this family has ever produced, and
+the checker agrees: **fixed 1 (`lv_0756 PassiveTile`), broke 0**, 24 files
+changed. On the score alone it ships.
+
+**It must not.** Counting structure rather than defects across those 24 files:
+
+    files LOSING an `if`:   5      files LOSING calls: 1      loops lost: 0
+
+    lv_0910 VRCamera      48 -> 45 ifs     lv_0925 ControlScript  74 -> 71
+    lv_0912 CameraScript  58 -> 56, calls 155 -> 153
+    lv_0005 BeequipTypes  93 -> 92         rc_0086 CameraModule   68 -> 67
+
+and the diff on `lv_0910` is unambiguous - four guards collapse into one:
+
+        - if arg1 == "offtrack" then
+        -     if not v11 then
+        -         if Head then
+        - if arg1 == "force" then
+        + if Head then
+
+The body now runs unconditionally where it was gated on the argument. That is
+r83's failure exactly: a scoring gain concealing guard deletion the semantic
+checker has no check for. Rejected on the standing rule - **a defect the
+checker cannot see is worth more than a defect it can** - not on the number.
+
+Reverted; baseline reproduced (1,297 / 33).
+
+**RULE FOR THE NEXT ATTEMPT: never accept a region-structuring change on the
+semantic score alone.** Count `if`/`elseif`/`for`/`while`/calls per changed file
+against the control build and require ZERO losses. Every one of the nine
+attempts so far would have been caught faster by that check than by reading the
+score, and the ninth would have shipped without it.
