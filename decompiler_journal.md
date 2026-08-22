@@ -9332,3 +9332,55 @@ one.
 That is the honest end state of this class: 11 defects, one named mechanism, one
 named reason no existing machinery reaches it, and one refuted shortcut recorded
 so it is not tried again.
+
+## The declared-but-Unknown seed: +6 files, and it TESTS THE WRONG CONDITION
+
+Extending `bound_seed` to registers that are DECLARED but hold `Unknown` (the
+gap between `unknown_seed`, which needs undeclared, and `bound_seed`, which
+needs a Name) scored better than anything else this session:
+
+    control                                  1,298 / 1,323   30 defects
+    declared-but-Unknown seed                1,305 / 1,323   22 defects
+    + nested-short-circuit guard             1,304 / 1,323   23 defects
+
+    declared_never_assigned 11 -> 6     undefined_local 2 -> 0
+    corpus missing calls    165 -> 165  (zero call regressions)
+
+Two regressions were found and one was FIXED by evidence:
+
+**`rc_0100 Popper` dropped a raycast.** Seeded at pc 90 on R15, arms
+(91,108)+(109,110). Both arms genuinely write R15, so every gate passed - but
+the then-arm contains a NESTED short-circuit on the same register:
+
+     90: JUMPIFNOT R3  -> 109     the branch tests R3
+     91..98:  CALL R15            raycast #1
+     99: JUMPIF    R15 -> 109     nested `or` ON R15
+    100..107: CALL R15            raycast #2
+    109: LOADB     R15 false      else arm
+
+Pinning one name across that flattens the chain and drops all but the last
+operand: `workspace:Raycast(arg4, NearPlaneZ4 - arg4, ..)` vanished entirely
+while the checker scored the file CLEAN. Guarding on a conditional jump INSIDE
+an arm that tests the seeded register fixed it (Raycast 5 -> 5). Three earlier
+discriminators failed because they tested the branch at `pc`, which tests R3.
+
+**`lv_0922 TransparencyController` now tests the WRONG CONDITION, and that one
+is not guardable.** Baseline:
+
+    if isType5 then          -- isType5 = Parent:IsA("Tool") or HasToolAncestor(..)
+
+Patched:
+
+    local Parent6 = Parent5 or HasToolAncestor(self.Parent)   -- DISCARDED
+    if isType3 then          -- isType3 = self:IsA("BasePart")
+
+The guard now examines an unrelated predicate. The seeded name captured the
+wrong register identity, the real result is computed and thrown away, and the
+semantic checker scores it clean because `isType3` IS assigned - there is no
+undefined name left to find.
+
+REVERTED. +6 files is the best trade this family has offered, and it is still a
+change that makes a program test the wrong thing. `structure_diff` flagged it
+only as `if -3`, which is why every flagged file has to be READ and not counted:
+two of the three flags on this run were genuine improvements (`LemonSignal`
+recovers a lost closure as `task and function`), and the third was this.
