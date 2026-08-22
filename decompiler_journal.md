@@ -8378,3 +8378,64 @@ Shipping corpus: **1,297 / 1,323 (98.0%), 33 defects**, of which 3 are the
 `rc_0270` false positives, so 1,300 / 1,323 (98.3%) is the true figure.
 Remaining real classes: calls_not_emitted 11, declared_never_assigned 11,
 branch_local_discarded 3, undefined_local 3, bodies_dropped 2.
+
+## calls_not_emitted: the mechanism, fully traced, 22 Aug 2026
+
+Ten of the eleven `calls_not_emitted` files share ONE mechanism. Worst proto
+per file, blocks collapsing into a single region:
+
+    rc_0274 Packet_Types 72   lv_0791 RoboBearGui 56   lv_0351 MusicPlayer 36
+    lv_0806 Leaderboards 32   rc_0047 IndexCtrl   24   lv_0124 StatCache  23
+    rc_0055 ShopLayout   19   lv_0756 PassiveTile 15   rc_0084 ClickToMove 13
+    rc_0030 Janitor       9
+
+(`lv_0905` is not one of them - it was the triple-lift COUNTING bug, fixed.)
+
+### The chain, end to end, on `rc_0274` proto #135 (`?@514`)
+Not inferred - every step printed by an existing trace:
+
+    REGIONS  ?@514 blocks=72 regions=1
+    IF       ?@514 cond_block=0 then=59 else=12 merge=None has_else=true
+    IFLIFT   then_stmts=119 then_calls=40  else_stmts=23 else_calls=8
+    ARM      ?@514 blocks=59 ranges=59            <- reaches lift_branch_region
+    RUNREG   ?@514 run=3..534  Linear 3..14
+    RUNREG   ?@514 run=3..534  InlineLoopInLoop 17..20
+    RUNREG   ?@514 run=3..534  Linear 21..68      <- a range-case, FLATTENED
+    PASS     after_eliminate_dead_stores calls=48
+    PASS     after_eliminate_dead_code   calls=8
+    DCE      depth=2 enter stmts=119 calls=40
+    DCE      depth=2 after_phase2_truncate stmts=12 calls=4
+
+The bytecode's 48 calls are then(40) + else(8); the AST keeps exactly 8. So:
+
+1. `early_ret` DOES fire and the arm DOES reach `lift_structured_run`.
+2. That run can only reach `structure_numeric_for_body`, which emits
+   Linear/loop regions and CANNOT emit `IfThenElse`. The arm's nested
+   if/elseif chain is flattened into one statement list.
+3. That list holds SEVERAL `return`s - one per range case.
+4. `eliminate_dead_code` phase 2 truncates after the first. 107 statements and
+   36 calls gone.
+
+**DCE is not the bug.** `return` must end a Lua block, so truncating a
+well-formed list is correct and NOT truncating would emit invalid Lua. The
+malformed input is the defect.
+
+### FOURTH measured rejection of arm structuring
+The only machinery that can emit `IfThenElse` for an arm is
+`structure_block_subset`, behind `LUAU_BRANCH_ARMS`. Prior rotations rejected
+it three times (r82 `LUAU_ARM_COND` 1,104->1,103; r83 `LUAU_ARM_IF` scored
++1 but lost `if 490000000000 <= value2.Honey then` in
+`1125_Supreme_Star_Amulet_Generator`, spending 490 billion honey
+unconditionally). Measured again today on the union corpus:
+
+    baseline                                   1,297 / 1,323   33 defects
+    LUAU_BRANCH_ARMS (any arm, >1 block)       1,044 / 1,323  639 defects
+    NARROWED to arms that would TRUNCATE       1,213 / 1,323  170 defects
+
+The narrower gate is the right IDEA - it fires only where flattening provably
+loses code - and it still costs 84 files. So the gate was never the problem:
+`structure_block_subset` itself produces bad regions. Reverted; the rebuilt
+binary reproduces 1,297 / 33 exactly.
+
+**The next attempt must fix the arm STRUCTURER, not its trigger.** Four gate
+variants have now been measured and all four lose more than they recover.
