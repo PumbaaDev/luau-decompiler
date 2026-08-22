@@ -9761,3 +9761,35 @@ That also explains why `compose_guard_chain` correctly does not fire here - by
 the time the terms are values, the tests ARE adjacent, and the reason they are
 not is the lost `isType`. Fix the merge loss and the guard chain composes
 itself.
+
+### rc_0055, third and final reading: the ARM BOUNDARY is wrong
+Traced one level further than the last two entries and this is the mechanism:
+
+    73: JUMPIFNOT R8  -> 80      the if-detection makes the arm 74..80
+    74..77: compute R10
+    78: JUMPIFNOT R10 -> 80      target == arm end, still liftable
+    79: JUMPIF    R9  -> 85      target is PAST the arm end -> STRANDED
+    80..84: body (warn ; return)
+
+`lift_instruction_range` lifts a conditional jump only when
+`target > pc && target <= end`. The jump at 79 leaves the arm entirely - it is
+the guard's PASS path, jumping over the failure body to 85 - so it fails that
+test and is silently dropped. With it gone nothing guards pc 80, the
+`warn(); return` becomes unconditional, and `eliminate_dead_code` truncates the
+remaining 21 calls.
+
+So the arm is not 74..80. The construct spans 73..85, and 80..84 is its FAILURE
+BODY, not code that follows it. The if-detection cut the arm at the first jump
+target it saw and never reconsidered when a later jump inside that arm proved
+the construct reached further.
+
+This supersedes both previous readings of this file: it is not a composition
+problem (the four working `and` chains prove composition is fine) and not a
+merge loss (`isType`/R10 is never read on the falsy path, so there is no merge
+to lose it at). It is a boundary chosen too early.
+
+WHAT WOULD FIX IT: when an arm contains a forward conditional jump whose target
+lies beyond the arm's end but inside the enclosing range, the arm end is wrong -
+extend the construct to that target before lifting. That is a change to arm
+DETECTION, and every previous attempt in this journal touched arm STRUCTURING or
+the seed instead, which is why none of them reached this file.
