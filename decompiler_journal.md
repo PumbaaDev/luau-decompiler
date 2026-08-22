@@ -9535,3 +9535,32 @@ before reading the diff, and prefer rename-immune counts (`if`/`elseif`/`while`/
     clean 1,305 / 1,323 = 98.6%   defects 23   missing calls 125
       false-positive only  1    format-blocked  2    FIXABLE 15
     CEILING 1,321 / 1,323 = 99.85%
+
+### The loop-spanning restriction is load-bearing - widening it is WORSE
+`rc_0047 IndexController` proto #9 is the same truncation mechanism as
+`rc_0274`, traced end to end:
+
+    IF     ?@1 cond_block=0 then=1 else=22 merge=None
+    IFLIFT else_stmts=62 else_calls=43        <- the arm lifts fine
+    PASS   eliminate_dead_code calls 47 -> 22 <- and DCE cuts it
+
+but its branch contains NO LOOP, so the shipped gate does not fire. Widening it
+from "the span contains a loop" to "or flattening would provably truncate"
+(a `RETURN` before the end of the span):
+
+    shipped    1,305 / 1,323   23 defects   125 missing calls
+    widened    1,304 / 1,323   24 defects   130 missing calls
+
+Worse on every axis INCLUDING the authoritative one - it loses five more calls
+than it recovers. All three probes still pass, which is exactly why the probes
+alone cannot decide a gate: they prove the MECHANISM is right, not that a given
+trigger is safe.
+
+So the loop-spanning restriction is not a conservative approximation that could
+be relaxed later; it is the thing that makes the mechanism safe. A branch whose
+span holds a loop is stranded by the run scanner's split and genuinely needs a
+region. A branch that merely truncates does not - the flat path handles it, and
+taking it away costs more than the truncation does.
+
+Reverted. `rc_0047`'s 30 missing calls stay, and the reason is now recorded
+rather than open.
