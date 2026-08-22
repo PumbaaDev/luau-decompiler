@@ -9889,3 +9889,53 @@ regions [63,71] and [72,161] are genuine siblings meeting at 162, whereas in
 test on the resulting diamond - both arms reaching the same merge, neither
 re-entered from outside - is the shape to try, and it must be checked BEFORE
 committing to the extension rather than after.
+
+### lv_0756: the dispatch chain never forms, and `current_loop_end` is None
+`lv_0756 PassiveTile` proto 7 emits 5 of 14 calls. The 9 missing are exactly the
+`Remove`, `Update` and `Use` arms of a string dispatch inside a `for` loop:
+
+    4: FORGPREP_NEXT R1 -> 163          loop body 5..162
+    7: JUMPXEQKS R6 not == "Add"    -> 66     body 8..65,  JUMP -> 163
+   68: JUMPXEQKS R6 not == "Remove" -> 84     body 69..83, JUMP -> 163
+   86: JUMPXEQKS R6 not == "Update" -> 111    body 87..110, JUMP -> 163
+  113: JUMPXEQKS R6 not == "Use"    -> 163    body 114..162
+
+An elseif chain. It emits as the FIRST arm only, with every "try the next case"
+jump turned into `break`:
+
+    if v.Action ~= "Add" then break end
+    ... Add arm ...
+    if not New3 then break end
+
+ADDED TWO TRACES rather than guessing again, after the `lv_0905` gate I reasoned
+my way into was measured a no-op. `LUAU_ELSE_TRACE` reports every
+`detect_else_skip` decision; `LUAU_OOR_TRACE` reports every forward jump that
+falls out of range. Both are env-gated and measured INERT - corpus output is
+byte-identical, 0 files differ.
+
+They answer it immediately:
+
+    OOR-XEQK pc=7   target=66  end=13   loop_end=None
+    OOR-XEQK pc=68  target=84  end=74   loop_end=None
+    OOR-XEQK pc=86  target=111 end=92   loop_end=None
+    OOR-XEQK pc=113 target=163 end=119  loop_end=None
+
+`detect_else_skip` is called ONCE in the whole file, for an unrelated range. It
+never sees the dispatch at all. Each test is lifted with an `end` barely past
+itself - pc 7 gets `end=13` while its arm runs to 65 - so every chain jump is
+out of range before any else-detection can run. The chain is not being rejected;
+it is never presented.
+
+SECOND DEFECT, INDEPENDENT: `loop_end=None` on every one of these. Only three
+loop kinds set `ctx.current_loop_end` (mod.rs 3159/3223/3325/3879) and the
+generic-for path is not among them. So the Break/Continue choice at
+opcode_handlers.rs:3787 has nothing to test and ALWAYS picks `Break`. The jumps
+at pc 32/40/45 target 163, which IS the FORGLOOP - those are continues, and they
+emit as `break`, abandoning the whole iteration instead of skipping one item.
+
+Note the existing comparison is `target < le`, so even with `le` set a jump TO
+the latch would still pick Break. A fix needs `target <= le`, and needs to be
+measured against files that already rely on the current reading.
+
+Neither defect is fixed. `lv_0756` and `rc_0030` are both dispatch-shaped, so
+the chain is worth roughly half of what remains.

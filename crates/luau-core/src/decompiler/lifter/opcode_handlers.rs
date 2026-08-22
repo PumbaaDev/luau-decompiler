@@ -227,7 +227,15 @@ fn detect_else_skip(
         LuauOpcode::JumpX => (last_pc as i32 + insn_e(last) + 1) as usize,
         _ => return (target, None),
     };
-    if jump_target > target && jump_target <= end {
+    let ok = jump_target > target && jump_target <= end;
+    if std::env::var("LUAU_ELSE_TRACE").is_ok() {
+        eprintln!(
+            "ELSE_SKIP then_start={} target={} end={} last_pc={} jump_target={} -> {}",
+            then_start, target, end, last_pc, jump_target,
+            if ok { "ELSE" } else { "reject" }
+        );
+    }
+    if ok {
         (last_pc, Some((target, jump_target)))
     } else {
         (target, None)
@@ -3762,6 +3770,12 @@ pub(super) fn lift_instruction_range(
                     continue;
                 } else if target > pc {
                     // Forward jump beyond our range (or out of the loop)
+                    if std::env::var("LUAU_OOR_TRACE").is_ok() {
+                        eprintln!(
+                            "OOR pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            pc, op, target, end, in_loop, ctx.current_loop_end
+                        );
+                    }
                     if in_loop {
                         let condition = if op == LuauOpcode::JumpIf {
                             cond
@@ -3948,6 +3962,12 @@ pub(super) fn lift_instruction_range(
                         });
                     }
                 } else {
+                    if std::env::var("LUAU_OOR_TRACE").is_ok() {
+                        eprintln!(
+                            "OOR-XEQK pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            pc, op, target, end, in_loop, ctx.current_loop_end
+                        );
+                    }
                     if in_loop {
                         stmts.push(Stat::If {
                             condition,
@@ -4108,6 +4128,12 @@ pub(super) fn lift_instruction_range(
                         });
                     }
                 } else {
+                    if std::env::var("LUAU_OOR_TRACE").is_ok() {
+                        eprintln!(
+                            "OOR-XEQK pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            pc, op, target, end, in_loop, ctx.current_loop_end
+                        );
+                    }
                     if in_loop {
                         stmts.push(Stat::If {
                             condition,
