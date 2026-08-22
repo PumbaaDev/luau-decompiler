@@ -828,6 +828,53 @@ pub(crate) fn structure_numeric_for_body(
             }
         }
 
+        if let Some((then_start, target)) = forward_conditional_jump(op, pc, insn) {
+            let cond_block = cfg.blocks.iter()
+                .find(|(_, b)| b.start <= pc && pc < b.end).map(|(id, _)| *id);
+            if let Some(cond_id) = cond_block {
+                if target > then_start && target <= body_end && then_start < body_end {
+                    let mut last_pc = then_start; let mut w = then_start; let mut spans_loop = false;
+                    while w < target && w < code.len() {
+                        last_pc = w;
+                        let wop = LuauOpcode::from_u8(insn_op(code[w]));
+                        if matches!(wop, LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+                            | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+                            | LuauOpcode::JumpBack) { spans_loop = true; }
+                        w += if wop.has_aux() { 2 } else { 1 };
+                    }
+                    let is_loop_cond = last_pc < code.len()
+                        && matches!(LuauOpcode::from_u8(insn_op(code[last_pc])), LuauOpcode::JumpBack)
+                        && (last_pc as i64 + insn_d(code[last_pc]) as i64 + 1) <= pc as i64;
+                    let mut merge = target;
+                    if last_pc < code.len()
+                        && matches!(LuauOpcode::from_u8(insn_op(code[last_pc])), LuauOpcode::Jump) {
+                        let d = insn_d(code[last_pc]);
+                        if d > 0 { let m = (last_pc as i64 + d as i64 + 1) as usize;
+                            if m > target && m <= body_end { merge = m; } }
+                    }
+                    let then_blocks: Vec<usize> = cfg.blocks.iter()
+                        .filter(|(_, b)| b.start >= then_start && b.start < target)
+                        .map(|(id, _)| *id).collect();
+                    let else_blocks: Vec<usize> = cfg.blocks.iter()
+                        .filter(|(_, b)| b.start >= target && b.start < merge)
+                        .map(|(id, _)| *id).collect();
+                    let mut spans: Vec<(usize, usize)> = then_blocks.iter().chain(else_blocks.iter())
+                        .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end))).collect();
+                    spans.sort_unstable();
+                    let tiles = !spans.is_empty() && spans[0].0 == then_start
+                        && spans.last().map(|s| s.1) == Some(merge)
+                        && spans.windows(2).all(|w| w[0].1 == w[1].0);
+                    if spans_loop && tiles && !is_loop_cond && !then_blocks.is_empty()
+                        && !then_blocks.contains(&cond_id) {
+                        if linear_start < pc { regions.push(Region::Linear { start: linear_start, end: pc }); }
+                        regions.push(Region::IfThenElse { cond_pc: cond_id,
+                            then_region: then_blocks, else_region: else_blocks, merge_pc: Some(merge) });
+                        pc = merge; linear_start = pc; continue;
+                    }
+                }
+            }
+        }
+
         // ── Phase B0.5, Shape A: nested ForGPrep → ForGLoop pair ─────────
         //
         // FORGPREP target formula: loop_pc = prep_pc + D + 1 (unconditional
@@ -1298,6 +1345,10 @@ pub(crate) fn range_contains_nested_for(code: &[u32], start: usize, end: usize) 
     while pc < end {
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
+        if matches!(op, LuauOpcode::JumpBack) {
+            let back = pc as i64 + insn_d(insn) as i64 + 1;
+            if back >= start as i64 && back < pc as i64 { return true; }
+        }
         // Nested NumericFor?
         if matches!(op, LuauOpcode::ForNPrep) {
             let d = insn_d(insn);
