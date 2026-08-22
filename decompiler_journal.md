@@ -10124,3 +10124,41 @@ this by consuming to the body end and breaking out of the region loop; there is
 no equivalent path in `lift_branch_region`, and adding one is the next real
 piece of work. Attempting the extension without it would duplicate code, which
 no counter in this repo would catch either.
+
+### rc_0084 narrowed further: `else_blocks=0`, and the loss is INSIDE lift_branch_region
+Followed the non-loop-drop family one level deeper with the existing
+`LUAU_IF_TRACE`, which prints exactly the question worth asking:
+
+    IFLIFT proto=ComputePath@376 else_blocks=0 else_stmts=None else_calls=None
+                                 then_stmts=14 then_calls=2 then_blocks=11
+
+Two facts, both decisive:
+
+1. `else_blocks=0`. The `IfThenElse` at cond_pc 0 has NO else region. The inner
+   if/else at pc 24 - arm A 25..59, arm B 60..107 - never becomes two arms;
+   everything lands in the THEN list.
+2. `then_blocks=11` produces `then_calls=2`, where the bytecode holds 5. The
+   comment beside this very trace states the rule: if the blocks go in and the
+   statements do not come out, the loss is INSIDE `lift_branch_region`, not in
+   whether the call was made. Eleven blocks in, two calls out.
+
+Confirmed against the emitted source: `ComputePath` contains only the
+`DirectPath` arm (its two `PathWaypoint.new` calls) and the async
+path-computation arm is absent entirely.
+
+Added `LUAU_RUN_TRACE`, printing the block ranges and the contiguous runs
+`lift_branch_region` splits them into. Measured INERT - 1308 clean, 18 defects,
+32 missing calls, 0 files differing.
+
+It also exposed a discrepancy worth writing down rather than papering over: the
+run trace prints no line for this proto even though `IFLIFT` proves
+`lift_branch_region` was called for it, so something returns before the run
+split. That is the next thing to look at and I have NOT explained it - recording
+it as an open question, not a conclusion.
+
+So the family now has two candidate roots and they are NOT the same:
+* the arms are never separated (`else_blocks=0`) - a structuring failure in
+  whatever assigns blocks to then/else, and
+* the then-arm's own blocks lose their code during the run lift.
+Fixing the second without the first would still emit arm B unconditionally
+rather than as an else. The structuring failure is the one to attack.

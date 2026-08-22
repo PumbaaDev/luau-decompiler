@@ -1701,6 +1701,13 @@ fn lift_branch_region(
     }
     let runs = split_contiguous_runs(&ranges);
 
+    if std::env::var("LUAU_RUN_TRACE").is_ok() {
+        let mut rs = ranges.clone();
+        rs.sort();
+        let spans: Vec<(usize, usize)> =
+            runs.iter().map(|&(lo, hi)| (ranges[lo].0, ranges[hi].1)).collect();
+        eprintln!("RUNS proto@{} blocks={:?} runs={:?}", proto.line_defined, rs, spans);
+    }
     for &(lo, hi) in &runs {
         let start = ranges[lo].0;
         let end = ranges[hi].1;
