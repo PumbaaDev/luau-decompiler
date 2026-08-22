@@ -115,6 +115,90 @@ pub(super) fn is_generic_placeholder(name: &str) -> bool {
 
 /// Detect the `if/else` diamond behind an inline forward branch.
 ///
+
+/// Recognise a multi-term short-circuit guard: a run of consecutive
+/// `JUMPIF`/`JUMPIFNOT` converging on exactly two pcs, the guard BODY and the
+/// construct EXIT.
+///
+/// Returns `(condition, body_start, exit)` where `condition` is true exactly
+/// when the body runs. Deliberately narrow: at least THREE terms (two is the
+/// ordinary `a and b` the existing path already handles), every term but the
+/// last targeting the body, the last targeting the exit, and both pcs inside
+/// the range being lifted. Anything else returns None and the caller behaves
+/// exactly as before.
+fn compose_guard_chain(
+    code: &[u32],
+    regs: &[RegVal],
+    pc: usize,
+    end: usize,
+) -> Option<(Expr, usize, usize)> {
+    let mut terms: Vec<(bool, usize, usize)> = Vec::new();
+    let mut w = pc;
+    while w < end && w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if !matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+            break;
+        }
+        let t = (w as i64 + insn_d(code[w]) as i64 + 1) as usize;
+        terms.push((op == LuauOpcode::JumpIf, insn_a(code[w]) as usize, t));
+        w += 1;
+    }
+    if terms.len() < 3 {
+        return None;
+    }
+    let body = w;
+    let (last_is_if, last_reg, last_target) = *terms.last()?;
+    if last_target <= body || last_target > end {
+        return None;
+    }
+    // Every term but the last must jump to the body.
+    if terms[..terms.len() - 1].iter().any(|t| t.2 != body) {
+        return None;
+    }
+    // FIRE condition of a term: JUMPIFNOT fires on `not r`, JUMPIF on `r`.
+    let fire = |is_if: bool, reg: usize| -> Expr {
+        let r = reg_expr_ref(regs, reg);
+        if is_if {
+            r
+        } else {
+            Expr::UnOp { op: UnOp::Not, operand: Box::new(r) }
+        }
+    };
+    let mut cond: Option<Expr> = None;
+    for &(is_if, reg, _) in &terms[..terms.len() - 1] {
+        let t = fire(is_if, reg);
+        cond = Some(match cond {
+            None => t,
+            Some(c) => Expr::BinOp {
+                left: Box::new(c),
+                op: BinOp::Or,
+                right: Box::new(t),
+            },
+        });
+    }
+    // The final jump SKIPS the body, so the body runs when it does NOT fire.
+    let last_fire = fire(last_is_if, last_reg);
+    let last_term = Expr::UnOp { op: UnOp::Not, operand: Box::new(last_fire) };
+    let cond = match cond {
+        None => last_term,
+        Some(c) => Expr::BinOp {
+            left: Box::new(c),
+            op: BinOp::Or,
+            right: Box::new(last_term),
+        },
+    };
+    Some((cond, body, last_target))
+}
+
+/// `reg_expr` without the &mut - the chain only READS its test registers.
+fn reg_expr_ref(regs: &[RegVal], idx: usize) -> Expr {
+    match regs.get(idx) {
+        Some(RegVal::Expr(e)) => e.clone(),
+        Some(RegVal::LoopVar(s)) => Expr::Name(s.clone()),
+        _ => Expr::Name(format!("v{}", idx)),
+    }
+}
+
 /// Given a then-body spanning `[then_start, target)`, check whether its final
 /// instruction is an unconditional forward JUMP that lands past `target` but
 /// still inside `end`. That jump is the compiler's else-skip, so the real then
@@ -3357,6 +3441,49 @@ pub(super) fn lift_instruction_range(
             }
 
             LuauOpcode::JumpIf | LuauOpcode::JumpIfNot => {
+                // MULTI-TERM SHORT-CIRCUIT GUARD.
+                //
+                // `if not (a and b and c and d) then .. end` compiles to a RUN
+                // of conditional jumps converging on two pcs - the guard body
+                // and the construct's exit. Lifted one jump at a time, each
+                // term becomes its own tiny `if` and NO SINGLE `if` OWNS THE
+                // BODY, so the body lands at the outer level. When that body
+                // ends in `return`, `eliminate_dead_code` then correctly cuts
+                // everything after it. `rc_0047 IndexController` proto #9 loses
+                // 30 of its 52 calls exactly this way:
+                //
+                //     136: JUMPIFNOT R13 -> 140   fires when !R13, jumps to BODY
+                //     137: JUMPIFNOT R14 -> 140
+                //     138: JUMPIFNOT R15 -> 140
+                //     139: JUMPIF    R16 -> 145   fires when R16, jumps to EXIT
+                //     140..144: warn(..) ; RETURN
+                //
+                // The body runs on `!R13 or !R14 or !R15 or !R16`. The rule:
+                // OR the FIRE conditions of every jump targeting the body, then
+                // OR the NEGATED fire condition of the final jump, which is the
+                // one that skips the body.
+                if let Some((chain_cond, body, exit_pc)) =
+                    compose_guard_chain(code, regs, pc, end)
+                {
+                    let snap = regs.clone();
+                    let mut then_stmts = Vec::new();
+                    lift_instruction_range(
+                        ctx, proto, proto_index, depth + 1, body, exit_pc,
+                        regs, locals, &mut then_stmts, in_loop,
+                    );
+                    regs.clear();
+                    regs.extend_from_slice(&snap);
+                    if !then_stmts.is_empty() {
+                        stmts.push(Stat::If {
+                            condition: chain_cond,
+                            then_body: then_stmts,
+                            elseif_clauses: Vec::new(),
+                            else_body: None,
+                        });
+                        pc = exit_pc;
+                        continue;
+                    }
+                }
                 let cond = reg_expr(regs, a);
                 let target = (pc as i32 + d as i32 + 1) as usize;
 
