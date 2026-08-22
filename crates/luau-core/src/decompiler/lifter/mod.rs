@@ -4498,11 +4498,28 @@ fn linear_branch_escapes(code: &[u32], start: usize, end: usize, limit: usize) -
                 // if/elseif/else that honoured an `arg1` override into an
                 // unconditional default, losing the override entirely while
                 // every corpus total still improved.
-                let prev = t - 1;
-                let pop = LuauOpcode::from_u8(insn_op(code[prev]));
-                let jt = match pop {
-                    LuauOpcode::Jump => Some((prev as i64 + insn_d(code[prev]) as i64 + 1) as usize),
-                    LuauOpcode::JumpX => Some((prev as i64 + insn_e(code[prev]) as i64 + 1) as usize),
+                // Find the instruction that ENDS at `t` by walking boundaries.
+                // `t - 1` is not safe to decode: it can land on the AUX word of
+                // a two-word instruction, and an AUX word read as an opcode is
+                // arbitrary. It happened to be a real JUMP in `lv_0756`.
+                let mut q = start;
+                let mut prev = None;
+                while q < t && q < code.len() {
+                    let qop = LuauOpcode::from_u8(insn_op(code[q]));
+                    let qsz = if qop.has_aux() { 2 } else { 1 };
+                    if q + qsz == t {
+                        prev = Some((q, qop));
+                        break;
+                    }
+                    q += qsz;
+                }
+                let jt = match prev {
+                    Some((q, LuauOpcode::Jump)) => {
+                        Some((q as i64 + insn_d(code[q]) as i64 + 1) as usize)
+                    }
+                    Some((q, LuauOpcode::JumpX)) => {
+                        Some((q as i64 + insn_e(code[q]) as i64 + 1) as usize)
+                    }
                     _ => None,
                 };
                 if jt.map_or(false, |j| j > t && j <= limit) {

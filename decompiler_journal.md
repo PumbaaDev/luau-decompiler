@@ -10031,3 +10031,45 @@ probes 9/9 13/13 8/8; tests 1037 pass, 1 pre-existing fail.
 
 Worth stating plainly: of the three variants tried here, TWO improved the
 headline totals while destroying real logic. The totals are not a safety net.
+
+### Made the dispatch gate AUX-safe (it was right by accident)
+The gate shipped in the previous entry decoded `code[t - 1]` to ask whether the
+arm ended in an unconditional JUMP. That is not safe: `t - 1` can land on the
+AUX WORD of a two-word instruction, and an AUX word decoded as an opcode is
+arbitrary data. It was a real `Jump` in `lv_0756`, so the gate worked - by luck,
+not by construction.
+
+Replaced with a boundary walk from the region start that finds the instruction
+whose start + size == t. Output is BYTE-IDENTICAL across all 1,323 files
+(0 differing, 1308 clean, 18 defects, 32 missing calls), which is the right
+result for a soundness fix: no behaviour change, one less way to be wrong.
+
+### rc_0030 `Cleanup@188`: a different failure, diagnosed not fixed
+26 blocks collapse to 2 regions - `IfThenElse { cond_pc: 0 }` plus a trailing
+`Linear { 124, 125 }` - and 9 of 10 calls are lost. Bytecode:
+
+     2: JUMPIF       R1 -> 124            re-entrancy guard
+    10: FORGPREP_NEXT R1 -> 103           loop body 11..102
+    12: JUMPIFEQ     R4 == R6 -> 103      continue
+    18: CALL (typeof)                     <- the ONLY call emitted
+    19: JUMPXEQKS R6 ==     "string" -> 23
+    21: JUMPXEQKS R6 not == "number" -> 26
+    23..25: JUMP -> 103                   string/number: skip the entry
+    26..102: the real cleanup work, ALL 9 remaining calls
+
+So string-or-number keys skip, and everything else reaches the work at 26. The
+emitted body inverts it:
+
+    if result19 ~= "string" then
+        if result19 ~= "number" then
+            continue          -- bytecode sends these to the WORK at 26
+        end
+    end
+
+and 26..102 is gone entirely. This is NOT the `lv_0756` shape - the dispatch
+here has no per-arm JUMP over the next case, so the gate correctly declines. The
+failure is upstream: an `IfThenElse` at pc 0 swallows 26 blocks and the nested
+structuring inside its arms never recovers the loop body.
+
+Remaining: `lv_0905` (10), `rc_0030` (9), `lv_0351` (5), `lv_0124` (5),
+`rc_0084` (3) = 32 calls across 5 files.
