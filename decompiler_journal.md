@@ -8949,3 +8949,40 @@ through the CFG rather than read off the struct. That is worth building - the
 `MOVE R9 R6` at pc 20 that vanished in `lv_0648_Stickers` is exactly what it
 would have caught at the point of introduction - but it must be complete before
 its output means anything.
+
+### The coverage invariant does NOT hold, and that is the finding
+Built it three more times, each cut narrowing the false positives:
+
+    cut 1  Linear/NumericFor/GenericFor only      349 gaps, 32 of 60 files
+    cut 2  all TEN Region variants                183 gaps, 28 of 60
+    cut 3  + terminator jumps are structure        79 gaps, 23 of 60
+
+Cut 3's exclusion was right: a block's terminating jump is consumed by whichever
+region owns the branch - the condition BECOMES the `if` expression - so it
+belongs to no region body. Requiring it reported `JUMPIF R1 -> +1` as a
+one-instruction gap three times over in a single file.
+
+Cut 3 still over-reports, and the disassembly of the first survivor says why:
+
+    10: [0x49] FASTCALL1  bit32.countrz R3 skip=2
+    11: [0x0C] GETIMPORT  R2
+    13: [0x15] CALL       R2 args=1 results=1
+
+**Luau FUSES instructions.** `FASTCALL1 ... skip=2` means the VM jumps the next
+two words on the fast path; they are one operation, not three statements, and no
+region claims them individually. Between fused fast-call sequences, structural
+jumps and terminators consumed by their regions, "every pc is claimed by exactly
+one region" is simply NOT TRUE of this bytecode.
+
+So the invariant proposed in the previous entry is wrong, and a coverage check
+built on it will keep producing numbers that look alarming and mean nothing.
+Reverted, all three cuts. What would actually catch the `MOVE R9 R6` case is
+narrower: a check that every REGISTER-WRITING instruction is claimed, with the
+fused-call and structural-jump families excluded by opcode - not a check over
+all pcs.
+
+Four instruments built today, three of them wrong and caught before shipping
+(`if`-counting on probes, 3-variant coverage, all-pc coverage). The one that
+survived - `tools/structure_diff.py` - is the one comparing two RUNS of the same
+decompiler, where the modelling error cancels on both sides. That is the pattern
+worth keeping: compare like with like, never source with output.
