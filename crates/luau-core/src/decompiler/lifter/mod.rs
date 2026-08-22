@@ -7300,7 +7300,10 @@ fn premateralize_branch_escapes_spans(
             // something trips the one-write rule, which is why the ordinary
             // `x = f(...)` two-arm selection was never reachable by it. The
             // gate trace reads `arm_writes=4` for a plain two-arm diamond.
-            let bound_seed = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+            let bound_seed = matches!(
+                regs.get(reg),
+                Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
+            )
                 && locals.is_non_param(reg)
                 && !then_ranges.is_empty()
                 && !else_ranges.is_empty()
@@ -7323,13 +7326,56 @@ fn premateralize_branch_escapes_spans(
                 // this case exists to avoid - so leave those to the gates below
                 // rather than forcing a rebind we cannot justify.
                 if matches!(kind, WriteKind::Shadow | WriteKind::FirstDecl) {
+                    if std::env::var("LUAU_SEED_TRACE").is_ok() {
+                        let sc = arm_ranges.iter().filter(|(a,b)| b>a).any(|&(a,b)| {
+                            let mut w=a; while w<b && w<proto.code.len() {
+                                let wi=proto.code[w];
+                                let wop=LuauOpcode::from_u8(insn_op(wi));
+                                if matches!(wop, LuauOpcode::JumpIf|LuauOpcode::JumpIfNot)
+                                    && insn_a(wi) as usize==reg { return true; }
+                                w += if wop.has_aux() {2} else {1};
+                            } false });
+                        eprintln!("SEED {}@{} reg={} pc={} name={} sc={} arms={:?}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined, reg, pc, final_name, sc, arm_ranges);
+                    }
                     stmts.push(Stat::Local {
                         names: vec![final_name.clone()],
                         values: Vec::new(),
                     });
                     regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
                     for &(s, e) in arm_ranges {
-                        if e > s {
+                        if e <= s {
+                            continue;
+                        }
+                        // DO NOT PIN ACROSS A NESTED SHORT-CIRCUIT ON THIS
+                        // REGISTER. `x = f(a) or f(b)` inside an arm writes the
+                        // register twice with a JUMPIF between; pinning one name
+                        // over that makes both operands assign it and the chain
+                        // collapses, dropping all but the last. Measured on
+                        // `rc_0100 Popper::queryPoint@258`: seeded at pc 90 on
+                        // R15 with a JUMPIF R15 at pc 99 inside arm (91,108),
+                        // and `workspace:Raycast(arg4, ..)` vanished while the
+                        // checker scored the file CLEAN.
+                        //
+                        // Seeding is still right - both arms do write the
+                        // register - so the seed stays and only the PIN is
+                        // withheld for that arm. Suppressing the whole seed
+                        // instead cost `lv_0922` its tool-ancestor guard.
+                        let mut w = s;
+                        let mut sc = false;
+                        while w < e && w < proto.code.len() {
+                            let wi = proto.code[w];
+                            let wop = LuauOpcode::from_u8(insn_op(wi));
+                            if matches!(wop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+                                && insn_a(wi) as usize == reg
+                            {
+                                sc = true;
+                                break;
+                            }
+                            w += if wop.has_aux() { 2 } else { 1 };
+                        }
+                        if !sc {
                             ctx.pin_reg_name(reg as u8, &final_name, s, e);
                         }
                     }
