@@ -8867,3 +8867,30 @@ discrimination is done; what remains is that new regions interact with
 `premateralize_branch_escapes_spans`/`merge_regs`. That is a value-merge
 problem, and it is now reproducible on two named files with a fast probe suite
 to confirm the branches stay recovered while it is fixed.
+
+### The last two files are the ONE-ARM seed shape, and that is already measured
+Traced `lv_0648_Stickers` under the near-miss variant. The defect is
+`return true, v9` at the merge of a large branch in
+`GiveStickerToPlayerStats@779`, and `LUAU_GATE_TRACE` gives the whole answer in
+two lines:
+
+    GATE  GiveStickerToPlayerStats@779  reg=9  val=Some("Unknown")  after=32..36
+    GATE    reg=9 name_bound=false reads_before_write=false arm_writes=3
+            parked_pure=false carried=false -> REJECT
+
+`unknown_seed` needs BOTH split arms to write the register; here they do not.
+That is the ONE-ARM shape, and seeding it was measured earlier this session
+(r6): **fixed 0, broke 2** - with one arm the seeded `local` is declared and
+never assigned, which IS `declared_never_assigned`. The change manufactures
+exactly the defect it targets.
+
+**So the two remaining regressions are not a structuring problem at all.** They
+are the one-arm merge, reached from a new direction. The structuring fix cannot
+ship until the one-arm merge is solved, and the one-arm merge is provably not
+solvable by seeding. Whatever solves it has to RECOVER the lost write rather
+than assert a value for the path that does not write - which means finding
+where the pre-branch value went, not inventing one.
+
+That is the honest end of this line for now: mechanism settled, discrimination
+done (146 -> 2), and the residue named precisely and shown to be a different
+defect wearing the same clothes.
