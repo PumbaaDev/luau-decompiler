@@ -9465,3 +9465,34 @@ lv_0922 guard intact, and the full +7 files is kept.
       false-positive only    1      format-blocked only 2      FIXABLE 15
     TRUE     1,306 / 1,323 = 98.7%
     CEILING  1,321 / 1,323 = 99.85%   -- 100% is not reachable
+
+### The seed fix UNBLOCKS the structuring variant - and it still deletes a guard
+Re-applied the loop-spanning structuring variant on top of the shipped seed fix
+(59e44d0). The seed fix removes almost all of the damage it used to do:
+
+    before the seed fix   1,269 / 1,323   64 defects   104-146 files lose structure
+    after  the seed fix   1,305 / 1,323   23 defects     6 files flagged
+
+    ALL THREE PROBES PASS: DispatchProbe 9/9, ModuleProbe 8/8, GuardProbe 13/13
+    corpus missing calls  165 -> 125      FORTY real calls recovered
+    file count            1,305 -> 1,305  neutral
+    defects                  22 -> 23     +1
+
+`rc_0274 Packet_Types`, the collapsed dispatcher, goes calls 783 -> 822 and
+loops 19 -> 93. Every flagged file GAINS calls. On the strongest instrument
+available - ground truth with known-correct output - this change is right.
+
+**It still does not ship.** `lv_0004_Beequips` loses
+
+    if INBOX_CAPACITY < #self.Beequips[v32] then
+
+outright, with nothing added in its place - verified by comparing the SORTED SET
+of `if`/`elseif` conditions, not line windows, and confirmed absent. A capacity
+check that silently stops happening is exactly the defect class the semantic
+checker cannot see, and it is why the rule is lose-nothing rather than
+score-better.
+
+So the position is now precise: the structuring mechanism is CORRECT (three
+probes prove it), it recovers 40 dropped calls, and it deletes one guard in one
+file. That is one file to explain, not a corpus to tune - a far better place
+than the 146-file blast radius this variant had before the seed fix.
