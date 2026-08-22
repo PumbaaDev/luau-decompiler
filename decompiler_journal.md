@@ -8485,3 +8485,29 @@ ONE, if the arm write does not land on the pinned name, the seed is a `local`
 that is declared and never assigned: the change manufactures exactly the defect
 it was meant to remove. The one-arm shape stays unfixed, and now for a measured
 reason rather than an argued one. Reverted; baseline reproduced.
+
+### SEVENTH: chunk-level name provenance cannot clear the false positives
+`name_body_mismatch` is only evidence when the name-to-body pairing was
+GUESSED. Wired a per-chunk counter (`named_installed` at the NEWCLOSURE/
+DUPCLOSURE hint site) into the header and had the check skip when nothing was
+reconstructed. Measured: **no change, 1,297 / 33 both ways.**
+
+The reason is in the counter itself - `rc_0270` evaera-promise reads
+`names: 61 reconstructed, 72 from bytecode debug info`. The three flagged
+declarations (`_new`, `_all`, `retryWithDelay`) ARE debug-named, but 61 other
+closures in the same chunk are not, so a CHUNK-level gate can never discriminate
+them. It would take PER-DECLARATION provenance, which means marking every
+function in the output.
+
+817 of 1,323 files do report 0 reconstructed, so the gate is meaningful in
+general - it just never fires where the false positives are. A change that
+adds a header line to 1,323 files for zero measured movement does not ship.
+Reverted; baseline reproduced (1,297 / 33).
+
+### Verification status of the 33
+Spot-checked one exhibit per class against the bytecode or the emitted code:
+`declared_never_assigned` REAL, `branch_local_discarded` REAL (four values
+computed into fresh arm-locals and discarded, plus an unbound `clamp = v4`),
+`bodies_dropped` REAL (`rc_0047` is 46 lines with ZERO functions for a 10-proto
+chunk), `undefined_local` REAL, `calls_not_emitted` REAL (traced to DCE
+truncation). Only `name_body_mismatch` is false. **30 of 33 are genuine.**
