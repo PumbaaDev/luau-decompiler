@@ -9600,3 +9600,36 @@ What this one needs is CONDITION COMPOSITION - folding consecutive conditional
 jumps that converge on the same target into one compound `and`/`or` condition,
 so the guarded body has an owner. That is new machinery, not a gate change, and
 it is the single largest remaining item (30 of the 125 missing calls).
+
+### Condition composition: why the SAME-TARGET version does not fix rc_0047
+Scoped the pass before writing it, and the arithmetic rules out the cheap form.
+`rc_0047 ?@1`:
+
+    136: JUMPIFNOT R13 -> 140   |
+    137: JUMPIFNOT R14 -> 140   +- same target, composable as `and`
+    138: JUMPIFNOT R15 -> 140   |
+    139: JUMPIF    R16 -> 145   <- DIFFERENT target, ends a same-target scan
+    140..144: warn(..) ; RETURN
+
+Folding only the same-target jumps (136-138) makes the then-body start at 139 -
+which is itself a conditional jump to 145, past that body's end, so it is
+stranded exactly as it is today and nothing is recovered. The body actually runs
+when `R13 and R14 and R15 and NOT R16`, so a correct pass has to treat 145 as
+the CONSTRUCT'S COMMON EXIT and fold a jump with a different target into the
+same chain.
+
+That is full short-circuit reconstruction over a jump lattice, not a
+same-target scan: the terms converge on two distinct pcs (140 = body,
+145 = exit), and which pc means "body" depends on the polarity of the LAST term.
+`Expr::BinOp { op: BinOp::And }` is available to build the condition, and
+`lift_instruction_range`'s inline-if arm is the right place to emit it, but the
+detection has to identify the pair (body, exit) first.
+
+Recorded rather than half-built: a partial version that folds only same-target
+runs would change output on every multi-term guard in the corpus while
+recovering nothing here, which is the worst combination available - blast radius
+without payoff.
+
+30 of the 125 missing calls are in this one proto, so the payoff for the FULL
+version is real and measurable, and `probes/` plus `tools/structure_diff.py`
+can judge it in seconds once written.
