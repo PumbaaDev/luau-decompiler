@@ -8894,3 +8894,30 @@ where the pre-branch value went, not inventing one.
 That is the honest end of this line for now: mechanism settled, discrimination
 done (146 -> 2), and the residue named precisely and shown to be a different
 defect wearing the same clothes.
+
+### CORRECTION: the last two are a COVERAGE bug, not the one-arm merge
+Disassembling `lv_0648_Stickers` proto 29 `GiveStickerToPlayerStats` settles
+what the gate trace only hinted at:
+
+    20: [0x06] MOVE    R9 R6      <- the write EXISTS
+    22: [0x16] RETURN  R8..R10
+
+`v9`'s producing write is `MOVE R9 R6`, TWO INSTRUCTIONS before the return that
+reads it. Nothing was lost at a merge and nothing needs seeding: under the
+restructured regions that instruction is simply not lifted.
+
+So the earlier reading - "this is the one-arm seed shape, already measured
+unsound" - was wrong. `arm_writes=3` at a gate site 12 instructions away
+described a DIFFERENT branch in the same proto, and pairing it with this defect
+was an identifier supplied by assumption, which is the mistake this journal
+records more than any other.
+
+The real question is narrow and answerable: which region claims pc 20, and why
+is it not emitted? The tiling check validates `[then_start, merge)` but nothing
+validates that the Linear flush before the branch, or the region the scan
+resumes into, covers every instruction the proto contains. A coverage assertion
+over the WHOLE range - every pc in `[body_start, body_end)` claimed by exactly
+one region - would catch this class at the point it is introduced instead of
+1,200 files later.
+
+That is the next thing to build, and it is a cheap invariant, not another gate.
