@@ -9693,3 +9693,36 @@ The metric was built to catch dropped bodies and it does that well - it found
 both mechanisms fixed today. But a proto whose guard is a compile-time constant
 will sit in its list forever, and no lifter change can or should remove it.
 A reachability check on the CALL scan would make the number mean what it says.
+
+### rc_0055: the same converging shape, but the terms are NOT ADJACENT
+`?@1` loses 22 calls the same way `rc_0047` did - `eliminate_dead_code` cuts
+34 -> 13 - but `compose_guard_chain` does not fire, and the bytecode says why:
+
+    73: JUMPIFNOT R8  -> 80    |
+    74..77: compute R10        |  <- intervening work
+    78: JUMPIFNOT R10 -> 80    |
+    79: JUMPIF    R9  -> 85    |
+    80..84: body, RETURN
+
+The convergence is there (73 and 78 to the body at 80, 79 to the exit at 85),
+so widening the scan to skip non-jump instructions would collect it. The scan
+width is not the problem.
+
+**The problem is evaluation order.** Those intervening instructions COMPUTE THE
+LATER TERMS, and under short-circuit semantics they run only if the earlier
+terms pass. Hoisting them above a composed `if` evaluates them unconditionally -
+and they are `GETTABLEKS` indexing, which errors on nil. A composed condition
+would turn a guard that safely tests `a and a.b and a.b.c` into one that
+indexes a nil.
+
+So this is the impure-value-join problem in another costume, the same one that
+blocks `find_value_join` from admitting a `CALL`: the terms cannot be lifted out
+of the control flow that guards them. `compose_guard_chain` is safe precisely
+BECAUSE it requires adjacency - adjacent conditional jumps test registers that
+are already computed, so composing them hoists nothing.
+
+That adjacency requirement is therefore not a conservative simplification to
+relax later. It is the correctness condition. Anything that composes
+non-adjacent terms has to keep each term's computation inside the branch that
+guards it, which means emitting nested ifs, not one composed condition - and
+nested ifs are what the lifter already produces here.
