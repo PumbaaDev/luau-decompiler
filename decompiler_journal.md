@@ -8624,3 +8624,63 @@ ten runs is enough evidence that another predicate will not clear it.
 branch carrying a distinct `MARKER_*`, so the correct structure is known BEFORE
 the run and a missing marker names the arm that was dropped. Compile-gated,
 never run, needs a live client.
+
+## GROUND TRUTH DOES NOT NEED A LIVE CLIENT — 22 Aug 2026
+
+I asserted several times this session that the structural defect could not be
+worked on until a Roblox client was available on the 25th. **That was wrong**,
+and the correction is one flag:
+
+    tools/luau/luau-compile.exe --binary -O1 -g2 --fflags=false X.luau > X.bin
+
+The bundled compiler emits **v11** by default, which this decompiler cannot
+read (gate 3-9; v10/v11 changed the proto layout, tested 2026-08-03).
+`--fflags=false` turns off the flags that bump the container and emits **v6**,
+which is in range. So: write a Luau source, compile it locally, decompile it,
+and compare against a source we wrote. Seconds, no client, no capture.
+
+### `LifterProbe.luau` passes — it does not reproduce the defect
+All 17 markers survive. The shapes it models (guard-then-work, pairs
+accumulation, upvalues, tailcall, nested guards, client/server split) are
+handled correctly. It was never going to find this bug.
+
+### `probes/DispatchProbe.luau` DOES, in 900 bytes
+Modelled on `rc_0274 Packet_Types` proto #135: a range dispatch where every arm
+ends in `return` with small `while` loops between the tests.
+
+    baseline: 2 of 9 markers survive
+
+Only the first arm of each side of the outer split is emitted; seven are
+dropped. Same failure as the 640-instruction original, in a file that decodes
+in milliseconds.
+
+### The branch case fixes it COMPLETELY, and still must not ship
+Re-applying the r8 branch case (emit `IfThenElse` for a forward conditional
+jump inside a run):
+
+    DispatchProbe   2/9 -> 9/9 markers          <- the mechanism is CORRECT
+    GuardProbe      13/13 (unchanged)           <- guards modelled are safe
+    union corpus    1,297 -> 1,269 clean, 33 -> 64 defects
+
+and `tools/structure_diff.py` on the same run:
+
+    146 files LOSE structure
+    rc_0043 GlovesShop      if -63   calls -208   loops -27
+    rc_0049 SellController  if -40   calls  -93   loops  -9
+    rc_0064 CrownsShop      if -34   calls  -77   loops  -7
+
+**The semantic score said -28 files. The structure count says 146.** The score
+understates the damage FIVE-FOLD, because it has no check for a deleted `if`,
+a deleted call, or a deleted loop.
+
+### What is now in place that was not
+* a local ground-truth loop (`probes/`, seconds per iteration, no client)
+* a probe that reproduces THIS defect and one that pins the shapes a fix must
+  not break
+* `tools/structure_diff.py`, which would have rejected every one of the eleven
+  attempts faster than the corpus did - and would have caught r9, the attempt
+  that SCORED BETTER while deleting three guards in `lv_0910 VRCamera`
+
+The remaining work is to make the branch case keep its 9/9 without touching the
+146. That is now an iterable problem with a fast, honest test, rather than a
+corpus score to guess against.
