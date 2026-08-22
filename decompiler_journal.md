@@ -9301,3 +9301,34 @@ This is the first mechanism-level statement about this class that rests on the
 bytecode rather than on the shape of the output, and it was only reachable once
 the report carried the read site so the defect could be pinned to `repaint@120`
 instead of to a register number that means something different in every proto.
+
+### And the obvious fix for it is UNSOUND - checked before writing it
+The tempting move: `lift_value_join`'s fallback lowering is
+`local r; if c1 then r = v1 elseif ... end`, documented as "Always sound,
+whatever the values turn out to be", and it emits each arm ONCE. So purity
+looks like it gates only the folding path, and admitting impure arms while
+forcing the fallback looks free.
+
+It is not. The lift ENUMERATES PATHS and calls `lift_instruction_range` per
+path before either lowering is chosen. An impure arm reachable along several
+paths would therefore be lifted - and its CALL emitted - once per path. The
+purity allowlist is load-bearing for the whole mechanism, exactly as
+`value_region.rs` says: "because the member blocks are required to be
+side-effect-free, a block reachable along several paths may be evaluated once
+per path without changing behaviour."
+
+So the gap stands and is genuinely architectural. `x = cond and f(y) or default`
+falls between:
+
+  * `ValueJoin`, which MUST refuse it (path enumeration would duplicate `f(y)`);
+  * `detect_else_skip`, which correctly finds no else-arm, because a
+    short-circuit ladder has no unconditional else-skip JUMP to find;
+
+and so `unknown_seed` never sees the two arms that the bytecode plainly has.
+Closing it needs a mechanism that structures a short-circuit ladder into an
+if/else WITHOUT enumerating paths - not a predicate change to either existing
+one.
+
+That is the honest end state of this class: 11 defects, one named mechanism, one
+named reason no existing machinery reaches it, and one refuted shortcut recorded
+so it is not tried again.
