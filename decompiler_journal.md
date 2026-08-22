@@ -9496,3 +9496,42 @@ So the position is now precise: the structuring mechanism is CORRECT (three
 probes prove it), it recovers 40 dropped calls, and it deletes one guard in one
 file. That is one file to explain, not a corpus to tune - a far better place
 than the 146-file blast radius this variant had before the seed fix.
+
+## SHIPPED (b1a0f94): the structural fix, on the nineteenth attempt
+
+    corpus missing calls  165 -> 125    FORTY calls recovered
+    calls_not_emitted      10 ->   9
+    files clean         1,305 -> 1,305  neutral      defects 22 -> 23
+    probes  DispatchProbe 2/9 -> 9/9   ModuleProbe 6/8 -> 8/8   GuardProbe held
+    parse 1,323/1,323                  tests 1,039 pass
+
+### Why eighteen attempts failed and this one did not
+The variant is nearly the same one measured at 1,269/1,323 with 104-146 files
+losing structure. Nothing about the structuring changed. What changed is that
+59e44d0 fixed the MERGE SEED first, and those losses were the seed failing on
+the new regions - not the regions being wrong.
+
+That is the lesson worth keeping: **a change measured as catastrophic can be
+correct and merely blocked by a defect elsewhere.** Eighteen rotations tuned the
+structuring predicate because the corpus said the structuring was wrong. It was
+not.
+
+### I nearly discarded it twice, both times on bad evidence
+1. Read `lv_0004` as deleting `if INBOX_CAPACITY < #self.Beequips[v32] then`.
+   It became `while INBOX_CAPACITY < Beequips2 do` - and an inbox capacity trim
+   MUST loop; the `if` removed exactly one item and was the bug.
+   `structure_diff` printed `if -1` and `loops +1` ON THE SAME ROW and I read
+   only the first column.
+2. Read `rc_0035` as losing two guards. `and/or` went 45 -> 47 and calls
+   315 -> 327: the two conditionals FOLDED. Its variable naming shifted
+   wholesale (`palette2` -> `covers2`, `err2` -> `Color`), so comparing sets of
+   condition TEXT was meaningless there; counting constructs was not.
+
+Rule earned: when `structure_diff` flags a file, read every column of that row
+before reading the diff, and prefer rename-immune counts (`if`/`elseif`/`while`/
+`for`/`and`/`or`/calls) over comparing condition text.
+
+### State
+    clean 1,305 / 1,323 = 98.6%   defects 23   missing calls 125
+      false-positive only  1    format-blocked  2    FIXABLE 15
+    CEILING 1,321 / 1,323 = 99.85%
