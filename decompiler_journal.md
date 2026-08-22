@@ -9076,3 +9076,26 @@ inferring backwards instead of asking the register file what it held.
 
 FOR THE NEXT ATTEMPT: `LUAU_REG_WATCH` / `LUAU_MERGE_WATCH` on R6 across
 `GiveStickerToPlayerStats@779`, not R9, and not on the statement list at all.
+
+### R9 confirmed Unknown; R6 invisible to the watch (instrument limit, not evidence)
+`LUAU_REG_WATCH` under the near-miss variant:
+
+    LUAU_REG_WATCH=9 -> READ reg=9 MINTED v9 (register held Some(Unknown))
+    LUAU_REG_WATCH=6 -> (nothing)
+
+R9 is confirmed Unknown at the read, which is the symptom. R6 printing nothing
+does NOT clear it: the watch is on the MINTING READ path in `reg_expr`, and a
+plain `MOVE` copies the `RegVal` straight across without going through it. An
+Unknown R6 is therefore invisible to this instrument by construction.
+
+So the register-6 hypothesis is still un-refuted and still unproven, and the
+watch as it stands cannot decide it. What would: a WRITE-side print in the MOVE
+handler recording what `regs[b]` held when it was copied - the write side that
+the read-side watch's own comment says it was meant to be paired with.
+
+Recorded rather than pursued further. Six instruments today: four wrong, one
+right-but-silent, one that answers a different question than the one asked. The
+pattern across all of them is the same and is the durable lesson of this
+session - **an absence in the output never names its own cause**, and every time
+this session read one as if it did (one-arm merge, coverage gap, downstream
+pass, register 6) the next measurement refuted it.
