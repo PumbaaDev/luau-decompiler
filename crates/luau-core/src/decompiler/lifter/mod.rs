@@ -1735,11 +1735,24 @@ fn lift_branch_region(
                 }
             }
         } else {
-            // Disjoint arm, run without a for-pair: keep the historical
-            // per-block lift for exactly these blocks.
-            for &(s, e) in &ranges[lo..=hi] {
-                lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, out, in_loop);
-            }
+            // LIFT THE RUN AS ONE RANGE, not block by block.
+            //
+            // `lift_instruction_range` is the ONLY code that turns a nested
+            // conditional jump into a `Stat::If`, and it is gated on
+            // `target > pc && target <= end`. Handing it one block at a time
+            // makes `end` the block's own end, so every nested jump that
+            // crosses a block boundary is past `end` and vanishes without a
+            // trace - the arm is emitted as straight-line code and its inner
+            // branches are gone.
+            //
+            // A RUN is contiguous by construction: `split_contiguous_runs`
+            // returns maximal runs of PC-adjacent ranges, and its own contract
+            // is that the span `ranges[lo].0 .. ranges[hi].1` "contains no
+            // instruction outside the listed blocks". So widening the call from
+            // per-block to per-run claims nothing the arm does not own; it only
+            // stops truncating the window the nested-jump handler is allowed to
+            // see. The single-run case above already does exactly this.
+            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
         }
     }
 }
