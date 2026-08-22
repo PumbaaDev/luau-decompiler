@@ -8806,3 +8806,64 @@ nested branch needs a FLAT RANGE to be recovered at all
 loop strands the branch; not splitting loses the loop. That conflict is why
 fifteen attempts have failed, and no gate can resolve it - only a structurer
 that NESTS them, emitting the branch region with the loop regions inside it.
+
+## The structuring fix is TWO FILES away — the full ladder, 22 Aug 2026
+
+Every variant below takes all three ground-truth probes to a perfect score
+(`DispatchProbe` 2/9 -> 9/9, `ModuleProbe` 6/8 -> 8/8, `GuardProbe` 13/13 held).
+What changes is only how well it separates a real branch from loop machinery:
+
+    variant                                     clean    files losing structure
+    ungated branch case                         1,269              146
+    + arms must TILE the span                   1,269              130
+    + per-run arm lift (a053b38, SHIPPED)       1,269              126
+    + loop-condition exclusion (JUMPBACK)       1,270              104
+    + fire ONLY when the span contains a loop   1,295                6
+    + while-loop detection in the arm lifter    1,296                2 broken
+    control                                     1,297                0
+
+**146 -> 2.** Each step was a real distinction, not a tuned threshold:
+
+1. TILING - the scan resumes at `merge`, so the arms must cover
+   `[then_start, merge)` with no gap or that code is skipped and never emitted.
+   An unvalidated form collapsed `rc_0043_GlovesShop` 1,588 lines -> 73.
+2. LOOP CONDITION - `while c do .. end` is a forward conditional jump plus a
+   JUMPBACK to the test; reading it as an `if` makes the loop a one-shot branch.
+3. LOOP SPANNING - nested `if`s are ALREADY recovered by
+   `lift_instruction_range`. Emitting regions for branches in general does that
+   job worse. The only shape the flat path cannot serve is a branch whose span
+   contains a LOOP, because the scan splits there and strands the branch's jump.
+   Restricting to that took 104 losers to 6.
+4. WHILE DETECTION - `range_contains_nested_for` finds ForNPrep/ForGPrep pairs
+   only, so an arm holding a `while` never reached `lift_structured_run` and the
+   loop was emitted as nothing. Adding a contained-JUMPBACK case fixed the loop
+   losses.
+
+### What the last variant actually does
+`rc_0274_Packet_Types` - the 640-instruction exhibit - goes from a two-arm
+collapse to the real nested dispatch:
+
+    if arg1 % 1 == 0 then
+        if arg1 < 0 then
+            if writef64 < arg1 then
+                while v2 < writef64 do v2 *= 2 end
+                writef64 = buffer.writeu8
+
+calls 783 -> 822, loops 19 -> 93, and its `call recovery` header - "1 proto
+emitted 40 fewer calls" - is GONE. Corpus short-proto files 10 -> 9.
+
+### Why it still does not ship
+It breaks exactly two previously-clean files, and both in the merge-loss family:
+
+    lv_0129 Eggs      declared_never_assigned x2, branch_local_discarded
+    lv_0648 Stickers  declared_never_assigned
+
+Restructuring creates merge points the value machinery then loses values at.
+Net 1,296 against a 1,297 control - fixed one, broke two. The standing rule
+holds: a structuring change must lose nothing.
+
+**NEXT: those two files, not another gate.** The mechanism is settled and the
+discrimination is done; what remains is that new regions interact with
+`premateralize_branch_escapes_spans`/`merge_regs`. That is a value-merge
+problem, and it is now reproducible on two named files with a fast probe suite
+to confirm the branches stay recovered while it is fixed.
