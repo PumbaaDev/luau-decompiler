@@ -8761,3 +8761,48 @@ Re-applying the tiling-validated structuring change ON TOP of the arm-lift fix:
 Identical damage to before. So the arm-lifting weakness was not what made
 region structuring destructive; they are separate defects, and one of them is
 now fixed. Fourteen attempts on the structuring half, still all rejected.
+
+### The structuring half is CONVERGING, and here is the ladder
+Each discriminator added to the run-structurer branch case, measured on the
+union corpus with `tools/structure_diff.py`:
+
+    variant                                    clean   files LOSING structure
+    ungated                                    1,269            146
+    + tiling check (arms must cover the span)  1,269            130
+    + arm-lift fix already shipped (a053b38)   1,269            126
+    + loop-condition exclusion (JUMPBACK)      1,270            104
+    control                                    1,297              0
+
+Every one of them takes all three probes to a perfect score:
+
+    DispatchProbe 2/9 -> 9/9    ModuleProbe 6/8 -> 8/8    GuardProbe 13/13 held
+
+So the mechanism is right and the DISCRIMINATION keeps improving - 146 to 104
+files as each real distinction is added - while still nowhere near zero. Two
+discriminators found so far and both were genuine:
+
+* the arms must TILE the span, or the code between them is skipped outright
+  (an unvalidated form collapsed `rc_0043_GlovesShop` 1,588 lines -> 73);
+* a `while` compiles to a forward conditional jump plus a JUMPBACK, so reading
+  that jump as an `if` turns the loop into a one-shot branch.
+
+The residual losers now lose only a few constructs each (-4, -2, -1 ifs), which
+is the signature of a few more shapes to separate, not of a wrong mechanism.
+
+### The tension this exposes, stated plainly
+`ModuleProbe.lookup` shows it in ten lines. Source:
+
+    if n > 8 then
+        while n > 8 do n = n - 1 end
+        return "MARKER_M_evicted"
+    end
+    return "MARKER_M_miss"
+
+Emitted at baseline: the `if n > 8` guard GONE, its body run unconditionally,
+and `MARKER_M_miss` dropped. A loop needs a REGION to be emitted at all (the
+linear dispatcher's FOR* arm is empty - "handled at the region level"), and a
+nested branch needs a FLAT RANGE to be recovered at all
+(`lift_instruction_range`, gated on `target <= end`). Splitting a range for the
+loop strands the branch; not splitting loses the loop. That conflict is why
+fifteen attempts have failed, and no gate can resolve it - only a structurer
+that NESTS them, emitting the branch region with the loop regions inside it.
