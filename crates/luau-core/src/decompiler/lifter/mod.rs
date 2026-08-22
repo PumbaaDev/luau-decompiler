@@ -931,12 +931,59 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
     let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
     // Always recorded, not gated: this feeds a semantic check, not a trace.
     {
+        // A CALL IN PROVABLY-DEAD CODE IS NOT A DROPPED CALL.
+        //
+        // `rc_0030 Janitor::AddPromise@103` reported 10 of 10 calls missing for
+        // a 57-word body, which looks like a total collapse and is correct
+        // output:
+        //
+        //     0: LOADB     R2 false
+        //     1: JUMPIFNOT R2 -> 56     <- R2 IS false, so this ALWAYS jumps
+        //     2..55: the body, 10 calls
+        //
+        // It is a bundled Janitor with `FoundPromiseLibrary` stubbed to false,
+        // so the compiler kept a branch that can never run. Charging those ten
+        // as dropped calls puts a proto in the defect list that no lifter change
+        // can or should remove.
+        //
+        // Only the constant-guard form is skipped - `LOADB Rn <b>` immediately
+        // followed by a jump on Rn whose polarity matches - because that is
+        // decidable from two adjacent words with no dataflow.
+        let mut dead: Vec<(usize, usize)> = Vec::new();
+        {
+            let code = &proto.code;
+            let mut i = 0usize;
+            while i + 1 < code.len() {
+                let op = LuauOpcode::from_u8((code[i] & 0xFF) as u8);
+                if matches!(op, LuauOpcode::LoadB) {
+                    let reg = insn_a(code[i]) as usize;
+                    let val = insn_b(code[i]) != 0;
+                    let jpc = i + 1;
+                    let jop = LuauOpcode::from_u8((code[jpc] & 0xFF) as u8);
+                    let same_reg = insn_a(code[jpc]) as usize == reg;
+                    let always = match jop {
+                        LuauOpcode::JumpIfNot => same_reg && !val,
+                        LuauOpcode::JumpIf => same_reg && val,
+                        _ => false,
+                    };
+                    if always {
+                        let t = (jpc as i64 + insn_d(code[jpc]) as i64 + 1) as usize;
+                        if t > jpc + 1 && t <= code.len() {
+                            dead.push((jpc + 1, t));
+                        }
+                    }
+                }
+                i += if op.has_aux() { 2 } else { 1 };
+            }
+        }
         let mut bc = 0usize;
         let mut i = 0usize;
         while i < proto.code.len() {
             let insn = proto.code[i];
             let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
-            if matches!(op, LuauOpcode::Call) {
+            if matches!(op, LuauOpcode::Call)
+                && !dead.iter().any(|&(s, e)| i >= s && i < e)
+            {
                 bc += 1;
             }
             i += if op.has_aux() { 2 } else { 1 };
