@@ -8921,3 +8921,31 @@ one region - would catch this class at the point it is introduced instead of
 1,200 files later.
 
 That is the next thing to build, and it is a cheap invariant, not another gate.
+
+### The coverage check needs ALL TEN region variants, or it lies
+Built the coverage assertion the previous entry called for: every pc in
+`[body_start, body_end)` claimed by some region, gaps reported under
+`LUAU_COVERAGE`. It found **349 gaps across 32 of 60 corpus files at
+BASELINE** - which would be a spectacular finding if it were true.
+
+It is not. `Region` has TEN variants:
+
+    Linear  IfThenElse  ValueJoin  WhileTrue  WhileDo  RepeatUntil
+    NumericFor  InlineLoopInLoop  GenericFor  InlineIfThenInLoop
+
+and the check mapped three of them to spans. Every `IfThenElse`, `ValueJoin`,
+`WhileDo`, ... region in a proto therefore registered as unclaimed. The number
+measures the check's blind spot, not the decompiler.
+
+Reverted rather than shipped. A diagnostic that reports 349 false gaps is worse
+than none: the next session would chase them. Same failure as the `if`-count
+probe check earlier today, caught the same way - by asking whether the
+instrument could be wrong before believing its output.
+
+A CORRECT version has to derive a span for all ten, and the block-list variants
+(`IfThenElse` carries `cond_pc` plus `then_region`/`else_region` block ids,
+`ValueJoin` carries `entry`/`arms`/`join`) need their block ranges resolved
+through the CFG rather than read off the struct. That is worth building - the
+`MOVE R9 R6` at pc 20 that vanished in `lv_0648_Stickers` is exactly what it
+would have caught at the point of introduction - but it must be complete before
+its output means anything.
