@@ -9726,3 +9726,38 @@ relax later. It is the correctness condition. Anything that composes
 non-adjacent terms has to keep each term's computation inside the branch that
 guards it, which means emitting nested ifs, not one composed condition - and
 nested ifs are what the lifter already produces here.
+
+### CORRECTION: composing with `and` is SAFE - rc_0055 is a merge loss, not a hoist
+The previous entry said non-adjacent terms cannot be composed because their
+computation would be hoisted and evaluated unconditionally. That is wrong, and
+the file's own output disproves it:
+
+    local Main3  = Main2  and Main2:FindFirstChild("Frames")
+    local Frames2 = Main3 and Main3:FindFirstChild("Shop")
+    local Shop2  = Frames2 and Frames2:FindFirstChild("MainScrollingFrame")
+    local MainScrollingFrame2 = Shop2 and Shop2:FindFirstChild("Holder")
+    if Shop2 then
+        local isType = Shop2:IsA("ScrollingFrame")     <- computed, DISCARDED
+    end
+    warn("[ShopLayout] ... not found - layout left alone.")
+    return
+
+FOUR terms are already folded into `and` chains WITH CALLS INSIDE THEM, and they
+are correct - `and` short-circuits, so `Main2:FindFirstChild(..)` is not
+evaluated when `Main2` is nil. Composition does not hoist; that was my error.
+
+The term that failed is `isType`, and it failed for a different reason: its
+result is DISCARDED. The value is computed inside `if Shop2 then .. end` and
+never reaches the merge, so the guard has nothing to test and the whole
+`warn(); return` ends up unconditional - after which DCE truncates the rest,
+34 calls -> 13.
+
+So `rc_0055` is not a composition problem at all. It is the MERGE-LOSS family:
+one arm computes a value, the merge cannot see it, and the guard that consumed
+it collapses. Same family as `declared_never_assigned`, reached from the guard
+side instead of the read side.
+
+That also explains why `compose_guard_chain` correctly does not fire here - by
+the time the terms are values, the tests ARE adjacent, and the reason they are
+not is the lost `isType`. Fix the merge loss and the guard chain composes
+itself.
