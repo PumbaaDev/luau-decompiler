@@ -65,7 +65,8 @@ measured.
 |---|---|
 | decodable | 1,323 / 1,323, 0 failed, 1 not a program |
 | semantic | **1,297 / 1,323 clean (98.0%), 33 defects** |
-| of which FALSE POSITIVES | 3 (`rc_0270` name_body_mismatch) → true **98.3%** |
+| of which FALSE POSITIVES | 3 defects, all in ONE file (`rc_0270`) → true **1,298/1,323 = 98.1%** |
+| **CEILING** | **1,321/1,323 = 99.85%** — `lv_0579` and `rc_0010` fail only on `upval_N`, and Roblox bytecode carries NO CAPTURE data, so those two can never be clean. **100% is not reachable.** The real gap is **23 files**. |
 | outputs that parse | 1,323 / 1,323 |
 | tests | 1,035 pass |
 

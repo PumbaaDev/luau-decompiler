@@ -9155,3 +9155,36 @@ Worth recording precisely because the argument was sound and the outcome was
 nil: a correct diagnosis of a real miscount is not evidence that fixing it
 changes output. Eighteenth attempt; the second this session to be right about
 the mechanism and worth nothing at the corpus.
+
+## 100% IS NOT REACHABLE, and my own "98.3%" was wrong
+
+Split the 26 defective files by whether their defects CAN be fixed:
+
+    files total                1,323
+    clean now                  1,297   (98.0%)
+    defective                     26
+      false-positive only          1   checker bug; the decompiler is CORRECT
+      format-blocked only          2   no CAPTURE data in Roblox bytecode
+      genuinely fixable           23
+
+    TRUE current quality   1,298 / 1,323 = 98.1%
+    CEILING                1,321 / 1,323 = 99.85%
+
+### Two corrections
+**1. "98.3% true" was arithmetic I got wrong, repeatedly.** I subtracted 3
+FALSE-POSITIVE DEFECTS from a FILE count. All three sit in ONE file
+(`rc_0270` evaera-promise), so discounting them moves the file total by one, not
+three: **1,298/1,323 = 98.1%**, not 98.3%. Defects and files are different
+denominators and I mixed them.
+
+**2. 100% cannot be reached, for a reason outside this code.**
+`lv_0579_Translation` and `rc_0010_topbarplus` fail only on `upval_N` -
+unbound upvalue names. CLAUDE.md has recorded since 8 Aug that Roblox bytecode
+carries NO CAPTURE data, so an upvalue's binding is not present to recover.
+No lifter change reaches them; it would take a format that does not exist.
+
+So the honest ceiling for this checker on this corpus is **99.85%**, and the
+gap between there and here is **23 files**, not 26 and not "13 defects".
+
+That is the number to work against. Quoting 100% as the target sets a bar the
+bytecode format forbids, and quoting 98.3% overstated where we already are.
