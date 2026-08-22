@@ -9016,3 +9016,38 @@ is not evidence of anything, and the honest next step is to run the same
 invariant inside `structure_control_flow` where the regions for these protos are
 actually built. Fifth instrument today; the fourth was wrong, and this one is
 right but aimed at the wrong function.
+
+### BOTH diagnoses of the residue are REFUTED
+Ran the unclaimed-write invariant inside `structure_control_flow` - where these
+protos' regions are actually built, which the previous entry correctly said the
+run-structurer version never saw.
+
+    baseline, 40 corpus files:            0 reports  (quiet on correct output)
+    near-miss variant, lv_0648_Stickers:  0 reports  (does NOT fire)
+
+**So `MOVE R9 R6` at pc 20 IS claimed by a region.** It is not a coverage
+problem, and the entry two above this - "a region COVERAGE bug, write exists at
+pc 20" - is wrong. So is the entry before that, which called it the one-arm
+merge shape. Both were inferences from a disassembly plus an absence, and both
+died on contact with a check that could actually decide the question.
+
+What is now KNOWN about the residue, as opposed to guessed:
+
+* the write `MOVE R9 R6` exists in the bytecode, two instructions before the
+  `RETURN R8..R10` that reads R9;
+* some region claims it;
+* it is absent from the output.
+
+Therefore the loss is DOWNSTREAM of structuring - in the lift of that region or
+in a later pass (dead-store elimination, DCE, the merge machinery). That is a
+different search than either of the two attempted, and it is the first statement
+about this defect in the whole session that rests on a measurement rather than
+on a plausible reading.
+
+The invariant is sound (zero false positives at baseline in both structurers)
+but reports nothing here, so it is not a detector for this defect. Reverted
+rather than shipped: a check that has never fired is not evidence, and carrying
+it would imply a guarantee it has not earned.
+
+Five instruments today. Four wrong, one right-but-silent. The scoreboard on
+hypotheses is worse than the scoreboard on code, and that is worth writing down.
