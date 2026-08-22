@@ -786,13 +786,35 @@ fn check_declared_but_never_assigned(source: &str, out: &mut Vec<Finding>) {
             })
             .count()
             .saturating_sub(1); // minus the declaration
+        // WHERE IT IS READ, not just where it is declared.
+        //
+        // The declaration of a hoisted free variable sits in the chunk-top
+        // block, inside no function, so a report carrying only that line
+        // cannot be joined to any lifter trace: the proto column reads `-`
+        // and the only remaining join key is the register NUMBER, which
+        // repeats across protos and produced a table that read one file as
+        // "admitted and still broken" when no such contradiction existed.
+        // The read site is inside the function that actually lost the value.
+        let first_read = lines
+            .iter()
+            .enumerate()
+            .find(|(k, l)| {
+                *k + 1 != *line
+                    && !l.trim_start().starts_with("--")
+                    && bare_idents(l).into_iter().any(|tok| tok == name)
+            })
+            .map(|(k, _)| k + 1);
+        let where_read = match first_read {
+            Some(r) => format!(" (first read line {})", r),
+            None => String::new(),
+        };
         out.push(Finding::wrong(
             "declared_never_assigned",
             Some(*line),
             format!(
-                "`{}` is declared but never assigned, yet read {} time(s) — \
+                "`{}` is declared but never assigned, yet read {} time(s){} - \
                  every use evaluates to nil, so a value the bytecode carried was dropped",
-                name, uses
+                name, uses, where_read
             ),
         ));
     }
