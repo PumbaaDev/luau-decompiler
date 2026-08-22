@@ -8720,3 +8720,44 @@ list, or teach `lift_branch_region` the nested-jump handling
 marker count made `GuardProbe` look like a 6/13 failure when it was 13/13
 intact, and made r11 look like it "fixed" a probe it never broke. Only
 `tools/run_probes.sh`, which tests each marker once, is a marker count.
+
+## SHIPPED: per-run arm lift recovers 28 dropped guards (a053b38)
+
+The thirteenth attempt's tiling check made all three probes pass while the
+corpus stayed damaged identically. That proved region structuring was never the
+problem and pointed at what happens AFTER a region is emitted - and that turned
+out to be a defect worth fixing on its own, with no structuring change at all.
+
+`lift_branch_region` split an arm into maximal contiguous RUNS, then lifted any
+multi-run arm BLOCK BY BLOCK. `lift_instruction_range` is the only code that
+turns a nested conditional jump into a `Stat::If`, gated on
+`target > pc && target <= end`, so a per-block call made `end` the block's own
+end and every nested jump crossing a block boundary vanished.
+
+A run is contiguous by construction and `split_contiguous_runs` guarantees its
+span "contains no instruction outside the listed blocks", so lifting the run as
+ONE range claims nothing new - it only stops truncating the window.
+
+    semantic score   1,297 / 1,323 -> 1,297 / 1,323   IDENTICAL
+    structure        +28 ifs, +22 calls, 0 losses across 18 files
+    parse            1,323 / 1,323
+    tests            1,039 pass, 1 pre-existing fail
+
+`rc_0105 CameraModule` alone goes 54 -> 65 ifs, recovering
+`if CFrame3:IsA("Humanoid")`, `if self:GetIsMouseLocked()`,
+`if getstate3 == Enum.HumanoidStateType.Dead`.
+
+**The score could not see this.** It is identical before and after, because the
+semantic checker has no check for a recovered guard any more than for a deleted
+one. Without `tools/structure_diff.py` this fix would have read as a pure no-op
+and been reverted under the project's own "measured neutral does not ship" rule.
+
+### The two problems are INDEPENDENT
+Re-applying the tiling-validated structuring change ON TOP of the arm-lift fix:
+
+    probes   DispatchProbe 9/9, GuardProbe 13/13, ModuleProbe 8/8   all pass
+    corpus   1,297 -> 1,269 clean, 126 files lose structure
+
+Identical damage to before. So the arm-lifting weakness was not what made
+region structuring destructive; they are separate defects, and one of them is
+now fixed. Fourteen attempts on the structuring half, still all rejected.
