@@ -941,7 +941,17 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
             }
             i += if op.has_aux() { 2 } else { 1 };
         }
-        crate::decompiler::call_recovery::record(bc, count_calls_stats(&out));
+        // proto INDEX, not just the line: several closures can share a line,
+        // and without the index a proto lifted more than once is
+        // indistinguishable from several distinct protos - which is exactly
+        // the confusion the header's "N proto(s)" count fell into.
+        let who = format!(
+            "#{} {}@{}",
+            proto_index,
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined
+        );
+        crate::decompiler::call_recovery::record(proto_index, &who, bc, count_calls_stats(&out));
     }
     if std::env::var("LUAU_BODY_REPORT").is_ok() {
         // Also count CALL-family opcodes. A `dropped_call` claim - "a call whose
@@ -7236,6 +7246,82 @@ fn premateralize_branch_escapes_spans(
                     }
                 }
                 continue;
+            }
+
+            // ROUND 5 - the NAME-BOUND twin of the unknown seed above.
+            //
+            // The exclusion further down rejects EVERY register already bound
+            // to a declared local, because the cure attempted there was to PIN
+            // THE EXISTING NAME across the arms - which threads one identity
+            // over a repurposed scratch slot and orphaned later readers
+            // (476_BadgeMenu, 111_Mechsquitos, both measured). That hazard is
+            // real, but it is a property of REUSING the bound name, not of the
+            // branch shape.
+            //
+            // Re-read the unknown-seed soundness argument above: it never
+            // mentions the pre-branch value. If BOTH arms write the register
+            // and the merge READS it before redefining it, the merge read
+            // provably cannot observe whatever the register held on entry -
+            // true whether that entry value was Unknown or a bound name. So
+            // seed a FRESH name, never the bound one, and the repurposing
+            // hazard cannot arise: nothing that referred to the old name is
+            // rebound, and the old binding simply goes out of use.
+            //
+            // Measured shape (rc_0037 GateController::makeSign, and the same in
+            // DigEffects, CashPassBadge, GloveModels, topbarplus Container):
+            //
+            //     local color
+            //     if self:GetAttribute("Vault") then
+            //         color = Color3.fromRGB(255, 214, 90)
+            //     else
+            //         color = Color3.fromRGB(130, 245, 140)
+            //     end
+            //     label.TextColor3 = color
+            //
+            // which decompiled as two arm-local declarations and an unbound
+            // `v9` at the merge. `carried_identity` cannot rescue this: it
+            // requires the register be written EXACTLY ONCE across the arms,
+            // and `Color3.fromRGB(...)` writes it TWICE per arm - GETIMPORT
+            // parks the callee in the result register, then CALL overwrites it
+            // with the result. Any arm that produces its value by CALLING
+            // something trips the one-write rule, which is why the ordinary
+            // `x = f(...)` two-arm selection was never reachable by it. The
+            // gate trace reads `arm_writes=4` for a plain two-arm diamond.
+            let bound_seed = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+                && locals.is_non_param(reg)
+                && !then_ranges.is_empty()
+                && !else_ranges.is_empty()
+                && ranges_write_reg(&proto.code, then_ranges, reg)
+                && ranges_write_reg(&proto.code, else_ranges, reg)
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+            if bound_seed {
+                let mut name = ctx.reg_name(proto, reg as u8, pc);
+                // A generic `vN` cannot be used: chunk-wide `vN` folding
+                // conflates unrelated variables (the 551_Shop compile
+                // failure). A name already live in this proto cannot be used
+                // either - shadowing a name some other register still reads
+                // would silently retarget that reader.
+                if opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
+                    name = format!("sel{}", reg);
+                }
+                let (kind, final_name) = locals.classify_write(reg, &name);
+                // Shadow is the ONLY outcome that introduces a fresh identity.
+                // Reassign would write the OLD name - precisely the repurposing
+                // this case exists to avoid - so leave those to the gates below
+                // rather than forcing a rebind we cannot justify.
+                if matches!(kind, WriteKind::Shadow | WriteKind::FirstDecl) {
+                    stmts.push(Stat::Local {
+                        names: vec![final_name.clone()],
+                        values: Vec::new(),
+                    });
+                    regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
+                    for &(s, e) in arm_ranges {
+                        if e > s {
+                            ctx.pin_reg_name(reg as u8, &final_name, s, e);
+                        }
+                    }
+                    continue;
+                }
             }
         }
         // Widen the seed gate from LITERAL-only (the residual 26f939b left) to

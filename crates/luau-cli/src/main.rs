@@ -961,6 +961,13 @@ fn run_batch(
 }
 
 /// Run the semantic checker over every .lua file just written.
+///
+/// Also writes `SEMANTIC_REPORT.tsv` beside the output: one row per defect,
+/// naming the FILE and LINE. The summary alone counts defects without saying
+/// where they are, and a count with no file list cannot be acted on or
+/// re-checked later — a defect ledger kept that way goes stale silently and
+/// then gets quoted as if it were current. The per-file rows are the evidence;
+/// the summary in MANIFEST.md is derived from exactly these rows.
 fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
     use luau_core::decompiler::semantic_check::{check, Severity};
     use std::collections::BTreeMap;
@@ -978,6 +985,8 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
     let mut clean = 0usize;
     let mut total = 0usize;
     let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // One row per defect: file / check / line / detail.
+    let mut report = String::from("file\tcheck\tline\tdetail\n");
 
     for p in &entries {
         let Ok(src) = fs::read_to_string(p) else { continue };
@@ -999,15 +1008,28 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
             continue;
         }
         total += wrong.len();
+        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for f in &wrong {
             *seen.entry(f.check).or_insert(0) += 1;
+            // Tabs and newlines inside a detail would forge extra columns and
+            // rows, so a malformed message cannot corrupt the table.
+            let detail = f.detail.replace(['\t', '\n', '\r'], " ");
+            let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+            report.push_str(&format!("{}\t{}\t{}\t{}\n", name, f.check, line, detail));
         }
         for (k, n) in seen {
             let e = counts.entry(k.to_string()).or_insert((0, 0));
             e.0 += 1;
             e.1 += n;
         }
+    }
+
+    // A failed write must not be silent: without this file the run's defect
+    // count cannot be traced back to any file, so say so rather than leaving
+    // a caller to assume the report exists.
+    if let Err(e) = fs::write(dir.join("SEMANTIC_REPORT.tsv"), &report) {
+        eprintln!("warning: could not write SEMANTIC_REPORT.tsv: {e}");
     }
 
     let mut by_check: Vec<(String, usize, usize)> =
