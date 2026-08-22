@@ -9128,3 +9128,30 @@ debug it.** The instruments were sound, the measurements were honest, every
 refutation was correct - and the whole sequence was still misdirected effort,
 because the target was chosen by momentum rather than by what would change the
 delivered artifact.
+
+### Call-pair collapse in `count_reg_writes`: measured NEUTRAL, reverted
+Back on SHIPPED code after the misdirected tail. `carried_identity` requires a
+register be "extended exactly once" across the arms, and `count_reg_writes`
+counts raw writes - so `x = f(...)`, which parks the callee in the result
+register (`GETIMPORT R9`) and then overwrites it with the result (`CALL R9`),
+reads as TWO writes. The gate trace shows the consequence directly on
+`lv_0934`: `reads_before_write=true` (a genuine carried identity) with
+`arm_writes=3`, so the one-write rule can never admit it.
+
+Collapsed the pair: skip a producer when the next write to that register is a
+`CALL` on it, since the producer's value IS the callee that call consumes.
+
+    semantic     1,297 / 1,323 -> 1,297 / 1,323   unchanged
+    structure    9 files changed, 0 LOSE
+    gains        ifs +0   calls +0   loops +0   generic vN +0
+
+Nine files differ and NOTHING is recovered - the diff is naming churn. The
+reasoning about the call-pair is still correct (the gate trace proves the
+miscount is real), but fixing the count does not, on this corpus, let
+`carried_identity` admit anything it should. Measured neutral, so it does not
+ship, by the same rule that reverted the `select_hint` reorder on 22 Aug.
+
+Worth recording precisely because the argument was sound and the outcome was
+nil: a correct diagnosis of a real miscount is not evidence that fixing it
+changes output. Eighteenth attempt; the second this session to be right about
+the mechanism and worth nothing at the corpus.
