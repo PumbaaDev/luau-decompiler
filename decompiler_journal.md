@@ -10605,3 +10605,37 @@ This is a THIRD distinct mechanism behind the remaining defects, alongside the
 seed family and `lv_0124`'s wrong merge point. Recording it because the earlier
 entries lumped all the `declared_never_assigned` rows together, and they are not
 one thing: a flattened loop and a dropped merge value need opposite fixes.
+
+### CORRECTION to the entry above: no second loop was flattened
+The previous entry claimed `lv_0883` proto `?@5` contains a generic-for
+flattened into `Linear 21..48`. That is WRONG and is corrected here rather than
+left to be quoted later.
+
+Proto 4 has exactly ONE `FORGPREP`, at pc 48:
+
+    47: CALL           R5 args=1 results=3    -- ipairs(..) triple
+    48: FORGPREP_INEXT R5 -> 52               -- body 49..51
+    49: NAMECALL R10 R11:"Destroy"
+    51: CALL     R10 args=1 results=0
+    52: FORGLOOP R5 -> 49 nresults=2 [inext]
+
+which is `for _, v in ipairs(X) do v:Destroy() end`, and RUNREG shows it
+correctly structured as `GenericFor 49..52`. Nothing was flattened at 21..48.
+
+The error: I matched the emitted `while` body (which reads the unbound `v5`) to
+proto `?@5` by eye, and it belongs to a different proto. The SYMPTOM stands -
+`v5` is declared at file scope, read twice, and written nowhere, and the emitted
+code does show an `ipairs` triple bound to plain locals beside an unbound loop
+variable - but the proto and pcs I attributed it to are not the right ones.
+
+WHAT IS STILL ESTABLISHED, and what is not:
+* established - `rc_0037 v19`, `rc_0040 v44`, `lv_0883 v5` are file-scope names
+  read but never written anywhere, so the value is never produced rather than
+  lost at a merge. That distinguishes them from `rc_0047`'s seed family.
+* NOT established - which construct fails, or that it is a loop at all. The
+  next attempt must locate the defect by TRACE, from the register the read
+  resolves to, and not by pattern-matching emitted text to a region dump.
+
+Three structural readings in this session needed correcting after the fact
+(`rc_0055` twice, and this one). All three were built by eye from emitted
+output; every reading that started from a trace has held.
