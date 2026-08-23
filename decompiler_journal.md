@@ -11272,3 +11272,34 @@ naming decision, because nothing else consults it.
 That is a much smaller job than the previous entry claimed, and it is the last
 thing standing between this codebase and a measured 1313 -> 1314 clean,
 10 -> 9 defects.
+
+### THE ACTUAL BLOCKER: local declarations have no single choke point
+Built the owner registry the previous entry specified - a shared
+`name -> (proto_index, reg)` map threaded into every `LocalTracker`, recorded in
+`classify_write`, keyed by OWNER so the seeder can tell its own name from a
+borrowed one. Wired at the single production `LocalTracker::new` site.
+
+The gain held (1313 -> 1314 clean, 10 -> 9 defects) and `rc_0241` STILL clobbers.
+
+The reason ends this line of work. `Stat::Local` is constructed at 113 SITES
+across the lifter:
+
+    mod.rs 49 · post_passes.rs 43 · opcode_handlers.rs 14 · table_reconstruction.rs 7
+
+Most never touch `LocalTracker`, so `classify_write` is not a choke point for
+local declaration - it is one of many. `local LocalPlayer = Players.LocalPlayer`
+is emitted by one of the others, so the registry never learns the name exists.
+
+That is the same structural gap that defeated `used_names` (stable hints bypass
+it) and `gen_var` (allocates through a set that was never told), now confirmed
+at a third layer. Three independent registries, one cause: THERE IS NO SINGLE
+PLACE THAT KNOWS A LOCAL WAS DECLARED.
+
+So the prerequisite for seeded-`Reassign` is not a registry at all. It is a
+choke point: route local declaration through one function that records the name,
+then any of the three guards works. That is an architectural change touching 113
+call sites, and it is the honest scope - not the "small job" the earlier entry
+claimed, and not the "enclosing-scope visibility" the entry before that claimed.
+
+Both of those characterisations were wrong and are corrected here. The measured
+prize is unchanged and modest: one clean file and one defect.
