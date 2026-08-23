@@ -10520,3 +10520,43 @@ So the seeder records the name without pinning the arm span, and
 (mod.rs ~2593) with no reference to the seed. That is where the next attempt
 belongs, and it must be measured against the r6 result already in this journal:
 naive one-arm seeding fixed 0 and broke 2.
+
+### Three measured attempts at the seed family, all rejected
+The remaining 9 real defects are one mechanism, and the naming path is NOT the
+lever. Three attempts, each reverted on measurement:
+
+1. **Pin outranks debug info in `reg_name`.** `pin_reg_name` writes into
+   `naming.assigned`; `reg_name` returns a debug-info name BEFORE consulting it,
+   so a deliberate pin loses. Measured: **0 files differing.** No pin exists at
+   the naming pc, so lookup order was never the question.
+
+2. **Pin the short-circuit JOIN instead of withholding the pin.** The seeder
+   deliberately withholds the pin when an arm contains a nested short-circuit on
+   the register - the comment records why, `rc_0100 Popper` collapsed when the
+   whole span was pinned. Pinning only the convergence point should leave the
+   operand writes alone. Measured: **0 files differing** again, and the new
+   `SEEDPIN` trace said why:
+
+       SEEDPIN setTile@156 reg=6 arm=(55,68) sc_join=Some(70) name=Text4
+
+   The convergence point is 70, OUTSIDE the arm (55,68) - it is the end of the
+   second arm (69,70). The whole construct is ONE short-circuit whose operands
+   ARE the two arms, so a gate of `j < e` can never fire.
+
+3. **Pin the join wherever it falls.** Fired at last - and made things worse.
+   One file changed, `rc_0035 RoomRenderer`, from
+
+       local LocalPlayer14 = LocalPlayer12 or firstUncleaned(arg1)
+
+   to assigning a HOISTED file-scope local instead, leaking the value out of its
+   scope. Zero defects fixed, one file degraded. Reverted.
+
+WHAT THIS ESTABLISHES: the seeded name is not being lost to a naming-precedence
+problem. The seed declares `Text4` and sets `regs[reg]`, and the arm still binds
+its result elsewhere - so the arm's write is not consulting the register file
+entry the seed installed. The next attempt belongs at the WRITE, not at the
+name: find why an arm write to a seeded register does not see
+`RegVal::Expr(Expr::Name(seed))` already sitting in `regs[reg]`.
+
+Three no-ops and a regression is a real result; recorded so the next attempt
+does not re-run any of them.
