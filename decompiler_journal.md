@@ -10925,3 +10925,31 @@ That is nine consecutive hypotheses measured and rejected across these families
 in one session: three no-ops, four regressions, one falsified, one actively
 harmful while reading as neutral. Each is written up with the measurement that
 killed it.
+
+### Why write-scoping fails, read from the diff rather than the count
+The previous entry rejected write-scoped hints on `if -1` across 63 files. That
+was the right verdict reached the wrong way - the same "read the count, not the
+diff" mistake this journal warns about, and `lv_0521` earlier in this session is
+proof it can go the other way (an `if -3` there was an improvement).
+
+Inspected. `lv_0210`:
+
+    - local CheckStatReqs = value13.CheckStatReqs(arg1, { ..
+    + local value14        = value13.CheckStatReqs(arg1, { ..
+    - local HasItem        = value13.HasItem(arg1, { ..
+    + local value16        = value13.HasItem(arg1, { ..
+
+The change is a NAMING regression, not a structural one. Scoping at the write
+discards the descriptive `Named` hints - the ones derived from field names -
+because they were recorded BEFORE the register's most recent write. The lost
+`if` is fallout from names no longer folding the same way downstream.
+
+So the rejection stands and now has a reason: hint PCs do not reliably mark
+WHICH value a hint describes. A `Named` hint recorded from a field access
+describes the value that access produced, and a later write to the same
+register does not invalidate it if the write is what stores that value. Scoping
+by PC cannot tell those apart, which is why both re-ranking and scoping fail -
+the PC is the wrong discriminator for hint validity.
+
+That is a sharper statement of the problem than CLAUDE.md's, and it rules out
+the whole PC-based family rather than just the two attempts made against it.
