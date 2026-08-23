@@ -36,6 +36,21 @@ pub enum RegisterHint {
     /// `game:GetService("X")` → name the result `X`, and
     /// `require(Path.To.Module)` → name the result `Module`.
     Named(String),
+    /// NOT A NAME - a barrier marking a write that produces a value UNRELATED
+    /// to whatever the register held before.
+    ///
+    /// Hints are append-only, so a name recorded for a previous occupant of a
+    /// register outlives it. Scoping every hint to the most recent write was
+    /// measured and REJECTED: it deletes deliberate inheritance, where
+    /// `GETTABLEKS .Field` names the function and the following `CALL`
+    /// overwrites the register with the result that should keep that name.
+    ///
+    /// The discriminator is derivation, not recency. Only a write whose value
+    /// cannot derive from the register's previous contents - an import, an
+    /// upvalue, a constant, a fresh table or closure - ends the name's life.
+    /// `lv_0452` needs exactly this: R13 holds a `math.min` result, then
+    /// `GETIMPORT R13` reuses the register for something unrelated.
+    FreshWrite,
 }
 
 /// Per-proto naming state, scoped so each proto gets its own clean namespace.
@@ -535,6 +550,17 @@ impl<'a> DecompileContext<'a> {
         }
 
         let prefix = match hint {
+            // `select_hint` never returns the barrier; it is a lifetime marker,
+            // not a name. Treat it as no hint at all.
+            Some(RegisterHint::FreshWrite) => {
+                // Unreachable in practice - `select_hint` never returns the
+                // barrier. Mirror the no-hint arm rather than inventing a
+                // third naming path.
+                let p = format!("v{}", reg);
+                let n = self.gen_scoped_name(&p);
+                crate::decompiler::mint_trace::note("GEN_VAR_NOHINT", &n);
+                return n;
+            }
             Some(RegisterHint::Named(ref name)) => {
                 // Phase B0.106: guard against Luau reserved words used as
                 // variable names.  A Named hint carrying a reserved keyword
@@ -933,14 +959,31 @@ fn select_hint(hints: &[(usize, RegisterHint)], pc: usize) -> Option<RegisterHin
             }
         }
         for (_, h) in collected.iter().rev() {
-            if !matches!(h, RegisterHint::Param(_) | RegisterHint::SelfParam) {
+            if !matches!(
+                h,
+                RegisterHint::Param(_) | RegisterHint::SelfParam | RegisterHint::FreshWrite
+            ) {
                 return Some(h.clone());
             }
         }
-        collected.first().map(|(_, h)| h.clone())
+        collected
+            .iter()
+            .find(|(_, h)| !matches!(h, RegisterHint::FreshWrite))
+            .map(|(_, h)| h.clone())
     }
 
-    let in_scope = hints.iter().filter(|(hpc, _)| *hpc <= pc).cloned();
+    // A `FreshWrite` at or before this read ends the previous value's life, so
+    // only hints from that point on describe what the register holds now.
+    let barrier = hints
+        .iter()
+        .filter(|(hpc, h)| *hpc <= pc && matches!(h, RegisterHint::FreshWrite))
+        .map(|(hpc, _)| *hpc)
+        .max()
+        .unwrap_or(0);
+    let in_scope = hints
+        .iter()
+        .filter(|(hpc, _)| *hpc <= pc && *hpc >= barrier)
+        .cloned();
     let chosen = pick(in_scope);
     if chosen.is_some() {
         return chosen;
@@ -1157,6 +1200,29 @@ pub fn analyze_register_usage(
         let c = insn_c(insn);
         let d = insn_d(insn);
         let aux = if op.has_aux() && pc + 1 < code.len() { Some(code[pc + 1]) } else { None };
+
+        // Record the barrier BEFORE this instruction's own hint, so the hint
+        // it pushes at the same pc stays inside the new value's lifetime.
+        if matches!(
+            op,
+            // NOT `GetImport`: a `require(Path.To.Module)` result legitimately
+            // inherits its name FROM the import, and barriering it replaces
+            // `local DynamicThumbstick2 = require(Thumbstick)` with
+            // `local import3 = ..` - measured on `lv_0925 ControlScript`.
+            LuauOpcode::GetGlobal
+                | LuauOpcode::GetUpval
+                | LuauOpcode::NewTable
+                | LuauOpcode::DupTable
+                | LuauOpcode::NewClosure
+                | LuauOpcode::DupClosure
+                | LuauOpcode::LoadK
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadNil
+                | LuauOpcode::GetVarargs
+        ) {
+            hints.entry(a).or_default().push((pc, RegisterHint::FreshWrite));
+        }
 
         match op {
             LuauOpcode::NewClosure | LuauOpcode::DupClosure => {

@@ -10983,3 +10983,50 @@ A real fix tracks derivation at the write: when an instruction's inputs include
 the register it defines, the hint carries; otherwise it is dropped. That is a
 change to how hints are RECORDED, not how they are selected, and it is the first
 approach in this area that is not already measured and rejected.
+
+### DERIVATION BARRIER: the eleventh attempt, and the one that works
+The previous entry concluded that no PC-based rule can work because the real
+question is whether a new value DERIVES from the register's previous contents.
+Implemented exactly that.
+
+`RegisterHint::FreshWrite` is a barrier, not a name. It is recorded for writes
+whose value cannot derive from what the register held - `GetGlobal`, `GetUpval`,
+`NewTable`, `DupTable`, `NewClosure`, `DupClosure`, `LoadK`, `LoadN`, `LoadB`,
+`LoadNil`, `GetVarargs`. `select_hint` then considers only hints at or after the
+last barrier, so a name from a previous occupant dies with it while deliberate
+inheritance across `GETTABLEKS` -> `CALL` survives untouched.
+
+`GetImport` is DELIBERATELY EXCLUDED. Including it replaced
+`local DynamicThumbstick2 = require(Thumbstick)` with `local import3 = ..` in
+`lv_0925`, because a `require` result legitimately inherits its name from the
+import path. That one exclusion halved the flagged files, 53 -> 27.
+
+| | control | shipped |
+|---|---|---|
+| clean | 1313 | 1313 |
+| defects | 11 | **10** |
+| missing calls | 5 | 5 |
+| corpus assignments | 120,100 | **120,223** |
+
+Exactly one defect row removed (`lv_0129 declared_never_assigned`), ZERO files
+newly defective. probes 9/9 13/13 8/8; tests 1039 pass, 1 pre-existing fail.
+
+SECOND JUSTIFIED OVERRIDE of a `structure_diff` REJECT, held to the same
+standard as the first: read every flagged file, and only override when the
+CONTROL is the wrong one. All four inspected are improvements, and each is the
+defect class this work targets:
+
+* `lv_0877` - the stray file-scope `local v13`, declared and never assigned, is
+  GONE. That IS `declared_never_assigned`.
+* `lv_0894` - hoisted `local Init4` gone; `task.spawn(function() .. end)`
+  instead of `local function Init() .. end ; task.spawn(Init)`.
+* `lv_0923` - `for result33 = 1, #tbl2` becomes `for i = 1, #tbl2`, and three
+  materialisations of one reused `CurrentCamera` variable holding three
+  unrelated booleans collapse into `if arg2:GetShiftLock() then ..`.
+* `lv_0925` - only a counter rename once `GetImport` was excluded.
+
+KNOWN LIMITATION OF MY OWN NEW METRIC, recorded so it is not mistaken for a
+defect later: `assign` falls when a SPURIOUS DECLARATION is removed, which is a
+fix. The metric cannot tell a dropped write from a deleted redundant one, so a
+negative `assign` is a prompt to read the diff, not a verdict. It still did its
+job today - it caught a 39-file regression that the old tool passed.
