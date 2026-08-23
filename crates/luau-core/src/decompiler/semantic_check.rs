@@ -429,6 +429,29 @@ fn check_name_body_agreement(source: &str, out: &mut Vec<Finding>) {
             if referenced_encloses {
                 continue;
             }
+            // A VARIANT MAY NAME THE FUNCTION IT IMPLEMENTS.
+            //
+            // `_new` is the internal constructor `new` delegates to, and its
+            // error text names the PUBLIC entry point because that is what the
+            // caller invoked:
+            //
+            //     error("Argument #2 to Promise.new must be a promise or nil", 2)
+            //
+            // That is correct code, and identical in kind to the nested-helper
+            // case above - the caller-visible operation is not this function's
+            // own name. `rc_0270` (evaera promise) trips it three times:
+            // `_new`/`new`, `_all`/`all`, `retryWithDelay`/`retry`.
+            //
+            // Related by convention means: the field is the referenced name
+            // with leading underscores, or the referenced name is a prefix of
+            // it. A genuine mis-pairing has UNRELATED names, so this narrows
+            // the check without blunting it.
+            let stripped = d.name.trim_start_matches('_');
+            let is_variant = (stripped == referenced && d.name.starts_with('_'))
+                || (d.name.len() > referenced.len() && stripped.starts_with(referenced.as_str()));
+            if is_variant {
+                continue;
+            }
             // Only a defect if the referenced name is a sibling declaration:
             // that is the shape produced by mis-paired closures.
             if declared.contains(referenced.as_str()) {
@@ -1180,6 +1203,57 @@ end
         assert!(
             f.iter().any(|x| x.check == "name_body_mismatch"),
             "should catch Create carrying ServerCall's body: {:?}",
+            f
+        );
+    }
+
+    /// An internal or extended VARIANT naming the function it implements is
+    /// correct code, not a mis-pairing.
+    ///
+    /// `rc_0270` (evaera promise) tripped this three times. `_new` is the
+    /// internal constructor `Promise.new` delegates to, and its error text
+    /// names the public entry point because that is what the caller invoked.
+    /// Same for `_all`/`all` and `retryWithDelay`/`retry`.
+    #[test]
+    fn variant_naming_its_public_counterpart_is_not_a_mismatch() {
+        let src = r#"
+function tbl.new(arg1)
+    return tbl._new(arg1)
+end
+function tbl._new(arg1)
+    error("Argument #2 to Promise.new must be a promise or nil", 2)
+end
+function tbl.retry(fn, times)
+    return fn(times)
+end
+function tbl.retryWithDelay(fn, times, delay)
+    error("Please pass a callback to Promise.retry", 2)
+end
+"#;
+        let f = check(src, None);
+        assert!(
+            !f.iter().any(|x| x.check == "name_body_mismatch"),
+            "`_new` naming `new`, and `retryWithDelay` naming `retry`, are              conventional variants and must not fire: {:?}",
+            f
+        );
+    }
+
+    /// The exemption must stay NARROW: unrelated sibling names still fire.
+    /// Without this the test above could be satisfied by deleting the check.
+    #[test]
+    fn unrelated_sibling_name_still_fires_after_variant_exemption() {
+        let src = r#"
+function tbl.Create(arg1, ...)
+    error("Events.ServerCall: No event named " .. arg1)
+end
+function tbl.ServerCall(arg1, ...)
+    error("Events.ServerCall: No event named " .. arg1)
+end
+"#;
+        let f = check(src, None);
+        assert!(
+            f.iter().any(|x| x.check == "name_body_mismatch"),
+            "`Create` and `ServerCall` are unrelated - the variant exemption              must not swallow this: {:?}",
             f
         );
     }

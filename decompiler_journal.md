@@ -10448,3 +10448,38 @@ a construct that reaches 50. Fixing it means widening the region, in
 `cfg.rs::find_merge_point` or in how `IfThenElse` arms are collected - and any
 attempt must be measured against the whole corpus, because merge points feed
 every branch in every file.
+
+### rc_0270's three defects were the CHECKER, not the decompiler
+CLAUDE.md has recorded these as false positives for a while without saying why.
+Verified rather than trusted, and they are.
+
+`name_body_mismatch` infers a function's identity from string literals in its
+body and fires when the referenced name is a SIBLING declaration. `rc_0270` is
+the evaera promise library, where `_new` is the internal constructor
+`Promise.new` delegates to:
+
+    error("Argument #2 to Promise.new must be a promise or nil", 2)
+
+Naming the PUBLIC entry point is right - that is what the caller invoked. Same
+for `_all`/`all` and `retryWithDelay`/`retry`. The check already exempts a
+NESTED helper naming its parent for exactly this reason; a variant naming the
+function it implements is the same situation between siblings.
+
+Exemption: the field is the referenced name with leading underscores, or the
+referenced name is a prefix of it. A genuine mis-pairing has UNRELATED names, so
+this narrows without blunting - and the original test (`Create` carrying
+`ServerCall`'s body) still fires untouched.
+
+Two tests, one of which exists only to stop the exemption from growing:
+`variant_naming_its_public_counterpart_is_not_a_mismatch` and
+`unrelated_sibling_name_still_fires_after_variant_exemption`. Without the second
+the first could be satisfied by deleting the check.
+
+1312 -> 1313 clean (99.2%), 14 -> 11 defects. Decompiled output is BYTE-IDENTICAL
+across all 1,323 files, which is the only correct result for a checker-only
+change. Tests 1039 pass (up 2), 1 pre-existing fail.
+
+Remaining 11 defects: 7 `declared_never_assigned`, 3 `branch_local_discarded`,
+1 `calls_not_emitted`. Of those, `lv_0579` and `rc_0010` are the format-blocked
+`upval_N` pair and can never be clean, so the reachable ceiling is unchanged at
+1321/1323.
