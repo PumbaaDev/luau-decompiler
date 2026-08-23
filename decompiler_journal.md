@@ -10682,3 +10682,23 @@ Next steps, each tied to its own mechanism rather than to one lumped family:
 * `rc_0047` + the `branch_local_discarded` rows - the seed family, write path
 * `lv_0124` - `find_merge_point` returning 5 for a construct reaching 50
 * `lv_0579`, `rc_0010` - unreachable, no CAPTURE data in the format
+
+### FRAME data for the two `UNK_CALL_CLEAR` files
+`LUAU_FRAME_TRACE` prints each call's clear and the registers still marked
+declared above it:
+
+    lv_0883  pc=3    A=0  clear_start=1  maxstack=10  DECLARED_ABOVE=[7,1,2,3,8,5]
+    rc_0037  pc=102  A=0  clear_start=0  maxstack=12  DECLARED_ABOVE=[1,3,0,4,8,9]
+
+A call based at register 0 wipes six registers the lifter still treats as
+declared. In real Lua a local that is live across a call sits BELOW the call
+base, so a call at A=0 implies nothing above it is live - which points at
+declaration tracking outliving the actual scope rather than at the clear being
+wrong.
+
+LEAD, NOT A FINDING. It has not been measured, and the MULTRET
+"assume 1 result by convention" hypothesis recorded above has not been measured
+either. Both are written down so the next attempt starts from data instead of
+re-deriving it; three sound-looking hypotheses in this same area have already
+measured as no-ops in this session, so neither should be trusted until a control
+build says otherwise.
