@@ -10639,3 +10639,46 @@ WHAT IS STILL ESTABLISHED, and what is not:
 Three structural readings in this session needed correcting after the fact
 (`rc_0055` twice, and this one). All three were built by eye from emitted
 output; every reading that started from a trace has held.
+
+### The remaining defects, classified BY TRACE (not by eye)
+Applied the rule from the correction above and used `LUAU_MINT_TRACE`, which
+reports for every minted name whether it was ever assigned, whether it lives in
+a closure, and which sites produced it. All five file-scope
+`declared_never_assigned` names in one pass:
+
+    lv_0579  upval_2  READONLY  inclosure=true  sites=UPVAL_NAME
+    rc_0010  upval_5  READONLY  inclosure=true  sites=UPVAL_NAME
+    rc_0037  v19      READONLY  inclosure=true  sites=REG_EXPR_UNKNOWN+UNK_CALL_CLEAR
+    lv_0883  v5       READONLY  inclosure=true  sites=REG_EXPR_UNKNOWN+UNK_CALL_CLEAR
+    rc_0040  v44      READONLY  inclosure=true  sites=GEN_VAR_NOHINT
+
+THREE different origins, where the journal previously had one. This also
+CONFIRMS the ceiling rather than assuming it: only the two `UPVAL_NAME` files
+are the format-blocked class, so 1321/1323 stands.
+
+`UNK_CALL_CLEAR` is raised where a CALL wipes every register above its results.
+The code comment there is explicit that this is "CORRECT by construction - a
+call leaves everything above its results genuinely holding nothing", and warns
+that suppressing a declaration whose register was cleared here "would replace a
+visible defect with a silent wrong value". So `rc_0037` and `lv_0883` are the
+decompiler correctly SIGNALLING that it does not know the value, and the fix
+belongs upstream of the read - either the value should have been in that
+register, or the read is of a register the call genuinely clobbers and the
+lifter mismodels the frame.
+
+One flagged assumption sits right there and is worth checking first:
+
+    let result_count = match nresults {
+        0 => 1,   // vararg results: assume 1 result by convention
+
+A MULTRET call whose real result count differs would put `clear_start` in the
+wrong place. That is a hypothesis, NOT a finding - it has not been measured
+against these two files, and this journal has already recorded three
+sound-looking hypotheses in this area that measured as no-ops.
+
+Next steps, each tied to its own mechanism rather than to one lumped family:
+* `rc_0037`, `lv_0883` - frame model at a CALL (`UNK_CALL_CLEAR`)
+* `rc_0040` - a name minted with no hint (`GEN_VAR_NOHINT`)
+* `rc_0047` + the `branch_local_discarded` rows - the seed family, write path
+* `lv_0124` - `find_merge_point` returning 5 for a construct reaching 50
+* `lv_0579`, `rc_0010` - unreachable, no CAPTURE data in the format
