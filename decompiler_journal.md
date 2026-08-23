@@ -11050,3 +11050,27 @@ defects, one `declared_never_assigned` removed, zero newly defective) and whose
 27 flagged files were each read and found to be improvements. The difference
 between the two is not the idea - it is that one moved a number and the other
 did not.
+
+### The one untried idea, recorded rather than started
+The shipped derivation barrier composes with the seed family in a way nothing
+has tried. `rc_0047`'s defect is that the seeder KNOWS the right name - the
+trace prints `SEED setTile@156 reg=6 pc=54 name=Text4` - and the arm still binds
+its result to a fresh `Text6`, because `reg_name` resolves from hints that know
+nothing about the seed.
+
+With `RegisterHint::FreshWrite` now in place, the natural move is for the seeder
+to record its own name as a BARRIER-BACKED hint at the seed pc: a `FreshWrite`
+followed by `Named(final_name)`. Every later read of that register in the arms
+would then resolve to the seeded identity, which is exactly what the pin was
+trying and failing to do.
+
+BLOCKER, and why it is recorded rather than attempted: hints are only pushed
+inside `analyze_register_usage`, the pre-pass. The seeder runs later, during
+lifting, and `DecompileContext` exposes no way to add a hint after the pre-pass -
+`pin_reg_name` writes to `assigned`, which `reg_name` consults AFTER debug info
+and which the earlier measurement showed is never even set for these registers.
+Adding a hint setter is a small change; doing it safely is not, because it
+changes naming for every register that carries a seed.
+
+This is the first idea in this area that is neither already measured nor ruled
+out by the PC-based analysis, and it is the one to pick up next.
