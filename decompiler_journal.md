@@ -10726,3 +10726,38 @@ That makes DECLARATION HOISTING the thing to examine, not the frame model. It
 is recorded as the next lead, unmeasured, alongside the note that four
 hypotheses in this area have now been measured and rejected in this session
 (three no-ops, one regression, and this one falsified before it cost a build).
+
+### lv_0124: `find_merge_point` is not the bug, and the fix is a structural feature
+Read the function rather than assuming from the symptom. It runs an alternating
+BFS from both successors and returns the first block reachable from BOTH. For
+the branch at pc 1:
+
+    successors: block@3 (fallthrough) and block@5 (target)
+    from 3: reaches 5 and 50
+    from 5: reaches 5
+    -> first common block is 5
+
+So `merge=Some(5)` is CORRECT by the function's own definition. Block 5 really is
+reachable from both arms. What makes it the wrong answer for structuring is that
+block 3 ALSO escapes to 50, so the construct is not a diamond closing at 5.
+
+The real shape is a guard whose body sits LATER in the file:
+
+    if cache ~= nil and statName ~= nil then <50..62 ; return> end
+    <5..49>
+
+The arm body (50..62) is NOT contiguous with the arm start (3), and everything
+between (5..49) belongs AFTER the construct. My existing `extended_arm_end`
+cannot help: extending the arm to 50 would swallow 5..49 into it, and those
+blocks are lifted separately, so they would be emitted twice.
+
+So this needs OUT-OF-ORDER ARM BODIES - emitting a construct whose then-branch
+lives past the code that follows it - which the lifter has no representation
+for. That is a feature, not a tweak, and it is the correct scope to record.
+
+Retracting my own earlier recommendation: I previously wrote that `lv_0124` was
+the highest-value next target because its root cause was "nailed down". The
+cause is understood, but the fix is the largest of the remaining items, not the
+smallest. Widening `find_merge_point` would be the wrong move - it is returning
+the right answer to the question it is asked, and it feeds every branch in
+every file.
