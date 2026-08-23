@@ -11149,3 +11149,29 @@ ORDERING, for whoever picks this up: make seed names trustworthy FIRST, then
 turn on `Reassign`. Doing it the other way converts a naming blemish into a
 silent overwrite, and this session has now produced that same trade three
 separate times.
+
+### The collision guard cannot work where it lives: LocalTracker is PER-PROTO
+Narrowed the seeded-`Reassign` rule to refuse when the seed name is already
+bound to another register, expecting that to save `rc_0241`. The gain survived -
+1314 clean, 9 defects - and the clobber did NOT go away:
+
+    139: local LocalPlayer = Players.LocalPlayer
+    182: LocalPlayer = DefaultListenerLocation13 == Camera4
+
+`LocalTracker::current_names` maps register -> name WITHIN ONE PROTO. The
+`LocalPlayer` being clobbered is declared at FILE SCOPE, in a different tracker
+entirely, so the guard is structurally incapable of seeing it. Not a tuning
+problem - the check is in the wrong place.
+
+Rejected. +1 clean file and -1 defect do not buy a silent overwrite of a live
+outer variable that no check in this repo detects.
+
+WHAT THIS PINS DOWN, and it is the useful part: the seeded-`Reassign` rule is
+correct, measurably worth 1313 -> 1314 clean and 10 -> 9 defects, and blocked on
+ONE missing capability - knowing whether a name is already live in an ENCLOSING
+scope. `used_names` on the context is global and already exists for exactly this
+kind of question; the guard belongs there, not on the per-proto tracker.
+
+That is a smaller, sharper next step than anything else outstanding in this
+area, and unlike the naming attempts it is not ruled out by measurement - it has
+simply never been built.
