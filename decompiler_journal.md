@@ -10836,3 +10836,35 @@ CLAUDE.md), so `MOVE` captures a NAME rather than a value and that name goes
 stale when the source register is reused. Fixing the alias fixes `lv_0452`
 properly and the guard can stay exactly as it is. Fixing the guard alone is
 worse than doing nothing.
+
+### Fixed the instrument that missed it: `structure_diff` now counts assignments
+The rejected `lv_0452` fix passed every check in the repo while writing wrong
+code. That is a tooling failure, not just a bad patch, so the tool is fixed.
+
+`structure_diff` counted ifs, calls and loops. An assignment is none of those,
+so `v9.PlaybackSpeed = v9` was invisible. Added two components:
+
+* `assign` - total assignments. FALLS when a write is dropped, which is the
+  loss that slipped through.
+* `selfassign` - writes of the form `x.field = x`, excluding `tbl.__index = tbl`
+  (the class-table idiom, correct under the probe-measured map). NEGATED in the
+  tuple so a RISE reads as a decrease under the existing "any component fell"
+  rule, with no change to the accept/reject logic.
+
+VALIDATED BOTH WAYS, because a checker that only fires is as useless as one that
+never does:
+
+* against the known corruption - now REJECTS, and shows it was WORSE than I had
+  seen: self-referential writes appeared in at least six files
+  (`rc_0008`, `rc_0074`, `lv_0396`, `lv_0578`, `lv_0654`, `lv_0685`), with
+  `lv_0685` gaining five. I had only inspected `lv_0452`.
+* against a change already shipped as good - still passes at 21 files, 0 losses.
+  No false positives.
+
+That second result matters: the tool would be worthless if the new components
+flagged the arm-boundary work already in the tree.
+
+The blind spot is why the `MOVE`-alias fix has not been attempted. It touches
+the hottest path in the lifter and its failure mode is silent wrong values -
+exactly what could not be seen until now. With `assign`/`selfassign` in place
+that change is finally measurable, and it is the right next piece of work.
