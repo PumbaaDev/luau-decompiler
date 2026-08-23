@@ -11110,3 +11110,42 @@ So the whole naming line of attack is now closed for the seed family:
 Five ways of telling the arm the right NAME, and the arm was never asking. The
 next attempt belongs in `classify_write`: why does a write to a register the
 seeder has already declared come back as a new declaration?
+
+### Seeded registers must REASSIGN, not shadow - right in principle, unsafe today
+Followed the lead the previous entry produced and it landed in the right layer.
+`classify_write` sees the seeder's `Text4` already declared, the arm's own name
+`Text6`, finds BOTH pass `is_semantic_local_name`, and takes:
+
+    if is_semantic_local_name(&old) && is_semantic_local_name(new_name) {
+        (WriteKind::Shadow, new_name.to_string())   // -> `local Text6 = ..`
+    }
+
+Shadowing where the merge needs a reassignment. Added a `seeded` set to
+`LocalTracker`, marked at the seed, and returned `Reassign` for those registers.
+
+IT WORKS: 1313 -> 1314 clean (99.3%), 10 -> 9 defects, exactly one row removed
+(`rc_0047 declared_never_assigned`), zero newly defective. `rc_0047` emits the
+if/else it should, assigning `Text4` in both arms. Corpus `elseif` count rises
+390 -> 401, so several of the flagged `if -1`/`-2` rows are if->elseif
+conversions the regex cannot see - `lv_0896` reads as a clear improvement, its
+value now landing in the seeded `sel2` instead of a dead-end `Freefall`.
+
+REJECTED ANYWAY, on `rc_0241 DefaultListener`:
+
+    139: local LocalPlayer = Players.LocalPlayer     -- a real variable
+    182: LocalPlayer = DefaultListenerLocation13 == Camera4   -- now a BOOLEAN
+
+Shadowing had been MASKING a stale seed name by minting `local Parent6`. Making
+the write reassign turns that stale name into a genuine clobber of an unrelated
+live variable. The semantic checker did NOT flag `rc_0241` - it is not newly
+defective by any check in the repo, and only reading the diff found it.
+
+So the rule is correct and its precondition is not met: seeded names must be
+TRUSTWORTHY before arms may assign them. The shipped `FreshWrite` barrier fixes
+some stale names but evidently not this one, since the seed name is chosen
+independently of it.
+
+ORDERING, for whoever picks this up: make seed names trustworthy FIRST, then
+turn on `Reassign`. Doing it the other way converts a naming blemish into a
+silent overwrite, and this session has now produced that same trade three
+separate times.
