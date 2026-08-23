@@ -10483,3 +10483,40 @@ Remaining 11 defects: 7 `declared_never_assigned`, 3 `branch_local_discarded`,
 1 `calls_not_emitted`. Of those, `lv_0579` and `rc_0010` are the format-blocked
 `upval_N` pair and can never be clean, so the reachable ceiling is unchanged at
 1321/1323.
+
+### The remaining defect family: seeded but not pinned
+`rc_0047 IndexController::setTile` is the clearest instance of the class that
+now dominates - 7 `declared_never_assigned` plus 3 `branch_local_discarded`,
+one mechanism:
+
+    local Text3
+    if arg2 then Text3 = self.gem.rarity else Text3 = "???" end
+    TextColor34.Text = Text3                      -- CORRECT
+
+    local Text4
+    if arg2 then
+        local Text6 = RARITY_COLOR[self.gem.rarity] or Color3.new(1, 1, 1)
+    end
+    TextColor34.TextColor3 = Text4                -- always nil
+
+The arm computes the value into a FRESH local and the seeded merge variable is
+never written. `LUAU_SEED_TRACE` shows the seed is created correctly:
+
+    SEED setTile@156 reg=6 pc=54 name=Text4 sc=true arms=[(55, 68), (69, 70)]
+
+so the seeder knows the register, the name and both arm ranges. The arm write
+simply does not land on it.
+
+TRIED AND REVERTED: making a pin outrank debug info in `reg_name`. The reasoning
+looked sound - `pin_reg_name` writes into `naming.assigned`, `reg_name` returns
+a debug-info name BEFORE consulting `assigned`, so a deliberate pin loses to
+whatever local name the compiler recorded. Measured: 0 files differing, every
+count identical. The pin is never SET for these registers, so the lookup order
+was never the question. Reverted rather than shipped - a no-op carrying a
+comment that claims a fix is worse than no change at all.
+
+So the seeder records the name without pinning the arm span, and
+`lift_value_join` names its result with a plain `ctx.reg_name` at the join
+(mod.rs ~2593) with no reference to the seed. That is where the next attempt
+belongs, and it must be measured against the r6 result already in this journal:
+naive one-arm seeding fixed 0 and broke 2.
