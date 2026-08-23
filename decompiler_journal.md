@@ -10802,3 +10802,37 @@ operand - a parameter register versus a computed local - not the target.
 
 That is the next thing to look at, and it is a genuinely different lever from
 the seed family, the frame model, or out-of-order arm bodies.
+
+### lv_0452 FULLY root-caused, and the fix REJECTED for making it worse
+Traced the dropped `SETTABLEKS` to its cause with a new `LUAU_SETK_TRACE`:
+
+    SETK-DROP pc=84 target=Field { object: Name("v9"), field: "PlaybackSpeed" }
+                    val=Name("v9")  selfref=true  artifact=false
+
+`MOVE R12 R13` at pc 74 aliases R12 to R13's NAME. R13 is then reused for the
+cloned sound, so by pc 84 both render as `v9` and the write reads as
+`v9.PlaybackSpeed = v9` - self-referential, and suppressed.
+
+In the bytecode A=12 and B=13, DIFFERENT registers, so the obvious fix is to
+gate the guard on `a == b` (the NAMECALL-misidentification shape it was written
+for). Measured: the write comes back, and it comes back as
+
+    v9.PlaybackSpeed = v9
+
+REJECTED. Un-suppressing does not fix the VALUE - R12 still renders as the stale
+alias - so the change converts a VISIBLE OMISSION into a SILENT WRONG VALUE.
+That is the exact trade the `UNK_CALL_CLEAR` comment warns against, and the
+guard was doing its job: refusing to emit garbage it had been handed.
+
+TOOLING BLIND SPOT, worth more than the fix: `structure_diff` passed this
+CLEAN - 23 files changed, 0 losing structure - because an assignment is not an
+`if`, a `call` or a `loop`. The corpus totals did not move either (1313/11/5),
+and `lv_0452`'s own defect row was unchanged. Every instrument in the repo said
+this change was neutral while it was writing wrong code into 23 files. Only
+reading the emitted line caught it.
+
+ROOT, for the next attempt: register hints are append-only (already recorded in
+CLAUDE.md), so `MOVE` captures a NAME rather than a value and that name goes
+stale when the source register is reused. Fixing the alias fixes `lv_0452`
+properly and the guard can stay exactly as it is. Fixing the guard alone is
+worse than doing nothing.
