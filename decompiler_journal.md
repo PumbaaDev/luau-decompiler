@@ -10338,3 +10338,65 @@ was previously flattened away. probes 9/9 13/13 8/8; tests 1037 pass, 1
 pre-existing fail.
 
 First time the corpus has crossed 99%.
+
+### lv_0905 and lv_0351 FIXED - one gate, found by trace, refined twice
+Unified the `JumpIf`/`JumpIfNot` arm on `extended_arm_end`, the helper written
+for `rc_0030`. That alone took the corpus to 1312/1323 with 5 missing calls -
+and damaged `rc_0089` again, exactly as the first attempt had months of entries
+ago. The difference this time is that the traces could answer WHY.
+
+    rc_0089 (damaging): arm_start=175 target=176 end=189 furthest=186
+    lv_0905 (correct):  arm_start=58  target=63  end=162 furthest=72
+    rc_0030 (correct):  arm_start=21  target=23  end=61  furthest=26
+
+`rc_0089`'s bytecode:
+
+    174: JUMPIF    R10 -> 176     outer; arm = [175, 176)
+    175: JUMPIFNOT R11 -> 186     escaping branch
+    176..179: (..):IsA("BasePart")
+    180: JUMPIFNOT R16 -> 186     <- SAME exit as the escaping branch
+    185: JUMP -> 189
+    186..188: else
+
+Two conditionals converging on ONE exit is a compound condition -
+`(a or b) and x:IsA("BasePart")` - not a construct boundary. Extending merges
+the terms and the `:IsA` result stops being the condition and becomes a
+discarded local. The call still prints, so no call counter can see it.
+
+GATE v1 - block when anything in the swallowed region targets `furthest`.
+Fixed `rc_0089`, broke `lv_0142 Beequip`: it turned
+
+    if arg3 then if not File2 then return false end end
+
+into `if arg3 then return false`, aborting whenever `arg3` is set. Corpus totals
+were IDENTICAL either way (1312/14/5) - the two variants simply traded which
+single file they wrecked, and only a per-file read could tell them apart.
+
+GATE v2 - block only when `furthest < end`. The trace gave the discriminator:
+
+    lv_0142: target=67  end=70  furthest=70   <- furthest == end
+    rc_0089: target=176 end=189 furthest=186  <- furthest < end
+
+When `furthest == end` the escaping branch targets the very end of the range, so
+extending just makes the arm the remainder and there is no trailing block to
+mis-assign. When `furthest < end` the extension swallows a region and leaves one
+behind - in `rc_0089` that leftover is the else body.
+
+| | before | after |
+|---|---|---|
+| clean | 1310 | **1312 (99.2%)** |
+| defects | 16 | **14** |
+| missing calls | 20 | **5** |
+
+21 files changed, 0 losing structure. `rc_0089`, `lv_0142` and `lv_0143` are all
+byte-identical to control. probes 9/9 13/13 8/8; tests 1037 pass, 1 pre-existing
+fail.
+
+The whole arm-boundary family - `rc_0055`, `lv_0791`, `rc_0030`, `lv_0905`,
+`lv_0351` - is now one helper with one gate, stated as: EXTEND WHEN THE
+SWALLOWED REGION DOES NOT REJOIN THE RANGE, UNLESS A SECOND CONDITIONAL
+CONVERGES ON THE SAME EXIT AND SOMETHING FOLLOWS IT.
+
+Only `lv_0124` (5 calls, lifted-then-discarded) still loses calls. Defects
+remaining: 7 `declared_never_assigned`, 3 `name_body_mismatch`,
+3 `branch_local_discarded`, 1 `calls_not_emitted`.
