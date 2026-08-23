@@ -10702,3 +10702,27 @@ either. Both are written down so the next attempt starts from data instead of
 re-deriving it; three sound-looking hypotheses in this same area have already
 measured as no-ops in this session, so neither should be trusted until a control
 build says otherwise.
+
+### The MULTRET hypothesis is FALSIFIED for these files
+Checked it rather than leaving it standing. `lv_0883`'s clearing frame
+
+    FRAME pc=3 A=0 clear_start=1 maxstack=10 DECLARED_ABOVE=[7,1,2,3,8,5]
+
+resolves to `monitorSegments` pc 3, `CALL R0 args=1 results=1` - an ordinary
+ONE-RESULT call. `clear_start = a + 1 = 1` follows directly, with no involvement
+from the `nresults == 0` MULTRET branch or its "assume 1 result by convention"
+assumption. So that assumption is not the cause here and the next attempt should
+not start there.
+
+What the data does show: the six registers wiped are ones the lifter had already
+HOISTED declarations for - the emitted body carries
+`local result4, result25, result36, v8, Position2` ahead of the loop, and `v5`
+is hoisted all the way to file scope. The call then clears exactly those
+registers before anything writes them. So the sequence is
+hoist-declaration -> call clears register -> later read finds nothing, and the
+clear is behaving as documented.
+
+That makes DECLARATION HOISTING the thing to examine, not the frame model. It
+is recorded as the next lead, unmeasured, alongside the note that four
+hypotheses in this area have now been measured and rejected in this session
+(three no-ops, one regression, and this one falsified before it cost a build).
