@@ -10868,3 +10868,34 @@ The blind spot is why the `MOVE`-alias fix has not been attempted. It touches
 the hottest path in the lifter and its failure mode is silent wrong values -
 exactly what could not be seen until now. With `assign`/`selfassign` in place
 that change is finally measurable, and it is the right next piece of work.
+
+### The MOVE-alias fix: REJECTED, and the new metric earned its keep immediately
+Attempted the fix the previous entry called the right next piece of work: at a
+`MOVE` whose source is a Name, materialise the destination as its own local
+when the source register is redefined later and the destination is read after
+that point.
+
+It does not work, and for an instructive reason. Output becomes:
+
+    local PlaybackSpeed = v9        -- v9 is still the UPVALUE here
+    v9 = script.CollectSound
+    v9.PlaybackSpeed = PlaybackSpeed
+
+The materialisation captures the stale name as its VALUE, because R13 ALREADY
+rendered as `v9` at pc 74 - the `math.min` result was never materialised and
+R13 had inherited an upvalue's name. So the corruption is upstream of `MOVE`
+too: the register is mis-named before the move ever happens.
+
+MEASURED: 39+ files each LOSE an assignment, with no gain at all - corpus
+totals unchanged and `lv_0452` still wrong. Reverted.
+
+THE TOOLING POINT: every one of those rows reads `if +0 calls +0 loops +0`. The
+OLD `structure_diff` would have passed this change as clean, exactly as it
+passed the previous one. The `assign` component added an hour earlier caught a
+39-file regression on its first real use.
+
+That is now two consecutive changes in this area whose damage was invisible to
+the pre-existing instruments. Anyone continuing here should treat that as the
+governing fact: the naming layer produces failures that if/call/loop counts
+cannot see, and the value of a new check is measured by what it rejects, not by
+what it permits.
