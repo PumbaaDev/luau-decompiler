@@ -11175,3 +11175,29 @@ kind of question; the guard belongs there, not on the per-proto tracker.
 That is a smaller, sharper next step than anything else outstanding in this
 area, and unlike the naming attempts it is not ruled out by measurement - it has
 simply never been built.
+
+### The guard needs to run BEFORE the seed name is registered, not after
+Checked whether `DecompileContext::is_name_used` - which exists, is public, and
+consults the global `used_names` - can serve as the cross-scope guard the
+per-proto tracker cannot provide. It cannot, as currently sequenced, and the
+reason is worth writing down because it names the actual next step.
+
+By the time the seeder holds `final_name`, that name has already been through
+`reg_name` / `classify_write`, which register it. So `is_name_used(final_name)`
+is TRUE for both cases the guard must separate:
+
+* `rc_0047`'s `Text4` - true because the seeder itself just minted it. The rule
+  should apply.
+* `rc_0241`'s `LocalPlayer` - true because a file-scope `local` already owns it,
+  and stable hints deliberately BYPASS `used_names` (mod.rs:88 says so), which
+  is how the collision arose. The rule must not apply.
+
+A single after-the-fact membership test cannot tell those apart. The check has
+to happen where the name is CHOSEN - refuse a seed name that is already live in
+an enclosing scope, and mint a distinct one instead - rather than after it is
+committed.
+
+So the outstanding work in this area is now one sentence long: make the seed
+name allocation aware of enclosing-scope names, and the measured
+1313 -> 1314 clean / 10 -> 9 defects gain from seeded-`Reassign` becomes safe to
+turn on. Everything else here has been measured and rejected.
