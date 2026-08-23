@@ -10284,3 +10284,57 @@ look like a bad gate rather than a misdiagnosis.
 Remaining, now with two distinct causes:
 * never lifted  - `rc_0030` (9), `lv_0351` (5), and `lv_0905` (10, arm layout)
 * lifted then discarded - `lv_0124` (5)
+
+### rc_0030 FIXED - and the gate that beat it unifies with the Return case
+`Cleanup@188` emitted 1 of 10 calls. Three wrong turns before the right one,
+each killed by a measurement rather than an argument:
+
+1. Extended spans in `lift_structured_regions` with a plain-if-then fallback.
+   Cost a file and a defect, recovered NOTHING - and could not have, because
+   that helper is never called on this proto's path. The measurement tested the
+   wrong site.
+2. Added a tail-branch extension to the generic-for body path. Exact no-op.
+3. Added the arm extension to the `JumpXEqK` handler gated on `m == end`. Exact
+   no-op again.
+
+`LUAU_XARM_TRACE` ended the guessing in one run:
+
+    XARM arm_start=21 target=23 end=61 furthest=26 last=Some(Jump) -> 23
+
+Everything matched except `end`. The enclosing range is the `Linear 11..61`
+region, not the loop body, and the JUMP at pc 25 goes to 103 - the loop
+back-edge, OUTSIDE that range. So `m == end` was simply the wrong question.
+
+The right one is the property `Return` already has: DOES THE SWALLOWED REGION
+REJOIN THIS RANGE? A jump landing at or past `end` leaves it and the region is
+a terminal skip path. A jump landing inside rejoins, which is ordinary code -
+and extending through ordinary code is exactly what demoted a real
+`:IsA("BasePart")` guard in `rc_0089` when this was tried before. Gating on
+`m >= end` admits `rc_0030` and still excludes `rc_0089`, which stays
+byte-identical.
+
+The bytecode:
+
+    19: JUMPXEQKS R6 ==     "string" -> 23      arm = [21, 23)
+    21: JUMPXEQKS R6 not == "number" -> 26      PAST 23 -> stranded
+    23..25: JUMP -> 103                         "is number": skip the entry
+    26..102: the real cleanup work, 9 calls
+
+Stranded, the branch at 21 degraded to a bare `continue`, which made the rest of
+the body unreachable and let DCE strip it - so `IFLIFT` reported 10 calls pushed
+while the file emitted 1. The AST was right and a post-pass was correct to
+remove what the lifter had already made dead.
+
+| | control | shipped |
+|---|---|---|
+| clean | 1309 | **1310 (99.0%)** |
+| defects | 17 | **16** |
+| missing calls | 29 | **20** |
+
+Two files changed, 0 losing structure. `rc_0030` recovers real Janitor logic -
+the `warnUser` closure, the `pcall` guard and its error path, the destructor
+dispatch. `lv_0740` recovers an `else` branch for a "Mythic" rarity tier that
+was previously flattened away. probes 9/9 13/13 8/8; tests 1037 pass, 1
+pre-existing fail.
+
+First time the corpus has crossed 99%.

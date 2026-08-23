@@ -207,6 +207,92 @@ fn reg_expr_ref(regs: &[RegVal], idx: usize) -> Expr {
 /// Returns `(then_end, else_range)`; `else_range` is `None` when the shape does
 /// not match, in which case `then_end == target` and the caller behaves exactly
 /// as it did before.
+/// Where a constant-test arm really ends.
+///
+/// `[arm_start, target)` is the fallthrough arm of a `JumpXEqK*`. A conditional
+/// branch INSIDE it whose target lies past `target` is the construct's own
+/// continuation, and `lift_instruction_range` only lifts a branch when
+/// `target <= end` - so cutting the arm at the first target strands it, and in
+/// a loop it degrades to a bare `continue`.
+///
+/// `rc_0030 Cleanup` loses nine of ten calls to this:
+///
+///     19: JUMPXEQKS R6 ==     "string" -> 23      arm = [21, 23)
+///     21: JUMPXEQKS R6 not == "number" -> 26      PAST 23 -> stranded
+///     23..25: JUMP -> 103                         the "is number" path: continue
+///     26..102: the real cleanup work, 9 calls
+///
+/// Extending to 26 puts the branch back in range and `detect_else_skip` finds
+/// the `JUMP -> 103` at pc 25, resolving both arms.
+///
+/// Gated hard: the swallowed region must end in a `Return`, or in an
+/// unconditional JUMP whose target is EXACTLY the enclosing range end. The
+/// second condition is what makes it a continue-to-the-back-edge rather than an
+/// arbitrary forward jump; without it this same extension demoted a real
+/// `:IsA("BasePart")` guard in `rc_0089` to a discarded local.
+fn extended_arm_end(code: &[u32], arm_start: usize, target: usize, end: usize) -> usize {
+    if target <= arm_start || target > end {
+        return target;
+    }
+    let mut w = arm_start;
+    let mut furthest = target;
+    while w < target && w < code.len() {
+        let wop = LuauOpcode::from_u8(insn_op(code[w]));
+        let wsz = if wop.has_aux() { 2 } else { 1 };
+        if matches!(
+            wop,
+            LuauOpcode::JumpIf
+                | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpXEqKNil
+                | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN
+                | LuauOpcode::JumpXEqKS
+        ) {
+            let t = (w as i64 + insn_d(code[w]) as i64 + 1) as usize;
+            if t > furthest && t <= end {
+                furthest = t;
+            }
+        }
+        w += wsz;
+    }
+    if furthest <= target {
+        return target;
+    }
+    let mut k = target;
+    let mut last: Option<(usize, LuauOpcode)> = None;
+    while k < furthest && k < code.len() {
+        let kop = LuauOpcode::from_u8(insn_op(code[k]));
+        last = Some((k, kop));
+        k += if kop.has_aux() { 2 } else { 1 };
+    }
+    let out = match last {
+        Some((_, LuauOpcode::Return)) => furthest,
+        // The swallowed region must NOT REJOIN inside this range - the same
+        // property `Return` has. A jump landing at or past `end` leaves the
+        // range (in `rc_0030` it is the loop back-edge at 103, while the
+        // enclosing Linear region ends at 61), so the region is a terminal skip
+        // path and the arm genuinely continues past it. A jump landing INSIDE
+        // the range rejoins it, which is ordinary code - extending through that
+        // is what demoted a real `:IsA("BasePart")` guard in `rc_0089`.
+        Some((jpc, LuauOpcode::Jump)) => {
+            let m = (jpc as i64 + insn_d(code[jpc]) as i64 + 1) as usize;
+            if m >= end { furthest } else { target }
+        }
+        Some((jpc, LuauOpcode::JumpX)) => {
+            let m = (jpc as i64 + insn_e(code[jpc]) as i64 + 1) as usize;
+            if m >= end { furthest } else { target }
+        }
+        _ => target,
+    };
+    if std::env::var("LUAU_XARM_TRACE").is_ok() {
+        eprintln!(
+            "XARM arm_start={} target={} end={} furthest={} last={:?} -> {}",
+            arm_start, target, end, furthest, last.map(|l| l.1), out
+        );
+    }
+    out
+}
+
 fn detect_else_skip(
     code: &[u32],
     then_start: usize,
@@ -4001,7 +4087,14 @@ pub(super) fn lift_instruction_range(
                 let cmp = if negated { BinOp::NotEq } else { BinOp::Eq };
                 let neg_cmp = if negated { BinOp::Eq } else { BinOp::NotEq };
                 let condition = Expr::BinOp { left: Box::new(left.clone()), op: cmp, right: Box::new(right.clone()) };
-                let target = (pc as i32 + d as i32 + 1) as usize;
+                let mut target = (pc as i32 + d as i32 + 1) as usize;
+                // A branch inside this arm targeting past it is the construct's
+                // own continuation; cutting here strands it into a bare
+                // `continue`. See `extended_arm_end`.
+                {
+                    let arm_start = pc + 1 + if op.has_aux() { 1 } else { 0 };
+                    target = extended_arm_end(code, arm_start, target, end);
+                }
 
                 // `local x = a < b` compiles to a branch over a LOADB pair —
                 // store the comparison as a value, not as control flow.
