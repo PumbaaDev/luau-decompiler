@@ -10560,3 +10560,48 @@ name: find why an arm write to a seeded register does not see
 
 Three no-ops and a regression is a real result; recorded so the next attempt
 does not re-run any of them.
+
+### lv_0883: a generic-for FLATTENED inside a branch arm (new mechanism)
+The line-8 `declared_never_assigned` cases are not all the seed family. Checked
+`rc_0037 v19`, `rc_0040 v44` and `lv_0883 v5`: each is declared at FILE SCOPE
+and read once or twice with NO WRITE ANYWHERE in the file. The value is not lost
+at a merge - it is never produced.
+
+`lv_0883` shows why. Emitted:
+
+    while result do
+        ...
+        result4, result25, result36 = ipairs(Body5)   -- the iterator TRIPLE
+        if v5.Parent ~= nil then continue end          -- v5 never bound
+        Position2 = (v5.Position - Position):Dot(v5.Position - Position)
+    end
+
+The source is `for _, part in ipairs(Body5) do .. end`. The FORGPREP was not
+structured, so the iterator triple got assigned to plain locals and the LOOP
+VARIABLE was never declared - every read of it is nil. `v5` is the loop
+variable, not a dropped merge value.
+
+Regions for the enclosing proto:
+
+    REGIONS proto=?@5 blocks=10 regions=1
+      IfThenElse { cond_pc: 0, then_region: [9],
+                   else_region: [10,14,20,21,48,49,52,54], merge_pc: None }
+
+and the arm's own run:
+
+    RUNREG ?@5 run=10..69  Linear 10..18
+                           InlineIfThenInLoop 18
+                           Linear 21..48        <- the flattened generic-for
+                           GenericFor 49..52
+                           Linear 54..69
+
+So the arm structurer DID find one generic-for (49..52) and missed another
+inside the same run (21..48). Other protos in this file structure their loops
+correctly - `initSegment@18` gets a proper `GenericFor` - so this is not a
+general failure of loop detection. It fails for a loop nested inside a branch
+arm that reaches `lift_structured_run`.
+
+This is a THIRD distinct mechanism behind the remaining defects, alongside the
+seed family and `lv_0124`'s wrong merge point. Recording it because the earlier
+entries lumped all the `declared_never_assigned` rows together, and they are not
+one thing: a flattened loop and a dropped merge value need opposite fixes.
