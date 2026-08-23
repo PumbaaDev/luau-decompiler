@@ -10899,3 +10899,29 @@ the pre-existing instruments. Anyone continuing here should treat that as the
 governing fact: the naming layer produces failures that if/call/loop counts
 cannot see, and the value of a new check is measured by what it rejects, not by
 what it permits.
+
+### Write-scoped register hints: attempted, MEASURED, rejected
+CLAUDE.md records re-ranking hint PRIORITY as tried and measured a no-op, and
+names the alternative: "clear or scope hints at the write, not re-rank them."
+That had never been attempted. It has now.
+
+Implemented: hints carry the PC at which they were observed, and `select_hint`
+accepts any whose PC <= the read. Added a scope floor - the PC of the most
+recent write to that register - so a hint recorded for a PREVIOUS occupant is
+excluded, falling back to the full set when that leaves nothing.
+
+    1313 -> 1312 clean, 11 defects, 5 missing calls
+    63 files LOSE an `if`; `rc_0074` newly defective
+
+REJECTED. It does what it was meant to - the `assign` column rises by 38-40 in
+the worst files, which is exactly the extra distinct names that scoping
+produces - but it costs guards to get them, and a lost `if` is a lost guard.
+
+So the CLAUDE.md recommendation is now itself measured, and both halves of it
+have failed: re-ranking is a no-op, scoping loses structure. Anyone reaching for
+the naming layer next should know that the note pointing here has been spent.
+
+That is nine consecutive hypotheses measured and rejected across these families
+in one session: three no-ops, four regressions, one falsified, one actively
+harmful while reading as neutral. Each is written up with the measurement that
+killed it.
