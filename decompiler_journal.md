@@ -10246,3 +10246,41 @@ that rejected `rc_0054` earlier, applied honestly in the other direction.
 
 probes 9/9 13/13 8/8; tests 1037 pass, 1 pre-existing fail.
 Remaining: `lv_0905` (10), `rc_0030` (9), `lv_0351` (5), `lv_0124` (5) = 29.
+
+### lv_0124 is a DIFFERENT failure: the code is lifted, then discarded
+Checked whether the `rc_0084` fix reaches the three remaining loop-shaped files.
+It does not, and for `lv_0124` the reason is that the mechanism is not the same
+one at all.
+
+`Update@62` holds 7 calls and emits 2. Its regions:
+
+    run=7..15   InlineLoopInLoop 9..12 , Linear 13..15
+    run=15..50  Linear 15..40 , InlineIfThenInLoop 40 , Linear 41..48 , Linear 48..50
+
+Note pcs 50..62 - which hold the calls at 55 and 61 - appear in NO run. The
+branch at pc 3 (`JUMPXEQKNIL R1 not == nil -> 50`) is what reaches them.
+
+`LUAU_IF_TRACE` then shows two lifts for this proto:
+
+    else_blocks=0  else_stmts=None      then_stmts=0   then_calls=0  then_blocks=1
+    else_blocks=3  else_stmts=Some(10)  then_stmts=2   then_calls=1  else_calls=Some(4)
+
+The second one PRODUCES FIVE CALLS - four in the else arm, one in the then arm -
+and the finished function contains two. So the statements exist and are then
+thrown away downstream. The first line is the shape of the discard: one block
+in, zero statements out.
+
+That is categorically different from `rc_0084`, where the code was never lifted
+because an escaping branch was dropped. Here lifting succeeds and something
+after it - an enclosing arm, `is_empty_if`, or a post-pass - deletes the result.
+Extending spans cannot help; the next step is to find what consumes a
+10-statement arm and emits nothing.
+
+Recording this because the whole family was previously written up as ONE
+mechanism ("the non-loop out-of-range drop"). That was wrong for `lv_0124`, and
+the correction matters: an extension fix aimed here would measure as a no-op and
+look like a bad gate rather than a misdiagnosis.
+
+Remaining, now with two distinct causes:
+* never lifted  - `rc_0030` (9), `lv_0351` (5), and `lv_0905` (10, arm layout)
+* lifted then discarded - `lv_0124` (5)
