@@ -11030,3 +11030,23 @@ defect later: `assign` falls when a SPURIOUS DECLARATION is removed, which is a
 fix. The metric cannot tell a dropped write from a deleted redundant one, so a
 negative `assign` is a prompt to read the diff, not a verdict. It still did its
 job today - it caught a 39-file regression that the old tool passed.
+
+### Extending the barrier to table reads: no gain, 282 files, rejected
+Natural follow-on to the shipped barrier: `GETTABLEKS/GETTABLE/GETTABLEN A B`
+with `b != a` reads out of ANOTHER register's table, so the value is equally
+unrelated to what `A` held. Gated on `b != a` so the common
+`GETTABLEKS R R."Field"` refinement chain still inherits its name.
+
+Measured: 1313 clean, 10 defects, 5 missing calls - IDENTICAL to control - while
+282 files changed and `structure_diff` rejected on assignment losses.
+
+Rejected on the arithmetic rather than on inspection: there is no upside to
+weigh against 282 changed files, and no way to hand-verify that many. A change
+with zero measurable gain does not earn the risk, whatever its reasoning looks
+like.
+
+Worth separating from the shipped barrier, which had a REAL gain (11 -> 10
+defects, one `declared_never_assigned` removed, zero newly defective) and whose
+27 flagged files were each read and found to be improvements. The difference
+between the two is not the idea - it is that one moved a number and the other
+did not.
