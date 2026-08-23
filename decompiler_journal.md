@@ -10953,3 +10953,33 @@ the PC is the wrong discriminator for hint validity.
 
 That is a sharper statement of the problem than CLAUDE.md's, and it rules out
 the whole PC-based family rather than just the two attempts made against it.
+
+### Why NO PC-based rule can work: name inheritance across writes is INTENTIONAL
+Completing the previous entry. The descriptive names that write-scoping
+destroyed were not stale - they were inherited on purpose.
+
+    local CheckStatReqs = value13.CheckStatReqs(arg1, { .. })
+
+The `Named` hint comes from the `GETTABLEKS .CheckStatReqs`, which writes the
+FUNCTION into the register. The `CALL` then overwrites that register with the
+RESULT, and the result inherits the name. That is correct and desirable - a call
+result named after the function it came from - and it is exactly the pattern a
+"hint recorded before the last write is stale" rule deletes.
+
+So the discriminator is not WHEN the hint was recorded but WHETHER the new value
+DERIVES from the old one:
+
+* `GETTABLEKS` then `CALL` on the same register - the result derives from the
+  function; INHERIT the name.
+* a register reused for an unrelated `Clone()` (`lv_0452`'s R13) - no
+  derivation; DROP the name.
+
+That is a dataflow question, and no PC comparison can answer it. It rules out
+the entire family - re-ranking, scoping, exact-match on the write PC - rather
+than the individual attempts, and it explains why `lv_0452` and the readable
+names in `lv_0210` pull in opposite directions under every rule tried.
+
+A real fix tracks derivation at the write: when an instruction's inputs include
+the register it defines, the hint carries; otherwise it is dropped. That is a
+change to how hints are RECORDED, not how they are selected, and it is the first
+approach in this area that is not already measured and rejected.
