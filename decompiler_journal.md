@@ -11201,3 +11201,40 @@ So the outstanding work in this area is now one sentence long: make the seed
 name allocation aware of enclosing-scope names, and the measured
 1313 -> 1314 clean / 10 -> 9 defects gain from seeded-`Reassign` becomes safe to
 turn on. Everything else here has been measured and rejected.
+
+### Unique seed-name allocation: built, measured, and it does NOT protect rc_0241
+Built the step the previous entry specified: route the seed name through
+`ctx.gen_var` so the arms assign a name the registry has not handed out, then
+mark the register seeded so every arm reassigns it.
+
+The target file is fixed exactly as intended:
+
+    local Text42
+    if arg2 then Text42 = Color3.new(1, 1, 1)
+    else         Text42 = color end
+    Text22.TextColor3 = Text42
+
+and the corpus moves 1313 -> 1314 clean, 10 -> 9 defects.
+
+It still REGRESSES `rc_0241`. Verified against the shipped control rather than
+assumed - the control emits `local Parent6 = DefaultListenerLocation13 ==
+Camera4`, a fresh local, and carries ZERO instances of the clobber. With the
+change it emits `LocalPlayer = DefaultListenerLocation13 == Camera4` over a live
+file-scope `local LocalPlayer = Players.LocalPlayer`.
+
+So `gen_var` does not deliver what the plan assumed. It allocates through
+`gen_scoped_name`, which is PER-PROTO, and the name being trampled belongs to an
+enclosing scope - the same blind spot that defeated the `LocalTracker` guard,
+one level up. Two different mechanisms, one missing capability: nothing in the
+naming layer can currently answer "is this identifier live in an enclosing
+scope?"
+
+Rejected, 0 files differing from shipped.
+
+FINAL STATE OF THIS LINE OF WORK: seeded-`Reassign` is correct and worth
+1313 -> 1314 clean / 10 -> 9 defects. It is blocked on ONE capability that does
+not exist anywhere in the codebase - enclosing-scope name visibility - and both
+places that looked like they might provide it (`LocalTracker::current_names`,
+`DecompileContext::gen_var`) have now been measured and do not. Building that
+visibility is the prerequisite, and it is a real piece of work rather than a
+tweak.
