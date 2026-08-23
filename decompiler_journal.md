@@ -11074,3 +11074,39 @@ changes naming for every register that carries a seed.
 
 This is the first idea in this area that is neither already measured nor ruled
 out by the PC-based analysis, and it is the one to pick up next.
+
+### The seed-plus-barrier composition: MEASURED, and it relocates the problem
+Attempted the idea the previous entry recorded. Added `seed_reg_name` to
+`DecompileContext` - a post-pass hint setter that pushes a `FreshWrite` barrier
+plus the seeded `Named` hint - and called it from the seeder alongside the
+existing `regs[reg] = Name(final_name)`.
+
+Measured: 1313 clean, 10 defects, 5 missing calls - unchanged - across 19
+changed files. Reverted.
+
+But the failure is informative, and it RETIRES the naming hypothesis for this
+family. `rc_0047`'s arm now names itself `Text43` instead of `Text6`, derived
+from the seeded `Text4`. So the hint IS reaching the arm and IS being consulted.
+The arm still emits:
+
+    local Text4
+    if arg2 then
+        local Text43 = RARITY_COLOR[self.gem.rarity] or Color3.new(1, 1, 1)
+    end
+    TextColor34.TextColor3 = Text4          -- still nil
+
+The write is being classified as a FRESH DECLARATION rather than a reassignment
+of the seeded local. That is `LocalTracker::classify_write` returning
+`FirstDecl`/`Shadow` where it should return `Reassign` - a different layer
+entirely from naming.
+
+So the whole naming line of attack is now closed for the seed family:
+* `pin_reg_name` - never set for these registers (measured)
+* pin outranking debug info - no-op (measured)
+* pinning the short-circuit join - no-op, then a regression (measured)
+* PC-scoped hints - loses descriptive names (measured)
+* seeded barrier-backed hint - reaches the arm and changes nothing (measured)
+
+Five ways of telling the arm the right NAME, and the arm was never asking. The
+next attempt belongs in `classify_write`: why does a write to a register the
+seeder has already declared come back as a new declaration?
