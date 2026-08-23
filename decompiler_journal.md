@@ -11238,3 +11238,37 @@ places that looked like they might provide it (`LocalTracker::current_names`,
 `DecompileContext::gen_var`) have now been measured and do not. Building that
 visibility is the prerequisite, and it is a real piece of work rather than a
 tweak.
+
+### CORRECTION: the blocker is not scope visibility, it is UNREGISTERED NAMES
+The previous entry concluded that `gen_var` failed because it allocates
+per-proto and cannot see enclosing scopes. That is WRONG, and the correct
+version is both simpler and more actionable.
+
+`gen_var` DOES consult the global set:
+
+    let name = naming.unique_name(prefix, &self.used_names);
+
+and `unique_name` returns the prefix UNCHANGED when it is free. It handed back
+`LocalPlayer` verbatim, so `LocalPlayer` was never in `used_names` at all.
+
+The reason is recorded at mod.rs:88 - names allocated through the STABLE-HINT
+path deliberately bypass `used_names`, so that a nested proto's `Param(0)` can
+render as `arg1` in both scopes the way Luau shadowing does. `local LocalPlayer
+= Players.LocalPlayer` in the main proto is one of those, so no allocator
+anywhere can avoid colliding with it - the registry it would have to consult was
+never told.
+
+So the prerequisite is NOT enclosing-scope visibility, which would be a large
+piece of work. It is that the seeder needs a name that no OTHER binding holds,
+and the global registry is incomplete by design. The bypass exists for a good
+reason and must not simply be removed - it would force `arg1` to `arg12` in every
+nested proto, which is what its comment warns about.
+
+The tractable shape is a SECOND registry: record every emitted local name,
+including stable-hint ones, purely for collision avoidance, and have the seeder
+allocate against that rather than against `used_names`. It changes no existing
+naming decision, because nothing else consults it.
+
+That is a much smaller job than the previous entry claimed, and it is the last
+thing standing between this codebase and a measured 1313 -> 1314 clean,
+10 -> 9 defects.
