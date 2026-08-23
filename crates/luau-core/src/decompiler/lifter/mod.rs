@@ -1225,7 +1225,9 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    eliminate_dead_code(&mut stmts);
+    if std::env::var("LUAU_NO_DCE").is_err() {
+        eliminate_dead_code(&mut stmts);
+    }
     pass_probe(proto, "eliminate_dead_code", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_code calls={}",
@@ -1243,7 +1245,9 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    eliminate_dead_code(&mut stmts);
+    if std::env::var("LUAU_NO_DCE").is_err() {
+        eliminate_dead_code(&mut stmts);
+    }
     pass_probe(proto, "eliminate_dead_code", &stmts);
     // Phase B0.46A: post-AST repeat-until detection. Catches `repeat ... until`
     // loops that the bytecode-level structuring pass emitted as

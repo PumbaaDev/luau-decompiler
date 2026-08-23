@@ -10400,3 +10400,51 @@ CONVERGES ON THE SAME EXIT AND SOMETHING FOLLOWS IT.
 Only `lv_0124` (5 calls, lifted-then-discarded) still loses calls. Defects
 remaining: 7 `declared_never_assigned`, 3 `name_body_mismatch`,
 3 `branch_local_discarded`, 1 `calls_not_emitted`.
+
+### lv_0124 root cause: the merge point is 5, the construct reaches 50
+Added `LUAU_NO_DCE`, which skips `eliminate_dead_code` so the AST can be read
+before the pass that hides the evidence. Measured inert - 1312 clean, 14
+defects, 5 missing calls, 0 files differing.
+
+It answered `lv_0124` immediately. `LUAU_PASS_TRACE` had already narrowed it:
+
+    after_eliminate_dead_stores calls=7
+    after_eliminate_dead_code   calls=2
+
+and with DCE off the emitted `Update` is:
+
+    if StatTools2 ~= nil then
+    end                                 -- EMPTY arm
+    local ClientCall2 = ClientCall("RetrievePlayerStat", arg2)
+    tbl:Set(arg2, ClientCall2)
+    return ClientCall2                  -- UNCONDITIONAL
+    if v6 then .. else .. end           -- 12 statements, 5 calls, all dead
+
+So DCE is right: the statements after that `return` genuinely are unreachable.
+The damage is done before it. The bytecode:
+
+    1: JUMPXEQKNIL R2 == nil     -> 5     cache == nil  -> fetch path
+    3: JUMPXEQKNIL R1 not == nil -> 50    statName ~= nil -> single-stat path
+    5..49:  the fetch path (the v6 if/else)
+    50..62: the single-stat path
+
+    OOR-XEQK pc=3 target=50 end=5 in_loop=false loop_end=None
+
+The arm of the branch at 1 is ONE BLOCK, [2,5), because the `IfThenElse` region
+reports `merge=Some(5)`. The branch at 3 targets 50, which is past the arm AND
+past `end`, so `extended_arm_end` never even counts it as escaping - `end` is 5.
+Outside a loop the branch is then dropped silently, the arm comes out EMPTY
+(`then_stmts=0 then_blocks=1`), and 50..62 is emitted unconditionally after it.
+Its `return` then kills the real body.
+
+The source is a guard whose BODY SITS LATER IN THE FILE:
+
+    if cache ~= nil and statName ~= nil then <50..62 ; return> end
+    <5..49>
+
+This is NOT the arm-boundary family and `extended_arm_end` cannot reach it: the
+region itself is wrong, not the arm inside it. `find_merge_point` returned 5 for
+a construct that reaches 50. Fixing it means widening the region, in
+`cfg.rs::find_merge_point` or in how `IfThenElse` arms are collected - and any
+attempt must be measured against the whole corpus, because merge points feed
+every branch in every file.
