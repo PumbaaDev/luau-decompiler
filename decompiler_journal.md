@@ -10192,3 +10192,57 @@ That also means widening the family is not the route to `rc_0084`/`rc_0030`/
 `lv_0124`. The route is applying the extension inside `lift_structured_run`,
 where their loss actually happens, and it will need its own gate measured from
 scratch rather than inherited from this one.
+
+### rc_0084 FIXED, and the first justified override of a structure_diff REJECT
+Applied the escaping-branch extension where this family actually loses its code:
+`lift_structured_regions`, not the generic-for arm. `rc_0084 ComputePath`
+structures its arm run 4..112 as
+
+    Linear 13..25      <- JUMPIFNOT at 24 targets 60
+    ValueJoin 25..50
+    Linear 50..112     <- contains JUMP at 59 -> 108, over arm B
+
+Two failures compound. The branch at 24 escapes its span, and OUTSIDE A LOOP an
+escaping branch is discarded silently, so no if/else is ever built. `Linear
+50..112` then follows the unconditional JUMP at 59 straight to 108, skipping
+60..107 - arm B and its three calls, emitted nowhere.
+
+The fix returns the JUMP's target (108) so the span lifts as 13..108, putting
+the branch in range for `detect_else_skip`. Consumption is tracked so a region
+INSIDE the extension is skipped while one STRADDLING it keeps its tail -
+`Linear 50..112` still emits 108..112.
+
+Gates: the branch must be the span's TAIL, its target must escape but stay in
+the run, and the instruction ending at that target - found by walking
+boundaries, never `t - 1`, which can be an AUX word - must be an unconditional
+JUMP forward.
+
+Result: 1308 -> 1309 clean, 18 -> 17 defects, 32 -> 29 missing calls.
+
+OVERRODE A REJECT, and the reasoning matters because this journal has spent all
+session insisting the tool be obeyed. `structure_diff` flagged `lv_0521` and
+`lv_0582` at `if -3, calls +0`. Inspected both. The CONTROL is the degenerate
+one:
+
+    local random6
+    if self.Bias then random6 = random3 * min3   -- a NUMBER
+    else random6 = {1, 1} end                    -- a TABLE
+
+Four separate `if self.Bias then` blocks, each assigning a different variable,
+with type-inconsistent else values - one branch fragmented into four bogus
+value-joins. No compiler emits that. The patched output collapses them into one
+coherent `if self.Linear then .. else .. end` with both arms computing `Value14`.
+The `if` count falls because four fake ifs became one real one.
+
+The other 8 changed files are PURE ADDITIONS, no deletions: `rc_0097
+LegacyCamera` gains 54 lines including a whole Fixed/Attach/Watch camera-type
+dispatch, `lv_0130 Accessory` gains 46 lines of equip logic with its
+`return false` guard.
+
+So the rule stands as "a structuring change must lose nothing", and an if-count
+is a PROXY for that, not the thing itself. Overriding is legitimate only after
+reading the diff and finding the control was wrong - which is the same standard
+that rejected `rc_0054` earlier, applied honestly in the other direction.
+
+probes 9/9 13/13 8/8; tests 1037 pass, 1 pre-existing fail.
+Remaining: `lv_0905` (10), `rc_0030` (9), `lv_0351` (5), `lv_0124` (5) = 29.

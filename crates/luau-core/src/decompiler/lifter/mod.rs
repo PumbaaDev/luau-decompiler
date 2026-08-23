@@ -1986,14 +1986,39 @@ fn lift_structured_regions(
     out: &mut Vec<Stat>,
     in_loop: bool,
 ) {
+    // The run's own bound, taken from the regions rather than a parameter.
+    let run_end = regions
+        .iter()
+        .filter_map(|r| match r {
+            Region::Linear { end, .. } => Some(*end),
+            Region::ValueJoin { join, .. } => Some(*join),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // How far an extended Linear lift already reached. Regions inside it were
+    // lifted as part of that span; a region STRADDLING it keeps its tail.
+    let mut consumed_to = 0usize;
     for sub in regions {
         match sub {
             Region::Linear { start, end } => {
+                if *end <= consumed_to {
+                    continue;
+                }
+                let from = (*start).max(consumed_to);
+                let ext = linear_escape_else_target(&proto.code, from, *end, run_end);
                 lift_instruction_range(
-                    ctx, proto, proto_index, depth, *start, *end, regs, locals, out, in_loop,
+                    ctx, proto, proto_index, depth, from, ext.unwrap_or(*end), regs, locals, out,
+                    in_loop,
                 );
+                if let Some(m) = ext {
+                    consumed_to = m;
+                }
             }
             Region::ValueJoin { entry, arms, join } => {
+                if *join <= consumed_to {
+                    continue;
+                }
                 lift_value_join(
                     ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, out,
                     in_loop,
@@ -4537,6 +4562,86 @@ fn linear_branch_escapes(code: &[u32], start: usize, end: usize, limit: usize) -
         pc += if op.has_aux() { 2 } else { 1 };
     }
     false
+}
+
+/// If the LAST instruction of `[start, end)` is a conditional branch escaping
+/// the span, and the instruction ending at its target is an unconditional JUMP
+/// forward, return that JUMP's target - the merge point of the if/else this
+/// span was cut through the middle of.
+///
+/// `rc_0084 ComputePath` structures its arm run 4..112 as
+///
+///     Linear 13..25      <- JUMPIFNOT at 24 targets 60
+///     ValueJoin 25..50
+///     Linear 50..112     <- contains JUMP at 59 -> 108, over arm B
+///
+/// The branch at 24 escapes its Linear span, and outside a loop an escaping
+/// branch is DISCARDED, so no if/else is built. `Linear 50..112` then follows
+/// the unconditional JUMP at 59 straight to 108, skipping 60..107 - arm B, and
+/// its three calls, emitted nowhere. Returning 108 here lets the span be lifted
+/// as 13..108 so the branch is in range and `detect_else_skip` recovers both
+/// arms.
+fn linear_escape_else_target(
+    code: &[u32],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> Option<usize> {
+    let mut pc = start;
+    let mut last: Option<(usize, LuauOpcode, usize)> = None;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let sz = if op.has_aux() { 2 } else { 1 };
+        last = Some((pc, op, pc + sz));
+        pc += sz;
+    }
+    let (bpc, bop, bend) = last?;
+    // The branch must BE the span's tail; a branch in the middle is ordinary
+    // code, not a construct the span was cut through.
+    if bend != end {
+        return None;
+    }
+    if !matches!(
+        bop,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+    ) {
+        return None;
+    }
+    let t = (bpc as i64 + insn_d(code[bpc]) as i64 + 1) as usize;
+    if t <= end || t > limit {
+        return None;
+    }
+    // Walk boundaries to the instruction ENDING at t - `t - 1` may be an AUX
+    // word, and an AUX word decoded as an opcode is arbitrary.
+    let mut q = end;
+    let mut prev = None;
+    while q < t && q < code.len() {
+        let qop = LuauOpcode::from_u8(insn_op(code[q]));
+        let qsz = if qop.has_aux() { 2 } else { 1 };
+        if q + qsz == t {
+            prev = Some((q, qop));
+            break;
+        }
+        q += qsz;
+    }
+    let (jpc, jop) = prev?;
+    let m = match jop {
+        LuauOpcode::Jump => (jpc as i64 + insn_d(code[jpc]) as i64 + 1) as usize,
+        LuauOpcode::JumpX => (jpc as i64 + insn_e(code[jpc]) as i64 + 1) as usize,
+        _ => return None,
+    };
+    if m > t && m <= limit {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 fn remove_trailing_jump(stmts: &mut Vec<Stat>) {
