@@ -10761,3 +10761,44 @@ cause is understood, but the fix is the largest of the remaining items, not the
 smallest. Widening `find_merge_point` would be the wrong move - it is returning
 the right answer to the question it is asked, and it feeds every branch in
 every file.
+
+### lv_0452: a dropped SETTABLEKS, and the cascade that hides it
+A fresh mechanism, not one of the families already logged. `playCaughtAnimation`
+loses BOTH a `math.min` clamp and a field write, from one root.
+
+Bytecode:
+
+    65: MULK       R13 R14 * K19   ; 0.0125
+    66: ADDK       R12 R13 + K18   ; 0.8
+    67: FASTCALL2K math.min R12 K6 skip=5
+    73: CALL       R13 args=2 results=1        ; math.min(pitch, 2)
+    74: MOVE       R12 R13
+    82: SETTABLEKS R13."Parent" R0             -- EMITTED
+    84: SETTABLEKS R13."PlaybackSpeed" R12     -- LOST
+    86: NAMECALL   R14 R15:"Play"              -- EMITTED
+
+`PlaybackSpeed` and `math.min` each appear ZERO times in the output while both
+sit in the constant pool (K28, and K19/K18 for the arithmetic).
+
+THE CASCADE, established by pass trace rather than assumed:
+
+    simplify_stmts         calls=9
+    eliminate_dead_stores  calls=8
+
+`math.min` IS lifted - it is present at 9 calls. `eliminate_dead_stores` then
+removes it because nothing reads its result, and nothing reads it because the
+SETTABLEKS at 84 that consumed R12 was already gone. So the visible symptom
+(`Workspace5` computed and never read, flagged as `branch_local_discarded`) is
+two removes from the cause.
+
+Also worth recording: the FASTCALL handlers do NOT skip - they only record
+`pending_fastcall` - so the fallback sequence is lifted normally. FASTCALL was
+my first suspect and it is not involved.
+
+ROOT: `SETTABLEKS R13."PlaybackSpeed" R12` at pc 84 is dropped during LIFTING.
+It survives neither with `LUAU_NO_DCE` nor before any post-pass. The adjacent
+`SETTABLEKS R13."Parent" R0` at pc 82 IS emitted, so the difference is the VALUE
+operand - a parameter register versus a computed local - not the target.
+
+That is the next thing to look at, and it is a genuinely different lever from
+the seed family, the frame model, or out-of-order arm bodies.
