@@ -7,7 +7,7 @@ not inside the harness.
 
     Claude Code  ->  unified_proxy (localhost:8770)  ->  Ollama (localhost:11434)
                         |  inject memory + sanitized skills into `system`
-                        |  route local <-> cloud (per-message @cloud / @local marker)
+                        |  route coder <-> thinker (per-message @local / @think marker)
 
 WHY A PROXY, NOT A HOOK: tools/local-claude.ps1 runs `claude --bare`, which turns
 off hooks/LSP/plugins so the 65k window is not eaten by the frontier-tuned global
@@ -24,7 +24,7 @@ a bad fact lookup must never break the terminal. Non /v1/messages paths (model
 lists, tags) are forwarded verbatim.
 
     python tools/unified_proxy.py            # foreground, logs to stderr
-    UNIFIED_PORT=8770 UNIFIED_DEFAULT=local UNIFIED_CLOUD_MODEL=gemma4:cloud python tools/unified_proxy.py
+    UNIFIED_PORT=8770 UNIFIED_DEFAULT=local UNIFIED_THINK_CTX=16384 python tools/unified_proxy.py
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,20 +44,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 PORT = int(os.environ.get("UNIFIED_PORT", "8770"))
 UPSTREAM = os.environ.get("UNIFIED_UPSTREAM", "http://localhost:11434")
 LOCAL_MODEL = os.environ.get("UNIFIED_LOCAL_MODEL", "uncensored-coder")
-CLOUD_MODEL = os.environ.get("UNIFIED_CLOUD_MODEL", "gemma4:cloud")
 THINK_MODEL = os.environ.get("UNIFIED_THINK_MODEL", "uncensored-thinker")  # uncensored reasoner
 THINK_MIN_TOKENS = int(os.environ.get("UNIFIED_THINK_MIN_TOKENS", "8000"))  # room to finish <think>+answer
-DEFAULT_ROUTE = os.environ.get("UNIFIED_DEFAULT", "local").lower()   # local | cloud
+DEFAULT_ROUTE = os.environ.get("UNIFIED_DEFAULT", "local").lower()   # local | think (cloud removed)
+if DEFAULT_ROUTE not in ("local", "think"):                          # a stale -Default cloud must not
+    print("[proxy] UNIFIED_DEFAULT=%r is not local|think; using local" % DEFAULT_ROUTE, file=sys.stderr)
+    DEFAULT_ROUTE = "local"                                          # silently route local while claiming cloud
 FACTS_K = int(os.environ.get("UNIFIED_FACTS_K", "6"))
 SKILL_K = int(os.environ.get("UNIFIED_SKILL_K", "1"))
 FACT_MIN = float(os.environ.get("UNIFIED_FACT_MIN", "12"))    # absolute floor for a fact score
 FACT_REL = float(os.environ.get("UNIFIED_FACT_REL", "0.5"))   # keep facts >= REL * top score
 SKILL_MIN = float(os.environ.get("UNIFIED_SKILL_MIN", "40"))  # skill relevance floor (name/desc)
-# The model's real window and how it is budgeted. Generation room is reserved STRUCTURALLY
-# in fit_window (num_ctx - reserve - margin), NOT by shrinking Claude Code's window - the
-# latter only makes it compact more often. Token estimate is conservative (~3.3 chars/tok,
-# code-heavy) so a code-dense prompt cannot silently exceed num_ctx and get its head cut.
-NUM_CTX = int(os.environ.get("UNIFIED_NUM_CTX", "32768"))       # matches Modelfile.uncensored-coder
+# Each model has its OWN window: the coder is num_ctx 32768, the thinker is 16384 (see their
+# Modelfiles). Budgeting @think against 32768 would silently truncate the thinker's prompt HEAD.
+# Generation room is reserved STRUCTURALLY in fit_window (num_ctx - reserve - margin). Token
+# estimate is conservative (~3.2 chars/tok) so a code-dense prompt cannot under-count and get cut.
+NUM_CTX = int(os.environ.get("UNIFIED_NUM_CTX", "32768"))       # coder window (Modelfile.uncensored-coder)
+THINK_CTX = int(os.environ.get("UNIFIED_THINK_CTX", "16384"))  # thinker window (Modelfile.uncensored-thinker)
 GEN_RESERVE = int(os.environ.get("UNIFIED_GEN_RESERVE", "4096"))  # trigger buffer (real output room = num_ctx - actual input, larger)
 FIT_MARGIN = int(os.environ.get("UNIFIED_FIT_MARGIN", "1024"))
 # The WHOLE per-turn injection (preamble + facts + skill) is bounded by this. Facts AND skill
@@ -124,7 +128,7 @@ def last_user_text(messages) -> str:
 
 
 def detect_marker(text: str):
-    """(route|None, cleaned_text). Honour @cloud/@local only as a standalone token
+    """(route|None, cleaned_text). Honour @local/@think only as a standalone token
     at the start or end; strip only that token, never touch the middle."""
     t = (text or "").strip()
     m = _MARK_LEAD.match(t)
@@ -136,20 +140,22 @@ def detect_marker(text: str):
     return None, text
 
 
-def set_last_user_text(messages, new_text) -> None:
-    """Replace the last user message's text (str, or its first text block) in place."""
+def typed_block(messages):
+    """The (container, key) of the user's TYPED text: the LAST text block of the last user
+    message. Claude Code sends the turn as [system-reminder block(s), typed text], so the
+    marker lives in the LAST block, not the joined string. (None, None) if there is none."""
     for m in reversed(messages or []):
         if m.get("role") != "user":
             continue
         c = m.get("content")
         if isinstance(c, str):
-            m["content"] = new_text
-        elif isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    b["text"] = new_text
-                    break
-        return
+            return m, "content"
+        if isinstance(c, list):
+            for b in reversed(c):
+                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                    return b, "text"
+        return None, None
+    return None, None
 
 
 _HARNESS_IDENTITY = re.compile(r"You are a Claude agent|Anthropic'?s Claude Agent SDK", re.I)
@@ -308,43 +314,72 @@ def _text_holders(payload):
     return holders
 
 
+def _nontext_chars(payload):
+    """Chars that Ollama templates into the prompt but that are NOT plain text holders: the
+    tool SCHEMAS (payload['tools'], ~10k tokens from Claude Code) and tool_use `input` objects
+    in history (a Write/Edit call carries a whole file). Ignoring these under-counted the prompt
+    by ~10k+ tokens, so fit_window declared success while the real prompt overran num_ctx and
+    Ollama dropped the HEAD. Counted, not trimmed (they are structural)."""
+    total = 0
+    tools = payload.get("tools")
+    if tools:
+        try:
+            total += len(json.dumps(tools))
+        except Exception:
+            pass
+    for m in payload.get("messages", []) or []:
+        c = m.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("input"), (dict, list)):
+                    try:
+                        total += len(json.dumps(b["input"]))
+                    except Exception:
+                        pass
+    return total
+
+
 def _est_tokens(payload):
     # ~3.2 chars/token: measured content on this model runs 3.08 (dense/injection) to 3.71
     # (plain) chars/tok. UNDER-counting is the dangerous direction - it lets a prompt exceed
     # num_ctx and Ollama then drops the HEAD (the injected memory + system prompt, the highest
     # value bytes), silently. So bias to the dense end: 3.2 never under-counts real code, and at
     # worst over-trims some OLD tail of a prose-heavy near-max turn (mild, and logged).
-    return (sum(len(c.get(k) or "") for c, k, _ in _text_holders(payload)) * 10) // 32
+    chars = sum(len(c.get(k) or "") for c, k, _ in _text_holders(payload)) + _nontext_chars(payload)
+    return (chars * 10) // 32
 
 
-def cap_output_tokens(payload):
+def cap_output_tokens(payload, num_ctx=NUM_CTX):
     """Bound max_tokens so INPUT + requested OUTPUT cannot exceed num_ctx. Claude Code sends
     max_tokens=32000 every turn; on a 32768 model that alone triggers 'context limit reached'
-    for ANY prompt (input + 32000 > 32768), which is a hard stop even on a tiny request. Cap it
-    to the room actually left after the (already fit_window-trimmed) input. Run AFTER fit_window."""
+    for ANY prompt (input + 32000 > 32768), a hard stop even on a tiny request. Cap it to the
+    room left after the (fit_window-trimmed) input. num_ctx is the CHOSEN model's window (the
+    thinker's 16384 is smaller than the coder's 32768). Run AFTER fit_window."""
     try:
-        room = max(512, NUM_CTX - _est_tokens(payload) - OUT_MARGIN)
+        room = max(512, num_ctx - _est_tokens(payload) - OUT_MARGIN)
         cur = int(payload.get("max_tokens") or 0)
         payload["max_tokens"] = min(cur, room) if cur > 0 else room
     except Exception as e:
         log("cap_output_tokens failed: %s" % e)
 
 
-def fit_window(payload):
-    """BACKSTOP so the request can never exceed num_ctx (which makes Ollama silently drop the
-    prompt HEAD). Two phases: (1) trim the largest NON-protected holder repeatedly - a huge
-    tool_result or old message goes tail-first, the user's current question is spared; (2) if
-    everything trimmable is gone and it is STILL over, the protected current message is itself
-    the bulk (a giant paste), so middle-truncate it (head+tail kept) rather than overflow. If
-    even that leaves it over, log the residual - never return silently oversized. Best-effort."""
+def fit_window(payload, num_ctx=NUM_CTX, reserve=GEN_RESERVE):
+    """BACKSTOP so the request can never exceed the CHOSEN model's num_ctx (which makes Ollama
+    silently drop the prompt HEAD). num_ctx + reserve are per-route: the thinker is 16384 and
+    reserves its full <think> budget. Two phases: (1) trim the largest NON-protected holder
+    repeatedly - a huge tool_result or old message goes tail-first, the user's current question
+    is spared; (2) if everything trimmable is gone and it is STILL over, the protected current
+    message is the bulk (a giant paste), so middle-truncate it. If even that leaves it over, log
+    the residual - never return silently oversized. Best-effort."""
     try:
-        budget = NUM_CTX - GEN_RESERVE - FIT_MARGIN
-        for _ in range(60):                            # converges even with many small holders
+        budget = num_ctx - reserve - FIT_MARGIN
+        floor = 160 + len(_TRUNC)                      # below this, trimming a holder cannot make net progress
+        for _ in range(80):                            # converges even with many small holders
             over = _est_tokens(payload) - budget
             if over <= 0:
                 return
             cands = [(c, k) for c, k, prot in _text_holders(payload)
-                     if not prot and len(c.get(k) or "") > 160]
+                     if not prot and len(c.get(k) or "") > floor]
             if not cands:
                 break
             cont, key = max(cands, key=lambda r: len(r[0].get(r[1]) or ""))
@@ -363,13 +398,16 @@ def fit_window(payload):
                     c[k] = cur[:head].rstrip() + _MIDCUT + cur[len(cur) - (keep - head):].lstrip()
                     break
             if _est_tokens(payload) - budget > 0:
-                log("fit_window: still ~%d est-tok over after full trim" % (_est_tokens(payload) - budget))
+                log("fit_window: still ~%d est-tok over budget %d (num_ctx %d)"
+                    % (_est_tokens(payload) - budget, budget, num_ctx))
     except Exception as e:
         log("fit_window failed: %s" % e)
 
 
 # -- REMEMBER harvest: model findings -> local_mem (Obsidian) ----------------
 _REMEMBER = re.compile(r"REMEMBER:\s*(.+?)(?:\n|$)", re.I)
+_SAVE_LOCK = threading.Lock()                          # ThreadingHTTPServer runs turns concurrently
+_SEEN_FIDS = set()                                     # dedupe under concurrency (path.exists is TOCTOU)
 
 
 def _slugify(t):
@@ -378,25 +416,30 @@ def _slugify(t):
 
 
 def save_finding(fact):
-    """Persist one model finding to local_mem/facts as an Obsidian markdown fact, and
-    append it to the live retrieval set so it is usable THIS session too. Deduped."""
+    """Persist one model finding to local_mem/facts as an Obsidian markdown fact, and append it
+    to the live retrieval set so it is usable THIS session too. Deduped under a lock: two
+    concurrent turns emitting the same REMEMBER line must not both write + double-append it."""
     fact = " ".join((fact or "").split())
     if len(fact) < 20 or len(fact) > 400:
         return
     try:
         fid = "session-" + _slugify(fact)
-        path = FINDINGS_DIR / (fid + ".md")
-        if path.exists():
-            return
-        path.write_text(
-            "---\nid: %s\ntitle: %s\ntype: fact\nauthority: claimed\naliases: []\n"
-            "tags: [session]\nupdated: \nsupersedes: []\n---\n\n%s\n"
-            % (fid, fact[:70], fact), encoding="utf-8")
-        if _FACTS is not None:
-            _FACTS.append({"id": fid, "title": fact[:70], "type": "fact",
-                           "authority": "claimed", "aliases": [], "tags": ["session"],
-                           "supersedes": [], "links": [], "body": fact})
-        log("saved finding -> %s" % fid)
+        with _SAVE_LOCK:                               # check + write + append are one critical section
+            if fid in _SEEN_FIDS:
+                return
+            _SEEN_FIDS.add(fid)
+            path = FINDINGS_DIR / (fid + ".md")
+            if path.exists():
+                return
+            path.write_text(
+                "---\nid: %s\ntitle: %s\ntype: fact\nauthority: claimed\naliases: []\n"
+                "tags: [session]\nupdated: \nsupersedes: []\n---\n\n%s\n"
+                % (fid, fact[:70], fact), encoding="utf-8")
+            if _FACTS is not None:
+                _FACTS.append({"id": fid, "title": fact[:70], "type": "fact",
+                               "authority": "claimed", "aliases": [], "tags": ["session"],
+                               "supersedes": [], "links": [], "body": fact})
+            log("saved finding -> %s" % fid)
     except Exception as e:
         log("save_finding failed: %s" % e)
 
@@ -501,28 +544,35 @@ class Handler(BaseHTTPRequestHandler):
         # /v1/messages: inject + route. Any parse failure -> clean passthrough.
         try:
             payload = json.loads(body)
+            payload.pop("thinking", None)             # NEVER forward Anthropic 'thinking': Ollama may map it to
+                                                      # `think`, which CRASHES qwen3-coder llama-server (0xc0000409),
+                                                      # killing every loaded model. The thinker emits <think> natively.
             strip_harness_identity(payload)           # drop "You are a Claude agent"; our preamble is the identity
             messages = payload.get("messages", [])
-            raw = last_user_text(messages)
-            kind, cleaned = detect_marker(raw)
+            cont, key = typed_block(messages)          # the user's TYPED block (marker lives here, not the join)
+            typed = (cont.get(key) if cont is not None else "") or ""
+            kind, cleaned = detect_marker(typed)
             label = kind or DEFAULT_ROUTE
             model = THINK_MODEL if label == "think" else LOCAL_MODEL  # LOCAL ONLY: cloud removed
-            if kind:                                     # a marker was present -> strip only it
-                set_last_user_text(messages, cleaned)
-            task = cleaned if kind else raw
+            if kind and cont is not None:              # a marker was present -> strip it from THAT block only
+                cont[key] = cleaned
+            task = cleaned if cont is not None else last_user_text(messages)
             ctx, nfacts, skill = build_context(task) if task else ("", 0, "-")
             inject_system(payload, ctx)
             payload["model"] = model
             if label == "think":
-                # a thinking model spends a big budget inside <think>; guarantee room
-                # to finish reasoning AND emit the answer, or the answer comes back empty.
+                nctx, reserve = THINK_CTX, THINK_MIN_TOKENS + OUT_MARGIN
+                # a thinking model spends a big budget inside <think>; reserve its full output
+                # room so the answer is not cut, and floor max_tokens at THINK_MIN_TOKENS.
                 payload["max_tokens"] = max(int(payload.get("max_tokens", 0) or 0), THINK_MIN_TOKENS)
-            fit_window(payload)                      # bound INPUT to fit the window
-            cap_output_tokens(payload)               # bound OUTPUT so input + max_tokens <= num_ctx
+            else:
+                nctx, reserve = NUM_CTX, GEN_RESERVE
+            fit_window(payload, nctx, reserve)       # bound INPUT to the CHOSEN model's window
+            cap_output_tokens(payload, nctx)         # bound OUTPUT so input + max_tokens <= num_ctx
             new_body = json.dumps(payload).encode("utf-8")
-            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  stream=%s"
+            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  ctx=%d  stream=%s"
                 % (label, model, nfacts, skill, _est_tokens(payload),
-                   payload.get("max_tokens"), payload.get("stream", False)))
+                   payload.get("max_tokens"), nctx, payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
             new_body = body

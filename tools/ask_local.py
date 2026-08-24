@@ -75,10 +75,12 @@ def retrieve(rows, query, k=8):
 
 
 def ask(prompt):
+    # NO `think` field: MODEL is qwen3-coder now, which CRASHES llama-server (0xc0000409) if the
+    # field is sent AT ALL - the old `think:False` was for the retired gemma4 default. Let the
+    # Modelfile govern num_ctx (32768) and temperature (0); the old 65536 was a gemma-era value
+    # that on this 30B model goes ~45GB resident and collapses to ~5 tok/s. Only num_predict is set.
     body = json.dumps({"model": MODEL, "prompt": prompt, "stream": False,
-                       "think": False,          # gemma4 returns EMPTY without this
-                       "options": {"num_ctx": 65536, "temperature": 0,
-                                   "num_predict": 4000}}).encode()
+                       "options": {"num_predict": 4000}}).encode()
     req = urllib.request.Request(URL, data=body,
                                  headers={"content-type": "application/json"})
     return json.load(urllib.request.urlopen(req, timeout=600)).get("response", "").strip()

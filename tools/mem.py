@@ -55,6 +55,9 @@ STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "is", "it", "that", "th
 # --------------------------------------------------------------------------- #
 # frontmatter (no pyyaml dependency - a tiny parser for the subset used here)
 # --------------------------------------------------------------------------- #
+_LIST_KEYS = {"aliases", "tags", "supersedes", "links"}
+
+
 def parse_fact(text: str) -> dict:
     fm, body = {}, text
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
@@ -65,11 +68,22 @@ def parse_fact(text: str) -> dict:
                 continue
             k, v = line.split(":", 1)
             k, v = k.strip(), v.strip()
-            if v.startswith("[") and v.endswith("]"):
-                v = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+            # Only the KNOWN list fields become Python lists. A scalar wrapped in brackets
+            # (Obsidian `title: [[Wikilink]]`, `title: [DRAFT]`) must stay a str: turning it
+            # into a list made retrieve()/alias_set crash, and one bad vault note then
+            # silently disabled ALL memory injection (the exception is swallowed per request).
+            if k in _LIST_KEYS and v.startswith("[") and v.endswith("]"):
+                # split on TOP-LEVEL commas only; a quoted item may itself contain a comma
+                items = re.findall(r"'[^']*'|\"[^\"]*\"|[^,]+", v[1:-1])
+                v = [x.strip().strip("'\"") for x in items if x.strip()]
             fm[k] = v
     fm["body"] = body
     return fm
+
+
+def _fmt_list(v) -> str:
+    # quote any item containing a comma/bracket so parse_fact's comma-split round-trips it intact
+    return "[%s]" % ", ".join(("'%s'" % x if any(c in x for c in ",[]") else x) for x in map(str, v))
 
 
 def dump_fact(fm: dict) -> str:
@@ -80,10 +94,11 @@ def dump_fact(fm: dict) -> str:
         v = fm.get(k)
         if v is None:
             continue
-        if isinstance(v, list):
-            lines.append("%s: [%s]" % (k, ", ".join(v)))
-        else:
-            lines.append("%s: %s" % (k, v))
+        lines.append("%s: %s" % (k, _fmt_list(v) if isinstance(v, list) else v))
+    for k, v in fm.items():                      # preserve any custom frontmatter key rather than dropping it
+        if k in order or k == "body" or k.startswith("_") or v is None:
+            continue
+        lines.append("%s: %s" % (k, _fmt_list(v) if isinstance(v, list) else v))
     lines.append("---")
     return "\n".join(lines) + "\n\n" + fm.get("body", "").strip() + "\n"
 
@@ -185,9 +200,10 @@ def tok(s: str) -> list[str]:
 # entities: API-ish names (CamelCase, dotted, v_digits), quoted terms, and numbers
 _ENTITY = re.compile(
     r"`[^`]+`"                              # `backticked`
-    r"|\"[^\"]+\"|'[^']+'"                 # quoted
-    r"|\b[A-Za-z_]\w*(?:[.:]\w+)+\b"       # dotted / colon method  a.b  A:b
-    r"|\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\w*\b"  # CamelCase
+    r"|\"[^\"\n]{1,80}\""                  # "double-quoted term" (bounded, no newline)
+    r"|(?<!\w)'[^'\n]{1,60}'(?!\w)"        # 'single-quoted term' - NOT an apostrophe inside a word
+    r"|\b[A-Za-z_]\w*(?:[.:]\w+)+\b"       # dotted / colon method  a.b  A:b   (what's/Jep's no longer
+    r"|\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\w*\b"  # CamelCase                         span a fake quoted entity)
     r"|\bv\d+\b"                            # register names
     r"|\b\d+(?:\.\d+)?\b"                  # numbers
 )
@@ -207,10 +223,43 @@ def alias_set(f: dict) -> set[str]:
     names = [f.get("id", ""), f.get("title", "")] + f.get("aliases", [])
     s = set()
     for n in names:
+        if not isinstance(n, str):                      # defensive: a stray list title must not crash
+            n = " ".join(map(str, n)) if isinstance(n, list) else str(n)
         s.add(n.lower())
         for e in entities(n):
             s.add(e.lower())
     return s
+
+
+# Per-unit caches, computed once and stored on the dict. retrieve() previously re-tokenized
+# every unit's full body TWICE and ran the entity regex per unit on EVERY call (~144ms over the
+# live 2600-unit corpus); these make repeat retrievals single-digit ms. Facts appended live
+# (session findings) get computed lazily on first use.
+def _unit_toks(f: dict) -> set:
+    t = f.get("_toks")
+    if t is None:
+        t = set(tok(f.get("title", "") + " " + f.get("body", "") + " " + " ".join(f.get("aliases", []))))
+        f["_toks"] = t
+    return t
+
+
+def _unit_alias(f: dict) -> set:
+    a = f.get("_alias")
+    if a is None:
+        a = alias_set(f)
+        f["_alias"] = a
+    return a
+
+
+def _unit_ents(f: dict) -> set:
+    """What this fact 'covers' for the anti-bluff check: id/title/alias entities PLUS the
+    entities named in its BODY, so a term a fact's body defines is never wrongly flagged
+    'NO FACT DEFINES' in the same prompt that supplies the defining fact."""
+    e = f.get("_ents")
+    if e is None:
+        e = set(_unit_alias(f)) | {x.lower() for x in entities(f.get("body", ""))}
+        f["_ents"] = e
+    return e
 
 
 # --------------------------------------------------------------------------- #
@@ -225,8 +274,7 @@ def retrieve(facts: list[dict], query: str, k: int = 6):
 
     df = Counter()
     for f in live:
-        seen = set(tok(f.get("title", "") + " " + f.get("body", "") + " " +
-                        " ".join(f.get("aliases", []))))
+        seen = _unit_toks(f)                            # cached; computed once per unit
         for w in q_terms:
             if w in seen:
                 df[w] += 1
@@ -234,10 +282,9 @@ def retrieve(facts: list[dict], query: str, k: int = 6):
 
     scored = []
     for f in live:
-        text = f.get("title", "") + " " + f.get("body", "") + " " + " ".join(f.get("aliases", []))
-        terms = set(tok(text))
+        terms = _unit_toks(f)
         lex = sum(qc * math.log(1 + n / (1 + df[w])) for w, qc in q_terms.items() if w in terms)
-        ent_hit = len(q_ents & alias_set(f))
+        ent_hit = len(q_ents & _unit_alias(f))
         if lex == 0 and ent_hit == 0:
             continue
         score = lex + 8.0 * ent_hit          # a named-entity match dominates
@@ -261,7 +308,7 @@ def unmet_entities(facts: list[dict], query: str) -> list[str]:
     live, _ = live_facts(facts)
     covered = set()
     for f in live:
-        covered |= alias_set(f)
+        covered |= _unit_ents(f)                        # id/title/alias entities AND body-defined entities
     out = []
     for e in entities(query):
         # numbers alone are not "entities to define"
@@ -308,9 +355,14 @@ def build_prompt(hits, unmet, q: str) -> str:
 
 
 def call_model(prompt: str, model: str) -> str:
+    # Let each Modelfile govern num_ctx (coder 32768 / thinker 16384) and temperature (coder 0
+    # for determinism / thinker 0.6 - greedy makes Qwen3-Thinking loop endlessly). Overriding
+    # them here forced the thinker to temp 0 and halved the coder's window. Only num_predict is
+    # set, and NOT lowered: 1500 truncated the coder's mandated TRACE/EDGE/CODE structure and
+    # starved the thinker's <think> chain, both reading as model failure. NO `think` field -
+    # qwen3-coder crashes llama-server (0xc0000409) if it is sent at all.
     body = json.dumps({"model": model, "prompt": prompt, "stream": False,
-                       "options": {"num_ctx": 16384, "temperature": 0,
-                                   "num_predict": 1500}}).encode()
+                       "options": {"num_predict": 8000}}).encode()
     req = urllib.request.Request(URL, data=body, headers={"content-type": "application/json"})
     return json.load(urllib.request.urlopen(req, timeout=600)).get("response", "").strip()
 
@@ -360,11 +412,15 @@ def cmd_add(args) -> int:
 
 
 def cmd_supersede(args) -> int:
+    if args.old == args.new:                          # self-supersession removes the fact entirely
+        sys.exit("a fact cannot supersede itself: %s" % args.new)
     facts = {f["id"]: f for f in load_facts()}
     if args.new not in facts:
         sys.exit("no such fact: %s" % args.new)
     if args.old not in facts:
         sys.exit("no such fact: %s" % args.old)
+    if args.new in facts[args.old].get("supersedes", []):   # mutual supersession hides BOTH facts
+        sys.exit("cycle: %s already supersedes %s - refusing" % (args.old, args.new))
     fm = facts[args.new]
     sup = set(fm.get("supersedes", [])) | {args.old}
     fm["supersedes"] = sorted(sup)
@@ -384,9 +440,21 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _corpus(args) -> list:
+    """load_facts, plus load_vault when --vault, so the CLI debug view matches what the proxy
+    actually retrieves over (facts + vault). Without it, search/ask show a different ranking."""
+    facts = load_facts()
+    if getattr(args, "vault", False):
+        try:
+            facts = facts + load_vault()
+        except Exception as e:
+            print("vault load failed: %s" % e, file=sys.stderr)
+    return facts
+
+
 def cmd_search(args) -> int:
     q = " ".join(args.query)
-    facts = load_facts()
+    facts = _corpus(args)
     hits = retrieve(facts, q, args.k)
     unmet = unmet_entities(facts, q)
     print("query entities: %s" % (entities(q) or "none"))
@@ -398,7 +466,7 @@ def cmd_search(args) -> int:
 
 def cmd_ask(args) -> int:
     q = " ".join(args.question)
-    facts = load_facts()
+    facts = _corpus(args)
     hits = retrieve(facts, q, args.k)
     unmet = unmet_entities(facts, q)
     if args.show:
@@ -430,12 +498,14 @@ def main() -> int:
     l = sub.add_parser("list"); l.add_argument("--type", default=None)
 
     se = sub.add_parser("search"); se.add_argument("query", nargs="+"); se.add_argument("--k", type=int, default=6)
+    se.add_argument("--vault", action="store_true", help="include the Obsidian vault, as the proxy does")
 
     q = sub.add_parser("ask")
     q.add_argument("question", nargs="+")
     q.add_argument("--k", type=int, default=6)
     q.add_argument("--model", default=MODEL)
     q.add_argument("--show", action="store_true")
+    q.add_argument("--vault", action="store_true", help="include the Obsidian vault, as the proxy does")
 
     args = ap.parse_args()
     return {"build": lambda a: build_index(), "add": cmd_add, "supersede": cmd_supersede,

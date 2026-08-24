@@ -1,39 +1,45 @@
 <#
     THE unified terminal. One Claude Code terminal, one endpoint, everything behind it:
 
-      Claude Code  ->  unified_proxy (:8770)  ->  Ollama (:11434 local | cloud)
-                          injects memory (916 facts) + a sanitized, uncensored skill
-                          routes local <-> cloud per message marker
+      Claude Code  ->  unified_proxy (:8770)  ->  Ollama (:11434, LOCAL ONLY)
+                          injects memory + a sanitized, uncensored skill every turn
+                          routes coder <-> thinker per message marker (@local / @think)
 
     You type in one place. Every turn auto-gets the relevant project facts and, when
     the task matches one, a sanitized skill (refusal/disclaimer lines stripped, so the
-    abliterated model is never re-censored). Route a single turn to the cloud engine by
-    putting @cloud in the message; @local forces local. Default is local (free, offline,
-    uncensored).
+    abliterated model is never re-censored). Route a single turn to the reasoning model
+    by putting @think in the message; @local forces the coder. Default is local (free,
+    offline, uncensored). Cloud was removed - both engines are local.
 
-    This works under `claude --bare` (hooks/plugins off for the 65k window) because the
+    This works under `claude --bare` (hooks/plugins off for the 32k window) because the
     proxy injects at the HTTP layer, not via a hook.
 
     Usage:  .\tools\oneclaude.ps1
-            .\tools\oneclaude.ps1 -Default cloud          # default route = cloud
+            .\tools\oneclaude.ps1 -Default think          # default route = the reasoning model
             .\tools\oneclaude.ps1 -Model uncensored-coder-q6
             .\tools\oneclaude.ps1 -NoMcp -p "one-shot prompt"
 #>
 param(
     [string]$Model   = "uncensored-coder",
-    [ValidateSet("local", "cloud")][string]$Default = "local",
+    [ValidateSet("local", "think")][string]$Default = "local",
     [string]$Effort  = "low",
-    [switch]$WithMcp   # curated MCP is OFF by default: a 16384-ctx local model overflows
-)                      # on their tool schemas (measured: "hi" alone = 24208 tokens WITH MCP,
-                       # over the 16384 window; with no MCP it fits and answers).
+    [switch]$WithMcp   # curated MCP is OFF by default: the local model overflows on their tool
+)                      # schemas (measured: "hi" alone = 24208 tokens WITH MCP, over the 24000
+                       # harness budget; with no MCP it fits and answers).
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
 $proxyPort = 8770
 
-# -- 1. Ollama server up. Set the E: model store BEFORE `ollama serve` starts,
-#       or it starts against the wrong store and cannot find uncensored-coder.
-$env:OLLAMA_MODELS = "E:\ollama-models"
+# -- 1. Ollama server up. Set the E: model store AND the KV-cache config BEFORE `ollama serve`
+#       starts, so the serve process inherits them. The coder ships num_ctx 32768, which
+#       Modelfile.uncensored-coder says REQUIRES a q8_0 KV cache to fit the 16GB card (else it
+#       goes ~45GB resident and collapses to ~5 tok/s). Relying on the persisted User-scope vars
+#       is fragile - set them here so a fresh machine / cleared env cannot silently degrade.
+$env:OLLAMA_MODELS         = "E:\ollama-models"
+$env:OLLAMA_KV_CACHE_TYPE  = "q8_0"
+$env:OLLAMA_FLASH_ATTENTION = "1"
+$env:OLLAMA_NUM_PARALLEL   = "1"        # one GPU, one 18GB model: serialise (else N KV slots)
 $ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 try {
     Invoke-WebRequest "http://localhost:11434/api/tags" -TimeoutSec 8 -UseBasicParsing | Out-Null
@@ -49,8 +55,6 @@ try {
 #       the flags are never silently ignored by a stale proxy.
 function Start-UnifiedProxy {
     Write-Host "starting unified proxy on :$proxyPort ..." -ForegroundColor Yellow
-    $env:OLLAMA_MODELS       = "E:\ollama-models"
-    $env:OLLAMA_NUM_PARALLEL = "1"
     $env:PYTHONIOENCODING    = "utf-8"
     $env:UNIFIED_DEFAULT     = $Default
     $env:UNIFIED_LOCAL_MODEL = $Model
@@ -108,13 +112,13 @@ if (-not $WithMcp -or -not (Test-Path $mcpFile)) {
 $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
 ('{"effortLevel":"' + $Effort + '"}') | Out-File -FilePath $settingsFile -Encoding ascii -NoNewline
 
-$mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (16384 ctx cannot hold MCP schemas)" }
+$mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (local ctx cannot hold MCP schemas)" }
 Write-Host ""
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
 Write-Host "  engines (LOCAL ONLY, both uncensored): @local=$Model (codes)  @think=uncensored-thinker (reasons)" -ForegroundColor Green
 Write-Host "  every turn: memory + vault + sanitized skill injected via :$proxyPort; Claude-agent identity stripped" -ForegroundColor DarkGray
 Write-Host "  route one turn: put @local or @think in the message (default $Default) - no cloud" -ForegroundColor DarkGray
-Write-Host "  ctx=65536  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
+Write-Host "  coder ctx=32768  thinker ctx=16384  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
 Write-Host ""
 
 & "C:\Users\jep\.local\bin\claude.exe" `

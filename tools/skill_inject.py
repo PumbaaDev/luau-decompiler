@@ -57,12 +57,14 @@ FORCE_LOCAL = {
     "coding-standards", "regex-vs-llm-structured-text", "article-writing",
 }
 
-# external-dependency signals (a match => GATED unless FORCE_LOCAL)
+# external-dependency signals (a match => GATED unless FORCE_LOCAL). Each alternative carries
+# its OWN boundaries: an outer \b(...)\b could never anchor after a token ending in '_' (mcp__)
+# or a space (curl ), so `mcp__memory__search` and `curl -H ...` silently never gated.
 _GATE = re.compile(
-    r"\b(websearch|webfetch|web search|exa[_-]?search|browser|playwright|scrape|"
-    r"crawl|https?://|curl |mcp__|oauth|bearer token|access token|api[_ ]?key|"
-    r"\bgmail\b|google (drive|calendar)|\bslack\b|\bnotion\b|\bjira\b|youtube|"
-    r"elevenlabs|\bstripe\b|\bairtable\b|connector)\b", re.I)
+    r"websearch|webfetch|web search|exa[_-]?search|\bbrowser\b|\bplaywright\b|\bscrape\b|"
+    r"\bcrawl\b|https?://|\bcurl\b|mcp__[a-z0-9]+|\boauth\b|bearer token|access token|api[_ ]?key|"
+    r"\bgmail\b|google (?:drive|calendar)|\bslack\b|\bnotion\b|\bjira\b|\byoutube\b|"
+    r"\belevenlabs\b|\bstripe\b|\bairtable\b|\bconnector\b", re.I)
 
 # Refusal / disclaimer lines to STRIP before injection. Anchored to FIRST-PERSON /
 # IMPERATIVE refusal and true disclaimer sentences, so ordinary technical prose is
@@ -143,7 +145,10 @@ def classify(sk: dict) -> str:
     # does not USE them).
     if n.endswith("-reference"):
         return "local"
-    hay = sk["desc"] + "\n" + sk["body"][:4000]
+    # Scan the WHOLE body, not a 4000-char slice: knowledge-ops' first mcp__ reference sits at
+    # offset ~5336 and was invisible, so an MCP-driven skill leaked as local. classify() runs
+    # once per skill at discover time (cached), so full-body gate matching is not a hot path.
+    hay = sk["desc"] + "\n" + sk["body"]
     return "gated" if _GATE.search(hay) else "local"
 
 
@@ -221,7 +226,7 @@ def rank(task: str, skills: list[dict]) -> list[tuple[float, dict]]:
     return scored
 
 
-def build_injection(task: str, k: int = 1, min_score: float = 0.0) -> str:
+def build_injection(task: str, k: int = 1, min_score: float = 0.0, max_chars: int = 8000) -> str:
     skills = discover()
     # A skill qualifies on its DECLARED PURPOSE: a name-token match, or >=2
     # description matches. One coincidental token (e.g. "width" from INSTR_WIDTH
@@ -241,7 +246,12 @@ def build_injection(task: str, k: int = 1, min_score: float = 0.0) -> str:
             blocks.append("Offline scripts available in %s/scripts/: %s"
                           % (sk["dir"], ", ".join(sk["scripts"])))
         blocks.append(clean)
-    return "\n\n".join(blocks).strip() + "\n"
+    out = "\n\n".join(blocks).strip() + "\n"
+    # Bound the result for EVERY caller (ask_local applies no cap of its own; the proxy caps
+    # further). A full SKILL.md is ~20k chars and would otherwise crowd out the retrieved notes.
+    if max_chars and len(out) > max_chars:
+        out = out[:max_chars].rstrip() + "\n[...skill truncated to fit]\n"
+    return out
 
 
 def main() -> int:
