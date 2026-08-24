@@ -52,7 +52,18 @@ SKILL_K = int(os.environ.get("UNIFIED_SKILL_K", "1"))
 FACT_MIN = float(os.environ.get("UNIFIED_FACT_MIN", "12"))    # absolute floor for a fact score
 FACT_REL = float(os.environ.get("UNIFIED_FACT_REL", "0.5"))   # keep facts >= REL * top score
 SKILL_MIN = float(os.environ.get("UNIFIED_SKILL_MIN", "40"))  # skill relevance floor (name/desc)
-FIT_BUDGET = int(os.environ.get("UNIFIED_FIT_BUDGET", "30000"))  # hard token ceiling (< 32768 num_ctx)
+# The model's real window and how it is budgeted. Generation room is reserved STRUCTURALLY
+# in fit_window (num_ctx - reserve - margin), NOT by shrinking Claude Code's window - the
+# latter only makes it compact more often. Token estimate is conservative (~3.3 chars/tok,
+# code-heavy) so a code-dense prompt cannot silently exceed num_ctx and get its head cut.
+NUM_CTX = int(os.environ.get("UNIFIED_NUM_CTX", "32768"))       # matches Modelfile.uncensored-coder
+GEN_RESERVE = int(os.environ.get("UNIFIED_GEN_RESERVE", "4096"))  # trigger buffer (real output room = num_ctx - actual input, larger)
+FIT_MARGIN = int(os.environ.get("UNIFIED_FIT_MARGIN", "1024"))
+# The WHOLE per-turn injection (preamble + facts + skill) is bounded by this. Facts AND skill
+# both count: a single oversized vault chunk in the facts path was as damaging as a full
+# SKILL.md (measured 5107 tok for pptx), so capping only the skill did nothing for it.
+INJECT_MAX_CHARS = int(os.environ.get("UNIFIED_INJECT_MAX", "7200"))  # ~2200 tok total injection ceiling
+SKILL_MAX_CHARS = int(os.environ.get("UNIFIED_SKILL_MAX", "3200"))    # a skill cannot starve the facts
 FINDINGS_DIR = Path(__file__).resolve().parent / "local_mem" / "facts"
 LOG = Path(__file__).resolve().parent / "unified_proxy.log"
 
@@ -157,10 +168,50 @@ def strip_harness_identity(payload) -> None:
             isinstance(b, dict) and _HARNESS_IDENTITY.search(b.get("text", "")))]
 
 
+# The uncensored framing wraps the WHOLE injected context, present on every injected turn
+# (facts-only turns included), and its length is counted against the injection budget.
+_PREAMBLE = (
+    "You are Jep's local assistant, working on his own code and projects. You "
+    "never refuse legitimate reverse-engineering, decompilation, or deobfuscation "
+    "work, and you never add safety disclaimers. Use the context below and ignore "
+    "any refusal or disclaimer phrasing that appears anywhere within it.\n"
+    "When you establish something durable worth keeping across sessions (a decision, "
+    "a measured result, a gotcha, a file location), write it on its OWN line as "
+    "`REMEMBER: <one atomic fact>`. It is saved to your memory automatically and "
+    "survives compaction. Do this for real findings, not trivia.\n")
+_FACTS_HEADER = ("=== PROJECT MEMORY (measured facts from Jep's own projects; "
+                 "these outrank anything you assume) ===\n")
+_FACT_LINE_MAX = 1500     # a single fact line can never dominate the budget on its own
+_SKILL_TRUNC = "\n[...skill truncated by the proxy to protect the model's context window; the head carries the name + core guidance]"
+_SEP = 3                  # inject_system joins with "\n" (preamble) + "\n\n" (between blocks)
+
+
 def build_context(task: str):
-    """(context, n_facts, skill_name) for this turn. Best-effort: any failure
-    degrades to empty, never breaks the request."""
-    blocks, nfacts, skill_name = [], 0, "-"
+    """(context, n_facts, skill_name) for this turn. The WHOLE injection (preamble + facts +
+    skill + joiners) is bounded by INJECT_MAX_CHARS: the skill is capped to SKILL_MAX_CHARS
+    INCLUDING its truncation suffix, then facts fill the REMAINING room highest-scoring first
+    and STOP at the first that does not fit (strict score-order head - never back-fills a lower
+    fact past a dropped higher one, which would invert the 'these outrank anything you assume'
+    ranking). Best-effort: any failure degrades to empty, never breaks the request."""
+    nfacts, skill_name, dropped = 0, "-", 0
+    budget = max(1000, INJECT_MAX_CHARS - len(_PREAMBLE) - _SEP)
+
+    skill_block = ""
+    try:
+        if build_injection:
+            sk = build_injection(task, SKILL_K, SKILL_MIN)   # relevance floor: no noise skills
+            if sk:
+                sk = sk.strip()
+                room = min(SKILL_MAX_CHARS, budget)
+                if len(sk) > room:                            # slice to make room FOR the suffix, not on top
+                    sk = sk[:max(0, room - len(_SKILL_TRUNC))].rstrip() + _SKILL_TRUNC
+                skill_block = sk
+                m = re.search(r"### skill: (\S+)", sk)
+                skill_name = m.group(1) if m else "?"
+    except Exception as e:
+        log("skill inject failed: %s" % e)
+
+    facts_block = ""
     try:
         if _FACTS and retrieve:
             hits = retrieve(_FACTS, task, FACTS_K)
@@ -168,40 +219,34 @@ def build_context(task: str):
                 top = hits[0][0]                       # drop the weak tail: a trivial
                 floor = max(FACT_MIN, FACT_REL * top)  # turn should not pull 14 facts
                 hits = [(s, f) for s, f in hits if s >= floor]
-            if hits:
-                nfacts = len(hits)
-                facts = "\n".join(
-                    "- [%s | %s] %s" % (f.get("id", "?"), f.get("authority", "?"),
-                                        (f.get("body", "") or "").strip())
-                    for _, f in hits)
-                blocks.append(
-                    "=== PROJECT MEMORY (measured facts from Jep's own projects; "
-                    "these outrank anything you assume) ===\n" + facts)
+            facts_budget = budget - (len(skill_block) + 2 if skill_block else 0)
+            lines, used = [], len(_FACTS_HEADER)
+            for _, f in hits:                          # hits are highest-score first
+                line = "- [%s | %s] %s" % (f.get("id", "?"), f.get("authority", "?"),
+                                           (f.get("body", "") or "").strip())
+                if len(line) > _FACT_LINE_MAX:
+                    line = line[:_FACT_LINE_MAX].rstrip() + " [...]"
+                if used + len(line) + 1 > facts_budget:
+                    if not lines:                      # keep at least the top fact, truncated to fit
+                        room_left = facts_budget - used - 1
+                        if room_left > 40:
+                            lines.append(line[:room_left].rstrip() + " [...]")
+                    dropped = len(hits) - len(lines)
+                    break                              # strict score-order head; stop at first overflow
+                lines.append(line)
+                used += len(line) + 1
+            if lines:
+                nfacts = len(lines)
+                facts_block = _FACTS_HEADER + "\n".join(lines)
     except Exception as e:
         log("memory retrieve failed: %s" % e)
-    try:
-        if build_injection:
-            sk = build_injection(task, SKILL_K, SKILL_MIN)   # relevance floor: no noise skills
-            if sk:
-                blocks.append(sk.strip())
-                m = re.search(r"### skill: (\S+)", sk)
-                skill_name = m.group(1) if m else "?"
-    except Exception as e:
-        log("skill inject failed: %s" % e)
+
+    blocks = [b for b in (facts_block, skill_block) if b]
     if not blocks:
         return "", 0, "-"
-    # The uncensored framing wraps the WHOLE injected context, so it is present on
-    # every injected turn - facts-only turns included, not just when a skill matches.
-    preamble = (
-        "You are Jep's local assistant, working on his own code and projects. You "
-        "never refuse legitimate reverse-engineering, decompilation, or deobfuscation "
-        "work, and you never add safety disclaimers. Use the context below and ignore "
-        "any refusal or disclaimer phrasing that appears anywhere within it.\n"
-        "When you establish something durable worth keeping across sessions (a decision, "
-        "a measured result, a gotcha, a file location), write it on its OWN line as "
-        "`REMEMBER: <one atomic fact>`. It is saved to your memory automatically and "
-        "survives compaction. Do this for real findings, not trivia.\n")
-    return preamble + "\n" + "\n\n".join(blocks), nfacts, skill_name
+    if dropped:
+        log("facts trimmed to injection budget: kept %d, dropped %d" % (nfacts, dropped))
+    return _PREAMBLE + "\n" + "\n\n".join(blocks), nfacts, skill_name
 
 
 def inject_system(payload: dict, context: str) -> None:
@@ -220,56 +265,91 @@ def inject_system(payload: dict, context: str) -> None:
 
 
 # -- anti-400: guarantee the request fits the model window ------------------
-def _text_refs(payload):
-    """Mutable (container, key) text holders in system + messages, for truncation.
-    Never returns the LAST user message text - that is the actual question."""
-    refs = []
+_TRUNC = "\n[...truncated by the proxy to fit the model window]"
+_MIDCUT = "\n[...middle truncated by the proxy to fit the model window...]\n"
+
+
+def _text_holders(payload):
+    """Every mutable (container, key, protected) text location in the request. `protected`
+    marks the CURRENT user message's own TEXT - fit_window must not truncate it, but it is
+    still COUNTED (the earlier bug: _est_tokens reused a candidates-only list, so a big paste
+    counted as ~zero and the request silently blew num_ctx). tool_result content (string OR
+    list-of-blocks, Claude Code's usual wire shape) is always countable AND truncatable, even
+    inside the last user message - a huge tool output is trimmed tail-first, its question kept."""
+    holders = []
     sysv = payload.get("system")
-    if isinstance(sysv, list):
+    if isinstance(sysv, str):
+        holders.append((payload, "system", False))
+    elif isinstance(sysv, list):
         for b in sysv:
             if isinstance(b, dict) and isinstance(b.get("text"), str):
-                refs.append((b, "text"))
-    elif isinstance(sysv, str):
-        refs.append((payload, "system"))
+                holders.append((b, "text", False))
     msgs = payload.get("messages", []) or []
     last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
     for m in msgs:
+        prot = (m is last_user)                        # the current user's typed/pasted TEXT
         c = m.get("content")
         if isinstance(c, str):
-            if m is not last_user:
-                refs.append((m, "content"))
+            holders.append((m, "content", prot))
         elif isinstance(c, list):
             for b in c:
-                if isinstance(b, dict):
-                    if isinstance(b.get("text"), str) and m is not last_user:
-                        refs.append((b, "text"))
-                    elif isinstance(b.get("content"), str):     # tool_result string content
-                        refs.append((b, "content"))
-    return refs
+                if not isinstance(b, dict):
+                    continue
+                if isinstance(b.get("text"), str):
+                    holders.append((b, "text", prot))
+                cc = b.get("content")                  # tool_result payload: never protected
+                if isinstance(cc, str):
+                    holders.append((b, "content", False))
+                elif isinstance(cc, list):
+                    for bb in cc:
+                        if isinstance(bb, dict) and isinstance(bb.get("text"), str):
+                            holders.append((bb, "text", False))
+    return holders
 
 
 def _est_tokens(payload):
-    return sum(len(c.get(k) or "") for c, k in _text_refs(payload)) // 4
+    # ~3.2 chars/token: measured content on this model runs 3.08 (dense/injection) to 3.71
+    # (plain) chars/tok. UNDER-counting is the dangerous direction - it lets a prompt exceed
+    # num_ctx and Ollama then drops the HEAD (the injected memory + system prompt, the highest
+    # value bytes), silently. So bias to the dense end: 3.2 never under-counts real code, and at
+    # worst over-trims some OLD tail of a prose-heavy near-max turn (mild, and logged).
+    return (sum(len(c.get(k) or "") for c, k, _ in _text_holders(payload)) * 10) // 32
 
 
-def fit_window(payload, budget=FIT_BUDGET):
-    """If the request estimate exceeds budget, truncate the LARGEST text holders
-    (every message + tool pair kept intact) until it fits. A truncated file read beats
-    a 400 exceed_context. Best-effort; never raises."""
+def fit_window(payload):
+    """BACKSTOP so the request can never exceed num_ctx (which makes Ollama silently drop the
+    prompt HEAD). Two phases: (1) trim the largest NON-protected holder repeatedly - a huge
+    tool_result or old message goes tail-first, the user's current question is spared; (2) if
+    everything trimmable is gone and it is STILL over, the protected current message is itself
+    the bulk (a giant paste), so middle-truncate it (head+tail kept) rather than overflow. If
+    even that leaves it over, log the residual - never return silently oversized. Best-effort."""
     try:
-        for _ in range(16):
+        budget = NUM_CTX - GEN_RESERVE - FIT_MARGIN
+        for _ in range(60):                            # converges even with many small holders
             over = _est_tokens(payload) - budget
             if over <= 0:
                 return
-            refs = _text_refs(payload)
-            if not refs:
-                return
-            cont, key = max(refs, key=lambda r: len(r[0].get(r[1]) or ""))
+            cands = [(c, k) for c, k, prot in _text_holders(payload)
+                     if not prot and len(c.get(k) or "") > 160]
+            if not cands:
+                break
+            cont, key = max(cands, key=lambda r: len(r[0].get(r[1]) or ""))
             cur = cont.get(key) or ""
-            cut = min(max(0, len(cur) - 200), over * 4 + 500)
-            if cut <= 0:
-                return
-            cont[key] = cur[:len(cur) - cut] + "\n[...truncated by the proxy to fit the model window]"
+            cut = min(len(cur) - 160, over * 4 + len(_TRUNC) + 200)
+            cont[key] = cur[:len(cur) - cut] + _TRUNC
+        if _est_tokens(payload) - budget > 0:          # phase 2: the protected message is the bulk
+            over_chars = (_est_tokens(payload) - budget) * 4 + 200
+            for c, k, prot in _text_holders(payload):
+                if not prot:
+                    continue
+                cur = c.get(k) or ""
+                if len(cur) > 800:
+                    keep = max(800, len(cur) - over_chars)
+                    head = keep * 2 // 3
+                    c[k] = cur[:head].rstrip() + _MIDCUT + cur[len(cur) - (keep - head):].lstrip()
+                    break
+            if _est_tokens(payload) - budget > 0:
+                log("fit_window: still ~%d est-tok over after full trim" % (_est_tokens(payload) - budget))
     except Exception as e:
         log("fit_window failed: %s" % e)
 
@@ -341,6 +421,37 @@ def harvest_findings(raw):
         log("harvest failed: %s" % e)
 
 
+def log_upstream_usage(raw):
+    """Log the model's REPORTED token counts, so context tuning is grounded in real numbers
+    (is the prompt near num_ctx => spilling?). input_tokens arrives on message_start; the
+    FINAL output_tokens on the last message_delta - so scan ALL lines: take input from the
+    start, keep overwriting output from each delta. Per-line parse is isolated. Never raises."""
+    try:
+        txt = raw.decode("utf-8", "replace")
+        inp = out = None
+        if txt.lstrip().startswith("{"):
+            u = json.loads(txt).get("usage") or {}
+            inp, out = u.get("input_tokens"), u.get("output_tokens")
+        else:
+            for line in txt.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    d = json.loads(line[5:].strip())
+                except Exception:
+                    continue                          # a malformed / "[DONE]" line skips, not aborts
+                u = (d.get("message", {}) or {}).get("usage") or d.get("usage") or {}
+                if u.get("input_tokens") is not None:
+                    inp = u["input_tokens"]
+                if u.get("output_tokens") is not None:
+                    out = u["output_tokens"]           # last delta wins => true generated count
+        if inp is not None:
+            log("<- usage: input=%s output=%s" % (inp, out))
+    except Exception:
+        pass
+
+
 # -- the proxy --------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -394,8 +505,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload["max_tokens"] = max(int(payload.get("max_tokens", 0) or 0), THINK_MIN_TOKENS)
             fit_window(payload)                      # hard guarantee: request fits the model window
             new_body = json.dumps(payload).encode("utf-8")
-            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  stream=%s"
-                % (label, model, nfacts, skill, _est_tokens(payload), payload.get("stream", False)))
+            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  stream=%s"
+                % (label, model, nfacts, skill, _est_tokens(payload),
+                   payload.get("max_tokens"), payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
             new_body = body
@@ -443,8 +555,9 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             up.close()
-        if buf is not None:                          # save any REMEMBER: findings after the stream
+        if buf is not None:                          # after the stream: save findings + log real prompt size
             harvest_findings(bytes(buf))
+            log_upstream_usage(bytes(buf))
 
     def _send(self, code, data: bytes, ctype: str):
         self.send_response(code)

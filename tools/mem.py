@@ -118,9 +118,25 @@ VAULT_CHUNK = 700
 
 
 def _chunks(text: str, size: int = VAULT_CHUNK) -> list[str]:
-    """Group paragraphs into chunks of up to ~size chars, so a retrieved vault unit
-    is bounded (a raw 5KB note would blow the injection budget)."""
-    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    """Group paragraphs into chunks of up to ~size chars, so a retrieved vault unit is
+    bounded. A SINGLE paragraph longer than `size` (a blank-line-free code block or table)
+    is HARD-SPLIT first - without this it became one arbitrarily large chunk (measured:
+    19,603 / 16,247 / 8,178 chars in the live vault) that sailed past the injection cap and
+    re-inflated the model's window, the exact bug the cap exists to prevent."""
+    size = max(2, size)                    # a 0/negative size would spin the while-loop forever
+    raw = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    paras = []
+    for p in raw:
+        while len(p) > size:
+            cut = p.rfind("\n", size // 2, size)   # prefer a line boundary in the back half
+            if cut <= 0:
+                cut = size                          # no line break: hard cut at size (>= size//2, so p shrinks)
+            seg = p[:cut].strip()
+            if seg:
+                paras.append(seg)
+            p = p[cut:].strip()
+        if p:
+            paras.append(p)
     out, cur = [], ""
     for p in paras:
         if cur and len(cur) + len(p) + 2 > size:

@@ -87,11 +87,14 @@ $env:ANTHROPIC_MODEL            = $Model
 $env:ANTHROPIC_SMALL_FAST_MODEL = $Model
 $env:MAX_THINKING_TOKENS        = "2048"
 # Tell Claude Code the model's REAL window so it auto-compacts BEFORE overflowing.
-# The model's num_ctx is 32768; the proxy also injects ~2-3k of memory+skill on top,
-# so cap Claude Code's managed context below 32768 to leave that headroom. Set to
-# 65536 (a stale value) it let a multi-file task grow to 41729 tokens and the model
-# 400'd (request > 32768). 28000 -> Claude Code compacts ~22k, request stays < 32768.
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "28000"
+# The model's num_ctx is 32768. Set this so a FULL, code-heavy Claude Code window plus the
+# capped injection still sits UNDER fit_window's budget, so the proxy backstop stays dormant
+# in normal operation and only fires on a genuine overflow (a huge paste / tool result). The
+# honest ceiling measured from real usage: 32768 - GEN_RESERVE(4096) - margin(1024) - injection
+# (~2300 real tok) ~= 25300, and at ~3.2-3.4 real chars/tok a 24000-token code-heavy transcript
+# + 7.2KB injection estimates just under fit_window's 27648. So 24000 keeps the backstop quiet;
+# fit_window (not this value) reserves the generation room, so it need not be squeezed further.
+$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "24000"
 
 Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CODE_SESSION_ID    -ErrorAction SilentlyContinue
