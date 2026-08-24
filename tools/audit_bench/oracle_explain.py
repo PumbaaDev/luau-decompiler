@@ -189,10 +189,43 @@ def _extra_line(e):
     return "- **%s**%s `[%s]` — %s" % (tag, loc, e["kind"], e["explanation"] or e["detail"])
 
 
+def write_audit_xlsx(rows, path):
+    """Export audit findings to a spreadsheet. Built on the xlsx skill's guidance
+    (openpyxl, bold + frozen header, auto-width, auto-filter). DETERMINISTIC: this
+    export never calls the model, so nothing in the xlsx path can be censored - only
+    the defect explanations come from the (uncensored) model, upstream of here."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+    except ImportError:
+        print("openpyxl not installed; skipping xlsx  (pip install openpyxl)")
+        return None
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Audit Defects"
+    headers = ["File", "Kind", "Line", "Register/Anchor", "Explanation"]
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        ws.cell(row=1, column=c).font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    for r in rows:
+        ws.append([r["file"], r["kind"],
+                   r["line"] if r["line"] is not None else "",
+                   r["anchor"], r["explanation"]])
+    for col in ws.columns:
+        w = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+        ws.column_dimensions[col[0].column_letter].width = min(w + 2, 80)
+    ws.auto_filter.ref = "A1:E%d" % (len(rows) + 1)
+    wb.save(path)
+    return path
+
+
 def main():
     args = sys.argv[1:]
     dry = "--dry" in args                       # deterministic-only, no model calls
     args = [a for a in args if a != "--dry"]
+    xlsx = "--xlsx" in args
+    args = [a for a in args if a != "--xlsx"]
     if not args:
         print(__doc__); return 1
 
@@ -207,6 +240,7 @@ def main():
 
         if dry:
             print("DRY RUN - deterministic findings only, no model calls\n")
+            rows = []
             for p in files:
                 src = p.read_text(encoding="utf-8", errors="replace")
                 regs = oracle(src)
@@ -214,14 +248,24 @@ def main():
                 print("%s" % p.name)
                 if regs:
                     print("  undefined_register: %s" % regs)
+                    for reg in regs:
+                        rows.append({"file": p.name, "kind": "undefined_register",
+                                     "line": None, "anchor": reg, "explanation": ""})
                 for e in extra:
                     loc = "" if e["line"] is None else ":%d" % e["line"]
                     print("  %s%s  %s" % (e["kind"], loc, e["detail"]))
+                    rows.append({"file": p.name, "kind": e["kind"], "line": e["line"],
+                                 "anchor": e["anchor"] or e["kind"], "explanation": e["detail"]})
             print("\n%d files, no model used" % len(files))
+            if xlsx:
+                xp = write_audit_xlsx(rows, ROOT / "audit_report.xlsx")
+                if xp:
+                    print("wrote %s (%d rows)" % (xp, len(rows)))
             return 0
 
         report = ["# Decompiler audit report - oracle-finds / model-explains",
                   "model: %s   files: %d\n" % (MODEL, len(files))]
+        rows = []
         for p in files:
             print("auditing %s ..." % p.name, flush=True)
             src = p.read_text(encoding="utf-8", errors="replace")
@@ -230,13 +274,22 @@ def main():
             report.append("## %s" % p.name)
             for f in findings:
                 report.append("- **%s** `[undefined_register]` — %s" % (f["register"], f["explanation"]))
+                rows.append({"file": p.name, "kind": "undefined_register", "line": None,
+                             "anchor": f["register"], "explanation": f["explanation"]})
             for e in extra:
                 report.append(_extra_line(e))
+                rows.append({"file": p.name, "kind": e["kind"], "line": e["line"],
+                             "anchor": e["anchor"] or e["kind"],
+                             "explanation": e["explanation"] or e["detail"]})
             report.append("")
         stop()
         out = ROOT / "audit_report.md"
         out.write_text("\n".join(report), encoding="utf-8")
         print("\nwrote %s (%d files)" % (out, len(files)))
+        if xlsx:
+            xp = write_audit_xlsx(rows, ROOT / "audit_report.xlsx")
+            if xp:
+                print("wrote %s (%d rows)" % (xp, len(rows)))
     else:
         p = Path(args[0])
         if not p.exists():
