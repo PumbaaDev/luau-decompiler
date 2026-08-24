@@ -137,6 +137,12 @@ def classify(sk: dict) -> str:
         return "gated"
     if n in FORCE_LOCAL:
         return "local"
+    # A "*-reference" skill is book-to-skill's knowledge output - pure text injected
+    # as context, never calls a tool. It stays LOCAL even if its description names an
+    # HTTP/WebSocket/service API (a Potassium/Roblox reference describes such APIs but
+    # does not USE them).
+    if n.endswith("-reference"):
+        return "local"
     hay = sk["desc"] + "\n" + sk["body"][:4000]
     return "gated" if _GATE.search(hay) else "local"
 
