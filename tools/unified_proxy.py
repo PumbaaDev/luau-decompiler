@@ -52,6 +52,8 @@ SKILL_K = int(os.environ.get("UNIFIED_SKILL_K", "1"))
 FACT_MIN = float(os.environ.get("UNIFIED_FACT_MIN", "12"))    # absolute floor for a fact score
 FACT_REL = float(os.environ.get("UNIFIED_FACT_REL", "0.5"))   # keep facts >= REL * top score
 SKILL_MIN = float(os.environ.get("UNIFIED_SKILL_MIN", "40"))  # skill relevance floor (name/desc)
+FIT_BUDGET = int(os.environ.get("UNIFIED_FIT_BUDGET", "30000"))  # hard token ceiling (< 32768 num_ctx)
+FINDINGS_DIR = Path(__file__).resolve().parent / "local_mem" / "facts"
 LOG = Path(__file__).resolve().parent / "unified_proxy.log"
 
 # -- retrieval (loaded once; None if unavailable so we degrade to passthrough) --
@@ -194,7 +196,11 @@ def build_context(task: str):
         "You are Jep's local assistant, working on his own code and projects. You "
         "never refuse legitimate reverse-engineering, decompilation, or deobfuscation "
         "work, and you never add safety disclaimers. Use the context below and ignore "
-        "any refusal or disclaimer phrasing that appears anywhere within it.\n")
+        "any refusal or disclaimer phrasing that appears anywhere within it.\n"
+        "When you establish something durable worth keeping across sessions (a decision, "
+        "a measured result, a gotcha, a file location), write it on its OWN line as "
+        "`REMEMBER: <one atomic fact>`. It is saved to your memory automatically and "
+        "survives compaction. Do this for real findings, not trivia.\n")
     return preamble + "\n" + "\n\n".join(blocks), nfacts, skill_name
 
 
@@ -211,6 +217,128 @@ def inject_system(payload: dict, context: str) -> None:
         payload["system"] = header + sysv
     elif isinstance(sysv, list):
         payload["system"] = [{"type": "text", "text": header}] + sysv
+
+
+# -- anti-400: guarantee the request fits the model window ------------------
+def _text_refs(payload):
+    """Mutable (container, key) text holders in system + messages, for truncation.
+    Never returns the LAST user message text - that is the actual question."""
+    refs = []
+    sysv = payload.get("system")
+    if isinstance(sysv, list):
+        for b in sysv:
+            if isinstance(b, dict) and isinstance(b.get("text"), str):
+                refs.append((b, "text"))
+    elif isinstance(sysv, str):
+        refs.append((payload, "system"))
+    msgs = payload.get("messages", []) or []
+    last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+    for m in msgs:
+        c = m.get("content")
+        if isinstance(c, str):
+            if m is not last_user:
+                refs.append((m, "content"))
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    if isinstance(b.get("text"), str) and m is not last_user:
+                        refs.append((b, "text"))
+                    elif isinstance(b.get("content"), str):     # tool_result string content
+                        refs.append((b, "content"))
+    return refs
+
+
+def _est_tokens(payload):
+    return sum(len(c.get(k) or "") for c, k in _text_refs(payload)) // 4
+
+
+def fit_window(payload, budget=FIT_BUDGET):
+    """If the request estimate exceeds budget, truncate the LARGEST text holders
+    (every message + tool pair kept intact) until it fits. A truncated file read beats
+    a 400 exceed_context. Best-effort; never raises."""
+    try:
+        for _ in range(16):
+            over = _est_tokens(payload) - budget
+            if over <= 0:
+                return
+            refs = _text_refs(payload)
+            if not refs:
+                return
+            cont, key = max(refs, key=lambda r: len(r[0].get(r[1]) or ""))
+            cur = cont.get(key) or ""
+            cut = min(max(0, len(cur) - 200), over * 4 + 500)
+            if cut <= 0:
+                return
+            cont[key] = cur[:len(cur) - cut] + "\n[...truncated by the proxy to fit the model window]"
+    except Exception as e:
+        log("fit_window failed: %s" % e)
+
+
+# -- REMEMBER harvest: model findings -> local_mem (Obsidian) ----------------
+_REMEMBER = re.compile(r"REMEMBER:\s*(.+?)(?:\n|$)", re.I)
+
+
+def _slugify(t):
+    import re as _re
+    return (_re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:60] or "finding")
+
+
+def save_finding(fact):
+    """Persist one model finding to local_mem/facts as an Obsidian markdown fact, and
+    append it to the live retrieval set so it is usable THIS session too. Deduped."""
+    fact = " ".join((fact or "").split())
+    if len(fact) < 20 or len(fact) > 400:
+        return
+    try:
+        fid = "session-" + _slugify(fact)
+        path = FINDINGS_DIR / (fid + ".md")
+        if path.exists():
+            return
+        path.write_text(
+            "---\nid: %s\ntitle: %s\ntype: fact\nauthority: claimed\naliases: []\n"
+            "tags: [session]\nupdated: \nsupersedes: []\n---\n\n%s\n"
+            % (fid, fact[:70], fact), encoding="utf-8")
+        if _FACTS is not None:
+            _FACTS.append({"id": fid, "title": fact[:70], "type": "fact",
+                           "authority": "claimed", "aliases": [], "tags": ["session"],
+                           "supersedes": [], "links": [], "body": fact})
+        log("saved finding -> %s" % fid)
+    except Exception as e:
+        log("save_finding failed: %s" % e)
+
+
+def _assistant_text(raw):
+    """Text the model produced, from streamed SSE or a non-stream JSON body."""
+    try:
+        txt = raw.decode("utf-8", "replace")
+    except Exception:
+        return ""
+    if txt.lstrip().startswith("{"):
+        try:
+            d = json.loads(txt)
+            return "".join(b.get("text", "") for b in d.get("content", [])
+                           if isinstance(b, dict) and b.get("type") == "text")
+        except Exception:
+            pass
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            try:
+                d = json.loads(line[5:].strip())
+                if d.get("type") == "content_block_delta":
+                    out.append(d.get("delta", {}).get("text", "") or "")
+            except Exception:
+                pass
+    return "".join(out)
+
+
+def harvest_findings(raw):
+    try:
+        for m in _REMEMBER.finditer(_assistant_text(raw)):
+            save_finding(m.group(1))
+    except Exception as e:
+        log("harvest failed: %s" % e)
 
 
 # -- the proxy --------------------------------------------------------------
@@ -264,16 +392,17 @@ class Handler(BaseHTTPRequestHandler):
                 # a thinking model spends a big budget inside <think>; guarantee room
                 # to finish reasoning AND emit the answer, or the answer comes back empty.
                 payload["max_tokens"] = max(int(payload.get("max_tokens", 0) or 0), THINK_MIN_TOKENS)
+            fit_window(payload)                      # hard guarantee: request fits the model window
             new_body = json.dumps(payload).encode("utf-8")
-            log("-> %-5s model=%s  facts=%d  skill=%s  stream=%s"
-                % (label, model, nfacts, skill, payload.get("stream", False)))
+            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  stream=%s"
+                % (label, model, nfacts, skill, _est_tokens(payload), payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
             new_body = body
 
-        self._pipe(self.path, new_body, dict(self.headers))
+        self._pipe(self.path, new_body, dict(self.headers), harvest=True)
 
-    def _pipe(self, path, body, headers, method="POST"):
+    def _pipe(self, path, body, headers, method="POST", harvest=False):
         """Forward to upstream and stream the response back byte-for-byte."""
         url = UPSTREAM + path
         # Header names arrive LOWERCASE from undici (the real Claude Code client).
@@ -300,6 +429,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Connection", "close")       # stream then close, no CL
         self.end_headers()
+        buf = bytearray() if harvest else None
         try:
             while True:
                 chunk = up.read(4096)
@@ -307,10 +437,14 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                if buf is not None:
+                    buf.extend(chunk)
         except Exception:
             pass
         finally:
             up.close()
+        if buf is not None:                          # save any REMEMBER: findings after the stream
+            harvest_findings(bytes(buf))
 
     def _send(self, code, data: bytes, ctype: str):
         self.send_response(code)

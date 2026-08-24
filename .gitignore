@@ -18,3 +18,7 @@ __pycache__/
 *.log
 build_output.txt
 build_log.txt
+_claude_old_sessions/
+
+# local model memory - measured + auto-harvested facts stay local, never public
+tools/local_mem/
