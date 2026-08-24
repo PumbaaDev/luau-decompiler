@@ -103,9 +103,9 @@ $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
 $mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (16384 ctx cannot hold MCP schemas)" }
 Write-Host ""
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
-Write-Host "  engines: @local=$Model (codes)  @think=uncensored-thinker (reasons)  @cloud=gemma4:cloud" -ForegroundColor Green
-Write-Host "  every turn: memory (916 facts) + sanitized skill injected via :$proxyPort" -ForegroundColor DarkGray
-Write-Host "  route one turn: put @local / @think / @cloud in the message (default $Default)" -ForegroundColor DarkGray
+Write-Host "  engines (LOCAL ONLY, both uncensored): @local=$Model (codes)  @think=uncensored-thinker (reasons)" -ForegroundColor Green
+Write-Host "  every turn: memory + vault + sanitized skill injected via :$proxyPort; Claude-agent identity stripped" -ForegroundColor DarkGray
+Write-Host "  route one turn: put @local or @think in the message (default $Default) - no cloud" -ForegroundColor DarkGray
 Write-Host "  ctx=65536  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
 Write-Host ""
 

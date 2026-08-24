@@ -78,8 +78,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(cloud|local|think)\b\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|\s)@(cloud|local|think)\s*$", re.I)
+_MARK_LEAD = re.compile(r"^@(local|think)\b\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|\s)@(local|think)\s*$", re.I)
 
 
 def log(msg: str) -> None:
@@ -136,6 +136,23 @@ def set_last_user_text(messages, new_text) -> None:
                     b["text"] = new_text
                     break
         return
+
+
+_HARNESS_IDENTITY = re.compile(r"You are a Claude agent|Anthropic'?s Claude Agent SDK", re.I)
+
+
+def strip_harness_identity(payload) -> None:
+    """Remove the harness's 'You are a Claude agent' identity from the system prompt;
+    our uncensored preamble (prepended in inject_system) is the identity instead. The
+    --bare system prompt carries NO safety/refusal text (verified by capture), so this
+    is the only Anthropic framing to drop - env/git context and billing are kept."""
+    sysv = payload.get("system")
+    if isinstance(sysv, str):
+        payload["system"] = "\n".join(
+            ln for ln in sysv.splitlines() if not _HARNESS_IDENTITY.search(ln)).strip()
+    elif isinstance(sysv, list):
+        payload["system"] = [b for b in sysv if not (
+            isinstance(b, dict) and _HARNESS_IDENTITY.search(b.get("text", "")))]
 
 
 def build_context(task: str):
@@ -210,8 +227,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             info = json.dumps({"status": "ok", "default": DEFAULT_ROUTE,
-                               "local": LOCAL_MODEL, "cloud": CLOUD_MODEL,
-                               "think": THINK_MODEL,
+                               "local": LOCAL_MODEL, "think": THINK_MODEL,
                                "facts": len(_FACTS) if _FACTS else 0}).encode()
             self._send(200, info, "application/json")
             return
@@ -232,11 +248,12 @@ class Handler(BaseHTTPRequestHandler):
         # /v1/messages: inject + route. Any parse failure -> clean passthrough.
         try:
             payload = json.loads(body)
+            strip_harness_identity(payload)           # drop "You are a Claude agent"; our preamble is the identity
             messages = payload.get("messages", [])
             raw = last_user_text(messages)
             kind, cleaned = detect_marker(raw)
             label = kind or DEFAULT_ROUTE
-            model = {"cloud": CLOUD_MODEL, "think": THINK_MODEL}.get(label, LOCAL_MODEL)
+            model = THINK_MODEL if label == "think" else LOCAL_MODEL  # LOCAL ONLY: cloud removed
             if kind:                                     # a marker was present -> strip only it
                 set_last_user_text(messages, cleaned)
             task = cleaned if kind else raw
@@ -309,9 +326,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     nfacts = len(_FACTS) if _FACTS else 0
-    log("unified proxy on :%d -> %s | default=%s local=%s cloud=%s | %d retrieval units "
+    log("unified proxy on :%d -> %s | LOCAL ONLY default=%s local=%s think=%s | %d retrieval units "
         "(%d curated facts + %d vault chunks), skills=%s"
-        % (PORT, UPSTREAM, DEFAULT_ROUTE, LOCAL_MODEL, CLOUD_MODEL, nfacts,
+        % (PORT, UPSTREAM, DEFAULT_ROUTE, LOCAL_MODEL, THINK_MODEL, nfacts,
            nfacts - _VAULT_N, _VAULT_N, "on" if build_injection else "off"))
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
     return 0
