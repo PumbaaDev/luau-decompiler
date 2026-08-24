@@ -55,9 +55,16 @@ SKILL_MIN = float(os.environ.get("UNIFIED_SKILL_MIN", "40"))  # skill relevance 
 LOG = Path(__file__).resolve().parent / "unified_proxy.log"
 
 # -- retrieval (loaded once; None if unavailable so we degrade to passthrough) --
+_VAULT_N = 0
 try:
-    from mem import load_facts, retrieve
+    from mem import load_facts, retrieve, load_vault
     _FACTS = load_facts()
+    try:                                     # full Obsidian vault as extra retrieval
+        _vault = load_vault()
+        _VAULT_N = len(_vault)
+        _FACTS = _FACTS + _vault             # vault chunks rank below measured facts
+    except Exception as e:
+        print("[proxy] vault load failed: %s" % e, file=sys.stderr)
 except Exception as e:  # memory optional - never fatal
     _FACTS, retrieve = None, None
     print("[proxy] memory unavailable: %s" % e, file=sys.stderr)
@@ -302,9 +309,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     nfacts = len(_FACTS) if _FACTS else 0
-    log("unified proxy on :%d -> %s | default=%s local=%s cloud=%s | %d facts, skills=%s"
+    log("unified proxy on :%d -> %s | default=%s local=%s cloud=%s | %d retrieval units "
+        "(%d curated facts + %d vault chunks), skills=%s"
         % (PORT, UPSTREAM, DEFAULT_ROUTE, LOCAL_MODEL, CLOUD_MODEL, nfacts,
-           "on" if build_injection else "off"))
+           nfacts - _VAULT_N, _VAULT_N, "on" if build_injection else "off"))
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
     return 0
 
