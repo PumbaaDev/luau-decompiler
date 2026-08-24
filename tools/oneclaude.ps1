@@ -91,14 +91,16 @@ $env:ANTHROPIC_MODEL            = $Model
 $env:ANTHROPIC_SMALL_FAST_MODEL = $Model
 $env:MAX_THINKING_TOKENS        = "2048"
 # Tell Claude Code the model's REAL window so it auto-compacts BEFORE overflowing.
-# The model's num_ctx is 32768. Set this so a FULL, code-heavy Claude Code window plus the
-# capped injection still sits UNDER fit_window's budget, so the proxy backstop stays dormant
-# in normal operation and only fires on a genuine overflow (a huge paste / tool result). The
-# honest ceiling measured from real usage: 32768 - GEN_RESERVE(4096) - margin(1024) - injection
-# (~2300 real tok) ~= 25300, and at ~3.2-3.4 real chars/tok a 24000-token code-heavy transcript
-# + 7.2KB injection estimates just under fit_window's 27648. So 24000 keeps the backstop quiet;
-# fit_window (not this value) reserves the generation room, so it need not be squeezed further.
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "24000"
+# The model's num_ctx is 32768. This is the window Claude Code manages BEFORE it hard-stops
+# with "context limit reached" (its own limit - it hits this when a single large tool result,
+# e.g. a broad grep, will not fit and it cannot compact one item). Set it as HIGH as the model
+# can back: the proxy now reliably trims any model-side overflow (fit_window bounds input +
+# counts the tools schema, cap_output_tokens bounds max_tokens), so Claude Code can safely hold
+# more before hard-stopping - the proxy trims the ~few-k excess for the model. 30000 lets a
+# ~30k-token search result through where 24000 hard-stopped; a truly huge result (40k+) still
+# needs a scoped task. Do NOT exceed the model window much, or the proxy trims context CC thinks
+# it still has.
+$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "30000"
 
 Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CODE_SESSION_ID    -ErrorAction SilentlyContinue
