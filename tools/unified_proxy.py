@@ -64,6 +64,7 @@ FIT_MARGIN = int(os.environ.get("UNIFIED_FIT_MARGIN", "1024"))
 # SKILL.md (measured 5107 tok for pptx), so capping only the skill did nothing for it.
 INJECT_MAX_CHARS = int(os.environ.get("UNIFIED_INJECT_MAX", "7200"))  # ~2200 tok total injection ceiling
 SKILL_MAX_CHARS = int(os.environ.get("UNIFIED_SKILL_MAX", "3200"))    # a skill cannot starve the facts
+OUT_MARGIN = int(os.environ.get("UNIFIED_OUT_MARGIN", "2048"))        # safety gap when capping max_tokens
 FINDINGS_DIR = Path(__file__).resolve().parent / "local_mem" / "facts"
 LOG = Path(__file__).resolve().parent / "unified_proxy.log"
 
@@ -316,6 +317,19 @@ def _est_tokens(payload):
     return (sum(len(c.get(k) or "") for c, k, _ in _text_holders(payload)) * 10) // 32
 
 
+def cap_output_tokens(payload):
+    """Bound max_tokens so INPUT + requested OUTPUT cannot exceed num_ctx. Claude Code sends
+    max_tokens=32000 every turn; on a 32768 model that alone triggers 'context limit reached'
+    for ANY prompt (input + 32000 > 32768), which is a hard stop even on a tiny request. Cap it
+    to the room actually left after the (already fit_window-trimmed) input. Run AFTER fit_window."""
+    try:
+        room = max(512, NUM_CTX - _est_tokens(payload) - OUT_MARGIN)
+        cur = int(payload.get("max_tokens") or 0)
+        payload["max_tokens"] = min(cur, room) if cur > 0 else room
+    except Exception as e:
+        log("cap_output_tokens failed: %s" % e)
+
+
 def fit_window(payload):
     """BACKSTOP so the request can never exceed num_ctx (which makes Ollama silently drop the
     prompt HEAD). Two phases: (1) trim the largest NON-protected holder repeatedly - a huge
@@ -503,7 +517,8 @@ class Handler(BaseHTTPRequestHandler):
                 # a thinking model spends a big budget inside <think>; guarantee room
                 # to finish reasoning AND emit the answer, or the answer comes back empty.
                 payload["max_tokens"] = max(int(payload.get("max_tokens", 0) or 0), THINK_MIN_TOKENS)
-            fit_window(payload)                      # hard guarantee: request fits the model window
+            fit_window(payload)                      # bound INPUT to fit the window
+            cap_output_tokens(payload)               # bound OUTPUT so input + max_tokens <= num_ctx
             new_body = json.dumps(payload).encode("utf-8")
             log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  stream=%s"
                 % (label, model, nfacts, skill, _est_tokens(payload),
