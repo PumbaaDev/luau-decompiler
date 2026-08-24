@@ -44,6 +44,8 @@ PORT = int(os.environ.get("UNIFIED_PORT", "8770"))
 UPSTREAM = os.environ.get("UNIFIED_UPSTREAM", "http://localhost:11434")
 LOCAL_MODEL = os.environ.get("UNIFIED_LOCAL_MODEL", "uncensored-coder")
 CLOUD_MODEL = os.environ.get("UNIFIED_CLOUD_MODEL", "gemma4:cloud")
+THINK_MODEL = os.environ.get("UNIFIED_THINK_MODEL", "uncensored-thinker")  # uncensored reasoner
+THINK_MIN_TOKENS = int(os.environ.get("UNIFIED_THINK_MIN_TOKENS", "8000"))  # room to finish <think>+answer
 DEFAULT_ROUTE = os.environ.get("UNIFIED_DEFAULT", "local").lower()   # local | cloud
 FACTS_K = int(os.environ.get("UNIFIED_FACTS_K", "6"))
 SKILL_K = int(os.environ.get("UNIFIED_SKILL_K", "1"))
@@ -69,8 +71,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(cloud|local)\b\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|\s)@(cloud|local)\s*$", re.I)
+_MARK_LEAD = re.compile(r"^@(cloud|local|think)\b\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|\s)@(cloud|local|think)\s*$", re.I)
 
 
 def log(msg: str) -> None:
@@ -202,6 +204,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             info = json.dumps({"status": "ok", "default": DEFAULT_ROUTE,
                                "local": LOCAL_MODEL, "cloud": CLOUD_MODEL,
+                               "think": THINK_MODEL,
                                "facts": len(_FACTS) if _FACTS else 0}).encode()
             self._send(200, info, "application/json")
             return
@@ -226,13 +229,17 @@ class Handler(BaseHTTPRequestHandler):
             raw = last_user_text(messages)
             kind, cleaned = detect_marker(raw)
             label = kind or DEFAULT_ROUTE
-            model = CLOUD_MODEL if label == "cloud" else LOCAL_MODEL
+            model = {"cloud": CLOUD_MODEL, "think": THINK_MODEL}.get(label, LOCAL_MODEL)
             if kind:                                     # a marker was present -> strip only it
                 set_last_user_text(messages, cleaned)
             task = cleaned if kind else raw
             ctx, nfacts, skill = build_context(task) if task else ("", 0, "-")
             inject_system(payload, ctx)
             payload["model"] = model
+            if label == "think":
+                # a thinking model spends a big budget inside <think>; guarantee room
+                # to finish reasoning AND emit the answer, or the answer comes back empty.
+                payload["max_tokens"] = max(int(payload.get("max_tokens", 0) or 0), THINK_MIN_TOKENS)
             new_body = json.dumps(payload).encode("utf-8")
             log("-> %-5s model=%s  facts=%d  skill=%s  stream=%s"
                 % (label, model, nfacts, skill, payload.get("stream", False)))

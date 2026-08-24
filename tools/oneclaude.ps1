@@ -102,9 +102,9 @@ $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
 $mcpLabel = if ($NoMcp) { "none" } else { "rust,potassium,memory,filesystem" }
 Write-Host ""
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
-Write-Host "  engine default = $Default   local=$Model   cloud=gemma4:cloud" -ForegroundColor Green
+Write-Host "  engines: @local=$Model (codes)  @think=uncensored-thinker (reasons)  @cloud=gemma4:cloud" -ForegroundColor Green
 Write-Host "  every turn: memory (916 facts) + sanitized skill injected via :$proxyPort" -ForegroundColor DarkGray
-Write-Host "  route one turn: put @cloud or @local in the message" -ForegroundColor DarkGray
+Write-Host "  route one turn: put @local / @think / @cloud in the message (default $Default)" -ForegroundColor DarkGray
 Write-Host "  ctx=65536  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
 Write-Host ""
 
