@@ -86,7 +86,12 @@ $env:ANTHROPIC_AUTH_TOKEN       = "ollama"        # dummy; nothing is authentica
 $env:ANTHROPIC_MODEL            = $Model
 $env:ANTHROPIC_SMALL_FAST_MODEL = $Model
 $env:MAX_THINKING_TOKENS        = "2048"
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "65536"     # local window; else it compacts too late
+# Tell Claude Code the model's REAL window so it auto-compacts BEFORE overflowing.
+# The model's num_ctx is 32768; the proxy also injects ~2-3k of memory+skill on top,
+# so cap Claude Code's managed context below 32768 to leave that headroom. Set to
+# 65536 (a stale value) it let a multi-file task grow to 41729 tokens and the model
+# 400'd (request > 32768). 28000 -> Claude Code compacts ~22k, request stays < 32768.
+$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "28000"
 
 Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CODE_SESSION_ID    -ErrorAction SilentlyContinue
