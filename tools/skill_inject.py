@@ -64,17 +64,21 @@ _GATE = re.compile(
     r"\bgmail\b|google (drive|calendar)|\bslack\b|\bnotion\b|\bjira\b|youtube|"
     r"elevenlabs|\bstripe\b|\bairtable\b|connector)\b", re.I)
 
-# refusal / disclaimer / censoring lines to STRIP before injection
+# Refusal / disclaimer lines to STRIP before injection. Anchored to FIRST-PERSON /
+# IMPERATIVE refusal and true disclaimer sentences, so ordinary technical prose is
+# left intact: "consult a qualified schema" and "as an AI-generated summary" must
+# NOT match. The uncensored wrapper is the primary guarantee; this is a second net.
 _REFUSAL = re.compile(
-    r"\bI (cannot|can't|won't|will not|am unable|do not (provide|assist|help))\b"
-    r"|\b(decline|refuse) (to|the request|this)\b"
+    r"\bI (cannot|can't|won't|will not|am unable to|do not (provide|assist|help))\b"
+    r"|\b(decline|refuse) (to|the request|this request)\b"
     r"|\byou (must|should) (not (assist|help|generate)|refuse|decline)\b"
-    r"|\bdo not (assist|help) with\b"
-    r"|\bas an AI\b|\bI'?m just an AI\b"
+    r"|\bas an AI\b(?!-)|\bI'?m just an AI\b"
     r"|for educational purposes only"
-    r"|\bconsult (a|your) (licensed|qualified|professional|doctor|lawyer|attorney)\b"
+    r"|\bconsult (a|your|with a) (?:licensed |qualified )?"
+    r"(doctor|physician|lawyer|attorney|advisor|professional|specialist)\b"
     r"|this is not (legal|medical|financial|professional) advice"
-    r"|\bseek professional\b|\bwe do not condone\b|\bwe cannot condone\b",
+    r"|\bseek (professional|medical|legal|financial) (help|advice|guidance|care|counsel)\b"
+    r"|\bwe (do not|cannot) condone\b",
     re.I)
 
 UNCENSORED_HEADER = (
@@ -104,7 +108,16 @@ def parse_skill(path: Path) -> dict:
             "body": body.strip(), "scripts": scripts}
 
 
-def discover() -> list[dict]:
+_DISCOVER_CACHE = None
+
+
+def discover(force: bool = False) -> list[dict]:
+    """Skills from both sources. Cached: a long-running proxy would otherwise
+    re-glob and re-read ~150 SKILL.md files on every request (incl. every tool
+    round-trip). Restart the proxy, or call force=True, to pick up new skills."""
+    global _DISCOVER_CACHE
+    if _DISCOVER_CACHE is not None and not force:
+        return _DISCOVER_CACHE
     out = []
     for source, base in SOURCES:
         if not base.exists():
@@ -114,6 +127,7 @@ def discover() -> list[dict]:
             sk["source"] = source
             sk["klass"] = classify(sk)
             out.append(sk)
+    _DISCOVER_CACHE = out
     return out
 
 
@@ -140,10 +154,28 @@ def sanitize(body: str) -> tuple[str, int]:
 
 
 _WORD = re.compile(r"[a-z0-9]+")
+# Without this, "help me" matches internal-comms' "help me write" description and
+# an INSTR_WIDTH query's "in/the" grazes any skill. Stopwords must not qualify a skill.
+_STOP = frozenset(
+    "the a an and or of to in is it that this for on with as by be are was were how "
+    "what why when do does did i you we my our me us your they them their can will "
+    "would should could been being has have had not no if then else so at from into "
+    "out up down over under again more most some any all each please help make write "
+    "using use want need get give show tell".split())
 
 
 def _tok(s: str) -> list[str]:
-    return _WORD.findall(s.lower())
+    return [w for w in _WORD.findall(s.lower()) if w not in _STOP and len(w) > 1]
+
+
+# Strong domain keywords that NAME a skill even though the filename differs.
+# "export to a spreadsheet" should reach xlsx though the word "xlsx" never appears.
+_ALIAS = {
+    "spreadsheet": "xlsx", "excel": "xlsx", "xlsx": "xlsx",
+    "presentation": "pptx", "slides": "pptx", "slide": "pptx", "powerpoint": "pptx",
+    "document": "docx", "word": "docx", "docx": "docx",
+    "pdf": "pdf",
+}
 
 
 def rank(task: str, skills: list[dict]) -> list[tuple[float, dict]]:
@@ -160,27 +192,36 @@ def rank(task: str, skills: list[dict]) -> list[tuple[float, dict]]:
     for sk in skills:
         if sk["klass"] != "local":
             continue
-        name_t = set(_tok(sk["name"]))
+        name_t = set(_tok(sk["name"])) | {a for a, nm in _ALIAS.items() if nm == sk["name"]}
         desc_t = set(_tok(sk["desc"]))
         body_t = set(_tok(sk["body"][:3000]))
         s = 0.0
+        nh = dh = 0                                    # name / description hit counts
         for t in q:
             idf = 1.0 + (n / (1 + df.get(t, 0)))
             if t in name_t:
-                s += 6.0 * idf
+                s += 6.0 * idf; nh += 1
             elif t in desc_t:
-                s += 3.0 * idf
+                s += 3.0 * idf; dh += 1
             elif t in body_t:
-                s += 1.0 * idf
+                # body is a weak tiebreaker only. At full weight a single rare
+                # body token (idf ~= 109) makes EVERY skill score ~109, so an
+                # obfuscator query pulls docx. A skill qualifies on its declared
+                # purpose (name/description), not an incidental body word.
+                s += 0.15 * idf
         if s:
-            scored.append((round(s, 1), sk))
+            scored.append((round(s, 1), sk, nh, dh))
     scored.sort(key=lambda x: -x[0])
     return scored
 
 
-def build_injection(task: str, k: int = 1) -> str:
+def build_injection(task: str, k: int = 1, min_score: float = 0.0) -> str:
     skills = discover()
-    top = rank(task, skills)[:k]
+    # A skill qualifies on its DECLARED PURPOSE: a name-token match, or >=2
+    # description matches. One coincidental token (e.g. "width" from INSTR_WIDTH
+    # grazing the pptx description) is not enough - that was pure noise.
+    top = [(s, sk) for (s, sk, nh, dh) in rank(task, skills)
+           if s >= min_score and (nh >= 1 or dh >= 2)][:k]
     if not top:
         return ""
     blocks = [UNCENSORED_HEADER]
