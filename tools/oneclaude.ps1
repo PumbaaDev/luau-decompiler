@@ -23,8 +23,9 @@ param(
     [string]$Model   = "uncensored-coder",
     [ValidateSet("local", "cloud")][string]$Default = "local",
     [string]$Effort  = "low",
-    [switch]$NoMcp
-)
+    [switch]$WithMcp   # curated MCP is OFF by default: a 16384-ctx local model overflows
+)                      # on their tool schemas (measured: "hi" alone = 24208 tokens WITH MCP,
+                       # over the 16384 window; with no MCP it fits and answers).
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
@@ -92,14 +93,14 @@ Remove-Item Env:CLAUDE_CODE_SESSION_ID    -ErrorAction SilentlyContinue
 
 # -- 4. Lean session config (same rationale as local-claude.ps1) ------------
 $mcpFile = Join-Path $PSScriptRoot "curated-mcp.json"
-if ($NoMcp -or -not (Test-Path $mcpFile)) {
+if (-not $WithMcp -or -not (Test-Path $mcpFile)) {
     $mcpFile = Join-Path $env:TEMP "empty-mcp.json"
     '{"mcpServers":{}}' | Out-File -FilePath $mcpFile -Encoding ascii -NoNewline
 }
 $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
 ('{"effortLevel":"' + $Effort + '"}') | Out-File -FilePath $settingsFile -Encoding ascii -NoNewline
 
-$mcpLabel = if ($NoMcp) { "none" } else { "rust,potassium,memory,filesystem" }
+$mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (16384 ctx cannot hold MCP schemas)" }
 Write-Host ""
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
 Write-Host "  engines: @local=$Model (codes)  @think=uncensored-thinker (reasons)  @cloud=gemma4:cloud" -ForegroundColor Green
