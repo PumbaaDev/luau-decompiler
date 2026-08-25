@@ -58,7 +58,7 @@ function Start-UnifiedProxy {
     $env:PYTHONIOENCODING    = "utf-8"
     $env:UNIFIED_DEFAULT     = $Default
     $env:UNIFIED_LOCAL_MODEL = $Model
-    Start-Process -FilePath "python" -ArgumentList "tools\unified_proxy.py" `
+    Start-Process -FilePath "python" -ArgumentList "tools\local_proxy.py" `
         -WorkingDirectory $repo -WindowStyle Hidden
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
