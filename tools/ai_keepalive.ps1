@@ -22,3 +22,22 @@ if (-not $ok) {
   Start-Sleep 6
   try { L ("proxy up: " + (Invoke-WebRequest "http://localhost:8770/health" -TimeoutSec 5 -UseBasicParsing).Content) } catch { L "proxy STILL down" }
 } else { L "ok (both healthy)" }
+
+# FOOTPRINT CHECK: ollama answering is NOT the same as ollama being correct. If the server
+# was started without OLLAMA_KV_CACHE_TYPE=q8_0 the KV cache is f16, the model loads at ~22GB
+# instead of ~20GB, more layers fall back to CPU (23%/77% vs 18%/82%) and OUTPUT CHANGES -
+# measured 25 Aug: it drifted the benchmark control from 73/83 to 72/83. Detect and repair.
+try {
+  $ps = & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" ps 2>$null | Out-String
+  if ($ps -match '(\d+)\s*GB') {
+    $gb = [int]$Matches[1]
+    if ($gb -ge 22) {
+      L "DEGRADED: model loaded at ${gb}GB (expected ~20GB) - KV cache is not q8_0. Restarting ollama with correct env."
+      Get-Process -Name 'ollama','ollama app','llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep 4
+      Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList "serve" -WindowStyle Hidden
+      Start-Sleep 10
+      L "ollama restarted with q8_0 KV cache"
+    }
+  }
+} catch { }
