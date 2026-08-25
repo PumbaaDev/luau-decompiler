@@ -65,3 +65,37 @@ ITER 12  [2026-08-25 02:10]  HARNESS REPAIR (instrument, not model)
   OPEN: alias strip_block_comments 0/5, PatternError "invalid group reference 2" - the model
   emits a regex backreference to a group that does not exist. Real defect, attribution to the
   ITER 11 read-only rule UNKNOWN until re-run against the live control.
+- ITER 14 [2026-08-25 02:19] G1 75/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 13  [2026-08-25 02:19]  FIRST TRUSTWORTHY G1 SINCE THE MODEL SWAP (live control)
+  BASE 73/83   ALIAS 75/83   -> the system prompt is worth +2, NOT the documented +13.
+  The Modelfile header's "68/83 -> 81/83" was measured against Huihui weights (a DIFFERENT
+  model, now deleted). Against its OWN weights the base is far stronger: 73/83.
+  per-task (BASE -> ALIAS):
+    parse_protos              4/8 -> 8/8   +4
+    parse_stack_hint          3/6 -> 6/6   +3
+    count_real_calls          6/7 -> 7/7   +1
+    find_undefined_registers 10/10-> 8/10  -2  REGRESSED
+    split_locals              8/8 -> 7/8   -1  REGRESSED
+    strip_block_comments      3/5 -> 0/5   -3  REGRESSED
+    (6 tasks unchanged)
+  So the prompt helps 3 tasks (+8) and hurts 3 (-6) for a net +2, at a cost of 1957 tokens
+  per call and ~3.5x output growth. The premise "a weaker model running a strong process
+  beats a stronger model running none" was never tested against the same weights.
+  NEXT: revert the ITER 11 read-only rule and re-run G1 on the SAME live control, to
+  attribute strip_block_comments 0/5 (it was 5/5 on 23 Aug against the dead control).
+- ITER 15 [2026-08-25 02:32] G1 80/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 14  [2026-08-25 02:32]  ISOLATION: the ITER 11 read-only rule, on the LIVE control
+  WITHOUT rule: ALIAS 80/83   WITH rule: ALIAS 75/83   (same BASE 73/83 both runs)
+    strip_block_comments  4/5 -> 0/5   -4   PatternError "invalid group reference 2"
+    split_locals          8/8 -> 7/8   -1
+    all 10 other tasks unchanged
+  verdict: REVERTED. The rule cost 5 points. Mechanism: strip_block_comments is a task
+  about REMOVING COMMENTS FROM TEXT; the rule's "do NOT create, edit or overwrite" bled
+  into the task semantics and the model emitted broken regex instead of refusing outright.
+  A scope rule written about FILES was read as a rule about TRANSFORMING CONTENT.
+  CORRECTION: my earlier "prompt is worth only +2" was measured WITH this damaging rule
+  in place. Clean value is +7 (BASE 73 -> ALIAS 80), and only ONE task sits below base.
+  The Modelfile header table has been corrected from the false 68/83->81/83 (+13).
+  G1 remains RED: 80/83, gap of 3 = find_undefined_registers -2, strip_block_comments -1.
+  NEXT: find_undefined_registers is the single biggest loss AND the only task below BASE
+  (10/10 -> 8/10) - the known "declares only the FIRST name from local v1,v2,v3" defect.
