@@ -47,3 +47,21 @@ ITER 11  [2026-08-25 01:50]  change: CUDA_VISIBLE_DEVICES=0 (hide GTX 1650)
   verdict: REVERTED. The GTX 1650 HELPS; its 91% util was useful work, not a bottleneck.
   note: hypothesis "slow card gates the fast one" was WRONG - disproved by measurement.
 - ITER 11 [2026-08-25 01:50] G1 77/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 12 [2026-08-25 01:59] G1 77/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 13 [2026-08-25 02:06] G1 75/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 12  [2026-08-25 02:10]  HARNESS REPAIR (instrument, not model)
+  G1 returned base=0/83. Per the sacred-control rule that voids the whole run, so the
+  alias 75/83 from ITER 11 is NOT a valid measurement and is discarded.
+  CAUSE: bench_process_regression.py BASE pointed at
+    hf.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF:Q4_K_M
+  which was DELETED to reclaim ~17GB when the coder was swapped to Heretic (24 Aug).
+  Every BASE task logged "GENERATE FAILED: HTTPError" -> 0/83. A DEAD control makes every
+  alias task read "<-- improved", which is why nothing flagged it.
+  It was ALSO the wrong weights: the alias is built FROM the Heretic GGUF, so even alive,
+  Huihui-vs-Heretic compared two different models and could not isolate the system prompt.
+  FIX: BASE repointed at hf.co/mradermacher/Qwen3-Coder-30B-A3B-Instruct-Heretic-i1-GGUF:Q4_K_M
+  (present on disk, 25a7e5cad0ca) = same weights as the alias, no system prompt.
+  This is a harness repair, NOT a test loosened to pass: it restores like-for-like.
+  OPEN: alias strip_block_comments 0/5, PatternError "invalid group reference 2" - the model
+  emits a regex backreference to a group that does not exist. Real defect, attribution to the
+  ITER 11 read-only rule UNKNOWN until re-run against the live control.
