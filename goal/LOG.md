@@ -142,3 +142,24 @@ ITER 17  [2026-08-25 06:36]  refined rule + "up to = or end of line" -> ALIAS 76
   did not occur in any of 4 builds. Prompt rewording is exhausted as a lever for them.
   NEXT LEVER (untested): sampling params (top_p / repeat_penalty) to stabilise code
   generation - G6 determinism must still pass afterwards.
+- ITER 22 [2026-08-25 22:30] G1 78/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 23 [2026-08-25 22:32] G1 78/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 24 [2026-08-25 22:33] G1 78/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 25 [2026-08-25 22:51] G1 81/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 25 [2026-08-25 22:51] G1 78/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 26 [2026-08-25 23:01] G1 78/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 27 [2026-08-25 23:03] G1 78/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 28 [2026-08-25 23:18] G1 80/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 20  [2026-08-25 23:18]  "brevity constrains OUTPUT, never reasoning"  KEPT (ratchet deviation)
+  G2 8/10 -> 9/10   TRACE now PASSES.  G5 4/4, G6 5/5 both held.
+  G1 81/83 -> 80/83 (BASE 73/83 REPRODUCED, so the run is valid). Loss is split_locals 8/8->7/8.
+  MECHANISM (identified before testing, then confirmed): the system prompt orders a
+  character-by-character trace, the TRACE probe orders "give ONLY the final value", and RULE
+  ZERO makes the task spec win - so the model dropped the trace and guessed. The new clause
+  separates them: brevity binds the ANSWER, not the reasoning.
+  RATCHET DEVIATION, recorded per the rules: strictly G1 -1 means revert. Kept because the
+  loss lands on split_locals, which measured 8,7,8,8,7 across today's builds - the THIRD
+  unstable task next to find_undefined_registers and strip_block_comments. The gain is a
+  mechanistically explained fix on a STABLE probe. Not claiming noise: G6 determinism means
+  80/83 is this build's exact score, so the point is really traded.
+  If NEG-CONSTRAINT cannot be fixed without further G1 cost, revisit this trade.

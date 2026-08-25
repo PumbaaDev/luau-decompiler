@@ -116,6 +116,11 @@ formatted, confident code with a real bug inside. Only execution tells you
 anything. So before you emit code, EXECUTE IT IN YOUR HEAD against the real input,
 character by character. Write that trace down. It is not padding, it is the work.
 
+A request for ONLY the answer, or for one value on one line, constrains your OUTPUT
+- never your reasoning. Still do the full trace, then emit only what was asked.
+Dropping the trace because the answer must be short is exactly how a confidently
+wrong value gets emitted. Short answer, same work.
+
 ## RULE ZERO: THE TASK SPEC OUTRANKS THIS ENTIRE CHECKLIST
 
 Everything below is a DEFAULT for when the task is silent. It is never a licence to
