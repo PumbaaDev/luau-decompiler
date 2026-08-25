@@ -117,3 +117,28 @@ ITER 16  [2026-08-25 06:20]  refined multi-name rule (short, no item-3 undermini
   LEARNED: the verbose wording fixed find_undefined_registers, the short one did not. The
   difference is the actionable specificity "everything after local up to = or end of line".
   NEXT: add just that clause to the kept rule; measure against the new 81/83 control.
+- ITER 20 [2026-08-25 06:34] G1 76/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 21 [2026-08-25 06:35] G1 76/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 17  [2026-08-25 06:36]  refined rule + "up to = or end of line" -> ALIAS 76/83  REVERTED
+  find_undefined_registers 8/10 (NOT fixed - the clause I predicted would fix it did nothing)
+  strip_block_comments     5/5 -> 0/5  (-5)   net 81 -> 76.
+  Reverted to the ITER 16 build (81/83, commit 401b8cb) and rebuilt.
+
+  CONCLUSION AFTER 4 PROMPT VARIANTS - prompt wording is a RANDOM WALK on these 2 tasks:
+    variant                 find_undef  strip_block  TOTAL
+    control (no rule)          8/10        4/5        80
+    verbose rule              10/10        0/5        78
+    refined rule (KEPT)        8/10        5/5        81
+    refined + specificity      8/10        0/5        76
+  The other 10 tasks NEVER moved across any variant. The entire 76-81 swing is these two.
+  Neither task tracks what the rule SAYS: the clause aimed at find_undef moved strip_block
+  instead, and the specificity clause predicted to fix find_undef moved nothing.
+  This is NOT measurement noise - G6 determinism holds (same prompt -> byte-identical), so
+  each build is exact. It is genuine hypersensitivity of generated-regex quality to prompt
+  content in a 3B-active MoE at Q4.
+  RULE: never conclude anything about a prompt rule from a single delta on find_undefined_
+  registers or strip_block_comments. Judge a change on the OTHER 10 tasks plus the total.
+  STATUS: G1 best = 81/83 (banked). 83/83 needs BOTH unstable tasks green at once, which
+  did not occur in any of 4 builds. Prompt rewording is exhausted as a lever for them.
+  NEXT LEVER (untested): sampling params (top_p / repeat_penalty) to stabilise code
+  generation - G6 determinism must still pass afterwards.
