@@ -101,6 +101,17 @@ $env:MAX_THINKING_TOKENS        = "2048"
 # needs a scoped task. Do NOT exceed the model window much, or the proxy trims context CC thinks
 # it still has.
 $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "30000"
+# THE FIX for "Context limit reached" on a tiny first tool call. Claude Code does not
+# recognise the model id "uncensored-coder", so it ASSUMES a context window and ENFORCES it
+# client-side, hard-stopping before it ever calls the model. Its own message (extracted from
+# claude.exe) names this escape hatch verbatim: the flag "restores the previous
+# wait-for-the-API behavior". That is exactly what we want here, because the proxy already
+# guarantees the request fits the real window (fit_window bounds input incl. the tools schema,
+# cap_output_tokens bounds max_tokens), so the API cannot return a context error for CC to wait
+# on. Without this, CC's assumed window fights the real 32768 and stops work that would succeed.
+# NOTE: modelOverrides is NOT the lever - in this build it maps an Anthropic model ID to a
+# provider-specific ID (Bedrock ARNs); it carries no contextWindow field.
+$env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = "1"
 
 Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CODE_SESSION_ID    -ErrorAction SilentlyContinue
