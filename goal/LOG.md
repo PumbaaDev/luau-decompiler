@@ -99,3 +99,21 @@ ITER 14  [2026-08-25 02:32]  ISOLATION: the ITER 11 read-only rule, on the LIVE 
   G1 remains RED: 80/83, gap of 3 = find_undefined_registers -2, strip_block_comments -1.
   NEXT: find_undefined_registers is the single biggest loss AND the only task below BASE
   (10/10 -> 8/10) - the known "declares only the FIRST name from local v1,v2,v3" defect.
+- ITER 16 [2026-08-25 06:04] G1 78/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 17 [2026-08-25 06:05] G1 78/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 18 [2026-08-25 06:19] G1 81/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 19 [2026-08-25 06:20] G1 81/83  G2 8/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+ITER 15  [2026-08-25 06:04]  verbose multi-name rule -> ALIAS 78/83  REVERTED
+  find_undefined_registers 8/10 -> 10/10 (TARGET FIXED, proves it is reachable)
+  strip_block_comments     4/5  -> 0/5   (-4)  net 80 -> 78, so the ratchet reverts it.
+ITER 16  [2026-08-25 06:20]  refined multi-name rule (short, no item-3 undermining) -> 81/83 KEPT
+  strip_block_comments     4/5  -> 5/5   (+1)   <- the gain came from here
+  find_undefined_registers 8/10 -> 8/10  (target NOT fixed by the shorter wording)
+  BASE 73/83 reproduced, fixed point re-established for the Heretic control.
+  G5 uncensored 4/4. New control: ALIAS 81/83.
+  DISPROVED: "the item-3 sentence broke strip_block_comments". Across builds that task has
+  scored 5,0,4,0,5 - it swings on ANY prompt perturbation, not on rule content. Treat it as
+  UNSTABLE and never read a single strip_block_comments delta as evidence about a rule.
+  LEARNED: the verbose wording fixed find_undefined_registers, the short one did not. The
+  difference is the actionable specificity "everything after local up to = or end of line".
+  NEXT: add just that clause to the kept rule; measure against the new 81/83 control.

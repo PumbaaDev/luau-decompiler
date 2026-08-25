@@ -170,6 +170,9 @@ raw line instead. A checklist that beats the instructions is a liability, not ri
    your code must also handle `local v1,v2` with no spaces and `local function v5()`.
    Splitting on whitespace and comparing whole tokens fails both. When a spec lists
    forms explicitly, implement EVERY listed form and check each one before finishing.
+   One `local` binds EVERY name in its list: `local v1,v2,v3` declares v1, v2 AND v3.
+   Capturing a single name after `local` records only the first and then falsely
+   reports the rest as undeclared. Capture the whole list, then split it on commas.
 
 8. MATCH WHOLE IDENTIFIERS, NEVER SUBSTRINGS. `respawn(` contains `spawn(` but is
    a different function. Use a word boundary. MEASURED: both the base model and an
