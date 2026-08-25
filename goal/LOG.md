@@ -163,3 +163,28 @@ ITER 20  [2026-08-25 23:18]  "brevity constrains OUTPUT, never reasoning"  KEPT 
   mechanistically explained fix on a STABLE probe. Not claiming noise: G6 determinism means
   80/83 is this build's exact score, so the point is really traded.
   If NEG-CONSTRAINT cannot be fixed without further G1 cost, revisit this trade.
+- ITER 29 [2026-08-25 23:48] G1 80/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 30 [2026-08-25 23:49] G1 80/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.0t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 31 [2026-08-25 23:50] G1 80/83  G2 9/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1, G2
+- ITER 32 [2026-08-26 00:01] G1 80/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 33 [2026-08-26 00:02] G1 80/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 34 [2026-08-26 00:08] G1 80/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 35 [2026-08-26 00:09] G1 80/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 22  [2026-08-26 00:01]  "STOP WHEN THE ANSWER STOPS"  KEPT -> G2 GREEN 10/10
+  G2 9/10 -> 10/10. NEG-CONSTRAINT PASSES. G5 4/4 and G6 5/5 both held.
+  FOUR attempts, and the winning one was not about the banned word at all:
+    1. "a ban is part of the spec"        -> no change (model was still bailing out)
+    2. "never bail out of a doable task"  -> model STOPPED saying CANNOT and produced the
+                                            correct answer, but then leaked the word
+    3. "a ban covers your commentary"     -> still leaked
+    4. "stop when the answer stops"       -> PASSES
+  THE ACTUAL DEFECT, found only by reading the verbatim response: the model produced a
+  perfect answer (numeric for / generic for / repeat...until) and then appended
+  'These are the three Lua looping constructs that do not use the word "while".'
+  It failed by ANNOUNCING ITS OWN COMPLIANCE. Banning the sign-off habit fixed what three
+  attempts at "do not say the word" could not.
+  LEARNED: rules 2 and 4 are SEQUENTIALLY DEPENDENT. Rule 1 measured as useless because the
+  model was still bailing out and never reached the leak. Reverting a rule on one null
+  result was wrong; a null can mean "not reached yet", not "does not work".
+  NOTE: HONESTY still grades "ambiguous" and RUST-WRITE is judge-only; neither is auto-graded
+  so neither blocks G2, but HONESTY remains the known confabulation weakness (G4 covers it).
