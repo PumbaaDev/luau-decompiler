@@ -339,14 +339,44 @@ def _nontext_chars(payload):
     return total
 
 
-def _est_tokens(payload):
-    # ~3.2 chars/token: measured content on this model runs 3.08 (dense/injection) to 3.71
-    # (plain) chars/tok. UNDER-counting is the dangerous direction - it lets a prompt exceed
-    # num_ctx and Ollama then drops the HEAD (the injected memory + system prompt, the highest
-    # value bytes), silently. So bias to the dense end: 3.2 never under-counts real code, and at
-    # worst over-trims some OLD tail of a prose-heavy near-max turn (mild, and logged).
+# SELF-CALIBRATION. A fixed chars/token constant is not good enough: on real agentic turns the
+# model REPORTED 12082 tokens where the raw estimate said 8565 (-29%), and 28505 where it said
+# 24542 (-14%). Under-counting is the dangerous direction - input + granted max_tokens then
+# exceeds num_ctx and Ollama context-shifts, silently dropping the prompt HEAD (the injected
+# memory). So the estimate is multiplied by a ratio learned from the model's OWN reported
+# input_tokens: it jumps UP immediately on an under-count and drifts DOWN slowly, so the guard
+# errs toward trimming a little too much rather than overflowing.
+_CALIB = float(os.environ.get("UNIFIED_CALIB", "1.30"))   # starts above the worst observed miss
+_CALIB_LOCK = threading.Lock()
+
+
+def _observe_ratio(reported_input, raw_est):
+    """Learn est->real from a completed request. Compares against the RAW (uncalibrated)
+    estimate, so the correction cannot feed back on itself and decay to 1.0."""
+    global _CALIB
+    try:
+        if not reported_input or raw_est <= 200:
+            return
+        ratio = float(reported_input) / float(raw_est)
+        if not (0.2 < ratio < 3.0):                    # nonsense sample, ignore
+            return
+        with _CALIB_LOCK:
+            if ratio > _CALIB:
+                _CALIB = min(2.5, ratio * 1.05)        # react fast to an under-count
+            else:
+                _CALIB = max(1.0, _CALIB * 0.995)      # relax slowly when over-counting
+    except Exception:
+        pass
+
+
+def _raw_est_tokens(payload):
+    """Uncalibrated ~3.2 chars/token estimate over every counted byte."""
     chars = sum(len(c.get(k) or "") for c, k, _ in _text_holders(payload)) + _nontext_chars(payload)
     return (chars * 10) // 32
+
+
+def _est_tokens(payload):
+    return int(_raw_est_tokens(payload) * _CALIB)
 
 
 def cap_output_tokens(payload, num_ctx=NUM_CTX):
@@ -478,7 +508,7 @@ def harvest_findings(raw):
         log("harvest failed: %s" % e)
 
 
-def log_upstream_usage(raw):
+def log_upstream_usage(raw, raw_est=0):
     """Log the model's REPORTED token counts, so context tuning is grounded in real numbers
     (is the prompt near num_ctx => spilling?). input_tokens arrives on message_start; the
     FINAL output_tokens on the last message_delta - so scan ALL lines: take input from the
@@ -504,7 +534,9 @@ def log_upstream_usage(raw):
                 if u.get("output_tokens") is not None:
                     out = u["output_tokens"]           # last delta wins => true generated count
         if inp is not None:
-            log("<- usage: input=%s output=%s" % (inp, out))
+            _observe_ratio(inp, raw_est)               # learn est->real from the model's own count
+            log("<- usage: input=%s output=%s%s"
+                % (inp, out, ("  est=%d calib=%.2f" % (raw_est, _CALIB)) if raw_est else ""))
     except Exception:
         pass
 
@@ -570,16 +602,17 @@ class Handler(BaseHTTPRequestHandler):
             fit_window(payload, nctx, reserve)       # bound INPUT to the CHOSEN model's window
             cap_output_tokens(payload, nctx)         # bound OUTPUT so input + max_tokens <= num_ctx
             new_body = json.dumps(payload).encode("utf-8")
+            raw_est = _raw_est_tokens(payload)        # uncalibrated, for the est->real feedback loop
             log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  ctx=%d  stream=%s"
                 % (label, model, nfacts, skill, _est_tokens(payload),
                    payload.get("max_tokens"), nctx, payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
-            new_body = body
+            new_body, raw_est = body, 0
 
-        self._pipe(self.path, new_body, dict(self.headers), harvest=True)
+        self._pipe(self.path, new_body, dict(self.headers), harvest=True, raw_est=raw_est)
 
-    def _pipe(self, path, body, headers, method="POST", harvest=False):
+    def _pipe(self, path, body, headers, method="POST", harvest=False, raw_est=0):
         """Forward to upstream and stream the response back byte-for-byte."""
         url = UPSTREAM + path
         # Header names arrive LOWERCASE from undici (the real Claude Code client).
@@ -622,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
             up.close()
         if buf is not None:                          # after the stream: save findings + log real prompt size
             harvest_findings(bytes(buf))
-            log_upstream_usage(bytes(buf))
+            log_upstream_usage(bytes(buf), raw_est)
 
     def _send(self, code, data: bytes, ctype: str):
         self.send_response(code)
