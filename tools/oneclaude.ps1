@@ -33,6 +33,11 @@ param(
     [string]$Model   = "uncensored-coder",
     [ValidateSet("local", "think")][string]$Default = "local",
     [string]$Effort  = "low",
+    # Unattended by default: Jep granted the local model FULL authority (run/read/write/scrape) with
+    # no prompts. This uses the settings-based permission MODE (his rules' preferred path), not the
+    # --dangerously-skip-permissions flag. -Permission accept = confirm destructive writes;
+    # -Permission default = ask for everything (the stock Claude Code behaviour).
+    [ValidateSet("bypass", "accept", "default")][string]$Permission = "bypass",
     [switch]$WithMcp   # curated MCP is OFF by default: the local model overflows on their tool
 )                      # schemas (measured: "hi" alone = 24208 tokens WITH MCP, over the 24000
                        # harness budget; with no MCP it fits and answers).
@@ -133,7 +138,17 @@ if (-not $WithMcp -or -not (Test-Path $mcpFile)) {
     '{"mcpServers":{}}' | Out-File -FilePath $mcpFile -Encoding ascii -NoNewline
 }
 $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
-('{"effortLevel":"' + $Effort + '"}') | Out-File -FilePath $settingsFile -Encoding ascii -NoNewline
+$permMode = switch ($Permission) { "bypass" { "bypassPermissions" } "accept" { "acceptEdits" } default { "default" } }
+# Broad allow-list (his rules' preferred grant mechanism) PLUS the mode, so the local model runs
+# unattended: shell, file read/write/edit, and the local web tools, with no approval prompts.
+$settingsObj = @{
+    effortLevel = $Effort
+    permissions = @{
+        defaultMode = $permMode
+        allow       = @("Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookEdit")
+    }
+}
+($settingsObj | ConvertTo-Json -Depth 5 -Compress) | Out-File -FilePath $settingsFile -Encoding ascii -NoNewline
 
 $mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (local ctx cannot hold MCP schemas)" }
 Write-Host ""
@@ -144,6 +159,9 @@ Write-Host "  online (censored)  : @gemini=Google Gemini for hard general reason
 Write-Host "  every turn: memory + vault + sanitized skill injected via :$proxyPort; Claude-agent identity stripped" -ForegroundColor DarkGray
 Write-Host "  route one turn: put @local/@think/@qwen/@kat/@gemini in the message (default $Default)" -ForegroundColor DarkGray
 Write-Host "  coder ctx=32768  thinker ctx=16384  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
+$permLabel = switch ($Permission) { "bypass" { "UNATTENDED - full authority, no prompts" } "accept" { "auto reads/edits, confirm destructive" } default { "asks before acting" } }
+Write-Host "  permissions: $permLabel" -ForegroundColor DarkGray
+Write-Host "  web access : python tools\websearch.py `"query`"   +   python tools\webget.py <url>   (local, no key)" -ForegroundColor DarkGray
 Write-Host ""
 
 & "C:\Users\jep\.local\bin\claude.exe" `
