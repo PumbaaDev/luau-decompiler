@@ -61,6 +61,10 @@ MODEL_ALIASES = {
     # dumber on RE work, so it is a SPEED route for bulk/simple tasks, not the smart default.
     "gemma": os.environ.get("UNIFIED_GEMMA_MODEL",
         "hf.co/igorls/gemma-4-12B-it-heretic-GGUF:Q4_K_M"),
+    # @research -> Qwen3-30B-A3B-Instruct-2507 Heretic: the GENERAL/tool-tuned uncensored twin of the
+    # coder (same arch/speed/size, 262K ctx). Better at web research + synthesis than the code model.
+    "research": os.environ.get("UNIFIED_RESEARCH_MODEL",
+        "hf.co/mradermacher/Qwen3-30B-A3B-Instruct-2507-Heretic-i1-GGUF:Q4_K_M"),
 }
 # @gemini / @google -> Google's Gemini (the ONE online, CENSORED engine). Opt-in per turn; the
 # default stays the offline uncensored coder. Key is read from GEMINI_API_KEY (never in source);
@@ -121,8 +125,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat|gemma|gemini|google)(?=\s|$)\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|[ \t])@(local|think|coder|heretic|thinker|qwen|kat|gemma|gemini|google)[ \t]*$", re.I)
+_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat|gemma|research|gemini|google)(?=\s|$)\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|[ \t])@(local|think|coder|heretic|thinker|qwen|kat|gemma|research|gemini|google)[ \t]*$", re.I)
 
 
 def log(msg: str) -> None:
