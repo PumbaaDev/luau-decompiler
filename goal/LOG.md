@@ -267,3 +267,16 @@ ITER 27  [2026-08-26 13:29]  RESTART THE SERVER PER RUN  ->  G1 IS FINALLY REPRO
   and none of them should be quoted. That includes my "81/83 best", the KEPT/REVERTED calls on
   1-2 point margins, and the find_undefined_registers 8,10,8,8,8 series that the item-3 theory
   was built on. The FIRST trustworthy G1 numbers are BASE 73/83, ALIAS 76/83.
+ITER 28  [2026-08-26 14:01]  item-3 override RE-TESTED on the FIXED control  ->  DISPROVEN, REVERTED
+  WITHOUT override: BASE 73/83 (reproduced)  ALIAS 81/83
+  WITH    override: BASE 73/83 (reproduced)  ALIAS 76/83
+  The override COSTS 5 POINTS and did NOT move its target: find_undefined_registers is 8/10
+  in BOTH builds. My theory - that checklist item 3 ("prefer one anchored regex") steers the
+  model into a single capture group on a variable-length `local v1,v2,v3` list - is DISPROVEN.
+  It was built on ONE 10/10 reading from ITER 15; with a stable instrument the true value is 8.
+  That reading was noise, and I re-tested it three times on a moving ruler before fixing the
+  ruler. Lesson: fix the instrument BEFORE spending iterations on the hypothesis.
+  81/83 IS NOW VALIDATED on a reproducible control - it matches what single runs reported, so
+  that figure survives, this time earned rather than lucky.
+  G1 STANDS AT 81/83, blocked solely by find_undefined_registers 8/10 vs base 10/10 (+2 needed).
+  The prompt is worth +8 overall (73 -> 81) and -2 on that one task.
