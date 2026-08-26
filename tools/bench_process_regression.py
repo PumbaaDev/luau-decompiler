@@ -318,6 +318,34 @@ def _defence(block):
     return "\n".join(ln for ln in block.splitlines() if not ln.strip().startswith("```"))
 
 
+# REPEAT-AND-MEDIAN. MEASURED 26 Aug 2026: G1 is NOT reproducible run-to-run. Two runs with
+# NOTHING changed gave BASE 69/83 and 70/83, three tasks differing; BASE produced five distinct
+# signatures in one day. temperature 0, a fixed seed, a pinned GPU split and the per-task reset
+# all failed to remove it (G6 shows determinism only WITHIN one model load, and this bench
+# reloads per task by design). A single run carries about +/-3-4 points of noise, WIDER than
+# most changes being tested, so single-run A/B was reading noise as signal. Scoring each task
+# as the MEDIAN of REPEATS runs collapses that noise.
+REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
+
+
+def median_run(runs):
+    if not runs:
+        raise ValueError("runs must not be empty")
+
+    if len(runs) == 1:
+        return runs[0]
+
+    # Sort by 'passed' value ascending
+    sorted_runs = sorted(runs, key=lambda x: x[0])
+
+    n = len(sorted_runs)
+    # For even number of elements, we want the upper median
+    # which is at index n // 2
+    median_index = n // 2
+
+    return sorted_runs[median_index]
+
+
 def score_task(model, task):
     """Return (passed, total, code, notes, tok_s)."""
     n = len(task["cases"])
@@ -374,12 +402,15 @@ def main():
         print("#" * 78, flush=True)
         rows, tot_ok, tot_n, t0 = [], 0, 0, time.time()
         for task in TASKS:
-            ok, n, code, notes, tok_s = score_task(model, task)
+            _runs = [score_task(model, task) for _ in range(REPEATS)]
+            ok, n, code, notes, tok_s = median_run(_runs)
+            _spread = sorted(r[0] for r in _runs)
+            _sp = "" if len(set(_spread)) == 1 else "  spread=%s" % _spread
             tot_ok += ok
             tot_n += n
             mark = "OK  " if ok == n else "FAIL"
-            print("\n[%s] %-26s %2d/%-2d  %5.1f tok/s   (%s)"
-                  % (mark, task["name"], ok, n, tok_s, task["group"]), flush=True)
+            print("\n[%s] %-26s %2d/%-2d  %5.1f tok/s   (%s)%s"
+                  % (mark, task["name"], ok, n, tok_s, task["group"], _sp), flush=True)
             for ln in notes[:6]:
                 print(ln, flush=True)
             rows.append({"task": task["name"], "group": task["group"], "passed": ok,
