@@ -1,0 +1,61 @@
+{
+  "empty": 10,
+  "full": 8,
+  "suspects": [
+    {
+      "idx": 1,
+      "head": "## THE PRIME RULE",
+      "score": 8
+    },
+    {
+      "idx": 2,
+      "head": "## RULE ZERO: THE TASK SPEC OUTR",
+      "score": 8
+    },
+    {
+      "idx": 3,
+      "head": "## PRE-FLIGHT CHECKLIST. Run eve",
+      "score": 0
+    },
+    {
+      "idx": 4,
+      "head": "## NEVER BAIL OUT OF A TASK YOU ",
+      "score": 8
+    },
+    {
+      "idx": 5,
+      "head": "## STOP WHEN THE ANSWER STOPS",
+      "score": 8
+    },
+    {
+      "idx": 6,
+      "head": "## THE DIRECTION OF AN ERROR DEC",
+      "score": 8
+    },
+    {
+      "idx": 7,
+      "head": "## WHEN YOU WRITE A TEST",
+      "score": 8
+    },
+    {
+      "idx": 8,
+      "head": "## WHEN YOU REPORT A MEASUREMENT",
+      "score": 8
+    },
+    {
+      "idx": 9,
+      "head": "## HOW TO ANSWER",
+      "score": 8
+    },
+    {
+      "idx": 10,
+      "head": "## HARDWARE, AND WHAT IT RULES O",
+      "score": 8
+    },
+    {
+      "idx": 11,
+      "head": "## THE DECOMPILER",
+      "score": 8
+    }
+  ]
+}

@@ -280,3 +280,20 @@ ITER 28  [2026-08-26 14:01]  item-3 override RE-TESTED on the FIXED control  -> 
   that figure survives, this time earned rather than lucky.
   G1 STANDS AT 81/83, blocked solely by find_undefined_registers 8/10 vs base 10/10 (+2 needed).
   The prompt is worth +8 overall (73 -> 81) and -2 on that one task.
+ITER 29  [2026-08-26 14:15]  PROMPT BISECTION  ->  THE CAUSE IS THE PROMPT'S EXISTENCE, NOT ITS CONTENT
+  Controls separated cleanly: no system prompt 10/10, full prompt 8/10.
+  EVERY ONE of the 11 sections, tested alone, scores 8/10 - including sections that have
+  NOTHING to do with the task: "## HARDWARE, AND WHAT IT RULES OUT" (GPU specs) and
+  "## THE DECOMPILER" (project notes) cost exactly the same 2 points as RULE ZERO.
+  So the 2-point loss on find_undefined_registers is caused by HAVING a system prompt at all,
+  not by any rule in it. Prompt WORDING was never the variable, which is why six carefully
+  reasoned wording variants all failed, and why the effect appeared to move around.
+  OUTLIER: "## PRE-FLIGHT CHECKLIST" ALONE scores 0/10 - catastrophic - yet the FULL prompt
+  containing it scores 8/10. The other sections MITIGATE the checklist's damage, so the
+  sections interact; the prompt is better as a whole than the checklist is by itself.
+  CONSEQUENCE - G1 83/83 IS UNREACHABLE while any system prompt is loaded, because the gate
+  demands no task below BASE and BASE runs with no prompt. This is a property of the gate's
+  definition meeting this model, not a defect left to fix.
+  The prompt is worth +8 overall (73 -> 81) and -2 on this one task. Keeping it is correct.
+  METHOD NOTE: this took ~25 min and answered definitively what six prompt edits over several
+  hours could not. Bisect the CAUSE before tuning the SYMPTOM - and fix the instrument first.
