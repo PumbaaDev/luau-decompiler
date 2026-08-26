@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gemini_bridge as GEM
 
 # -- config -----------------------------------------------------------------
 PORT = int(os.environ.get("UNIFIED_PORT", "8770"))
@@ -56,6 +57,14 @@ MODEL_ALIASES = {
     "kat": os.environ.get("UNIFIED_KAT_MODEL",
         "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M"),
 }
+# @gemini / @google -> Google's Gemini (the ONE online, CENSORED engine). Opt-in per turn; the
+# default stays the offline uncensored coder. Key is read from GEMINI_API_KEY (never in source);
+# UNIFIED_GEMINI_GROUNDING=1 turns on google_search so @gemini can also pull live web info.
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("UNIFIED_GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_GROUNDING = os.environ.get("UNIFIED_GEMINI_GROUNDING", "").lower() in ("1", "true", "yes", "on")
+MODEL_ALIASES["gemini"] = GEMINI_MODEL
+MODEL_ALIASES["google"] = GEMINI_MODEL
 THINK_MIN_TOKENS = int(os.environ.get("UNIFIED_THINK_MIN_TOKENS", "8000"))  # room to finish <think>+answer
 DEFAULT_ROUTE = os.environ.get("UNIFIED_DEFAULT", "local").lower()   # local | think (cloud removed)
 if DEFAULT_ROUTE not in ("local", "think"):                          # a stale -Default cloud must not
@@ -107,8 +116,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat)\b\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|\s)@(local|think|coder|heretic|thinker|qwen|kat)\s*$", re.I)
+_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat|gemini|google)(?=\s|$)\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|[ \t])@(local|think|coder|heretic|thinker|qwen|kat|gemini|google)[ \t]*$", re.I)
 
 
 def log(msg: str) -> None:
@@ -601,6 +610,12 @@ class Handler(BaseHTTPRequestHandler):
             is_think = route in ("think", "thinker")
             if kind and cont is not None:              # a marker was present -> strip it from THAT block only
                 cont[key] = cleaned
+            if route in ("gemini", "google"):         # online, censored, NO private-memory injection
+                try:
+                    self._gemini(payload, GEMINI_MODEL)
+                except Exception as ge:               # a gemini turn must NEVER fall through to the local
+                    log("gemini route error (no local fallthrough): %s" % ge)   # Ollama upstream below
+                return
             task = cleaned if cont is not None else last_user_text(messages)
             ctx, nfacts, skill = build_context(task) if task else ("", 0, "-")
             inject_system(payload, ctx)
@@ -669,6 +684,49 @@ class Handler(BaseHTTPRequestHandler):
         if buf is not None:                          # after the stream: save findings + log real prompt size
             harvest_findings(bytes(buf))
             log_upstream_usage(bytes(buf), raw_est)
+
+    def _gemini(self, payload, model):
+        """@gemini route: translate to Gemini, call Google, re-emit as Anthropic. Any failure or a
+        missing key is rendered as a normal assistant turn, never a 500 that breaks the terminal."""
+        stream = bool(payload.get("stream"))
+        if not GEMINI_KEY:
+            self._emit_gemini(
+                "@gemini is wired but no key is set. Create a free key at Google AI Studio "
+                "(aistudio.google.com/apikey), then run once:  setx GEMINI_API_KEY \"<key>\"  "
+                "and reopen the terminal. Note: @gemini turns go to Google (online) and are NOT "
+                "given your private memory/vault.", model, stream)
+            return
+        try:
+            body = GEM.to_gemini_request(payload, grounding=GEMINI_GROUNDING)
+            resp = GEM.call_gemini(model, GEMINI_KEY, body,
+                                   timeout=int(os.environ.get("UNIFIED_TIMEOUT", "600")))
+            text, out_tok, finish = GEM.extract_text(resp)
+            in_tok = int((resp.get("usageMetadata") or {}).get("promptTokenCount", 0) or 0)
+            log("-> gemini model=%s grounding=%s in=%d out=%d finish=%s"
+                % (model, GEMINI_GROUNDING, in_tok, out_tok, finish))
+            self._emit_gemini(text, model, stream, in_tok, out_tok, finish)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            self._emit_gemini("Gemini API error %s: %s" % (e.code, detail), model, stream)
+        except Exception as e:
+            self._emit_gemini("Gemini call failed: %s: %s" % (type(e).__name__, e), model, stream)
+
+    def _emit_gemini(self, text, model, stream, in_tok=0, out_tok=0, finish="STOP"):
+        if stream:
+            data = GEM.anthropic_sse(text, model, in_tok, out_tok, finish)
+            ctype = "text/event-stream"
+        else:
+            data = GEM.anthropic_json(text, model, in_tok, out_tok, finish)
+            ctype = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def _send(self, code, data: bytes, ctype: str):
         self.send_response(code)

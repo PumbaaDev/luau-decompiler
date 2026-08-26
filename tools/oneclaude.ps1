@@ -1,15 +1,22 @@
 <#
     THE unified terminal. One Claude Code terminal, one endpoint, everything behind it:
 
-      Claude Code  ->  unified_proxy (:8770)  ->  Ollama (:11434, LOCAL ONLY)
+      Claude Code  ->  unified_proxy (:8770)  ->  Ollama (:11434, LOCAL)  | Google Gemini (@gemini)
                           injects memory + a sanitized, uncensored skill every turn
-                          routes coder <-> thinker per message marker (@local / @think)
+                          routes per message marker: @local @think @qwen @kat @gemini
 
     You type in one place. Every turn auto-gets the relevant project facts and, when
     the task matches one, a sanitized skill (refusal/disclaimer lines stripped, so the
-    abliterated model is never re-censored). Route a single turn to the reasoning model
-    by putting @think in the message; @local forces the coder. Default is local (free,
-    offline, uncensored). Cloud was removed - both engines are local.
+    abliterated model is never re-censored). Route a single turn with a @marker:
+      @local / @heretic  the uncensored coder (DEFAULT - free, offline, 4/4 uncensored)
+      @think             the uncensored reasoner
+      @qwen              Qwen3.8-27B (best on find_undefined_registers + RE explanations)
+      @kat               KAT-Coder-35B abliterated
+      @gemini / @google  Google's Gemini - the ONE online, CENSORED, frontier engine.
+                         For hard GENERAL reasoning, not the uncensored/RE work. @gemini
+                         turns leave the machine to Google and are NOT given your private
+                         memory. Needs a free key:  setx GEMINI_API_KEY "<key>"  (then reopen).
+                         Set UNIFIED_GEMINI_GROUNDING=1 to let @gemini pull live web info.
 
     This works under `claude --bare` (hooks/plugins off for the 32k window) because the
     proxy injects at the HTTP layer, not via a hook.
@@ -127,10 +134,12 @@ $settingsFile = Join-Path $env:TEMP "oneclaude-settings.json"
 
 $mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (local ctx cannot hold MCP schemas)" }
 Write-Host ""
+$gem = if ($env:GEMINI_API_KEY) { "key SET" } else { "no key (setx GEMINI_API_KEY)" }
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
-Write-Host "  engines (LOCAL ONLY, both uncensored): @local=$Model (codes)  @think=uncensored-thinker (reasons)" -ForegroundColor Green
+Write-Host "  local (uncensored): @local=$Model (codes)  @think=uncensored-thinker (reasons)  @qwen  @kat" -ForegroundColor Green
+Write-Host "  online (censored)  : @gemini=Google Gemini for hard general reasoning [$gem] - leaves the machine, no private memory" -ForegroundColor DarkGray
 Write-Host "  every turn: memory + vault + sanitized skill injected via :$proxyPort; Claude-agent identity stripped" -ForegroundColor DarkGray
-Write-Host "  route one turn: put @local or @think in the message (default $Default) - no cloud" -ForegroundColor DarkGray
+Write-Host "  route one turn: put @local/@think/@qwen/@kat/@gemini in the message (default $Default)" -ForegroundColor DarkGray
 Write-Host "  coder ctx=32768  thinker ctx=16384  effort=$Effort  mcp=$mcpLabel  (bare: no hooks/plugins)" -ForegroundColor DarkGray
 Write-Host ""
 
