@@ -112,6 +112,7 @@ def _ddgs_lib(query, n):
 def _searxng(query, n):
     """A local self-hosted SearXNG instance (tools/searxng/, http://localhost:8888) - fully local,
     keyless, unlimited, aggregates ~100 engines. Best option when it is running."""
+    import os
     import json as _json
     import urllib.parse
     import urllib.request
