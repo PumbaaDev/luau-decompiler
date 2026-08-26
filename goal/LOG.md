@@ -225,3 +225,28 @@ ITER 25  [2026-08-26 01:10]  RULE ZERO strengthening ("a complete spec needs obe
   causes it - RULE ZERO was the best mechanistic candidate and made things worse.
   NET POSITION: the prompt is worth +8 overall (73 -> 81) and -2 on this one task. Keeping it
   is correct; the -2 is the price of the +8, not a bug to be tuned away by wording.
+- ITER 40 [2026-08-26 11:37] G1 81/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 40 [2026-08-26 11:42] G1 78/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 41 [2026-08-26 11:56] G1 76/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 41 [2026-08-26 12:00] G1 75/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 26  [2026-08-26 12:00]  PIN num_gpu=36 + seed=42 in the bench  ->  REVERTED, hypothesis DISPROVEN
+  Ran G1 TWICE with NOTHING changed between the runs:
+    run 1 BASE [4,7,6,6,6,3,6,7,3,9,4,8] = 69
+    run 2 BASE [3,8,6,6,6,3,6,8,3,9,4,8] = 70   <- 3 tasks drifted
+  So the CPU/GPU layer split was NOT the cause of control drift. Pinning it also cost
+  benchmark throughput (30 t/s vs 45-55) and lowered both BASE and ALIAS, so it is reverted.
+
+  *** THE CENTRAL FINDING OF THIS WHOLE EFFORT ***
+  G1 IS NOT REPRODUCIBLE RUN-TO-RUN, even at temperature 0, with a fixed seed, a pinned GPU
+  split and a per-task model reset. BASE has produced FIVE different signatures today with no
+  code change. The drift is +/- 1 on several tasks, so a single run carries roughly +/-3-4
+  points of noise.
+  CONSEQUENCE: every single-run A/B in this log is unreliable, including my own "KEPT" and
+  "REVERTED" verdicts. Differences of 1-4 points (81 vs 80 vs 78) are INSIDE the noise band.
+  find_undefined_registers reading 8,10,8,8,8 is consistent with noise, not with a fixable
+  defect - the 10/10 I built a theory on may simply have been a lucky draw.
+  LIKELY MECHANISM: G6 proves determinism WITHIN one model load (5/5 byte-identical). The
+  bench RELOADS the model for every task by design, and each load is not bit-identical. The
+  harness's own contamination defence is what injects the variance.
+  WHAT WOULD ACTUALLY FIX IT: repeat each configuration N times and compare medians, or stop
+  reloading per task. Both are real work and neither is a prompt change.

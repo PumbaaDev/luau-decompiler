@@ -176,8 +176,12 @@ raw line instead. A checklist that beats the instructions is a liability, not ri
    Splitting on whitespace and comparing whole tokens fails both. When a spec lists
    forms explicitly, implement EVERY listed form and check each one before finishing.
    One `local` binds EVERY name in its list: `local v1,v2,v3` declares v1, v2 AND v3.
-   Capturing a single name after `local` records only the first and then falsely
-   reports the rest as undeclared. Capture the whole list, then split it on commas.
+   THIS IS THE ONE PLACE ITEM 3 IS THE WRONG INSTINCT. A single anchored regex is right
+   for a FIXED format, but a `local` list is VARIABLE LENGTH, and one capture group can
+   only ever hold one name. So `local\s+(v\d+)` records v1 and then falsely reports v2
+   and v3 as undeclared - an INVENTED defect, the most expensive kind of error here.
+   For any variable-length list: capture the whole list first, then split it. Never try
+   to match a list with a fixed number of groups.
 
 8. MATCH WHOLE IDENTIFIERS, NEVER SUBSTRINGS. `respawn(` contains `spawn(` but is
    a different function. Use a word boundary. MEASURED: both the base model and an
