@@ -56,6 +56,11 @@ MODEL_ALIASES = {
     "qwen": os.environ.get("UNIFIED_QWEN_MODEL", "qwen38-rvn"),
     "kat": os.environ.get("UNIFIED_KAT_MODEL",
         "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M"),
+    # @gemma -> Google Gemma 4 12B, well-abliterated (4/4 uncensored), QAT-class fit: runs 100% on
+    # GPU at ~46 tok/s in 8GB, NO spill. Measured 70/83 on G1 vs the Qwen coder's 81 - FASTER but
+    # dumber on RE work, so it is a SPEED route for bulk/simple tasks, not the smart default.
+    "gemma": os.environ.get("UNIFIED_GEMMA_MODEL",
+        "hf.co/igorls/gemma-4-12B-it-heretic-GGUF:Q4_K_M"),
 }
 # @gemini / @google -> Google's Gemini (the ONE online, CENSORED engine). Opt-in per turn; the
 # default stays the offline uncensored coder. Key is read from GEMINI_API_KEY (never in source);
@@ -116,8 +121,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat|gemini|google)(?=\s|$)\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|[ \t])@(local|think|coder|heretic|thinker|qwen|kat|gemini|google)[ \t]*$", re.I)
+_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat|gemma|gemini|google)(?=\s|$)\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|[ \t])@(local|think|coder|heretic|thinker|qwen|kat|gemma|gemini|google)[ \t]*$", re.I)
 
 
 def log(msg: str) -> None:

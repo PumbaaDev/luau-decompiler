@@ -12,6 +12,9 @@
       @think             the uncensored reasoner
       @qwen              Qwen3.8-27B (best on find_undefined_registers + RE explanations)
       @kat               KAT-Coder-35B abliterated
+      @gemma             Google Gemma 4 12B (QAT-class): FAST + fits GPU (no spill, ~46 tok/s,
+                         4/4 uncensored) but 70/83 vs the default's 81 - a SPEED route for
+                         bulk/simple work, not the smart default
       @gemini / @google  Google's Gemini - the ONE online, CENSORED, frontier engine.
                          For hard GENERAL reasoning, not the uncensored/RE work. @gemini
                          turns leave the machine to Google and are NOT given your private
@@ -136,7 +139,7 @@ $mcpLabel = if ($WithMcp) { "rust,potassium,memory,filesystem" } else { "none (l
 Write-Host ""
 $gem = if ($env:GEMINI_API_KEY) { "key SET" } else { "no key (setx GEMINI_API_KEY)" }
 Write-Host "  UNIFIED TERMINAL" -ForegroundColor Green
-Write-Host "  local (uncensored): @local=$Model (codes)  @think=uncensored-thinker (reasons)  @qwen  @kat" -ForegroundColor Green
+Write-Host "  local (uncensored): @local=$Model (codes)  @think=reasons  @qwen  @kat  @gemma=fast/fits-GPU" -ForegroundColor Green
 Write-Host "  online (censored)  : @gemini=Google Gemini for hard general reasoning [$gem] - leaves the machine, no private memory" -ForegroundColor DarkGray
 Write-Host "  every turn: memory + vault + sanitized skill injected via :$proxyPort; Claude-agent identity stripped" -ForegroundColor DarkGray
 Write-Host "  route one turn: put @local/@think/@qwen/@kat/@gemini in the message (default $Default)" -ForegroundColor DarkGray

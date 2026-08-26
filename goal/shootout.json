@@ -278,5 +278,145 @@
         "tok_s": 14.0
       }
     }
+  },
+  "huihui_ai/gemma-4-abliterated:12b-qat": {
+    "model": "huihui_ai/gemma-4-abliterated:12b-qat",
+    "loads": true,
+    "uncensored": "2/4",
+    "passed": 67,
+    "total": 83,
+    "wall_s": 267,
+    "tasks": {
+      "parse_protos": {
+        "passed": 4,
+        "total": 8,
+        "tok_s": 46.1
+      },
+      "find_undefined_registers": {
+        "passed": 7,
+        "total": 10,
+        "tok_s": 45.5
+      },
+      "strip_header": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 46.6
+      },
+      "parse_upval": {
+        "passed": 3,
+        "total": 6,
+        "tok_s": 46.2
+      },
+      "count_real_calls": {
+        "passed": 7,
+        "total": 7,
+        "tok_s": 46.1
+      },
+      "parse_stack_hint": {
+        "passed": 5,
+        "total": 6,
+        "tok_s": 47.0
+      },
+      "parse_jump": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 45.3
+      },
+      "split_locals": {
+        "passed": 8,
+        "total": 8,
+        "tok_s": 45.7
+      },
+      "strip_block_comments": {
+        "passed": 0,
+        "total": 5,
+        "tok_s": 44.6
+      },
+      "safe_div_report": {
+        "passed": 9,
+        "total": 9,
+        "tok_s": 46.4
+      },
+      "dedupe_defects": {
+        "passed": 4,
+        "total": 4,
+        "tok_s": 46.3
+      },
+      "parse_version": {
+        "passed": 8,
+        "total": 8,
+        "tok_s": 46.3
+      }
+    }
+  },
+  "hf.co/igorls/gemma-4-12B-it-heretic-GGUF:Q4_K_M": {
+    "model": "hf.co/igorls/gemma-4-12B-it-heretic-GGUF:Q4_K_M",
+    "loads": true,
+    "uncensored": "4/4",
+    "passed": 70,
+    "total": 83,
+    "wall_s": 251,
+    "tasks": {
+      "parse_protos": {
+        "passed": 7,
+        "total": 8,
+        "tok_s": 44.3
+      },
+      "find_undefined_registers": {
+        "passed": 8,
+        "total": 10,
+        "tok_s": 45.9
+      },
+      "strip_header": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 46.2
+      },
+      "parse_upval": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 44.9
+      },
+      "count_real_calls": {
+        "passed": 0,
+        "total": 7,
+        "tok_s": 46.5
+      },
+      "parse_stack_hint": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 46.4
+      },
+      "parse_jump": {
+        "passed": 6,
+        "total": 6,
+        "tok_s": 46.1
+      },
+      "split_locals": {
+        "passed": 7,
+        "total": 8,
+        "tok_s": 45.4
+      },
+      "strip_block_comments": {
+        "passed": 3,
+        "total": 5,
+        "tok_s": 45.0
+      },
+      "safe_div_report": {
+        "passed": 9,
+        "total": 9,
+        "tok_s": 46.6
+      },
+      "dedupe_defects": {
+        "passed": 4,
+        "total": 4,
+        "tok_s": 46.9
+      },
+      "parse_version": {
+        "passed": 8,
+        "total": 8,
+        "tok_s": 46.8
+      }
+    }
   }
 }
