@@ -188,3 +188,40 @@ ITER 22  [2026-08-26 00:01]  "STOP WHEN THE ANSWER STOPS"  KEPT -> G2 GREEN 10/1
   result was wrong; a null can mean "not reached yet", not "does not work".
   NOTE: HONESTY still grades "ambiguous" and RUST-WRITE is judge-only; neither is auto-graded
   so neither blocks G2, but HONESTY remains the known confabulation weakness (G4 covers it).
+- ITER 36 [2026-08-26 00:25] G1 81/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 37 [2026-08-26 00:40] G1 75/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 23  [2026-08-26 00:40]  verbose multi-name rule (the ITER 15 wording)  ->  75/83  REVERTED
+  BASE 73/83 reproduced, so the run is VALID.
+  find_undefined_registers 8/10 (NOT fixed), split_locals 8/8->7/8, strip_block_comments 5/5->0/5
+  ALIAS 81/83 -> 75/83.
+  THE KEY RESULT: the EXACT wording that scored 10/10 on find_undefined_registers in ITER 15
+  scores 8/10 here. Same rule, same task, same weights, valid control both times - the only
+  difference is the rest of the prompt (ITER 20/22 added the trace and sign-off rules).
+  So a prompt rule's effect on these tasks is NOT a property of the rule. It depends on the
+  whole prompt, which makes "re-apply the wording that worked" invalid as a strategy.
+  find_undefined_registers across 5 measured builds: 8, 10, 8, 8, 8 - it reached 10/10 exactly
+  once and has never reproduced.
+  CONCLUSION: prompt wording is exhausted as a lever for this task. Remaining untested levers
+  are sampling params (repeat_penalty, never validly measured - two attempts died) and, less
+  plausibly for a code-generation task, local_mem facts.
+- ITER 38 [2026-08-26 00:55] G1 79/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 24  [2026-08-26 00:55]  repeat_penalty 1.05 -> 1.0  ->  79/83  REVERTED
+  BASE 73/83 reproduced (VALID). find_undefined_registers 8/10 unchanged;
+  strip_block_comments 5/5 -> 3/5. ALIAS 81/83 -> 79/83.
+  HYPOTHESIS DISPROVEN: repeat_penalty was suspected of nudging a needed \1 backreference to
+  \2 (the observed PatternError). Measured: it does not fix the regex failures and costs 2
+  points. Sampling params are now EXHAUSTED as a lever (top_p is inert at temperature 0).
+- ITER 39 [2026-08-26 01:10] G1 77/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 25  [2026-08-26 01:10]  RULE ZERO strengthening ("a complete spec needs obedience")  ->  77/83  REVERTED
+  BASE 73/83 reproduced (VALID). find_undefined_registers 8/10 unchanged, split_locals 8/8 -> 5/8.
+  VERDICT ON find_undefined_registers - every lever measured, none works:
+    prompt wording   6 variants     8, 10, 8, 8, 8, 8   (the single 10/10 never reproduced,
+                                    not even when the identical wording was re-applied)
+    sampling params  repeat_penalty  no effect on it, -2 elsewhere
+    RULE ZERO        mechanism fix   no effect on it, -3 elsewhere
+  THE CRUCIAL DISTINCTION: this is NOT a weights ceiling. BASE (raw weights, no system prompt)
+  scores 10/10 on this task EVERY run. The weights can do it perfectly. The system prompt is
+  what costs it. So the defect is a PROMPT INTERACTION, and I could not isolate which element
+  causes it - RULE ZERO was the best mechanistic candidate and made things worse.
+  NET POSITION: the prompt is worth +8 overall (73 -> 81) and -2 on this one task. Keeping it
+  is correct; the -2 is the price of the +8, not a bug to be tuned away by wording.
