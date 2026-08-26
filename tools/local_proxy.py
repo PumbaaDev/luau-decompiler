@@ -45,6 +45,17 @@ PORT = int(os.environ.get("UNIFIED_PORT", "8770"))
 UPSTREAM = os.environ.get("UNIFIED_UPSTREAM", "http://localhost:11434")
 LOCAL_MODEL = os.environ.get("UNIFIED_LOCAL_MODEL", "uncensored-coder")
 THINK_MODEL = os.environ.get("UNIFIED_THINK_MODEL", "uncensored-thinker")  # uncensored reasoner
+# Extra LOCAL models you can route a single turn to with a @marker. Measured 26 Aug on the G1
+# shootout: qwen (Qwen3.8-27B RVN) 82/83 coding but refuses 1/4; kat (KAT-Coder) 74/83 refuses
+# 2/4. The DEFAULT stays the Heretic coder (4/4 uncensored). These let you reach the others per
+# turn without leaving the terminal - e.g. "@qwen find undefined registers in this".
+MODEL_ALIASES = {
+    "local": LOCAL_MODEL, "coder": LOCAL_MODEL, "heretic": LOCAL_MODEL,
+    "think": THINK_MODEL, "thinker": THINK_MODEL,
+    "qwen": os.environ.get("UNIFIED_QWEN_MODEL", "qwen38-rvn"),
+    "kat": os.environ.get("UNIFIED_KAT_MODEL",
+        "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M"),
+}
 THINK_MIN_TOKENS = int(os.environ.get("UNIFIED_THINK_MIN_TOKENS", "8000"))  # room to finish <think>+answer
 DEFAULT_ROUTE = os.environ.get("UNIFIED_DEFAULT", "local").lower()   # local | think (cloud removed)
 if DEFAULT_ROUTE not in ("local", "think"):                          # a stale -Default cloud must not
@@ -96,8 +107,8 @@ except Exception as e:  # skills optional
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
-_MARK_LEAD = re.compile(r"^@(local|think)\b\s*", re.I)
-_MARK_TAIL = re.compile(r"(?:^|\s)@(local|think)\s*$", re.I)
+_MARK_LEAD = re.compile(r"^@(local|think|coder|heretic|thinker|qwen|kat)\b\s*", re.I)
+_MARK_TAIL = re.compile(r"(?:^|\s)@(local|think|coder|heretic|thinker|qwen|kat)\s*$", re.I)
 
 
 def log(msg: str) -> None:
@@ -585,14 +596,16 @@ class Handler(BaseHTTPRequestHandler):
             typed = (cont.get(key) if cont is not None else "") or ""
             kind, cleaned = detect_marker(typed)
             label = kind or DEFAULT_ROUTE
-            model = THINK_MODEL if label == "think" else LOCAL_MODEL  # LOCAL ONLY: cloud removed
+            route = (kind or DEFAULT_ROUTE)
+            model = MODEL_ALIASES.get(route, LOCAL_MODEL)  # @qwen/@kat/@think/@local; default local
+            is_think = route in ("think", "thinker")
             if kind and cont is not None:              # a marker was present -> strip it from THAT block only
                 cont[key] = cleaned
             task = cleaned if cont is not None else last_user_text(messages)
             ctx, nfacts, skill = build_context(task) if task else ("", 0, "-")
             inject_system(payload, ctx)
             payload["model"] = model
-            if label == "think":
+            if is_think:
                 nctx, reserve = THINK_CTX, THINK_MIN_TOKENS + OUT_MARGIN
                 # a thinking model spends a big budget inside <think>; reserve its full output
                 # room so the answer is not cut, and floor max_tokens at THINK_MIN_TOKENS.

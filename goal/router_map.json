@@ -1,0 +1,14 @@
+{
+  "parse_protos": "uncensored-coder",
+  "find_undefined_registers": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "strip_header": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "parse_upval": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "count_real_calls": "uncensored-coder",
+  "parse_stack_hint": "uncensored-coder",
+  "parse_jump": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "split_locals": "uncensored-coder",
+  "strip_block_comments": "uncensored-coder",
+  "safe_div_report": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "dedupe_defects": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M",
+  "parse_version": "hf.co/jakeroxs/KAT-Coder-V2.5-Dev-35B-A3B-MTP-ABLITERATED-GGUF:Q4_K_M"
+}
