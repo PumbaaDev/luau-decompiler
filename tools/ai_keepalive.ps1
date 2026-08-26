@@ -41,3 +41,26 @@ try {
     }
   }
 } catch { }
+
+# THERMAL + RESOURCE GUARD. Jep is abroad and long GPU benchmarks run unattended, so the
+# watchdog also records temps and steps in if the box is genuinely in trouble. Baseline
+# measured 26 Aug under 86% GPU load: 5060 Ti 49C, 14.8W of 180W, fan 32%, no throttling.
+# The 5060 Ti throttles around 83C, so 85C is a real emergency rather than a busy afternoon.
+try {
+  $q = & nvidia-smi --query-gpu=index,temperature.gpu,utilization.gpu,clocks_throttle_reasons.hw_thermal_slowdown --format=csv,noheader 2>$null
+  foreach ($line in $q) {
+    if ($line -match '^\s*(\d+),\s*(\d+),\s*(\d+)') {
+      $idx = $Matches[1]; $temp = [int]$Matches[2]; $util = $Matches[3]
+      if ($temp -ge 85) {
+        L "THERMAL EMERGENCY: GPU $idx at ${temp}C - unloading models to let it cool"
+        & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" stop uncensored-coder 2>$null
+        & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" stop uncensored-thinker 2>$null
+      } elseif ($temp -ge 78) {
+        L "WARNING: GPU $idx at ${temp}C (util ${util}%) - hot but under the 83C throttle point"
+      }
+    }
+  }
+  $os = Get-CimInstance Win32_OperatingSystem
+  $freeGB = [math]::Round($os.FreePhysicalMemory/1MB, 1)
+  if ($freeGB -lt 2) { L "WARNING: only ${freeGB}GB RAM free - a runaway llama-server is the usual cause" }
+} catch { }
