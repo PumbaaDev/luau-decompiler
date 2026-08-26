@@ -250,3 +250,20 @@ ITER 26  [2026-08-26 12:00]  PIN num_gpu=36 + seed=42 in the bench  ->  REVERTED
   harness's own contamination defence is what injects the variance.
   WHAT WOULD ACTUALLY FIX IT: repeat each configuration N times and compare medians, or stop
   reloading per task. Both are real work and neither is a prompt change.
+- ITER 42 [2026-08-26 12:14] G1 81/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+- ITER 43 [2026-08-26 12:58] G1 76/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 54.7t/s  G8 3/3 | change: none | red: G1
+ITER 27  [2026-08-26 13:29]  RESTART THE SERVER PER RUN  ->  G1 IS FINALLY REPRODUCIBLE
+  RUN A base [4,10,6,6,6,3,6,8,3,9,4,8]=73  ALIAS 76/83
+  RUN B base [4,10,6,6,6,3,6,8,3,9,4,8]=73  ALIAS 76/83   IDENTICAL, nothing changed between.
+  THE DRIFT WAS THE SERVER, NOT THE MODEL. The harness reset the MODEL per task, which made
+  tasks within one invocation 3/3 identical (measured: 0 of 24 task-sets disagreed). But ollama
+  itself ran across the whole invocation and its start state varied - visible as the CPU/GPU
+  split reading 14%/86%, 18%/82% and 27%/73% on different starts. Restarting ollama at the top
+  of each run pins it.
+  MY OWN median-of-3 FIX WAS AIMED AT THE WRONG LEVEL and is reverted to REPEATS=1: it averaged
+  within-run variance that provably does not exist, at 3x wall clock. The machinery is kept for
+  diagnosing a task suspected of genuine instability.
+  CONSEQUENCE: every G1 verdict recorded BEFORE this iteration was measured on a moving ruler
+  and none of them should be quoted. That includes my "81/83 best", the KEPT/REVERTED calls on
+  1-2 point margins, and the find_undefined_registers 8,10,8,8,8 series that the item-3 theory
+  was built on. The FIRST trustworthy G1 numbers are BASE 73/83, ALIAS 76/83.

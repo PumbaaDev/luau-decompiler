@@ -325,7 +325,11 @@ def _defence(block):
 # reloads per task by design). A single run carries about +/-3-4 points of noise, WIDER than
 # most changes being tested, so single-run A/B was reading noise as signal. Scoring each task
 # as the MEDIAN of REPEATS runs collapses that noise.
-REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
+# MEASURED 26 Aug, AFTER shipping this: within ONE bench invocation the repeats are 3/3
+# IDENTICAL on all 24 task-sets - there is NO within-run variance to average away. The drift is
+# BETWEEN invocations. So REPEATS defaults to 1 (3 was 3x cost for nothing); the machinery stays
+# for diagnosing a task suspected of genuine instability.
+REPEATS = int(os.environ.get("BENCH_REPEATS", "1"))
 
 
 def median_run(runs):
@@ -394,7 +398,34 @@ def score_task(model, task):
     return ok, n, code, notes, tok_s
 
 
+def _restart_server():
+    """Restart ollama itself before a run. The per-task reset makes tasks within a run
+    identical (proven 3/3), but the SERVER carries state across the whole invocation, and
+    that is where the drift lives: BASE produced 69, 70, 72 and 73 across invocations with no
+    code change. Starting each run from a freshly started server removes that variable."""
+    import subprocess, time as _t
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "ollama.exe"], capture_output=True, timeout=60)
+        subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], capture_output=True, timeout=60)
+    except Exception:
+        pass
+    _t.sleep(5)
+    env = dict(os.environ)
+    env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")     # 32768 only fits the 16GB card with q8
+    env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+    env.setdefault("OLLAMA_NUM_PARALLEL", "1")
+    try:
+        subprocess.Popen([_OLLAMA, "serve"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("WARN: could not restart ollama: %s" % e, flush=True)
+    _t.sleep(12)
+
+
 def main():
+    if os.environ.get("BENCH_RESTART_SERVER", "1") == "1":
+        print("# restarting ollama for a clean, identical starting state", flush=True)
+        _restart_server()
     results = {}
     for tag, model in (("BASE", BASE), ("ALIAS", ALIAS)):
         print("\n" + "#" * 78)
