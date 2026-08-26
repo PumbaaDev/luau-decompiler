@@ -64,3 +64,26 @@ try {
   $freeGB = [math]::Round($os.FreePhysicalMemory/1MB, 1)
   if ($freeGB -lt 2) { L "WARNING: only ${freeGB}GB RAM free - a runaway llama-server is the usual cause" }
 } catch { }
+
+# UNCENSORED GUARD. An abliterated model refusing legitimate reverse-engineering work is a
+# SYMPTOM, not a judgement: it means the alias no longer points at the abliterated weights, or
+# the Modelfile's uncensored SYSTEM prompt was lost (wrong base, an ollama pull, a bad edit).
+# tools/uncensored_guard.py probes with gate G5's own prompts and markers and, on a refusal,
+# REINSTALLS the alias from the Modelfile and re-verifies.
+# Rate-limited to hourly: the probes cost real model time and this runs every 5 minutes.
+# Skipped entirely while a benchmark holds the server, so it can never contaminate a gate run.
+try {
+  $stamp = Join-Path $PSScriptRoot ".uncensored_guard.stamp"
+  $due = $true
+  if (Test-Path $stamp) { $due = ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalMinutes -ge 60 }
+  $benchBusy = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -EA 0 |
+                 Where-Object { $_.CommandLine -match 'goal_gates|bench_process|bisect_prompt' }).Count -gt 0
+  if ($due -and -not $benchBusy) {
+    Set-Content -Path $stamp -Value (Get-Date).ToString("s") -Encoding ascii
+    $out = & python (Join-Path $PSScriptRoot "uncensored_guard.py") 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($code -eq 1) { L "UNCENSORED GUARD: refusal detected, alias REINSTALLED and verified" }
+    elseif ($code -ge 2) { L "UNCENSORED GUARD: STILL REFUSING after reinstall - needs a human" }
+    # exit 0 is the normal case and is intentionally not logged, to keep the log readable
+  }
+} catch { L ("uncensored guard error: " + $_.Exception.Message) }
