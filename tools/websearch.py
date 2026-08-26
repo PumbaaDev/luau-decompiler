@@ -95,9 +95,34 @@ def _relevant(query, results):
     return any(w in blob for w in words)
 
 
+def _ddgs_lib(query, n):
+    """The maintained `ddgs` library rotates across ~10 real search backends (bing/brave/google/
+    mojeek/...) and returns clean dicts - far more reliable than scraping one engine's HTML."""
+    from ddgs import DDGS
+    rows = DDGS().text(query, max_results=n, backend="auto")
+    out = []
+    for r in rows:
+        title = r.get("title") or ""
+        url = r.get("href") or r.get("url") or ""
+        if url.startswith("http"):
+            out.append((title, url, r.get("body") or ""))
+    return out
+
+
 def search(query, n):
-    import requests
     errors = []
+    # 1) the ddgs library (installed, multi-backend, proven on this machine)
+    try:
+        res = _ddgs_lib(query, n)
+        if res and _relevant(query, res):
+            return "ddgs", res
+    except Exception as e:
+        errors.append("ddgs: %s" % e)
+    # 2) fall back to scraping Bing then DuckDuckGo HTML directly (no extra deps)
+    try:
+        import requests
+    except Exception as e:
+        raise RuntimeError("no requests and " + "; ".join(errors) + " %s" % e)
     for name, fn in (("bing", _bing), ("ddg-html", _ddg)):
         try:
             res = fn(query, n, requests)
