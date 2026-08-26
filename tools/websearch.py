@@ -109,9 +109,35 @@ def _ddgs_lib(query, n):
     return out
 
 
+def _searxng(query, n):
+    """A local self-hosted SearXNG instance (tools/searxng/, http://localhost:8888) - fully local,
+    keyless, unlimited, aggregates ~100 engines. Best option when it is running."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    base = os.environ.get("SEARXNG_URL", "http://localhost:8888")
+    url = base.rstrip("/") + "/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
+    req = urllib.request.Request(url, headers={"User-Agent": "webresearch/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = _json.load(r)
+    out = []
+    for row in (data.get("results") or [])[:n]:
+        u = row.get("url") or ""
+        if u.startswith("http"):
+            out.append((row.get("title") or "", u, row.get("content") or ""))
+    return out
+
+
 def search(query, n):
     errors = []
-    # 1) the ddgs library (installed, multi-backend, proven on this machine)
+    # 1) local self-hosted SearXNG if it's up (fully local, unlimited)
+    try:
+        res = _searxng(query, n)
+        if res and _relevant(query, res):
+            return "searxng", res
+    except Exception as e:
+        errors.append("searxng: %s" % e)
+    # 2) the ddgs library (installed, multi-backend, proven on this machine)
     try:
         res = _ddgs_lib(query, n)
         if res and _relevant(query, res):
