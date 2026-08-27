@@ -63,11 +63,27 @@ def parse_fact(text: str) -> dict:
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
     if m:
         body = m.group(2).strip()
-        for line in m.group(1).splitlines():
+        lines = m.group(1).splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
             if ":" not in line:
+                i += 1
                 continue
             k, v = line.split(":", 1)
             k, v = k.strip(), v.strip()
+            if not v and k in _LIST_KEYS:
+                # BLOCK-style YAML list (key: then `- item` lines). Without this it parsed as an
+                # empty string, so a block `supersedes:` silently un-superseded facts (dead facts
+                # reappeared in retrieval). Gather the following `- ` items into the list.
+                items, j = [], i + 1
+                while j < len(lines) and lines[j].lstrip().startswith("- "):
+                    items.append(lines[j].lstrip()[2:].strip().strip("'\""))
+                    j += 1
+                if items:
+                    fm[k] = items
+                    i = j
+                    continue
             # Only the KNOWN list fields become Python lists. A scalar wrapped in brackets
             # (Obsidian `title: [[Wikilink]]`, `title: [DRAFT]`) must stay a str: turning it
             # into a list made retrieve()/alias_set crash, and one bad vault note then
@@ -77,6 +93,7 @@ def parse_fact(text: str) -> dict:
                 items = re.findall(r"'[^']*'|\"[^\"]*\"|[^,]+", v[1:-1])
                 v = [x.strip().strip("'\"") for x in items if x.strip()]
             fm[k] = v
+            i += 1
     fm["body"] = body
     return fm
 
@@ -169,7 +186,12 @@ def load_vault() -> list[dict]:
     if not VAULT_DIR.exists():
         return []
     out = []
-    for p in sorted(VAULT_DIR.glob("*.md")):
+    # rglob, not glob: notes live in subfolders too (top-level-only missed ~1/3 of the live vault).
+    # Skip Obsidian config / trash / template dirs.
+    _skip = (".obsidian", ".trash", ".git", "templates")
+    for p in sorted(VAULT_DIR.rglob("*.md")):
+        if any(part in _skip for part in p.parts):
+            continue
         try:
             fm = parse_fact(p.read_text(encoding="utf-8", errors="replace"))
         except Exception:
@@ -296,18 +318,27 @@ def retrieve(facts: list[dict], query: str, k: int = 6):
 
 
 def _recency(datestr: str) -> float:
+    """Monotonic tie-break in (0, 1) - never negative, never dominant. The old form
+    ((y-2026)*12 + ...) was unbounded and went NEGATIVE before 2026, so it inverted the
+    authority ranking (a measured 2025 fact scored below an assumed 2026 one). This is a
+    bounded nudge: newer > older, but the gap can never overturn a real score difference."""
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", datestr or "")
     if not m:
         return 0.0
     y, mo, d = (int(x) for x in m.groups())
-    return (y - 2026) * 12 + mo + d / 31.0        # small monotonic nudge
+    months = max(0.0, (y - 2020) * 12 + mo + d / 31.0)   # months since 2020, clamped >= 0
+    return months / (months + 24.0)                       # saturating: (0,1), monotonic in time
 
 
-def unmet_entities(facts: list[dict], query: str) -> list[str]:
-    """Named entities in the query that NO live fact defines. The anti-bluff key."""
-    live, _ = live_facts(facts)
+def unmet_entities(facts: list[dict], query: str, cover=None) -> list[str]:
+    """Named entities in the query that the coverage set does not define. The anti-bluff key.
+    cover defaults to ALL live facts; pass cover=the injected hits to also flag entities that ARE
+    in the corpus but were NOT retrieved - otherwise the model receives no fact for them yet they
+    aren't flagged 'unknown', which reopens the bluff path (#6)."""
+    if cover is None:
+        cover, _ = live_facts(facts)
     covered = set()
-    for f in live:
+    for f in cover:
         covered |= _unit_ents(f)                        # id/title/alias entities AND body-defined entities
     out = []
     for e in entities(query):
@@ -364,7 +395,11 @@ def call_model(prompt: str, model: str) -> str:
     body = json.dumps({"model": model, "prompt": prompt, "stream": False,
                        "options": {"num_predict": 8000}}).encode()
     req = urllib.request.Request(URL, data=body, headers={"content-type": "application/json"})
-    return json.load(urllib.request.urlopen(req, timeout=600)).get("response", "").strip()
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=600)).get("response", "").strip()
+    except Exception as e:                          # Ollama down / model missing -> clear message, not a traceback
+        return "ERROR: could not reach the local model '%s' (%s: %s). Is Ollama running and the model pulled?" % (
+            model, type(e).__name__, e)
 
 
 # --------------------------------------------------------------------------- #
@@ -456,7 +491,7 @@ def cmd_search(args) -> int:
     q = " ".join(args.query)
     facts = _corpus(args)
     hits = retrieve(facts, q, args.k)
-    unmet = unmet_entities(facts, q)
+    unmet = unmet_entities(facts, q, cover=[f for _, f in hits])   # coverage == what's injected
     print("query entities: %s" % (entities(q) or "none"))
     print("unmet (no fact): %s\n" % (unmet or "none"))
     for s, f in hits:
@@ -468,7 +503,7 @@ def cmd_ask(args) -> int:
     q = " ".join(args.question)
     facts = _corpus(args)
     hits = retrieve(facts, q, args.k)
-    unmet = unmet_entities(facts, q)
+    unmet = unmet_entities(facts, q, cover=[f for _, f in hits])   # coverage == what's injected
     if args.show:
         print("retrieved: %s" % [f["id"] for _, f in hits], file=sys.stderr)
         print("unmet entities: %s\n" % unmet, file=sys.stderr)
