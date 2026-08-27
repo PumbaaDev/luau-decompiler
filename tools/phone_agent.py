@@ -51,10 +51,10 @@ OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
 NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
-MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "6"))
-TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "8000"))  # per tool result; 6 iters x 8k << 32k num_ctx
+MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to read several files while exploring
+TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
 RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
-WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "180"))           # seconds before we force a final answer
+WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer
 ROOT = Path(__file__).resolve().parent
 
 # reuse the desktop proxy's memory injection (import does NOT start its server)
@@ -97,7 +97,12 @@ BASE_PERSONA = (
     "truth, so verify against the real files. His decompiler project is at "
     "C:\\Users\\jep\\Downloads\\luau-decompiler-v2. For current web facts use web_search / web_fetch. "
     "His EMAIL lives in Gmail, NOT on disk: for any order, receipt, delivery, purchase, or message, "
-    "call email_search / email_read - do NOT look for .eml files with the file tools. "
+    "call email_search / email_read - do NOT look for .eml files with the file tools.\n"
+    "To UNDERSTAND his code broadly (how something works, where a thing is, what a subsystem does), "
+    "use search_knowledge FIRST - his ENTIRE codebase is indexed there, so you can answer about any "
+    "part WITHOUT reading every file. Use read_file for one file's exact contents and list_dir to see "
+    "what exists. You canNOT read every file of a large project in one turn (there are hundreds); read "
+    "the key ones, use search_knowledge for the rest, and be honest about which you actually read.\n"
     "Only say you do not know AFTER a tool has actually tried and failed to find it."
 )
 
