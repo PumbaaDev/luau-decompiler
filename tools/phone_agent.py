@@ -41,6 +41,8 @@ MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
 NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "6"))
+TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "4000"))  # per tool result, keeps total under num_ctx
+WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "180"))           # seconds before we force a final answer
 ROOT = Path(__file__).resolve().parent
 
 # reuse the desktop proxy's memory injection (import does NOT start its server)
@@ -64,19 +66,30 @@ BASE_PERSONA = (
 # tools that actually run on this PC
 # --------------------------------------------------------------------------- #
 def _run(cmd, timeout=60, shell="powershell"):
+    if shell == "powershell":
+        full = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd]
+    else:
+        full = cmd if isinstance(cmd, list) else ["cmd.exe", "/c", cmd]
     try:
-        if shell == "powershell":
-            full = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd]
-        else:
-            full = cmd if isinstance(cmd, list) else ["cmd.exe", "/c", cmd]
-        p = subprocess.run(full, capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
-        out = (p.stdout or "") + (("\n[stderr] " + p.stderr) if p.stderr.strip() else "")
-        return out.strip() or "(no output)"
+        p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        return "(error launching command: %s: %s)" % (type(e).__name__, e)
+    try:
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return "(command timed out after %ds)" % timeout
+        # kill the WHOLE tree - a grandchild (e.g. `ping -t`, a server) can hold the pipe open
+        # and make a parent-only kill block communicate() forever.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        return "(command timed out after %ds and was killed)" % timeout
     except Exception as e:
         return "(error running command: %s: %s)" % (type(e).__name__, e)
+    result = (out or "") + (("\n[stderr] " + err) if err and err.strip() else "")
+    return result.strip() or "(no output)"
 
 
 def tool_system_info(_args):
@@ -215,13 +228,19 @@ def _system_block(messages):
     return "\n\n".join(parts)
 
 
-def _ollama_chat(messages):
-    body = {"model": MODEL, "messages": messages, "tools": TOOL_SPECS, "stream": False,
+def _ollama_chat(messages, tools=None):
+    body = {"model": MODEL, "messages": messages, "stream": False,
             "options": {"num_ctx": NUM_CTX, "temperature": 0.6}}
+    if tools:
+        body["tools"] = tools
     req = urllib.request.Request(OLLAMA + "/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=int(os.environ.get("PHONE_TIMEOUT", "600"))) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=int(os.environ.get("PHONE_TIMEOUT", "600"))) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError("Ollama HTTP %s: %s" % (e.code, detail))
 
 
 def run_agent(client_messages):
@@ -235,8 +254,9 @@ def run_agent(client_messages):
             msgs.append({"role": m["role"], "content": c})
 
     tools_used = []
+    deadline = time.time() + WALL_BUDGET
     for _ in range(MAX_TOOL_ITERS):
-        resp = _ollama_chat(msgs)
+        resp = _ollama_chat(msgs, tools=TOOL_SPECS)
         msg = resp.get("message", {}) or {}
         calls = msg.get("tool_calls") or []
         if not calls:
@@ -252,14 +272,25 @@ def run_agent(client_messages):
                     args = json.loads(args)
                 except Exception:
                     args = {}
+            if not isinstance(args, dict):        # a stray list/scalar must not crash the turn
+                args = {}
             tools_used.append(name)
             handler = TOOLS.get(name)
-            result = handler(args) if handler else "(unknown tool: %s)" % name
-            msgs.append({"role": "tool", "content": str(result)[:8000],
-                         "tool_name": name})
-    # ran out of tool iterations - ask for a final answer with no tools
-    resp = _ollama_chat([m for m in msgs] + [{"role": "user",
-            "content": "Now give me your final answer in plain language, using what the tools returned."}])
+            if not handler:
+                result = "(unknown tool: %s)" % name
+            else:
+                try:
+                    result = handler(args)
+                except Exception as e:            # one bad tool call self-corrects, never kills the turn
+                    result = "(tool error in %s: %s: %s)" % (name, type(e).__name__, e)
+            msgs.append({"role": "tool", "content": str(result)[:TOOL_RESULT_CAP], "tool_name": name})
+        if time.time() > deadline:                # stop looping once we blow the time budget
+            break
+    # out of iterations or time - force a final answer with NO tools offered, so the model must
+    # produce text instead of spiralling into another tool call.
+    resp = _ollama_chat(msgs + [{"role": "user",
+            "content": "Now give me your final answer in plain language, using what the tools returned so far."}],
+            tools=None)
     return (resp.get("message", {}) or {}).get("content", "") or "(no final answer)", tools_used
 
 
@@ -324,6 +355,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) if length else b"{}")
+            if not isinstance(payload, dict):     # a JSON array/string body must 400, not crash the thread
+                raise ValueError("body must be a JSON object")
         except Exception:
             self._send(400, b'{"error":"bad request"}'); return
         stream = bool(payload.get("stream"))
