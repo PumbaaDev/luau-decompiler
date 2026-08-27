@@ -98,6 +98,17 @@ def _iter_files():
 
 
 def build_index():
+    """Full rebuild from the corpus. Exclusive: holds the single-writer lock for the whole run so an
+    ingest can't interleave with the from-scratch overwrite."""
+    if not _acquire_lock():
+        raise RuntimeError("another indexer holds %s - refusing to rebuild concurrently" % LOCK_PATH)
+    try:
+        return _build_index_locked()
+    finally:
+        _release_lock()
+
+
+def _build_index_locked():
     IDX_DIR.mkdir(exist_ok=True)
     chunks = []   # (source, text)
     seen = set()
@@ -132,12 +143,18 @@ def build_index():
         if (n + 1) % 200 == 0:
             print("  %d/%d (%.0fs)" % (n + 1, len(chunks), time.time() - t0), file=sys.stderr)
 
+    if not vecs:                                   # nothing embedded (e.g. Ollama down) - don't wipe the store
+        print("build_index: 0 chunks embedded, leaving existing store untouched", file=sys.stderr)
+        return 0
     arr = np.asarray(vecs, dtype=np.float32)
     arr /= (np.linalg.norm(arr, axis=1, keepdims=True) + 1e-8)   # pre-normalise for cosine
-    np.save(VEC_PATH, arr)
-    with META_PATH.open("w", encoding="utf-8") as f:
+    _atomic_save_vecs(arr)
+    tmp = META_PATH.parent / (META_PATH.name + ".tmp")           # atomic meta swap to match
+    with tmp.open("w", encoding="utf-8") as f:
         for m in meta:
             f.write(json.dumps(m) + "\n")
+    os.replace(tmp, META_PATH)
+    _CACHE["vecs"], _CACHE["meta"] = arr, meta                   # refresh cache to the rebuilt store
     print("indexed %d chunks -> %s (%.0fs)" % (len(meta), VEC_PATH.name, time.time() - t0), file=sys.stderr)
     return len(meta)
 
@@ -145,13 +162,45 @@ def build_index():
 _CACHE = {"vecs": None, "meta": None}
 
 
-def _load():
-    if _CACHE["vecs"] is None:
+def _load(force=False):
+    """Load the store into the cache. force=True re-reads DISK (a long-running process must do this
+    before writing, or it rewrites from a stale snapshot and clobbers another writer's flushes).
+    Defensively truncates to the common prefix so a crash-torn flush self-heals instead of poisoning
+    retrieval with vec[i] not matching meta[i]."""
+    if force or _CACHE["vecs"] is None:
         if not VEC_PATH.exists():
             raise RuntimeError("no RAG index - run: python tools/rag.py index")
-        _CACHE["vecs"] = np.load(VEC_PATH)
-        _CACHE["meta"] = [json.loads(l) for l in META_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+        vecs = np.load(VEC_PATH)
+        meta = [json.loads(l) for l in META_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if len(vecs) != len(meta):                # crash-torn write: keep only the aligned prefix
+            n = min(len(vecs), len(meta))
+            print("rag: store length mismatch (vecs=%d meta=%d), aligning to %d" % (len(vecs), len(meta), n),
+                  file=sys.stderr)
+            vecs, meta = vecs[:n], meta[:n]
+        _CACHE["vecs"], _CACHE["meta"] = vecs, meta
     return _CACHE["vecs"], _CACHE["meta"]
+
+
+def _atomic_save_vecs(arr):
+    """Write the vectors file atomically (temp + os.replace) so a crash never leaves a half-written
+    .npy that fails to load. np.save to an open handle avoids its auto-.npy-suffix rewrite."""
+    IDX_DIR.mkdir(exist_ok=True)
+    tmp = VEC_PATH.parent / (VEC_PATH.name + ".tmp")
+    with open(tmp, "wb") as f:
+        np.save(f, arr)
+    os.replace(tmp, VEC_PATH)
+
+
+def _write_load():
+    """Fresh disk snapshot for a WRITER (called under the lock). If the store files exist but fail to
+    load, ABORT rather than returning an empty base - overwriting with empty would destroy the store
+    (the #9 corruption). Only an absent store yields the empty base of a first run."""
+    try:
+        return _load(force=True)
+    except RuntimeError:
+        if VEC_PATH.exists():                     # exists but unreadable -> do NOT clobber it
+            raise
+        return np.zeros((0, 768), dtype=np.float32), []
 
 
 def retrieve(query: str, k: int = 5):
@@ -168,19 +217,21 @@ def retrieve(query: str, k: int = 5):
 def append_pages(pages, source_prefix="web:"):
     """Chunk + embed crawled pages and APPEND them to the index PERMANENTLY (dedup'd). Updates disk
     AND the in-memory cache, so a long-running agent can learn a site then immediately recall it."""
+    # Embed first WITHOUT the lock (embedding is the slow part and touches no shared file); dedup
+    # against a snapshot just to avoid obvious re-embeds.
     try:
-        vecs, meta = _load()
+        _, meta0 = _load()
     except Exception:
-        vecs, meta = np.zeros((0, 768), dtype=np.float32), []
-    keys = {(m["source"], m["text"][:80]) for m in meta}
-    new_vecs, new_meta = [], []
+        meta0 = []
+    seen = {(m["source"], m["text"][:80]) for m in meta0}
+    pending = []   # (src, chunk, vec)
     for url, title, text in pages:
         src = source_prefix + url
         for c in _chunk(text, src):
             key = (src, c[:80])
-            if key in keys:
+            if key in seen:
                 continue
-            keys.add(key)
+            seen.add(key)
             try:
                 e = _embed("search_document: " + c)
             except Exception:
@@ -189,19 +240,35 @@ def append_pages(pages, source_prefix="web:"):
                 continue
             v = np.asarray(e, dtype=np.float32)
             v /= (np.linalg.norm(v) + 1e-8)
-            new_vecs.append(v)
-            new_meta.append({"source": src, "text": c})
-    if not new_vecs:
+            pending.append((src, c, v))
+    if not pending:
         return 0
-    stacked = np.asarray(new_vecs, dtype=np.float32)
-    allv = np.vstack([vecs, stacked]) if len(vecs) else stacked
-    IDX_DIR.mkdir(exist_ok=True)
-    np.save(VEC_PATH, allv)
-    with META_PATH.open("a", encoding="utf-8") as f:      # append keeps order aligned with allv
-        for m in new_meta:
-            f.write(json.dumps(m) + "\n")
-    _CACHE["vecs"], _CACHE["meta"] = allv, meta + new_meta
-    return len(new_meta)
+    # WRITE under the single-writer lock, off a FRESH disk snapshot (never a stale cache), atomically.
+    if not _acquire_lock():
+        raise RuntimeError("another indexer holds %s - refusing concurrent write" % LOCK_PATH)
+    try:
+        vecs, meta = _write_load()
+        have = {(m["source"], m["text"][:80]) for m in meta}
+        add_v, add_m = [], []
+        for src, c, v in pending:
+            k = (src, c[:80])
+            if k in have:                          # another writer added it between embed and write
+                continue
+            have.add(k)
+            add_v.append(v)
+            add_m.append({"source": src, "text": c})
+        if not add_m:
+            return 0
+        stacked = np.asarray(add_v, dtype=np.float32)
+        allv = np.vstack([vecs, stacked]) if len(vecs) else stacked
+        _atomic_save_vecs(allv)
+        with META_PATH.open("a", encoding="utf-8") as f:   # append keeps order aligned with allv
+            for m in add_m:
+                f.write(json.dumps(m) + "\n")
+        _CACHE["vecs"], _CACHE["meta"] = allv, meta + add_m
+        return len(add_m)
+    finally:
+        _release_lock()
 
 
 def ingest_url(url, max_pages=15, max_depth=2):
@@ -283,10 +350,10 @@ import subprocess  # noqa: E402  (used by _pid_alive)
 
 
 def _ensure_loaded():
-    try:
-        _load()
-    except Exception:
-        _CACHE["vecs"], _CACHE["meta"] = np.zeros((0, 768), dtype=np.float32), []
+    """Fresh disk snapshot for a writer (ingest holds the lock when this runs). Never fabricates an
+    empty base over an existing-but-unreadable store - _write_load raises so the run aborts instead
+    of clobbering the store on the next flush."""
+    _write_load()
 
 
 def _flush(buf_v, buf_m):
@@ -296,7 +363,7 @@ def _flush(buf_v, buf_m):
     IDX_DIR.mkdir(exist_ok=True)
     stacked = np.asarray(buf_v, dtype=np.float32)
     allv = np.vstack([_CACHE["vecs"], stacked]) if len(_CACHE["vecs"]) else stacked
-    np.save(VEC_PATH, allv)
+    _atomic_save_vecs(allv)
     with META_PATH.open("a", encoding="utf-8") as f:
         for m in buf_m:
             f.write(json.dumps(m) + "\n")
