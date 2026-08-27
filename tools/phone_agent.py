@@ -171,12 +171,15 @@ TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "get_system_info", "description":
         "Get live hardware and OS info about THIS PC (CPU, RAM, GPU model/VRAM/usage/temperature, "
-        "OS version, uptime). Call this for any question about the user's computer or its specs.",
+        "OS version, uptime). Call this for any question about the user's computer or its specs. "
+        "This is the AUTHORITATIVE source for GPU details incl. exact VRAM (it uses nvidia-smi).",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "run_command", "description":
         "Run a PowerShell command on THIS PC and return its output. Use for anything about the live "
-        "system: running processes, disk space, installed apps, network, files, etc.",
+        "system: running processes, disk space, installed apps, network, files, etc. Do NOT use it "
+        "to read GPU VRAM (Windows Win32_VideoController caps AdapterRAM at ~4GB and lies) - use "
+        "get_system_info for GPU/VRAM instead.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "the PowerShell command to run"}},
             "required": ["command"]}}},
