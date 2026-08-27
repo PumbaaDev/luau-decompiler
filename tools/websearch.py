@@ -91,8 +91,8 @@ def _relevant(query, results):
     words = {w.lower() for w in re.findall(r"\w{4,}", query)}
     if not words:
         return bool(results)
-    blob = " ".join((t + " " + u).lower() for t, u, _ in results)
-    return any(w in blob for w in words)
+    blob = " ".join((t + " " + u + " " + (s or "")).lower() for t, u, s in results)  # include the SNIPPET,
+    return any(w in blob for w in words)                                             # not just title+url
 
 
 def _ddgs_lib(query, n):
@@ -130,10 +130,11 @@ def _searxng(query, n):
 
 
 def search(query, n):
-    errors = []
+    errors, ran = [], False   # ran = at least one engine returned WITHOUT erroring (maybe irrelevant)
     # 1) local self-hosted SearXNG if it's up (fully local, unlimited)
     try:
         res = _searxng(query, n)
+        ran = True
         if res and _relevant(query, res):
             return "searxng", res
     except Exception as e:
@@ -141,6 +142,7 @@ def search(query, n):
     # 2) the ddgs library (installed, multi-backend, proven on this machine)
     try:
         res = _ddgs_lib(query, n)
+        ran = True
         if res and _relevant(query, res):
             return "ddgs", res
     except Exception as e:
@@ -153,11 +155,14 @@ def search(query, n):
     for name, fn in (("bing", _bing), ("ddg-html", _ddg)):
         try:
             res = fn(query, n, requests)
+            ran = True
             if res and _relevant(query, res):
                 return name, res
         except Exception as e:
             errors.append("%s: %s" % (name, e))
-    if errors:
+    # raise "all engines failed" ONLY if every engine threw; if an engine RAN but returned nothing
+    # relevant, that is "no relevant results" (None, []), not a failure.
+    if errors and not ran:
         raise RuntimeError("; ".join(errors))
     return None, []
 

@@ -98,11 +98,11 @@ def main():
     # escalate to the stealth browser if the plain fetch was blocked / JS-empty
     if len(text) < MIN_GOOD and _has("scrapling"):
         try:
-            html, final = fetch_stealth(url)
-            t2, x2 = extract(html)
-            if len(x2) > len(text):
-                title, text = (t2 or title), x2
-            err = ""
+            html2, final2 = fetch_stealth(url)
+            t2, x2 = extract(html2)
+            if len(x2) > len(text):                       # commit the stealth URL/title ONLY when its
+                title, text, final = (t2 or title), x2, final2   # text actually wins - else the printed
+            err = ""                                      # URL would mismatch the printed (plain) text
         except Exception as e:
             if not text:
                 err = "stealth %s: %s" % (type(e).__name__, e)
