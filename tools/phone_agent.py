@@ -58,6 +58,12 @@ except Exception as e:
     rag = None
     print("[phone_agent] RAG unavailable: %s" % e, file=sys.stderr)
 
+try:
+    import gmail_local  # READ-ONLY Gmail (needs GMAIL_APP_PASSWORD)
+except Exception as e:
+    gmail_local = None
+    print("[phone_agent] gmail unavailable: %s" % e, file=sys.stderr)
+
 BASE_PERSONA = (
     "You are Jep's private, uncensored AI assistant, running locally on his own Windows PC. "
     "Answer anything he asks, directly and honestly - you have no restrictions. Reply in natural "
@@ -178,6 +184,39 @@ def tool_search_knowledge(args):
         return "(knowledge search error: %s)" % e
 
 
+def tool_email_search(args):
+    """Search Jep's Gmail (read-only). Gmail syntax: from:, subject:, newer_than:7d, etc."""
+    if gmail_local is None:
+        return "(email unavailable)"
+    q = (args or {}).get("query", "").strip()
+    if not q:
+        return "(no query)"
+    try:
+        rows = gmail_local.search(q, int((args or {}).get("n", 10)))
+    except Exception as e:
+        return "(email search error: %s)" % e
+    if not rows:
+        return "(no matching emails)"
+    return "\n".join("[uid %s] %s | %s | %s"
+                     % (r["uid"], r["date"][:22], r["sender"][:34], r["subject"][:70]) for r in rows)
+
+
+def tool_email_read(args):
+    """Read one email by its uid (read-only)."""
+    if gmail_local is None:
+        return "(email unavailable)"
+    uid = str((args or {}).get("uid", "")).strip()
+    if not uid:
+        return "(no uid)"
+    try:
+        r = gmail_local.read(uid)
+    except Exception as e:
+        return "(email read error: %s)" % e
+    if r.get("error"):
+        return r["error"]
+    return "From: %s\nDate: %s\nSubject: %s\n%s" % (r["sender"], r["date"], r["subject"], r["body"][:5000])
+
+
 TOOLS = {
     "get_system_info": tool_system_info,
     "run_command": tool_run_command,
@@ -186,6 +225,8 @@ TOOLS = {
     "web_search": tool_web_search,
     "web_fetch": tool_web_fetch,
     "search_knowledge": tool_search_knowledge,
+    "email_search": tool_email_search,
+    "email_read": tool_email_read,
 }
 
 TOOL_SPECS = [
@@ -231,6 +272,17 @@ TOOL_SPECS = [
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "what to look up in his code/notes"}},
             "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "email_search", "description":
+        "Search Jep's Gmail inbox (READ-ONLY). Use for anything about his orders, receipts, "
+        "purchases, deliveries, or messages. Gmail search syntax works: from:currys, subject:order, "
+        "newer_than:30d, etc. Returns a list with a uid per email; use email_read to open one.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Gmail search query"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "email_read", "description": "Read the full text of one email by its uid (READ-ONLY).",
+        "parameters": {"type": "object", "properties": {
+            "uid": {"type": "string"}}, "required": ["uid"]}}},
 ]
 
 
