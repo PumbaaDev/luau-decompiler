@@ -31,6 +31,7 @@ EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "nomic-embed-text")
 IDX_DIR = ROOT / "goal"
 META_PATH = IDX_DIR / "rag_index.jsonl"
 VEC_PATH = IDX_DIR / "rag_vectors.npy"
+LOCK_PATH = IDX_DIR / "rag_index.lock"     # guards against concurrent writers corrupting the store
 CHUNK_CHARS = int(os.environ.get("RAG_CHUNK_CHARS", "1500"))
 CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "200"))
 
@@ -52,6 +53,17 @@ def _embed(text: str, timeout: int = 60) -> list[float]:
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r).get("embedding", [])
+
+
+def _embed_batch(texts, timeout: int = 180) -> list[list[float]]:
+    """Embed many chunks in ONE call via Ollama's /api/embed (array input). ~15-28x faster than
+    one HTTP round-trip per chunk: measured 39 embeds/s batched vs ~2/s single on the 5060 Ti.
+    Applies the same 'search_document: ' prefix as the single path so vectors stay consistent."""
+    body = json.dumps({"model": EMBED_MODEL, "input": ["search_document: " + t for t in texts]}).encode()
+    req = urllib.request.Request(OLLAMA + "/api/embed", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r).get("embeddings", [])
 
 
 def _chunk(text: str, path: str):
@@ -199,6 +211,183 @@ def ingest_url(url, max_pages=15, max_depth=2):
     return append_pages(pages)
 
 
+def looks_like_source(path, sample=16384):
+    """True only for real human-readable SOURCE text; rejects COMPILED/binary content.
+
+    Roblox repos ship compiled artifacts too - binary .rbxl/.rbxm place files, and occasionally
+    Luau BYTECODE (string.dump / luau-compile output) saved with a .lua extension. Bytecode is
+    binary and useless to a code-knowledge index. Discriminator: source is clean UTF-8 text with
+    no NUL bytes and almost no control chars; compiled/bytecode has NULs and fails UTF-8."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(sample)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    if b"\x00" in raw:                       # a NUL byte never appears in Lua source; = binary/bytecode
+        return False
+    try:
+        text = raw.decode("utf-8")           # source is valid UTF-8; bytecode is not
+    except UnicodeDecodeError:
+        return False
+    ctrl = sum(1 for c in text if ord(c) < 0x20 and c not in "\t\n\r\f")
+    if ctrl > len(text) * 0.02:              # >2% control chars = binary, not source
+        return False
+    return True
+
+
+def _pid_alive(pid):
+    try:
+        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=10)
+        return ("python" in out.stdout.lower())
+    except Exception:
+        return True   # can't tell -> assume alive (safer: don't steal a live lock)
+
+
+def _acquire_lock():
+    """Exclusive single-writer lock. Two concurrent ingest runs would overwrite each other's
+    vectors (the .npy is rewritten whole on each flush) and misalign it from the .jsonl - which is
+    exactly the corruption seen on 27 Aug. Steal only a lock whose owning PID is gone (stale)."""
+    IDX_DIR.mkdir(exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                owner = int(LOCK_PATH.read_text().strip() or "0")
+            except Exception:
+                owner = 0
+            if owner and owner != os.getpid() and _pid_alive(owner):
+                return False                      # a live indexer holds it - refuse
+            try:
+                LOCK_PATH.unlink()                # stale (dead owner) - steal and retry
+            except OSError:
+                return False
+    return False
+
+
+def _release_lock():
+    try:
+        if LOCK_PATH.exists() and LOCK_PATH.read_text().strip() == str(os.getpid()):
+            LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+import subprocess  # noqa: E402  (used by _pid_alive)
+
+
+def _ensure_loaded():
+    try:
+        _load()
+    except Exception:
+        _CACHE["vecs"], _CACHE["meta"] = np.zeros((0, 768), dtype=np.float32), []
+
+
+def _flush(buf_v, buf_m):
+    """Append a batch to disk + live cache (keeps order aligned so retrieve stays correct)."""
+    if not buf_v:
+        return
+    IDX_DIR.mkdir(exist_ok=True)
+    stacked = np.asarray(buf_v, dtype=np.float32)
+    allv = np.vstack([_CACHE["vecs"], stacked]) if len(_CACHE["vecs"]) else stacked
+    np.save(VEC_PATH, allv)
+    with META_PATH.open("a", encoding="utf-8") as f:
+        for m in buf_m:
+            f.write(json.dumps(m) + "\n")
+    _CACHE["vecs"], _CACHE["meta"] = allv, _CACHE["meta"] + buf_m
+
+
+def ingest_dir(root, exts=(".lua", ".luau"), source_prefix="", flush_every=800, max_file=300_000):
+    """Walk a directory of CODE files and index them into permanent knowledge, saving incrementally
+    (a crash mid-run keeps everything already flushed). Dedup'd against what's already indexed.
+    Holds a single-writer lock for the whole run so a second indexer can't corrupt the store."""
+    if not _acquire_lock():
+        raise RuntimeError("another indexer holds %s - refusing to run concurrently (a second writer "
+                           "corrupts the vector store). If it is stale, delete that file." % LOCK_PATH)
+    try:
+        return _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file)
+    finally:
+        _release_lock()
+
+
+def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=64):
+    root = Path(root)
+    _ensure_loaded()
+    keys = {(m["source"], m["text"][:80]) for m in _CACHE["meta"]}
+    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts
+             and not (SKIP_DIRS & set(p.parts))]
+    print("ingest_dir: %d %s files under %s" % (len(files), "/".join(exts), root), file=sys.stderr)
+
+    buf_v, buf_m = [], []                     # embedded, awaiting disk flush
+    pend_src, pend_txt = [], []               # chunks awaiting a batch embed call
+    state = {"added": 0, "skipped_compiled": 0, "fi": 0}
+    t0 = time.time()
+
+    def do_embed():                           # embed the pending batch in one HTTP call
+        if not pend_txt:
+            return
+        try:
+            embs = _embed_batch(pend_txt)
+        except Exception as ex:
+            print("  batch embed failed (%s), skipping %d chunks" % (ex, len(pend_txt)), file=sys.stderr)
+            embs = []
+        for c, src, e in zip(pend_txt, pend_src, embs):
+            if not e:
+                continue
+            v = np.asarray(e, dtype=np.float32)
+            v /= (np.linalg.norm(v) + 1e-8)
+            buf_v.append(v)
+            buf_m.append({"source": src, "text": c})
+        pend_src.clear()
+        pend_txt.clear()
+
+    def maybe_flush():
+        if len(buf_v) >= flush_every:
+            _flush(buf_v, buf_m)
+            state["added"] += len(buf_m)
+            print("  indexed %d chunks (%d/%d files, %.0fs, %.1f/s)"
+                  % (state["added"], state["fi"], len(files), time.time() - t0,
+                     state["added"] / max(time.time() - t0, 1)), file=sys.stderr)
+            buf_v.clear()
+            buf_m.clear()
+
+    for n, p in enumerate(files):
+        state["fi"] = n + 1
+        try:
+            if p.stat().st_size > max_file:
+                continue
+            if not looks_like_source(p):      # reject compiled/bytecode masquerading as .lua
+                state["skipped_compiled"] += 1
+                continue
+            txt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        src = source_prefix + str(p.relative_to(root)).replace("\\", "/")
+        for c in _chunk(txt, src):
+            key = (src, c[:80])
+            if key in keys:
+                continue
+            keys.add(key)
+            pend_src.append(src)
+            pend_txt.append(c)
+            if len(pend_txt) >= batch:
+                do_embed()
+                maybe_flush()
+    do_embed()                                # final partial batch
+    _flush(buf_v, buf_m)
+    state["added"] += len(buf_m)
+    print("ingest_dir done: +%d chunks from source, %d compiled/binary files skipped (%.0fs, %.1f/s)"
+          % (state["added"], state["skipped_compiled"], time.time() - t0,
+             state["added"] / max(time.time() - t0, 1)), file=sys.stderr)
+    return state["added"]
+
+
 def format_hits(hits) -> str:
     if not hits:
         return "(nothing relevant found in the codebase/notes)"
@@ -227,12 +416,19 @@ def main():
         md = int(sys.argv[4]) if len(sys.argv) > 4 else 2
         n = ingest_url(sys.argv[2], mp, md)
         print("ingested %d new chunks from %s into permanent knowledge" % (n, sys.argv[2]), file=sys.stderr)
+    elif cmd == "ingest-dir":
+        if len(sys.argv) < 3:
+            print("usage: rag.py ingest-dir <dir> [source_prefix]"); return 2
+        prefix = sys.argv[3] if len(sys.argv) > 3 else ""
+        n = ingest_dir(sys.argv[2], source_prefix=prefix)
+        print("ingested %d new source chunks from %s into permanent knowledge" % (n, sys.argv[2]), file=sys.stderr)
     elif cmd == "stats":
         try:
             v, m = _load()
             web = sum(1 for x in m if str(x["source"]).startswith("web:"))
-            print("index: %d chunks (%d from crawled web), %d-dim vectors, %.1f MB"
-                  % (len(m), web, v.shape[1], VEC_PATH.stat().st_size / 1e6))
+            rbx = sum(1 for x in m if str(x["source"]).startswith("roblox:"))
+            print("index: %d chunks (%d web, %d roblox), %d-dim vectors, %.1f MB"
+                  % (len(m), web, rbx, v.shape[1], VEC_PATH.stat().st_size / 1e6))
         except Exception as e:
             print("no index:", e)
     else:
