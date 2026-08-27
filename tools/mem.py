@@ -454,8 +454,22 @@ def cmd_supersede(args) -> int:
         sys.exit("no such fact: %s" % args.new)
     if args.old not in facts:
         sys.exit("no such fact: %s" % args.old)
-    if args.new in facts[args.old].get("supersedes", []):   # mutual supersession hides BOTH facts
-        sys.exit("cycle: %s already supersedes %s - refusing" % (args.old, args.new))
+    # A cycle of ANY length hides every fact in it (each is superseded by another). Adding
+    # new->old closes a cycle iff `old` already transitively supersedes `new`. Walk the chain,
+    # not just the direct edge (the old 2-cycle-only check missed A->B->C->A).
+    def _reaches(start, target):
+        seen, stack = set(), [start]
+        while stack:
+            cur = stack.pop()
+            if cur == target:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(facts.get(cur, {}).get("supersedes", []))
+        return False
+    if _reaches(args.old, args.new):
+        sys.exit("cycle: %s already (transitively) supersedes %s - refusing" % (args.old, args.new))
     fm = facts[args.new]
     sup = set(fm.get("supersedes", [])) | {args.old}
     fm["supersedes"] = sorted(sup)
