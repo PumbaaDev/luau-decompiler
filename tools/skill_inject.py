@@ -100,11 +100,26 @@ def parse_skill(path: Path) -> dict:
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.S)
     if m:
         fm, body = m.group(1), m.group(2)
-        for line in fm.splitlines():
-            if line.lower().startswith("name:"):
-                name = line.split(":", 1)[1].strip() or name
-            elif line.lower().startswith("description:"):
-                desc = line.split(":", 1)[1].strip()
+        lines = fm.splitlines()
+        i = 0
+        while i < len(lines):
+            low = lines[i].lower()
+            if low.startswith("name:"):
+                name = lines[i].split(":", 1)[1].strip().strip("'\"") or name
+                i += 1
+            elif low.startswith("description:"):
+                val = lines[i].split(":", 1)[1].strip()
+                if val in (">", "|", ">-", "|-", ">+", "|+", ""):   # BLOCK scalar / empty: gather the
+                    parts, j = [], i + 1                             # indented continuation lines (was
+                    while j < len(lines) and (lines[j][:1] in (" ", "\t") or not lines[j].strip()):
+                        if lines[j].strip():                        # dropped entirely -> no ranking signal)
+                            parts.append(lines[j].strip())
+                        j += 1
+                    desc, i = " ".join(parts), j
+                else:
+                    desc, i = val.strip("'\""), i + 1               # strip surrounding quotes (#38)
+            else:
+                i += 1
     scripts = sorted(p.name for p in path.parent.glob("scripts/*") if p.is_file())
     return {"name": name, "dir": str(path.parent), "desc": desc,
             "body": body.strip(), "scripts": scripts}
@@ -250,7 +265,10 @@ def build_injection(task: str, k: int = 1, min_score: float = 0.0, max_chars: in
     # Bound the result for EVERY caller (ask_local applies no cap of its own; the proxy caps
     # further). A full SKILL.md is ~20k chars and would otherwise crowd out the retrieved notes.
     if max_chars and len(out) > max_chars:
-        out = out[:max_chars].rstrip() + "\n[...skill truncated to fit]\n"
+        out = out[:max_chars].rstrip()
+        if out.count("```") % 2:                  # cut landed inside a code fence -> close it so the
+            out += "\n```"                        # injected prompt isn't left with a dangling ```
+        out += "\n[...skill truncated to fit]\n"
     return out
 
 
@@ -277,7 +295,10 @@ def main() -> int:
     k = 1
     if "--k" in args:
         i = args.index("--k")
-        k = int(args[i + 1])
+        try:
+            k = int(args[i + 1])
+        except (IndexError, ValueError):
+            print("--k needs an integer, e.g. --k 2"); return 1
         args = args[:i] + args[i + 2:]
     if args and args[0] == "--task":
         args = args[1:]
