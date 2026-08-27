@@ -31,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -536,24 +537,46 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b'{"error":"bad request"}'); return
         stream = bool(payload.get("stream"))
         t0 = time.time()
-        try:
-            text, tools_used = run_agent(payload.get("messages", []))
-        except Exception as e:
-            text, tools_used = "Sorry - I hit an error: %s: %s" % (type(e).__name__, e), []
-        print("[phone_agent] answered in %.1fs  tools=%s" % (time.time() - t0, tools_used or "none"),
-              file=sys.stderr)
+        messages = payload.get("messages", [])
         if stream:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
+            # The tool loop is synchronous and can take up to WALL_BUDGET; run it in a thread and
+            # emit SSE heartbeat comments while it works so the client's idle timeout doesn't drop a
+            # long answer before the first token arrives.
+            result = {}
+
+            def _work():
+                try:
+                    result["text"], result["tools"] = run_agent(messages)
+                except Exception as e:
+                    result["text"], result["tools"] = "Sorry - I hit an error: %s: %s" % (type(e).__name__, e), []
+
+            th = threading.Thread(target=_work, daemon=True)
+            th.start()
             try:
-                for chunk in _oa_stream_chunks(text):
+                while th.is_alive():
+                    th.join(timeout=15)
+                    if th.is_alive():
+                        self.wfile.write(b": keepalive\n\n")   # SSE comment line, ignored by the client
+                        self.wfile.flush()
+                for chunk in _oa_stream_chunks(result.get("text", "")):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except Exception:
                 pass
+            print("[phone_agent] answered in %.1fs  tools=%s"
+                  % (time.time() - t0, result.get("tools") or "none"), file=sys.stderr)
         else:
+            try:
+                text, tools_used = run_agent(messages)
+            except Exception as e:
+                text, tools_used = "Sorry - I hit an error: %s: %s" % (type(e).__name__, e), []
+            print("[phone_agent] answered in %.1fs  tools=%s" % (time.time() - t0, tools_used or "none"),
+                  file=sys.stderr)
             self._send(200, _oa_nonstream(text))
 
 
