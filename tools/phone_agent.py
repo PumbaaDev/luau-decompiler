@@ -29,6 +29,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -413,6 +414,41 @@ def _ollama_chat(messages, tools=None):
         raise RuntimeError("Ollama HTTP %s: %s" % (e.code, detail))
 
 
+_TOOLCALL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
+_FN_NAME = re.compile(r"<function\s*=\s*([A-Za-z0-9_]+)", re.I)
+_FN_PARAM = re.compile(r"<parameter\s*=\s*([A-Za-z0-9_]+)\s*>(.*?)</parameter>", re.S | re.I)
+
+
+def _parse_text_tool_calls(text):
+    """Qwen3-Coder sometimes writes the tool call as TEXT (<tool_call><function=read_file>
+    <parameter=path>...</parameter></function></tool_call>) instead of returning a structured
+    tool_call, so Ollama hands it back as content and the loop never runs it. Parse those out of
+    the text so they execute anyway. Also handles a bare JSON {"name","arguments"} form."""
+    calls = []
+    for block in _TOOLCALL_BLOCK.findall(text or ""):
+        nm = _FN_NAME.search(block)
+        if not nm:
+            continue
+        args = {k.strip(): v.strip() for k, v in _FN_PARAM.findall(block)}
+        calls.append({"function": {"name": nm.group(1), "arguments": args}})
+    if not calls:                                    # JSON form: {"name": "read_file", "arguments": {...}}
+        for m in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([A-Za-z0-9_]+)"[^{}]*?"arguments"\s*:\s*(\{.*?\})',
+                             text or "", re.S):
+            try:
+                calls.append({"function": {"name": m.group(1), "arguments": json.loads(m.group(2))}})
+            except Exception:
+                pass
+    return calls
+
+
+def _strip_tool_calls(text):
+    """Remove any leaked tool-call syntax from a final answer so the user never sees raw
+    <tool_call>/<function=>/<parameter=> markup."""
+    t = _TOOLCALL_BLOCK.sub("", text or "")
+    t = re.sub(r"</?(tool_call|function|parameter)[^>]*>", "", t, flags=re.I)
+    return t.strip()
+
+
 def run_agent(client_messages):
     """Returns the final assistant text. Injects memory, runs the tool loop on the host."""
     msgs = [{"role": "system", "content": _system_block(client_messages)}]
@@ -428,11 +464,14 @@ def run_agent(client_messages):
     for _ in range(MAX_TOOL_ITERS):
         resp = _ollama_chat(msgs, tools=TOOL_SPECS)
         msg = resp.get("message", {}) or {}
+        content = msg.get("content", "") or ""
         calls = msg.get("tool_calls") or []
+        if not calls:                                 # model may have written the call as TEXT - recover it
+            calls = _parse_text_tool_calls(content)
         if not calls:
-            return msg.get("content", "") or "(the model returned an empty reply)", tools_used
-        # record the assistant's tool-call turn, then execute each call on the host
-        msgs.append({"role": "assistant", "content": msg.get("content", "") or "", "tool_calls": calls})
+            return _strip_tool_calls(content) or "(the model returned an empty reply)", tools_used
+        # record the assistant's tool-call turn (leaked markup stripped), then execute each call
+        msgs.append({"role": "assistant", "content": _strip_tool_calls(content), "tool_calls": calls})
         for call in calls:
             fn = (call.get("function") or {})
             name = fn.get("name", "")
@@ -459,9 +498,10 @@ def run_agent(client_messages):
     # out of iterations or time - force a final answer with NO tools offered, so the model must
     # produce text instead of spiralling into another tool call.
     resp = _ollama_chat(msgs + [{"role": "user",
-            "content": "Now give me your final answer in plain language, using what the tools returned so far."}],
+            "content": "Now give me your final answer in plain language, using what the tools returned so far. "
+                       "Do NOT emit any tool-call markup; just the answer."}],
             tools=None)
-    return (resp.get("message", {}) or {}).get("content", "") or "(no final answer)", tools_used
+    return _strip_tool_calls((resp.get("message", {}) or {}).get("content", "")) or "(no final answer)", tools_used
 
 
 # --------------------------------------------------------------------------- #
