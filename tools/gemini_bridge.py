@@ -83,6 +83,8 @@ def to_gemini_request(payload, grounding=False):
         else:
             merged.append({"role": c["role"], "parts": list(c["parts"])})
     contents = merged
+    while contents and contents[0]["role"] == "model":  # Gemini requires the first turn to be 'user'
+        contents.pop(0)                                 # drop a leading assistant turn (e.g. a prefilled reply)
     if not contents:                                   # Gemini rejects an empty contents array
         contents = [{"role": "user", "parts": [{"text": "(no content)"}]}]
     body = {"contents": contents}
