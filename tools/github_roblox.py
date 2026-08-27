@@ -20,6 +20,7 @@ Env: ROBLOX_CORPUS (default E:\\roblox_corpus), ROBLOX_REPO_LIMIT (default 150),
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import os
 import shutil
@@ -102,51 +103,53 @@ def _repo_size_kb(name):
         return -1
 
 
+def _clone_one(name, stars):
+    """Clone one repo. Returns ('clone'|'skip'|'big'|'fail', name). Network-bound, so callers run
+    several of these concurrently."""
+    dest = CORPUS / name.replace("/", "__")
+    if dest.exists():
+        if (dest / ".git").exists():            # a complete clone -> skip
+            return ("skip", name)
+        shutil.rmtree(dest, ignore_errors=True)   # a partial/failed clone -> discard and retry
+    if _repo_size_kb(name) > MAX_DISK_KB:
+        print("  SKIP %s (> %d MB cap)" % (name, MAX_DISK_KB // 1024), file=sys.stderr)
+        return ("big", name)
+    url = "https://github.com/%s" % name
+    try:
+        # core.longpaths=true so deep repos don't fail checkout with 'Filename too long' on Windows
+        r = subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--quiet",
+                            url, str(dest)], capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            print("  cloned %s (%d*)" % (name, stars), file=sys.stderr)
+            return ("clone", name)
+        shutil.rmtree(dest, ignore_errors=True)   # don't leave a partial dir counted as 'present'
+        print("  FAILED %s: %s" % (name, (r.stderr or "").strip()[:100]), file=sys.stderr)
+        return ("fail", name)
+    except Exception as e:
+        shutil.rmtree(dest, ignore_errors=True)
+        print("  FAILED %s: %s" % (name, e), file=sys.stderr)
+        return ("fail", name)
+
+
 def clone(repos):
+    """Clone repos concurrently - the stage is network-bound, so a small pool is a 4-8x wall-clock
+    win over the old strictly-sequential loop (and the per-repo size checks parallelise too)."""
     CORPUS.mkdir(parents=True, exist_ok=True)
-    cloned, skipped, failed, skipped_big = 0, 0, 0, 0
-    for i, (name, stars) in enumerate(repos):
-        dest = CORPUS / name.replace("/", "__")
-        if dest.exists():
-            if (dest / ".git").exists():        # a complete clone -> skip
-                skipped += 1
-                continue
-            shutil.rmtree(dest, ignore_errors=True)   # a partial/failed clone -> discard and retry
-        size = _repo_size_kb(name)
-        if size > MAX_DISK_KB:
-            skipped_big += 1
-            print("  [%d/%d] SKIP %s (%.0f MB > cap)" % (i + 1, len(repos), name, size / 1024),
-                  file=sys.stderr)
-            continue
-        url = "https://github.com/%s" % name
-        try:
-            # core.longpaths=true so deep repos don't fail checkout with 'Filename too long' on Windows
-            r = subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--quiet",
-                                url, str(dest)], capture_output=True, text=True, timeout=300)
-            if r.returncode == 0:
-                cloned += 1
-                print("  [%d/%d] cloned %s (%d*)" % (i + 1, len(repos), name, stars), file=sys.stderr)
-            else:
-                failed += 1
-                shutil.rmtree(dest, ignore_errors=True)   # don't leave a partial dir counted as 'present'
-                print("  [%d/%d] FAILED %s: %s" % (i + 1, len(repos), name,
-                      (r.stderr or "").strip()[:120]), file=sys.stderr)
-        except Exception as e:
-            failed += 1
-            shutil.rmtree(dest, ignore_errors=True)
-            print("  [%d/%d] FAILED %s: %s" % (i + 1, len(repos), name, e), file=sys.stderr)
+    workers = int(os.environ.get("ROBLOX_CLONE_WORKERS", "8"))
+    counts = {"clone": 0, "skip": 0, "big": 0, "fail": 0}
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for kind, _name in ex.map(lambda r: _clone_one(*r), repos):
+            counts[kind] += 1
     print("clone: %d new, %d already present, %d too big, %d failed"
-          % (cloned, skipped, skipped_big, failed), file=sys.stderr)
-    return cloned
+          % (counts["clone"], counts["skip"], counts["big"], counts["fail"]), file=sys.stderr)
+    return counts["clone"]
 
 
 def index():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import rag
-    lua = list(CORPUS.rglob("*.lua")) + list(CORPUS.rglob("*.luau"))
-    print("index: %d .lua/.luau files on disk under %s" % (len(lua), CORPUS), file=sys.stderr)
-    n = rag.ingest_dir(CORPUS, exts=(".lua", ".luau"), source_prefix="roblox:")
-    return n
+    # ingest_dir does its own walk + prints its own file count; no need for a second pre-count walk.
+    return rag.ingest_dir(CORPUS, exts=(".lua", ".luau"), source_prefix="roblox:")
 
 
 def main():
