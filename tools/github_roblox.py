@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -80,8 +81,14 @@ def discover():
     for name in CURATED:
         found.setdefault(name, 0)               # keep even if a search missed it
 
-    ranked = sorted(found.items(), key=lambda kv: -kv[1])[:REPO_LIMIT]
-    print("discover: %d unique repos, taking top %d by stars" % (len(found), len(ranked)), file=sys.stderr)
+    # Curated must-haves are ALWAYS kept (they carry 0 stars, so a plain star-sort + truncate would
+    # drop the very ecosystem repos we care about). Reserve their slots, fill the rest by stars.
+    cur = set(CURATED)
+    curated = [(n, found[n]) for n in CURATED if n in found]
+    searched = sorted(((n, s) for n, s in found.items() if n not in cur), key=lambda kv: -kv[1])
+    ranked = curated + searched[:max(0, REPO_LIMIT - len(curated))]
+    print("discover: %d unique repos, taking %d (%d curated + %d top-starred)"
+          % (len(found), len(ranked), len(curated), len(ranked) - len(curated)), file=sys.stderr)
     return ranked
 
 
@@ -101,8 +108,10 @@ def clone(repos):
     for i, (name, stars) in enumerate(repos):
         dest = CORPUS / name.replace("/", "__")
         if dest.exists():
-            skipped += 1
-            continue
+            if (dest / ".git").exists():        # a complete clone -> skip
+                skipped += 1
+                continue
+            shutil.rmtree(dest, ignore_errors=True)   # a partial/failed clone -> discard and retry
         size = _repo_size_kb(name)
         if size > MAX_DISK_KB:
             skipped_big += 1
@@ -111,17 +120,20 @@ def clone(repos):
             continue
         url = "https://github.com/%s" % name
         try:
-            r = subprocess.run(["git", "clone", "--depth", "1", "--quiet", url, str(dest)],
-                               capture_output=True, text=True, timeout=300)
+            # core.longpaths=true so deep repos don't fail checkout with 'Filename too long' on Windows
+            r = subprocess.run(["git", "-c", "core.longpaths=true", "clone", "--depth", "1", "--quiet",
+                                url, str(dest)], capture_output=True, text=True, timeout=300)
             if r.returncode == 0:
                 cloned += 1
                 print("  [%d/%d] cloned %s (%d*)" % (i + 1, len(repos), name, stars), file=sys.stderr)
             else:
                 failed += 1
+                shutil.rmtree(dest, ignore_errors=True)   # don't leave a partial dir counted as 'present'
                 print("  [%d/%d] FAILED %s: %s" % (i + 1, len(repos), name,
                       (r.stderr or "").strip()[:120]), file=sys.stderr)
         except Exception as e:
             failed += 1
+            shutil.rmtree(dest, ignore_errors=True)
             print("  [%d/%d] FAILED %s: %s" % (i + 1, len(repos), name, e), file=sys.stderr)
     print("clone: %d new, %d already present, %d too big, %d failed"
           % (cloned, skipped, skipped_big, failed), file=sys.stderr)
