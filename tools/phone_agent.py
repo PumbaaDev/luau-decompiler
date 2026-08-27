@@ -15,14 +15,18 @@ connection) and, on every message:
      results back, and repeats until the model gives a final answer.
 
 So the phone model's habit of reaching for tools becomes the feature: the tools actually work.
-Default model is the measured best all-rounder (qwen38-rvn). Runs on the tailnet, behind Open
-WebUI's login. SECURITY: run_command gives shell access to this PC - that is the point (Jep asked
-for live PC access) and it is gated by Open WebUI auth on his private Tailscale network.
+SECURITY: run_command gives shell access to this PC - that is the point (Jep asked for live PC
+access). Open WebUI's own login lives on :3000; it does NOT protect this backend on :8772. This
+process must gate its OWN transport: set PHONE_AGENT_TOKEN and a matching Bearer token is required
+on every host-tool request (Open WebUI sends it as the connection's API key). Without the token set,
+the endpoint is UNAUTHENTICATED - anyone who can reach :8772 (a LAN/IoT device via the 0.0.0.0 bind,
+or any tailnet node) gets code execution + arbitrary file read. Always set the token.
 
     python tools/phone_agent.py            # serves on 0.0.0.0:8772
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import subprocess
@@ -36,6 +40,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 PORT = int(os.environ.get("PHONE_AGENT_PORT", "8772"))
+# Shared-secret gate for the host-tool endpoints. The server binds 0.0.0.0 so the Open WebUI Docker
+# container can reach it via host.docker.internal; that same bind exposes it on the LAN + tailnet, and
+# the tool loop runs PowerShell / reads files on the host - so require a Bearer token when one is set.
+# Set it as the API key on Open WebUI's OpenAI connection; OWUI then sends it automatically.
+PHONE_AGENT_TOKEN = os.environ.get("PHONE_AGENT_TOKEN", "").strip()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
@@ -470,6 +479,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _authorized(self):
+        """True if no token is configured (open) OR the request carries the right Bearer token.
+        Constant-time compare so the check can't be timing-probed."""
+        if not PHONE_AGENT_TOKEN:
+            return True
+        got = self.headers.get("Authorization", "")
+        if got.startswith("Bearer "):
+            got = got[7:]
+        return hmac.compare_digest(got.strip(), PHONE_AGENT_TOKEN)
+
     def _send(self, code, body, ctype="application/json"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -482,18 +501,22 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
+        if self.path == "/health":                       # unauthenticated liveness ping (no host access)
+            self._send(200, json.dumps({"status": "ok", "model": MODEL, "memory": bool(build_context)}).encode())
+        elif not self._authorized():
+            self._send(401, b'{"error":"unauthorized"}')
+        elif self.path.rstrip("/") in ("/v1/models", "/models"):
             data = json.dumps({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "jep"}]}).encode()
             self._send(200, data)
-        elif self.path == "/health":
-            self._send(200, json.dumps({"status": "ok", "model": MODEL, "memory": bool(build_context)}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 
     def do_POST(self):
         if not self.path.startswith("/v1/chat/completions") and not self.path.startswith("/chat/completions"):
             self._send(404, b'{"error":"not found"}'); return
+        if not self._authorized():                       # host tools live behind this - never run them keyless
+            self._send(401, b'{"error":"unauthorized"}'); return
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) if length else b"{}")
@@ -525,8 +548,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print("[phone_agent] :%d -> Ollama %s | model=%s | memory=%s | tools=%s"
-          % (PORT, OLLAMA, MODEL, "on" if build_context else "off", ",".join(TOOLS)), file=sys.stderr)
+    print("[phone_agent] :%d -> Ollama %s | model=%s | memory=%s | auth=%s | tools=%s"
+          % (PORT, OLLAMA, MODEL, "on" if build_context else "off",
+             "token" if PHONE_AGENT_TOKEN else "OPEN", ",".join(TOOLS)), file=sys.stderr)
+    if not PHONE_AGENT_TOKEN:
+        print("[phone_agent] WARNING: PHONE_AGENT_TOKEN is unset - host tools (PowerShell, file read) "
+              "are exposed UNAUTHENTICATED on :%d. Set PHONE_AGENT_TOKEN to require a Bearer token." % PORT,
+              file=sys.stderr)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
