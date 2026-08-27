@@ -472,10 +472,21 @@ def _sse(obj):
     return ("data: " + json.dumps(obj) + "\n\n").encode("utf-8")
 
 
-def _oa_stream_chunks(text):
-    """Emit the completed answer as OpenAI streaming deltas so Open WebUI renders it progressively."""
-    yield _sse({"id": "chatcmpl-phone", "object": "chat.completion.chunk", "model": MODEL_ID,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+def _sse_role():
+    return _sse({"id": "chatcmpl-phone", "object": "chat.completion.chunk", "model": MODEL_ID,
+                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+
+
+def _sse_heartbeat():
+    """A valid empty-CONTENT chunk. Open WebUI only resets its stream timeout on real data chunks,
+    NOT on SSE comment lines - so during a cold 18GB model load or a long tool loop, comment-only
+    keepalives let it time out ('Load failed'). This counts as data and renders nothing."""
+    return _sse({"id": "chatcmpl-phone", "object": "chat.completion.chunk", "model": MODEL_ID,
+                 "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]})
+
+
+def _oa_stream_content(text):
+    """Content deltas + stop + DONE (NO role - the role chunk is sent up-front before the wait)."""
     step = 120
     for i in range(0, len(text), step):
         yield _sse({"id": "chatcmpl-phone", "object": "chat.completion.chunk", "model": MODEL_ID,
@@ -558,12 +569,14 @@ class Handler(BaseHTTPRequestHandler):
             th = threading.Thread(target=_work, daemon=True)
             th.start()
             try:
+                self.wfile.write(_sse_role())                  # start the stream with real data at once
+                self.wfile.flush()
                 while th.is_alive():
-                    th.join(timeout=15)
+                    th.join(timeout=10)
                     if th.is_alive():
-                        self.wfile.write(b": keepalive\n\n")   # SSE comment line, ignored by the client
+                        self.wfile.write(_sse_heartbeat())     # empty-content chunk keeps OWUI's timeout alive
                         self.wfile.flush()
-                for chunk in _oa_stream_chunks(result.get("text", "")):
+                for chunk in _oa_stream_content(result.get("text", "")):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except Exception:
