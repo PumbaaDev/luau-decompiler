@@ -17,6 +17,7 @@ Uses Gmail's X-GM-RAW so full Gmail search syntax works (from:, subject:, newer_
 from __future__ import annotations
 
 import email
+import html
 import imaplib
 import os
 import re
@@ -43,14 +44,31 @@ def _decode(s):
     out = []
     for part, enc in decode_header(s):
         if isinstance(part, bytes):
-            out.append(part.decode(enc or "utf-8", "replace"))
+            try:
+                out.append(part.decode(enc or "utf-8", "replace"))
+            except (LookupError, UnicodeDecodeError):   # bogus/unknown charset must not abort the search
+                out.append(part.decode("utf-8", "replace"))
         else:
             out.append(part)
     return "".join(out)
 
 
+def _imap_quote(s):
+    """Quote a string as an IMAP literal (escape backslash + quote) so an embedded \"phrase\" in a
+    Gmail query survives instead of being stripped."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _html_to_text(s: str) -> str:
+    """HTML -> readable text: drop <script>/<style> CONTENT (not just the tags), strip remaining
+    tags, decode entities (&amp; -> &), collapse whitespace."""
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
 def _body_text(msg) -> str:
-    """Pull readable text from a message (prefer text/plain; strip tags from html)."""
+    """Pull readable text from a message (prefer text/plain; render html to clean text)."""
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
@@ -61,8 +79,8 @@ def _body_text(msg) -> str:
         for part in msg.walk():
             if part.get_content_type() == "text/html":
                 try:
-                    html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                    return re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", html)).strip()
+                    raw = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+                    return _html_to_text(raw)
                 except Exception:
                     pass
         return ""
@@ -71,7 +89,7 @@ def _body_text(msg) -> str:
     except Exception:
         payload = str(msg.get_payload())
     if msg.get_content_type() == "text/html":
-        payload = re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", payload))
+        payload = _html_to_text(payload)
     return payload.strip()
 
 
@@ -80,7 +98,15 @@ def search(query: str, n: int = 10):
     m = _connect()
     try:
         m.select("INBOX", readonly=True)
-        typ, data = m.uid("search", None, "X-GM-RAW", '"%s"' % query.replace('"', ""))
+        # IMAP-quoted (not quote-stripped) query so a "phrase" survives. Pure-ASCII queries go
+        # straight through; non-ASCII would need an IMAP literal the server rejects inline, so fall
+        # back to an ASCII-safe query - approximate results beat a UnicodeEncodeError crash.
+        try:
+            query.encode("ascii")
+            typ, data = m.uid("search", "X-GM-RAW", _imap_quote(query))
+        except UnicodeEncodeError:
+            ascii_q = query.encode("ascii", "ignore").decode("ascii")
+            typ, data = m.uid("search", "X-GM-RAW", _imap_quote(ascii_q))
         uids = data[0].split()[-n:][::-1] if data and data[0] else []
         out = []
         for uid in uids:
