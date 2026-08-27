@@ -15,6 +15,7 @@ code + notes on demand.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,13 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+
+def _dedup_key(source, text):
+    """Dedup identity for a chunk. A (source, text[:80]) key COLLIDED when two distinct chunks of the
+    same file shared an 80-char prefix (a repeated banner/license header), silently dropping the
+    second. Hash the full text so only truly identical chunks dedupe."""
+    return (source, hashlib.sha1(text.encode("utf-8", "replace")).hexdigest())
 
 import numpy as np
 
@@ -121,7 +129,7 @@ def _build_index_locked():
             continue
         rel = str(p).replace(str(ROOT) + os.sep, "")
         for c in _chunk(txt, rel):
-            key = (rel, c[:80])
+            key = _dedup_key(rel, c)
             if key in seen:
                 continue
             seen.add(key)
@@ -130,18 +138,20 @@ def _build_index_locked():
 
     vecs, meta = [], []
     t0 = time.time()
-    for n, (src, c) in enumerate(chunks):
+    for i in range(0, len(chunks), 64):                # BATCH embed (one HTTP call per 64) not per-chunk
+        part = chunks[i:i + 64]
         try:
-            e = _embed("search_document: " + c)
+            embs = _embed_batch([c for _, c in part])
         except Exception as ex:
-            print("  embed failed on %s: %s" % (src, ex), file=sys.stderr)
-            continue
-        if not e:
-            continue
-        vecs.append(e)
-        meta.append({"source": src, "text": c})
-        if (n + 1) % 200 == 0:
-            print("  %d/%d (%.0fs)" % (n + 1, len(chunks), time.time() - t0), file=sys.stderr)
+            print("  batch embed failed at %d: %s" % (i, ex), file=sys.stderr)
+            embs = []
+        for (src, c), e in zip(part, embs):
+            if not e:
+                continue
+            vecs.append(e)
+            meta.append({"source": src, "text": c})
+        if i and i % 1600 == 0:
+            print("  %d/%d (%.0fs)" % (i, len(chunks), time.time() - t0), file=sys.stderr)
 
     if not vecs:                                   # nothing embedded (e.g. Ollama down) - don't wipe the store
         print("build_index: 0 chunks embedded, leaving existing store untouched", file=sys.stderr)
@@ -223,19 +233,24 @@ def append_pages(pages, source_prefix="web:"):
         _, meta0 = _load()
     except Exception:
         meta0 = []
-    seen = {(m["source"], m["text"][:80]) for m in meta0}
-    pending = []   # (src, chunk, vec)
+    seen = {_dedup_key(m["source"], m["text"]) for m in meta0}
+    todo = []   # (src, chunk) - unique chunks to embed
     for url, title, text in pages:
         src = source_prefix + url
         for c in _chunk(text, src):
-            key = (src, c[:80])
+            key = _dedup_key(src, c)
             if key in seen:
                 continue
             seen.add(key)
-            try:
-                e = _embed("search_document: " + c)
-            except Exception:
-                continue
+            todo.append((src, c))
+    pending = []   # (src, chunk, vec)
+    for i in range(0, len(todo), 64):                  # BATCH embed (one HTTP call per 64) not per-chunk
+        part = todo[i:i + 64]
+        try:
+            embs = _embed_batch([c for _, c in part])
+        except Exception:
+            embs = []
+        for (src, c), e in zip(part, embs):
             if not e:
                 continue
             v = np.asarray(e, dtype=np.float32)
@@ -248,10 +263,10 @@ def append_pages(pages, source_prefix="web:"):
         raise RuntimeError("another indexer holds %s - refusing concurrent write" % LOCK_PATH)
     try:
         vecs, meta = _write_load()
-        have = {(m["source"], m["text"][:80]) for m in meta}
+        have = {_dedup_key(m["source"], m["text"]) for m in meta}
         add_v, add_m = [], []
         for src, c, v in pending:
-            k = (src, c[:80])
+            k = _dedup_key(src, c)
             if k in have:                          # another writer added it between embed and write
                 continue
             have.add(k)
@@ -386,7 +401,7 @@ def ingest_dir(root, exts=(".lua", ".luau"), source_prefix="", flush_every=800, 
 def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=64):
     root = Path(root)
     _ensure_loaded()
-    keys = {(m["source"], m["text"][:80]) for m in _CACHE["meta"]}
+    keys = {_dedup_key(m["source"], m["text"]) for m in _CACHE["meta"]}
     files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts
              and not (SKIP_DIRS & set(p.parts))]
     print("ingest_dir: %d %s files under %s" % (len(files), "/".join(exts), root), file=sys.stderr)
@@ -437,7 +452,7 @@ def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=6
             continue
         src = source_prefix + str(p.relative_to(root)).replace("\\", "/")
         for c in _chunk(txt, src):
-            key = (src, c[:80])
+            key = _dedup_key(src, c)
             if key in keys:
                 continue
             keys.add(key)
