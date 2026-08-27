@@ -50,7 +50,8 @@ MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
 NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "6"))
-TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "4000"))  # per tool result, keeps total under num_ctx
+TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "8000"))  # per tool result; 6 iters x 8k << 32k num_ctx
+RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
 WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "180"))           # seconds before we force a final answer
 ROOT = Path(__file__).resolve().parent
 
@@ -94,7 +95,9 @@ BASE_PERSONA = (
 # --------------------------------------------------------------------------- #
 def _run(cmd, timeout=60, shell="powershell"):
     if shell == "powershell":
-        full = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd]
+        # force UTF-8 stdout so non-ASCII output isn't garbled by the default console codepage
+        full = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + cmd]
     else:
         full = cmd if isinstance(cmd, list) else ["cmd.exe", "/c", cmd]
     try:
@@ -143,7 +146,12 @@ def tool_run_command(args):
     cmd = (args or {}).get("command", "").strip()
     if not cmd:
         return "(no command given)"
-    return _run(cmd, timeout=int((args or {}).get("timeout", 60)))
+    try:
+        t = int((args or {}).get("timeout", 60) or 60)
+    except (TypeError, ValueError):
+        t = 60
+    # cap the model-supplied timeout: an uncapped value could pin a worker thread far past WALL_BUDGET
+    return _run(cmd, timeout=max(1, min(t, RUN_CMD_MAX_TIMEOUT)))
 
 
 def tool_read_file(args):
@@ -162,7 +170,9 @@ def tool_list_dir(args):
     path = (args or {}).get("path", ".").strip() or "."
     try:
         entries = sorted(os.listdir(path))
-        return "%d entries in %s:\n" % (len(entries), path) + "\n".join(entries[:200])
+        shown = entries[:200]
+        extra = ("\n[...%d more not shown]" % (len(entries) - 200)) if len(entries) > 200 else ""
+        return "%d entries in %s:\n" % (len(entries), path) + "\n".join(shown) + extra
     except Exception as e:
         return "(cannot list %s: %s)" % (path, e)
 
