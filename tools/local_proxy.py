@@ -39,7 +39,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import gemini_bridge as GEM
+try:
+    import gemini_bridge as GEM       # optional: only the @gemini route needs it
+except Exception as _e:               # a broken bridge must NOT take down the whole proxy + memory injection
+    GEM = None
+    print("[proxy] gemini bridge unavailable (@gemini disabled): %s" % _e, file=sys.stderr)
 
 # -- config -----------------------------------------------------------------
 PORT = int(os.environ.get("UNIFIED_PORT", "8770"))
@@ -170,9 +174,12 @@ def detect_marker(text: str):
 
 
 def typed_block(messages):
-    """The (container, key) of the user's TYPED text: the LAST text block of the last user
-    message. Claude Code sends the turn as [system-reminder block(s), typed text], so the
-    marker lives in the LAST block, not the joined string. (None, None) if there is none."""
+    """The (container, key) of the user's TYPED text: the LAST text block of the most recent user
+    message that HAS one. Claude Code sends the turn as [system-reminder block(s), typed text], so
+    the marker lives in the LAST block. On a tool-CONTINUATION turn the most recent user message is
+    tool_result-only (no text block); we keep scanning BACK to the last typed message so an @marker
+    route (and the retrieval task) persist across tool calls instead of silently reverting to the
+    default model mid-task. (None, None) if no user text exists at all."""
     for m in reversed(messages or []):
         if m.get("role") != "user":
             continue
@@ -183,7 +190,8 @@ def typed_block(messages):
             for b in reversed(c):
                 if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
                     return b, "text"
-        return None, None
+            # tool_result-only user message: no typed text here - look further back, don't give up
+            continue
     return None, None
 
 
@@ -284,7 +292,10 @@ def build_context(task: str):
 
     blocks = [b for b in (facts_block, skill_block) if b]
     if not blocks:
-        return "", 0, "-"
+        # No fact/skill hit, but strip_harness_identity already removed the "Claude agent" line,
+        # so returning "" would leave the model with NO identity at all - inject the uncensored
+        # preamble on its own so the framing (and the REMEMBER instruction) is always present.
+        return _PREAMBLE, 0, "-"
     if dropped:
         log("facts trimmed to injection budget: kept %d, dropped %d" % (nfacts, dropped))
     return _PREAMBLE + "\n" + "\n\n".join(blocks), nfacts, skill_name
@@ -469,7 +480,11 @@ def fit_window(payload, num_ctx=NUM_CTX, reserve=GEN_RESERVE):
 
 
 # -- REMEMBER harvest: model findings -> local_mem (Obsidian) ----------------
-_REMEMBER = re.compile(r"REMEMBER:\s*(.+?)(?:\n|$)", re.I)
+# Require REMEMBER at the START of a line (the preamble tells the model to write it "on its OWN
+# line"). This ignores an echoed "... REMEMBER: x" quoted from a web page / file mid-sentence, which
+# would otherwise poison memory. Harvest is also capped per turn (below).
+_REMEMBER = re.compile(r"(?m)^\s{0,3}REMEMBER:\s*(.+?)\s*$", re.I)
+HARVEST_MAX_PER_TURN = int(os.environ.get("UNIFIED_HARVEST_MAX", "5"))
 _SAVE_LOCK = threading.Lock()                          # ThreadingHTTPServer runs turns concurrently
 _SEEN_FIDS = set()                                     # dedupe under concurrency (path.exists is TOCTOU)
 
@@ -536,8 +551,12 @@ def _assistant_text(raw):
 
 def harvest_findings(raw):
     try:
+        saved = 0
         for m in _REMEMBER.finditer(_assistant_text(raw)):
+            if saved >= HARVEST_MAX_PER_TURN:      # cap a flood of quoted/echoed REMEMBER lines
+                break
             save_finding(m.group(1))
+            saved += 1
     except Exception as e:
         log("harvest failed: %s" % e)
 
@@ -603,16 +622,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(length) if length else b""
 
-        if not self.path.startswith("/v1/messages"):
+        # only the chat endpoint gets injected/routed; /v1/messages/count_tokens (and any other
+        # sub-path) must pass through verbatim or the token count is computed on a mutated body.
+        # Compare the PATH only (strip any ?query) so /v1/messages?beta=... still injects.
+        if self.path.split("?", 1)[0].rstrip("/") != "/v1/messages":
             self._forward_raw(body)
             return
 
         # /v1/messages: inject + route. Any parse failure -> clean passthrough.
+        new_body, raw_est = body, 0                   # fallback defaults; kept if injection below throws
         try:
             payload = json.loads(body)
             payload.pop("thinking", None)             # NEVER forward Anthropic 'thinking': Ollama may map it to
                                                       # `think`, which CRASHES qwen3-coder llama-server (0xc0000409),
                                                       # killing every loaded model. The thinker emits <think> natively.
+            new_body = json.dumps(payload).encode("utf-8")   # SAFE fallback: thinking already stripped, so an
+                                                             # inject error below still forwards a thinking-free body
             strip_harness_identity(payload)           # drop "You are a Claude agent"; our preamble is the identity
             messages = payload.get("messages", [])
             cont, key = typed_block(messages)          # the user's TYPED block (marker lives here, not the join)
@@ -650,7 +675,8 @@ class Handler(BaseHTTPRequestHandler):
                    payload.get("max_tokens"), nctx, payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
-            new_body, raw_est = body, 0
+            # keep new_body from the last successful step (thinking-stripped parse, or original body
+            # if even json.loads failed - an unparseable body has no 'thinking' to worry about)
 
         self._pipe(self.path, new_body, dict(self.headers), harvest=True, raw_est=raw_est)
 
@@ -662,7 +688,9 @@ class Handler(BaseHTTPRequestHandler):
         # length with the rewritten (larger) body -> Ollama reads a truncated JSON.
         # Rebuild case-insensitively so urllib recomputes the length, and force
         # identity so the SSE stream is never gzipped (unreadable to the client).
-        drop = {"host", "content-length", "accept-encoding"}
+        # also drop hop-by-hop headers: forwarding Transfer-Encoding/Connection made urllib mis-frame
+        # the body (a chunked request read as empty upstream).
+        drop = {"host", "content-length", "accept-encoding", "transfer-encoding", "connection"}
         fwd = {k: v for k, v in headers.items() if k.lower() not in drop}
         fwd["Accept-Encoding"] = "identity"
         try:
@@ -680,12 +708,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(up.status)
         self.send_header("Content-Type", ctype)
         self.send_header("Connection", "close")       # stream then close, no CL
+        self.close_connection = True                  # actually close: the header alone doesn't tell BaseHTTP
         self.end_headers()
         buf = bytearray() if harvest else None
         try:
             while True:
-                chunk = up.read(4096)
-                if not chunk:
+                chunk = up.readline()                 # per-line: SSE tokens reach the client immediately,
+                if not chunk:                         # not buffered until 4KB accumulates
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
@@ -703,6 +732,10 @@ class Handler(BaseHTTPRequestHandler):
         """@gemini route: translate to Gemini, call Google, re-emit as Anthropic. Any failure or a
         missing key is rendered as a normal assistant turn, never a 500 that breaks the terminal."""
         stream = bool(payload.get("stream"))
+        if GEM is None:                          # the bridge failed to import - degrade, don't crash
+            self._send(200, json.dumps({"error": "@gemini is unavailable (gemini_bridge failed to "
+                                        "import); other routes work normally."}).encode(), "application/json")
+            return
         if not GEMINI_KEY:
             self._emit_gemini(
                 "@gemini is wired but no key is set. Create a free key at Google AI Studio "
@@ -735,6 +768,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -747,6 +781,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         try:
             self.wfile.write(data)
