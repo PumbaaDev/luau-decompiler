@@ -14,6 +14,7 @@ a total-text cap, and a small politeness delay. Returns aggregated, source-tagge
 from __future__ import annotations
 
 import collections
+import html
 import re
 import sys
 import time
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import webget
 
 MAX_PAGES_CAP = 60          # hard ceiling regardless of what's asked
+MAX_DEPTH_CAP = 4           # hard depth ceiling
 MIN_TEXT = 150              # below this a page counts as "blocked/empty" -> try stealth
 DEFAULT_PAGES = 20
 DEFAULT_DEPTH = 2
@@ -32,15 +34,15 @@ SKIP_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".zip", ".mp4", ".m
             ".css", ".js", ".ico", ".woff", ".woff2", ".xml", ".rss")
 
 
-def _links(html: str, base: str):
+def _links(page_html: str, base: str):
     out = []
-    for h in re.findall(r'href=["\']([^"\'>]+)', html or ""):
-        h = h.strip()
+    for h in re.findall(r'href=["\']([^"\'>]+)', page_html or ""):
+        h = html.unescape(h.strip())                    # &amp; in an href -> & (real URL)
         if not h or h.startswith(("mailto:", "javascript:", "tel:", "#")):
             continue
         u = urljoin(base, h).split("#")[0]
-        if u.startswith("http") and not u.lower().endswith(SKIP_EXT):
-            out.append(u)
+        if u.startswith("http") and not urlparse(u).path.lower().endswith(SKIP_EXT):
+            out.append(u)                               # test extension against the PATH, not query string
     return out
 
 
@@ -49,37 +51,43 @@ def crawl(start: str, max_pages: int = DEFAULT_PAGES, max_depth: int = DEFAULT_D
     if not start.startswith(("http://", "https://")):
         start = "https://" + start
     max_pages = min(max_pages, MAX_PAGES_CAP)
+    max_depth = min(max(0, max_depth), MAX_DEPTH_CAP)            # clamp depth (was unbounded)
+    max_fetches = min(max_pages * 3, MAX_PAGES_CAP * 3)          # bound HTTP work even if pages yield no text
     root = urlparse(start).netloc
     seen: set[str] = set()
     queue = collections.deque([(start, 0)])
-    pages, total = [], 0
+    pages, total, fetches = [], 0, 0
 
-    while queue and len(pages) < max_pages and total < TOTAL_CHAR_CAP:
+    while queue and len(pages) < max_pages and total < TOTAL_CHAR_CAP and fetches < max_fetches:
         url, depth = queue.popleft()
         if url in seen:
             continue
         seen.add(url)
+        fetches += 1
+        page_html, final, title, text = "", url, "", ""
         try:
-            html, final = webget.fetch_plain(url)
+            page_html, final = webget.fetch_plain(url)
+            title, text = webget.extract(page_html)             # extract INSIDE the try - a bad page can't kill the crawl
         except Exception:
-            continue
-        title, text = webget.extract(html)
-        if len(text) < MIN_TEXT and webget._has("scrapling"):   # escalate blocked/JS pages
+            page_html, text = "", ""
+        # escalate to stealth when plain is blocked/empty OR raised (HTTP 403 / JS wall) - the old
+        # `except: continue` skipped this entirely, so anti-bot blocks were never retried.
+        if len(text) < MIN_TEXT and webget._has("scrapling"):
             try:
-                html2, final = webget.fetch_stealth(url)
-                _t, text2 = webget.extract(html2)
+                html2, final2 = webget.fetch_stealth(url)
+                title2, text2 = webget.extract(html2)
                 if len(text2) > len(text):
-                    text, html = text2, html2
+                    page_html, final, title, text = html2, final2, title2, text2   # keep the stealth title too
             except Exception:
                 pass
         if text.strip():
             pages.append((final, title, text.strip()))
             total += len(text)
-        if depth < max_depth:                                    # enqueue child links
-            for lk in _links(html, final):
+        if depth < max_depth and page_html:                     # enqueue child links
+            for lk in _links(page_html, final):
                 if lk not in seen and (not same_domain or urlparse(lk).netloc == root):
                     queue.append((lk, depth + 1))
-        time.sleep(0.3)                                          # be polite
+        time.sleep(0.3)                                          # be polite on EVERY fetch, success or not
     return pages
 
 
