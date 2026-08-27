@@ -206,6 +206,22 @@ def tool_crawl_site(args):
         return "(crawl error: %s)" % e
 
 
+def tool_learn_web(args):
+    """Crawl a whole site and add it PERMANENTLY to the knowledge index, so it's remembered and
+    searchable forever via search_knowledge. Use when Jep wants you to 'learn'/'remember' a site."""
+    if rag is None:
+        return "(knowledge index unavailable)"
+    url = (args or {}).get("url", "").strip()
+    if not url:
+        return "(no url)"
+    try:
+        n = rag.ingest_url(url, int((args or {}).get("max_pages", 20)),
+                           int((args or {}).get("max_depth", 2)))
+        return "learned and permanently indexed %d new chunks from %s (now searchable via search_knowledge)" % (n, url)
+    except Exception as e:
+        return "(learn error: %s)" % e
+
+
 def tool_email_search(args):
     """Search Jep's Gmail (read-only). Gmail syntax: from:, subject:, newer_than:7d, etc."""
     if gmail_local is None:
@@ -247,6 +263,7 @@ TOOLS = {
     "web_search": tool_web_search,
     "web_fetch": tool_web_fetch,
     "crawl_site": tool_crawl_site,
+    "learn_web": tool_learn_web,
     "search_knowledge": tool_search_knowledge,
     "email_search": tool_email_search,
     "email_read": tool_email_read,
@@ -295,6 +312,15 @@ TOOL_SPECS = [
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "the starting page to crawl from"},
             "max_pages": {"type": "integer", "description": "how many pages to crawl (default 15)"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "learn_web", "description":
+        "Crawl a whole site and add it PERMANENTLY to your knowledge - remembered and searchable "
+        "forever after. Use when Jep says to 'learn', 'remember', or 'index' a site so you keep its "
+        "info. Bounded (default ~20 pages, depth 2); raise max_pages to absorb more.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "site to learn"},
+            "max_pages": {"type": "integer", "description": "pages to crawl+index (default 20)"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "search_knowledge", "description":

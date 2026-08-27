@@ -153,6 +153,52 @@ def retrieve(query: str, k: int = 5):
     return [{"source": meta[i]["source"], "score": float(sims[i]), "text": meta[i]["text"]} for i in idx]
 
 
+def append_pages(pages, source_prefix="web:"):
+    """Chunk + embed crawled pages and APPEND them to the index PERMANENTLY (dedup'd). Updates disk
+    AND the in-memory cache, so a long-running agent can learn a site then immediately recall it."""
+    try:
+        vecs, meta = _load()
+    except Exception:
+        vecs, meta = np.zeros((0, 768), dtype=np.float32), []
+    keys = {(m["source"], m["text"][:80]) for m in meta}
+    new_vecs, new_meta = [], []
+    for url, title, text in pages:
+        src = source_prefix + url
+        for c in _chunk(text, src):
+            key = (src, c[:80])
+            if key in keys:
+                continue
+            keys.add(key)
+            try:
+                e = _embed("search_document: " + c)
+            except Exception:
+                continue
+            if not e:
+                continue
+            v = np.asarray(e, dtype=np.float32)
+            v /= (np.linalg.norm(v) + 1e-8)
+            new_vecs.append(v)
+            new_meta.append({"source": src, "text": c})
+    if not new_vecs:
+        return 0
+    stacked = np.asarray(new_vecs, dtype=np.float32)
+    allv = np.vstack([vecs, stacked]) if len(vecs) else stacked
+    IDX_DIR.mkdir(exist_ok=True)
+    np.save(VEC_PATH, allv)
+    with META_PATH.open("a", encoding="utf-8") as f:      # append keeps order aligned with allv
+        for m in new_meta:
+            f.write(json.dumps(m) + "\n")
+    _CACHE["vecs"], _CACHE["meta"] = allv, meta + new_meta
+    return len(new_meta)
+
+
+def ingest_url(url, max_pages=15, max_depth=2):
+    """Crawl a whole site and add all of it to the permanent knowledge index."""
+    import webcrawl
+    pages = webcrawl.crawl(url, max_pages, max_depth)
+    return append_pages(pages)
+
+
 def format_hits(hits) -> str:
     if not hits:
         return "(nothing relevant found in the codebase/notes)"
@@ -174,10 +220,19 @@ def main():
         k = int(sys.argv[-1]) if sys.argv[-1].isdigit() else 5
         q = " ".join(sys.argv[2:2 + (len(sys.argv) - 2 - (1 if sys.argv[-1].isdigit() else 0))])
         print(format_hits(retrieve(q, k)))
+    elif cmd == "ingest":
+        if len(sys.argv) < 3:
+            print("usage: rag.py ingest <url> [max_pages] [max_depth]"); return 2
+        mp = int(sys.argv[3]) if len(sys.argv) > 3 else 15
+        md = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+        n = ingest_url(sys.argv[2], mp, md)
+        print("ingested %d new chunks from %s into permanent knowledge" % (n, sys.argv[2]), file=sys.stderr)
     elif cmd == "stats":
         try:
             v, m = _load()
-            print("index: %d chunks, %d-dim vectors, %.1f MB" % (len(m), v.shape[1], VEC_PATH.stat().st_size / 1e6))
+            web = sum(1 for x in m if str(x["source"]).startswith("web:"))
+            print("index: %d chunks (%d from crawled web), %d-dim vectors, %.1f MB"
+                  % (len(m), web, v.shape[1], VEC_PATH.stat().st_size / 1e6))
         except Exception as e:
             print("no index:", e)
     else:
