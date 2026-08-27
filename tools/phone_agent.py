@@ -53,6 +53,7 @@ MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI
 NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to read several files while exploring
 TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
+READ_FILE_PAGE = int(os.environ.get("PHONE_READ_FILE_PAGE", "40000"))  # read_file returns up to this per call (~10k tok); pages beyond
 RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
 WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer
 ROOT = Path(__file__).resolve().parent
@@ -176,9 +177,22 @@ def tool_read_file(args):
     if not path:
         return "(no path given)"
     try:
+        off = int((args or {}).get("offset", 0) or 0)
+    except (TypeError, ValueError):
+        off = 0
+    try:
         data = Path(path).read_text(encoding="utf-8", errors="replace")
-        cap = 8000
-        return data[:cap] + ("\n[...truncated at %d chars]" % cap if len(data) > cap else "")
+        total = len(data)
+        # Return the FULL file when it fits in one page (READ_FILE_PAGE). For a file bigger than the
+        # context window, page through it: this slice + an offset the model can pass to read the rest,
+        # so it can read the WHOLE file across calls instead of only ever seeing the first few KB.
+        chunk = data[off:off + READ_FILE_PAGE]
+        end = off + len(chunk)
+        if total <= READ_FILE_PAGE and off == 0:
+            return chunk                                   # whole file, no marker
+        head = "[file %s: chars %d-%d of %d]\n" % (path, off, end, total)
+        tail = ("\n[...more: call read_file again with offset=%d to continue]" % end) if end < total else "\n[end of file]"
+        return head + chunk + tail
     except Exception as e:
         return "(cannot read %s: %s)" % (path, e)
 
@@ -322,9 +336,13 @@ TOOL_SPECS = [
             "command": {"type": "string", "description": "the PowerShell command to run"}},
             "required": ["command"]}}},
     {"type": "function", "function": {
-        "name": "read_file", "description": "Read a text file on this PC and return its contents.",
+        "name": "read_file", "description": "Read a text file on this PC and return its FULL contents. "
+        "A file bigger than one page returns a slice plus a continuation offset; call again with that "
+        "offset to read the REST, and keep going until you reach end of file, so you read it fully.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "absolute path to the file"}},
+            "path": {"type": "string", "description": "path to the file"},
+            "offset": {"type": "integer", "description": "start reading at this character offset (default 0); "
+                       "use the offset from a previous read to continue through a large file"}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "list_dir", "description": "List the entries in a directory on this PC.",
@@ -499,7 +517,9 @@ def run_agent(client_messages):
                     result = handler(args)
                 except Exception as e:            # one bad tool call self-corrects, never kills the turn
                     result = "(tool error in %s: %s: %s)" % (name, type(e).__name__, e)
-            msgs.append({"role": "tool", "content": str(result)[:TOOL_RESULT_CAP], "tool_name": name})
+            # read_file gets a bigger cap so a "read it fully" actually delivers the whole page, not 6KB
+            rcap = READ_FILE_PAGE + 400 if name == "read_file" else TOOL_RESULT_CAP
+            msgs.append({"role": "tool", "content": str(result)[:rcap], "tool_name": name})
         if time.time() > deadline:                # stop looping once we blow the time budget
             break
     # out of iterations or time - force a final answer with NO tools offered, so the model must
