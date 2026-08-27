@@ -5,6 +5,7 @@ set OLLAMA_MODELS=E:\ollama-models
 set OLLAMA_KV_CACHE_TYPE=q8_0
 set OLLAMA_FLASH_ATTENTION=1
 set OLLAMA_NUM_PARALLEL=1
+set OLLAMA_KEEP_ALIVE=30m
 set PYTHONIOENCODING=utf-8
 REM start the Ollama server if it isn't already running
 tasklist /fi "imagename eq ollama.exe" | find /i "ollama.exe" >nul

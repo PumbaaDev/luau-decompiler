@@ -29,8 +29,10 @@ if (-not $ok) {
 # measured 25 Aug: it drifted the benchmark control from 73/83 to 72/83. Detect and repair.
 try {
   $ps = & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" ps 2>$null | Out-String
-  if ($ps -match '(\d+)\s*GB') {
-    $gb = [int]$Matches[1]
+  # capture decimals (19.5 GB matched as "5" under \d+) and take the LARGEST loaded model, not the first
+  $gbMatches = [regex]::Matches($ps, '(\d+(?:\.\d+)?)\s*GB')
+  if ($gbMatches.Count -gt 0) {
+    $gb = ($gbMatches | ForEach-Object { [double]$_.Groups[1].Value } | Measure-Object -Maximum).Maximum
     if ($gb -ge 22) {
       L "DEGRADED: model loaded at ${gb}GB (expected ~20GB) - KV cache is not q8_0. Restarting ollama with correct env."
       Get-Process -Name 'ollama','ollama app','llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -52,9 +54,14 @@ try {
     if ($line -match '^\s*(\d+),\s*(\d+),\s*(\d+)') {
       $idx = $Matches[1]; $temp = [int]$Matches[2]; $util = $Matches[3]
       if ($temp -ge 85) {
-        L "THERMAL EMERGENCY: GPU $idx at ${temp}C - unloading models to let it cool"
-        & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" stop uncensored-coder 2>$null
-        & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" stop uncensored-thinker 2>$null
+        L "THERMAL EMERGENCY: GPU $idx at ${temp}C - unloading ALL loaded models to let it cool"
+        # stop EVERY currently-loaded model, not just the two defaults - a hot @qwen/@kat/@gemma
+        # would otherwise keep the GPU cooking through the emergency.
+        $loaded = & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" ps 2>$null | Select-Object -Skip 1
+        foreach ($ln in $loaded) {
+          $mn = (($ln -replace '\s{2,}', "`t") -split "`t")[0].Trim()
+          if ($mn) { & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" stop $mn 2>$null }
+        }
       } elseif ($temp -ge 78) {
         L "WARNING: GPU $idx at ${temp}C (util ${util}%) - hot but under the 83C throttle point"
       }
