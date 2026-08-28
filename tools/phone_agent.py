@@ -628,39 +628,69 @@ form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px so
 textarea{flex:1;resize:none;max-height:120px;background:#0d0f14;color:var(--tx);border:1px solid #2a2e38;border-radius:12px;padding:10px 12px;font:inherit}
 button{background:var(--acc);color:#04122e;border:0;border-radius:12px;padding:0 16px;font-weight:600}
 button:disabled{opacity:.5}
-</style></head><body><div id=app>
-<header><span class=dot></span>__NAME__<small id=st>ready</small></header>
+#mn,#nw{background:none;color:var(--tx);font-size:20px;font-weight:400;padding:2px 8px}
+#ov{position:fixed;inset:0;background:#0009;z-index:9;display:none}#ov.open{display:block}
+#drawer{position:fixed;top:0;bottom:0;left:0;width:82%;max-width:330px;background:var(--panel);z-index:10;transform:translateX(-100%);transition:transform .2s ease;display:flex;flex-direction:column;border-right:1px solid #23262e}
+#drawer.open{transform:none}
+#dh{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #23262e;font-weight:600}
+#dh button{font-size:14px;padding:6px 11px}
+#chats{flex:1;overflow-y:auto}
+.crow{padding:12px 14px;border-bottom:1px solid #1a1d24;display:flex;align-items:center;gap:8px}
+.crow.cur{background:#1e2436}
+.crow .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.crow .x{color:var(--mut);padding:2px 8px;font-size:18px}
+</style></head><body>
+<div id=ov></div>
+<div id=drawer><div id=dh><span style=flex:1>Chats</span><button id=nw2>+ New</button></div><div id=chats></div></div>
+<div id=app>
+<header><button id=mn>&#9776;</button><span class=dot></span>__NAME__<small id=st>ready</small><button id=nw title="New chat">+</button></header>
 <div id=log></div>
 <form id=f><textarea id=i rows=1 placeholder="Ask anything..." autofocus></textarea><button id=b>Send</button></form>
 </div><script>
-const KEY="jepai_token", MODEL="__MODEL__";
-let tok=localStorage.getItem(KEY), msgs=[];
-if(!tok){tok=prompt("Enter your access token (one time):")||"";localStorage.setItem(KEY,tok);}
+const TKEY="jepai_token", CKEY="jepai_chats", CURKEY="jepai_cur", MODEL="__MODEL__";
+let tok=localStorage.getItem(TKEY);
+if(!tok){tok=prompt("Enter your access token (one time):")||"";localStorage.setItem(TKEY,tok);}
 const log=document.getElementById("log"),inp=document.getElementById("i"),btn=document.getElementById("b"),
-      f=document.getElementById("f"),st=document.getElementById("st");
+      f=document.getElementById("f"),st=document.getElementById("st"),
+      drawer=document.getElementById("drawer"),ov=document.getElementById("ov"),chatsEl=document.getElementById("chats");
+// ---- chat history saved in localStorage, private to this phone; survives refresh / reopen ----
+function loadChats(){try{return JSON.parse(localStorage.getItem(CKEY))||[]}catch(_){return[]}}
+function saveChats(){try{localStorage.setItem(CKEY,JSON.stringify(chats.slice(0,50)))}catch(_){}}
+let chats=loadChats(),curId=localStorage.getItem(CURKEY);
+const cur=()=>chats.find(c=>c.id===curId);
 function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+function render(){log.innerHTML="";const c=cur();if(c)for(const m of c.messages)add(m.role==="user"?"me":"ai",m.content);}
+function renderChats(){chatsEl.innerHTML="";for(const c of chats){const r=document.createElement("div");r.className="crow"+(c.id===curId?" cur":"");
+  const t=document.createElement("div");t.className="t";t.textContent=c.title||"New chat";
+  const x=document.createElement("div");x.className="x";x.textContent="×";
+  r.appendChild(t);r.appendChild(x);r.onclick=()=>openChat(c.id);x.onclick=e=>delChat(c.id,e);chatsEl.appendChild(r);}}
+function persist(){const c=cur();if(!c)return;const fu=c.messages.find(m=>m.role==="user");if(fu)c.title=fu.content.slice(0,42);c.ts=Date.now();chats=[c,...chats.filter(x=>x.id!==c.id)];saveChats();renderChats();}
+function newChat(){const id="c"+Date.now()+Math.random().toString(36).slice(2,6);chats.unshift({id,title:"New chat",messages:[],ts:Date.now()});curId=id;localStorage.setItem(CURKEY,id);saveChats();render();renderChats();closeDrawer();inp.focus();}
+function openChat(id){curId=id;localStorage.setItem(CURKEY,id);render();renderChats();closeDrawer();}
+function delChat(id,e){e.stopPropagation();chats=chats.filter(c=>c.id!==id);saveChats();if(curId===id)curId=chats[0]&&chats[0].id;localStorage.setItem(CURKEY,curId||"");if(!chats.length)newChat();else{render();renderChats();}}
+const openDrawer=()=>{drawer.classList.add("open");ov.classList.add("open");};
+const closeDrawer=()=>{drawer.classList.remove("open");ov.classList.remove("open");};
+document.getElementById("mn").onclick=openDrawer;ov.onclick=closeDrawer;
+document.getElementById("nw").onclick=newChat;document.getElementById("nw2").onclick=newChat;
+if(!chats.length||!cur())newChat();else{render();renderChats();}
 inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,120)+"px";});
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function jget(url){return fetch(url,{headers:{"Authorization":"Bearer "+tok}});}
-// SUBMIT then POLL: the query runs on the PC; each poll is a tiny request. This survives the phone
-// sleeping, app-switching, and network blips - a held connection does not (iOS suspends the page).
+async function jget(u){return fetch(u,{headers:{"Authorization":"Bearer "+tok}});}
+// SUBMIT then POLL: the query runs on the PC; each poll is a tiny request, surviving phone sleep/app-switch.
 f.addEventListener("submit",async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;
-  add("me",q);msgs.push({role:"user",content:q});inp.value="";inp.style.height="auto";
+  const c=cur();if(!c){newChat();return f.requestSubmit();}
+  add("me",q);c.messages.push({role:"user",content:q});persist();inp.value="";inp.style.height="auto";
   btn.disabled=true;const th=add("think","working...");
   try{
-    const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:msgs})});
-    if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(KEY);location.reload();};return;}
-    const {job_id}=await r.json();
-    let fails=0;
-    while(true){
-      await sleep(3000);
-      let j;
-      try{const p=await jget("/poll?id="+job_id);if(p.status===404){throw new Error("expired");}j=await p.json();fails=0;}
-      catch(_){fails++;if(fails>40){th.remove();add("ai","Lost the server. Tap Send to retry.");break;}continue;}
-      if(j.status==="done"){th.remove();add("ai",j.content||"(empty reply)");msgs.push({role:"assistant",content:j.content||""});break;}
-      th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";
-    }
+    const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
+    if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};return;}
+    const {job_id}=await r.json();let fails=0;
+    while(true){await sleep(3000);let j;
+      try{const p=await jget("/poll?id="+job_id);if(p.status===404)throw new Error("expired");j=await p.json();fails=0;}
+      catch(_){fails++;if(fails>60){th.remove();add("ai","Lost the server. Tap Send to retry.");break;}continue;}
+      if(j.status==="done"){th.remove();const ans=j.content||"(empty reply)";add("ai",ans);c.messages.push({role:"assistant",content:ans});persist();break;}
+      th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";}
   }catch(err){th.remove();add("ai","Error: "+err.message+" - tap Send to retry.");}
   finally{btn.disabled=false;st.textContent="ready";inp.focus();}
 });
