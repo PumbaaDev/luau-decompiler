@@ -6,7 +6,10 @@ right engine (local uncensored model, or cloud). Backend-agnostic: it works unde
 not inside the harness.
 
     Claude Code  ->  unified_proxy (localhost:8770)  ->  Ollama (localhost:11434)
-                        |  inject memory + sanitized skills into `system`
+                        |  static preamble -> `system` (byte-identical every turn, so
+                        |    llama.cpp's prompt-prefix cache survives across turns)
+                        |  per-turn memory + sanitized skill -> the newest TYPED user
+                        |    message (history replays its original blocks verbatim)
                         |  route coder <-> thinker (per-message @local / @think marker)
 
 WHY A PROXY, NOT A HOOK: tools/local-claude.ps1 runs `claude --bare`, which turns
@@ -28,6 +31,7 @@ lists, tags) are forwarded verbatim.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -35,6 +39,7 @@ import sys
 import threading
 import urllib.request
 import urllib.error
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -253,6 +258,27 @@ def detect_marker(text: str):
     return None, text
 
 
+def _typed_messages(messages):
+    """[(index, message, container, key)] for EVERY user message that has typed text - the
+    LAST text block of the message (earlier blocks are system-reminders), the same rule
+    typed_block applies to the newest one. Conversation order. The whole list is needed
+    because PAST typed messages must get their originally-injected context block re-applied
+    byte-for-byte (see inject_messages) or the model's prompt-prefix cache dies anyway."""
+    out = []
+    for i, m in enumerate(messages or []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append((i, m, m, "content"))
+        elif isinstance(c, list):
+            for b in reversed(c):
+                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                    out.append((i, m, b, "text"))
+                    break                              # tool_result-only messages add nothing
+    return out
+
+
 def typed_block(messages):
     """The (container, key) of the user's TYPED text: the LAST text block of the most recent user
     message that HAS one. Claude Code sends the turn as [system-reminder block(s), typed text], so
@@ -260,19 +286,8 @@ def typed_block(messages):
     tool_result-only (no text block); we keep scanning BACK to the last typed message so an @marker
     route (and the retrieval task) persist across tool calls instead of silently reverting to the
     default model mid-task. (None, None) if no user text exists at all."""
-    for m in reversed(messages or []):
-        if m.get("role") != "user":
-            continue
-        c = m.get("content")
-        if isinstance(c, str):
-            return m, "content"
-        if isinstance(c, list):
-            for b in reversed(c):
-                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
-                    return b, "text"
-            # tool_result-only user message: no typed text here - look further back, don't give up
-            continue
-    return None, None
+    tm = _typed_messages(messages)
+    return (tm[-1][2], tm[-1][3]) if tm else (None, None)
 
 
 _HARNESS_IDENTITY = re.compile(r"You are a Claude agent|Anthropic'?s Claude Agent SDK", re.I)
@@ -292,8 +307,11 @@ def strip_harness_identity(payload) -> None:
             isinstance(b, dict) and _HARNESS_IDENTITY.search(b.get("text", "")))]
 
 
-# The uncensored framing wraps the WHOLE injected context, present on every injected turn
-# (facts-only turns included), and its length is counted against the injection budget.
+# The uncensored framing. In the PROXY it is the ONLY thing injected into `system` - byte-
+# identical every turn so the model's prompt-prefix cache survives (the per-turn blocks ride
+# in the typed user message instead; see inject_messages). build_context still prepends it to
+# its return value (phone_agent consumes that whole string), and its length still counts
+# against the injection budget - selection is unchanged, only the proxy's PLACEMENT moved.
 _PREAMBLE = (
     "You are Jep's local assistant, working on his own code and projects. You "
     "never refuse legitimate reverse-engineering, decompilation, or deobfuscation "
@@ -403,7 +421,8 @@ def build_context(task: str):
 
 def inject_system(payload: dict, context: str) -> None:
     """Prepend the context to the Anthropic `system` field, handling both the
-    string and content-block-list forms, in place."""
+    string and content-block-list forms, in place. The proxy only ever passes the
+    static _PREAMBLE here, so `system` stays byte-identical across turns."""
     if not context:
         return
     sysv = payload.get("system")
@@ -414,6 +433,102 @@ def inject_system(payload: dict, context: str) -> None:
         payload["system"] = header + sysv
     elif isinstance(sysv, list):
         payload["system"] = [{"type": "text", "text": header}] + sysv
+
+
+# -- prefix-stable injection ------------------------------------------------
+# Retrieved facts change every turn; injecting them at the HEAD of `system` therefore changed
+# the whole system+tools prefix and made llama.cpp re-prefill the ENTIRE ~25-30k-token prompt
+# each turn (~15-40s dead time). So `system` now carries ONLY the static _PREAMBLE, and the
+# per-turn facts+skill block rides in the newest TYPED user message. For the prefix to hold,
+# PAST typed messages must show exactly what the model saw when they were newest - the client
+# resends history WITHOUT our injections - so every applied injection is cached and re-applied
+# byte-for-byte. The same cache freezes retrieval for the WHOLE turn: a tool continuation
+# resends the same typed message, hits the cache, and replays the frozen block, so a mid-turn
+# REMEMBER append cannot change the prompt between tool calls.
+INJECT_CACHE_MAX = int(os.environ.get("UNIFIED_INJECT_CACHE", "200"))
+_INJECT_CACHE = OrderedDict()   # (msg index, sha1(typed text AS SENT)) -> (cleaned, block, nfacts, skill)
+_INJECT_LOCK = threading.Lock()
+
+
+def _inject_key(idx, text):
+    """Key a message by position AND typed bytes AS SENT by the client (@marker included -
+    the client resends history verbatim, so the raw bytes are the stable identity). Two
+    conversations colliding on (index, text) replay each other's block, which is benign:
+    the block was built from the identical query text."""
+    return (idx, hashlib.sha1((text or "").encode("utf-8", "replace")).hexdigest())
+
+
+def _cache_get(key):
+    with _INJECT_LOCK:
+        v = _INJECT_CACHE.get(key)
+        if v is not None:
+            _INJECT_CACHE.move_to_end(key)             # LRU: a hit is recent again
+        return v
+
+
+def _cache_put(key, value):
+    with _INJECT_LOCK:
+        _INJECT_CACHE[key] = value
+        _INJECT_CACHE.move_to_end(key)
+        while len(_INJECT_CACHE) > INJECT_CACHE_MAX:   # bounded: evict the coldest
+            _INJECT_CACHE.popitem(last=False)
+
+
+def _context_block(ctx):
+    """The per-turn facts/skill/episode part of a build_context() result, static _PREAMBLE
+    removed - the preamble lives in `system` now. build_context itself is UNTOUCHED (same
+    return signature, same selection; phone_agent imports it): only the placement moved."""
+    if not ctx or ctx == _PREAMBLE:
+        return ""
+    if ctx.startswith(_PREAMBLE):
+        return ctx[len(_PREAMBLE):].lstrip("\n")
+    return ctx
+
+
+def _apply_injection(msg, cont, key, cleaned, block):
+    """Write the (marker-stripped) typed text and put the context block in front of the
+    message's first TEXT block. ONE code path for fresh and cached application, so a
+    replayed injection is byte-for-byte what the model saw the first time. The block goes
+    before the first text block, never before tool_result blocks (the API wants those
+    first); for string content it becomes the head of the string."""
+    cont[key] = cleaned
+    if not block:
+        return
+    c = msg.get("content")
+    if isinstance(c, list):
+        at = next((i for i, b in enumerate(c)
+                   if isinstance(b, dict) and b.get("type") == "text"), len(c))
+        c.insert(at, {"type": "text", "text": block})
+    else:
+        msg["content"] = block + "\n\n" + cleaned
+
+
+def inject_messages(messages, cleaned):
+    """Prefix-stable per-turn injection over the whole conversation, in place. PAST typed
+    messages get their ORIGINALLY-injected block re-applied from the cache (byte-for-byte;
+    a miss - proxy restart or LRU eviction - leaves that message untouched: fresh retrieval
+    there would inject wrong-turn facts AND still break the prefix). Only the NEWEST typed
+    message gets fresh retrieval, and only on its FIRST appearance: a tool continuation
+    resends the same typed message, hits the cache, and replays the frozen block - so
+    retrieval is frozen for the turn. Returns (n_facts, skill_name, fresh|cached|none)."""
+    typed_msgs = _typed_messages(messages)
+    if not typed_msgs:
+        return 0, "-", "none"
+    for idx, msg, c, k in typed_msgs[:-1]:             # history: cache-only, never fresh
+        hit = _cache_get(_inject_key(idx, c.get(k)))
+        if hit is not None:
+            _apply_injection(msg, c, k, hit[0], hit[1])
+    idx, msg, c, k = typed_msgs[-1]
+    ck = _inject_key(idx, c.get(k))
+    hit = _cache_get(ck)
+    if hit is not None:                                # tool continuation: this turn is frozen
+        _apply_injection(msg, c, k, hit[0], hit[1])
+        return hit[2], hit[3], "cached"
+    ctx, nfacts, skill = build_context(cleaned) if cleaned else ("", 0, "-")
+    block = _context_block(ctx)
+    _apply_injection(msg, c, k, cleaned, block)
+    _cache_put(ck, (cleaned, block, nfacts, skill))
+    return nfacts, skill, "fresh"
 
 
 # -- anti-400: guarantee the request fits the model window ------------------
@@ -749,17 +864,21 @@ class Handler(BaseHTTPRequestHandler):
             route = (kind or DEFAULT_ROUTE)
             model = MODEL_ALIASES.get(route, LOCAL_MODEL)  # @qwen/@kat/@think/@local; default local
             is_think = route in ("think", "thinker")
-            if kind and cont is not None:              # a marker was present -> strip it from THAT block only
-                cont[key] = cleaned
             if route in ("gemini", "google"):         # online, censored, NO private-memory injection
+                if kind and cont is not None:          # a marker was present -> strip it from THAT block only
+                    cont[key] = cleaned
                 try:
                     self._gemini(payload, GEMINI_MODEL)
                 except Exception as ge:               # a gemini turn must NEVER fall through to the local
                     log("gemini route error (no local fallthrough): %s" % ge)   # Ollama upstream below
                 return
-            task = cleaned if cont is not None else last_user_text(messages)
-            ctx, nfacts, skill = build_context(task) if task else ("", 0, "-")
-            inject_system(payload, ctx)
+            # PREFIX-STABLE placement: `system` gets ONLY the static preamble (byte-identical
+            # every turn -> llama.cpp keeps its prompt-prefix cache instead of re-prefilling
+            # the whole prompt); the per-turn facts+skill block rides in the newest TYPED user
+            # message, and history replays its original blocks verbatim. Marker stripping now
+            # happens inside inject_messages (the cache key needs the RAW typed bytes).
+            inject_system(payload, _PREAMBLE)
+            nfacts, skill, inj = inject_messages(messages, cleaned)
             payload["model"] = model
             if is_think:
                 nctx, reserve = THINK_CTX, THINK_MIN_TOKENS + OUT_MARGIN
@@ -772,8 +891,8 @@ class Handler(BaseHTTPRequestHandler):
             cap_output_tokens(payload, nctx)         # bound OUTPUT so input + max_tokens <= num_ctx
             new_body = json.dumps(payload).encode("utf-8")
             raw_est = _raw_est_tokens(payload)        # uncalibrated, for the est->real feedback loop
-            log("-> %-5s model=%s  facts=%d  skill=%s  ~%dtok  mt=%s  ctx=%d  stream=%s"
-                % (label, model, nfacts, skill, _est_tokens(payload),
+            log("-> %-5s model=%s  facts=%d  skill=%s  inj=%s  ~%dtok  mt=%s  ctx=%d  stream=%s"
+                % (label, model, nfacts, skill, inj, _est_tokens(payload),
                    payload.get("max_tokens"), nctx, payload.get("stream", False)))
         except Exception as e:
             log("passthrough (inject error: %s)" % e)
