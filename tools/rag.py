@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import pickle
 import re
 import sys
 import time
@@ -40,6 +42,7 @@ IDX_DIR = ROOT / "goal"
 META_PATH = IDX_DIR / "rag_index.jsonl"
 VEC_PATH = IDX_DIR / "rag_vectors.npy"
 LOCK_PATH = IDX_DIR / "rag_index.lock"     # guards against concurrent writers corrupting the store
+BM25_PATH = IDX_DIR / "rag_bm25.pkl"       # keyword (BM25) index for hybrid retrieval, keyed by store size
 CHUNK_CHARS = int(os.environ.get("RAG_CHUNK_CHARS", "1500"))
 CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "200"))
 
@@ -213,15 +216,103 @@ def _write_load():
         return np.zeros((0, 768), dtype=np.float32), []
 
 
-def retrieve(query: str, k: int = 5):
-    vecs, meta = _load()
-    q = np.asarray(_embed("search_query: " + query), dtype=np.float32)
-    if q.size == 0:
+# ------------------------- keyword (BM25) side of hybrid retrieval ------------------------- #
+_WORD = re.compile(r"[A-Za-z0-9]+")
+# split identifiers into subtokens so "ground truth" matches set_ground_truth and "Knit Server" matches KnitServer
+_CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
+_BM = {"N": None, "postings": None, "doclen": None, "avgdl": 0.0}
+
+
+def _tokenize(text):
+    toks = []
+    for w in _WORD.findall(text):
+        parts = _CAMEL.findall(w) or [w]
+        for p in parts:
+            toks.append(p.lower())
+    return toks
+
+
+def _bm25_ensure(meta):
+    """Build (or load) a compact inverted index over every chunk's text. Keyed by store size so it
+    self-rebuilds after the store grows. Compressed to numpy arrays (~tens of MB) and persisted."""
+    n = len(meta)
+    if _BM["N"] == n and _BM["postings"] is not None:
+        return
+    if BM25_PATH.exists():
+        try:
+            d = pickle.load(open(BM25_PATH, "rb"))
+            if d.get("N") == n:
+                _BM.update(d)
+                return
+        except Exception:
+            pass
+    print("rag: building BM25 keyword index over %d chunks (one-time)..." % n, file=sys.stderr)
+    raw = {}                                        # term -> list[(doc_id, tf)]
+    doclen = np.zeros(n, dtype=np.int32)
+    for i, m in enumerate(meta):
+        toks = _tokenize(m["text"])
+        doclen[i] = len(toks)
+        tf = {}
+        for t in toks:
+            tf[t] = tf.get(t, 0) + 1
+        for t, c in tf.items():
+            raw.setdefault(t, []).append((i, c))
+    postings = {t: (np.fromiter((d for d, _ in lst), dtype=np.int32, count=len(lst)),
+                    np.fromiter((c for _, c in lst), dtype=np.int32, count=len(lst)))
+                for t, lst in raw.items()}
+    _BM.update({"N": n, "postings": postings, "doclen": doclen,
+                "avgdl": float(doclen.mean()) if n else 0.0})
+    try:
+        with open(BM25_PATH, "wb") as f:
+            pickle.dump({k: _BM[k] for k in ("N", "postings", "doclen", "avgdl")}, f, protocol=4)
+    except Exception as e:
+        print("rag: could not persist BM25 index: %s" % e, file=sys.stderr)
+
+
+def _bm25_search(query, k=40, k1=1.5, b=0.75):
+    """BM25 over the query's terms. Only touches docs containing a query term, so it is fast even at
+    90k chunks. Returns [(doc_id, score)] best first."""
+    meta = _CACHE["meta"]
+    if not meta:
         return []
-    q /= (np.linalg.norm(q) + 1e-8)
-    sims = vecs @ q
-    idx = np.argsort(-sims)[:k]
-    return [{"source": meta[i]["source"], "score": float(sims[i]), "text": meta[i]["text"]} for i in idx]
+    _bm25_ensure(meta)
+    n, avgdl = _BM["N"], (_BM["avgdl"] or 1.0)
+    scores = {}
+    for t in set(_tokenize(query)):
+        post = _BM["postings"].get(t)
+        if post is None:
+            continue
+        docs, tfs = post
+        idf = math.log(1.0 + (n - len(docs) + 0.5) / (len(docs) + 0.5))
+        dl = _BM["doclen"][docs].astype(np.float32)
+        contrib = idf * (tfs * (k1 + 1)) / (tfs + k1 * (1 - b + b * dl / avgdl))
+        for d, s in zip(docs.tolist(), contrib.tolist()):
+            scores[d] = scores.get(d, 0.0) + s
+    return sorted(scores.items(), key=lambda kv: -kv[1])[:k]
+
+
+def retrieve(query: str, k: int = 5, semantic_k: int = 40, keyword_k: int = 40, rrf_c: int = 60):
+    """HYBRID retrieval: fuse semantic (embedding cosine) and keyword (BM25) rankings with reciprocal
+    rank fusion. Semantic is great for concepts; keyword nails exact identifiers (an opcode, a
+    function name) the embedding blurs. RRF needs no score normalisation across the two scales."""
+    vecs, meta = _load()
+    sem = []
+    q = np.asarray(_embed("search_query: " + query), dtype=np.float32)
+    if q.size:
+        q /= (np.linalg.norm(q) + 1e-8)
+        sims = vecs @ q
+        sidx = np.argsort(-sims)[:semantic_k]
+        sem = [int(i) for i in sidx]
+    kw = [d for d, _ in _bm25_search(query, keyword_k)]
+    fused = {}
+    for rank, i in enumerate(sem):
+        fused[i] = fused.get(i, 0.0) + 1.0 / (rrf_c + rank + 1)
+    for rank, i in enumerate(kw):
+        fused[i] = fused.get(i, 0.0) + 1.0 / (rrf_c + rank + 1)
+    if not fused:
+        return []
+    order = sorted(fused.items(), key=lambda kv: -kv[1])[:k]
+    return [{"source": meta[i]["source"], "score": float(s), "text": meta[i]["text"]} for i, s in order]
 
 
 def append_pages(pages, source_prefix="web:"):
