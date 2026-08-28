@@ -609,14 +609,26 @@ inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
 f.addEventListener("submit",async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;
   add("me",q);msgs.push({role:"user",content:q});inp.value="";inp.style.height="auto";
-  btn.disabled=true;st.textContent="thinking...";const th=add("think","typing...");
+  btn.disabled=true;st.textContent="thinking...";const th=add("think","working...");
+  // STREAM the reply: for long tool loops (reading many files) no-stream would time out the
+  // connection with no bytes flowing. Streaming + the agent's heartbeats keep it alive.
   try{const r=await fetch("/v1/chat/completions",{method:"POST",
       headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
-      body:JSON.stringify({model:MODEL,messages:msgs,stream:false})});
-    if(r.status===401){th.remove();add("ai","Unauthorized - wrong token. Tap here to re-enter.").onclick=()=>{localStorage.removeItem(KEY);location.reload();};return;}
-    const j=await r.json();const a=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||"(empty reply)";
-    th.remove();add("ai",a);msgs.push({role:"assistant",content:a});
-  }catch(err){th.remove();add("ai","Error: "+err.message);}
+      body:JSON.stringify({model:MODEL,messages:msgs,stream:true})});
+    if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(KEY);location.reload();};return;}
+    if(!r.ok||!r.body){th.remove();add("ai","Error: server returned "+r.status);return;}
+    th.remove();const aiDiv=add("ai","");let acc="";
+    const reader=r.body.getReader(),dec=new TextDecoder();let buf="";
+    while(true){const {done,value}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});let i;
+      while((i=buf.indexOf("\n\n"))>=0){const block=buf.slice(0,i);buf=buf.slice(i+2);
+        const dl=block.split("\n").find(l=>l.startsWith("data:"));if(!dl)continue;
+        const data=dl.slice(5).trim();if(data==="[DONE]")continue;
+        try{const j=JSON.parse(data);const c=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;
+          if(c){acc+=c;aiDiv.textContent=acc;st.textContent="typing...";log.scrollTop=log.scrollHeight;}}catch(_){}}}
+    if(!acc)aiDiv.textContent="(empty reply)";
+    msgs.push({role:"assistant",content:acc||""});
+  }catch(err){th.remove();add("ai","Connection dropped ("+err.message+"). Tap Send to retry.");}
   finally{btn.disabled=false;st.textContent="ready";inp.focus();}
 });
 </script></body></html>"""
