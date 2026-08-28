@@ -36,8 +36,10 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -572,6 +574,38 @@ def _oa_stream_content(text):
     yield b"data: [DONE]\n\n"
 
 
+# ----- async job store: the phone SUBMITS a question then POLLS for the answer, so a 2-3 min query
+# survives the phone sleeping / app-switching / network blips (a held streaming connection does not,
+# because iOS suspends the page). The tool loop runs on the host regardless of the phone's state. -----
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
+JOB_TTL = 1800   # forget a job 30 min after it finishes / is created
+
+
+def _job_gc(now):
+    dead = [j for j, v in _JOBS.items() if now - v.get("born", now) > JOB_TTL]
+    for j in dead:
+        _JOBS.pop(j, None)
+
+
+def _start_job(messages):
+    jid = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _job_gc(time.time())
+        _JOBS[jid] = {"status": "pending", "text": "", "born": time.time(), "tools": []}
+
+    def _worker():
+        try:
+            text, tools = run_agent(messages)
+        except Exception as e:
+            text, tools = "Sorry - I hit an error: %s: %s" % (type(e).__name__, e), []
+        with _JOBS_LOCK:
+            if jid in _JOBS:
+                _JOBS[jid].update(status="done", text=text, tools=tools)
+    threading.Thread(target=_worker, daemon=True).start()
+    return jid
+
+
 CHAT_PAGE = r"""<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>__NAME__</title>
@@ -607,28 +641,27 @@ const log=document.getElementById("log"),inp=document.getElementById("i"),btn=do
 function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
 inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,120)+"px";});
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function jget(url){return fetch(url,{headers:{"Authorization":"Bearer "+tok}});}
+// SUBMIT then POLL: the query runs on the PC; each poll is a tiny request. This survives the phone
+// sleeping, app-switching, and network blips - a held connection does not (iOS suspends the page).
 f.addEventListener("submit",async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;
   add("me",q);msgs.push({role:"user",content:q});inp.value="";inp.style.height="auto";
-  btn.disabled=true;st.textContent="thinking...";const th=add("think","working...");
-  // STREAM the reply: for long tool loops (reading many files) no-stream would time out the
-  // connection with no bytes flowing. Streaming + the agent's heartbeats keep it alive.
-  try{const r=await fetch("/v1/chat/completions",{method:"POST",
-      headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
-      body:JSON.stringify({model:MODEL,messages:msgs,stream:true})});
+  btn.disabled=true;const th=add("think","working...");
+  try{
+    const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:msgs})});
     if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(KEY);location.reload();};return;}
-    if(!r.ok||!r.body){th.remove();add("ai","Error: server returned "+r.status);return;}
-    th.remove();const aiDiv=add("ai","");let acc="";
-    const reader=r.body.getReader(),dec=new TextDecoder();let buf="";
-    while(true){const {done,value}=await reader.read();if(done)break;
-      buf+=dec.decode(value,{stream:true});let i;
-      while((i=buf.indexOf("\n\n"))>=0){const block=buf.slice(0,i);buf=buf.slice(i+2);
-        const dl=block.split("\n").find(l=>l.startsWith("data:"));if(!dl)continue;
-        const data=dl.slice(5).trim();if(data==="[DONE]")continue;
-        try{const j=JSON.parse(data);const c=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;
-          if(c){acc+=c;aiDiv.textContent=acc;st.textContent="typing...";log.scrollTop=log.scrollHeight;}}catch(_){}}}
-    if(!acc)aiDiv.textContent="(empty reply)";
-    msgs.push({role:"assistant",content:acc||""});
-  }catch(err){th.remove();add("ai","Connection dropped ("+err.message+"). Tap Send to retry.");}
+    const {job_id}=await r.json();
+    let fails=0;
+    while(true){
+      await sleep(3000);
+      let j;
+      try{const p=await jget("/poll?id="+job_id);if(p.status===404){throw new Error("expired");}j=await p.json();fails=0;}
+      catch(_){fails++;if(fails>40){th.remove();add("ai","Lost the server. Tap Send to retry.");break;}continue;}
+      if(j.status==="done"){th.remove();add("ai",j.content||"(empty reply)");msgs.push({role:"assistant",content:j.content||""});break;}
+      th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";
+    }
+  }catch(err){th.remove();add("ai","Error: "+err.message+" - tap Send to retry.");}
   finally{btn.disabled=false;st.textContent="ready";inp.focus();}
 });
 </script></body></html>"""
@@ -667,6 +700,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"status": "ok", "model": MODEL, "memory": bool(build_context)}).encode())
         elif not self._authorized():
             self._send(401, b'{"error":"unauthorized"}')
+        elif self.path.startswith("/poll"):               # phone polls here for its submitted job's result
+            jid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            with _JOBS_LOCK:
+                job = _JOBS.get(jid)
+                if job and job["status"] == "done":
+                    _JOBS.pop(jid, None)                  # one-shot: hand the answer over then forget it
+            if not job:
+                self._send(404, b'{"error":"no such job"}')
+            elif job["status"] == "done":
+                self._send(200, json.dumps({"status": "done", "content": job["text"]}).encode())
+            else:
+                self._send(200, json.dumps({"status": "pending", "elapsed": int(time.time() - job["born"])}).encode())
         elif self.path.rstrip("/") in ("/v1/models", "/models"):
             data = json.dumps({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "jep"}]}).encode()
@@ -675,6 +720,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b'{"error":"not found"}')
 
     def do_POST(self):
+        if self.path.startswith("/ask"):                  # phone submits a question -> get a job id, then poll
+            if not self._authorized():
+                self._send(401, b'{"error":"unauthorized"}'); return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) if length else b"{}")
+                messages = payload.get("messages", []) if isinstance(payload, dict) else []
+            except Exception:
+                self._send(400, b'{"error":"bad request"}'); return
+            jid = _start_job(messages)
+            self._send(200, json.dumps({"job_id": jid}).encode())
+            return
         if not self.path.startswith("/v1/chat/completions") and not self.path.startswith("/chat/completions"):
             self._send(404, b'{"error":"not found"}'); return
         if not self._authorized():                       # host tools live behind this - never run them keyless
