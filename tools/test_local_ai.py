@@ -58,7 +58,7 @@ def main():
     for name, url, hdr, want in [
         ("phone_agent /health", PHONE + "/health", None, 200),
         ("ollama /api/tags", OLLAMA + "/api/tags", None, 200),
-        ("open-webui", OWUI, None, 200),
+        ("phone chat page /", PHONE + "/", None, 200),   # Docker-free phone UI (replaced OpenWebUI)
         ("proxy /health", PROXY + "/health", None, 200),
     ]:
         st, _ = _get(url, hdr)
