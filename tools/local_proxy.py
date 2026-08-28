@@ -510,14 +510,16 @@ def save_finding(fact):
             path = FINDINGS_DIR / (fid + ".md")
             if path.exists():
                 return
+            import datetime as _dt
+            today = _dt.date.today().isoformat()          # date-stamp so mem._recency() ranks it fresh
             path.write_text(
                 "---\nid: %s\ntitle: %s\ntype: fact\nauthority: claimed\naliases: []\n"
-                "tags: [session]\nupdated: \nsupersedes: []\n---\n\n%s\n"
-                % (fid, fact[:70], fact), encoding="utf-8")
+                "tags: [session]\nupdated: %s\nsupersedes: []\n---\n\n%s\n"
+                % (fid, fact[:70], today, fact), encoding="utf-8")
             if _FACTS is not None:
                 _FACTS.append({"id": fid, "title": fact[:70], "type": "fact",
                                "authority": "claimed", "aliases": [], "tags": ["session"],
-                               "supersedes": [], "links": [], "body": fact})
+                               "updated": today, "supersedes": [], "links": [], "body": fact})
             log("saved finding -> %s" % fid)
     except Exception as e:
         log("save_finding failed: %s" % e)

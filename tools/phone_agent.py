@@ -26,12 +26,15 @@ or any tailnet node) gets code execution + arbitrary file read. Always set the t
 """
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -57,7 +60,25 @@ MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to
 TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
 READ_FILE_PAGE = int(os.environ.get("PHONE_READ_FILE_PAGE", "40000"))  # read_file returns up to this per call (~10k tok); pages beyond
 RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
-WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer
+WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer (SSE path)
+# The submit/poll (phone) path was built to wait minutes, so it gets a much larger budget + more
+# iterations than the SSE path - a genuine multi-step job (crawl docs, cross-check code, page a big
+# file) must not be force-finalized half-done just because it inherited the SSE cap.
+JOB_WALL_BUDGET = int(os.environ.get("PHONE_JOB_WALL_BUDGET", "900"))   # seconds for the async /ask path
+JOB_MAX_ITERS = int(os.environ.get("PHONE_JOB_MAX_ITERS", "30"))       # tool-loop iterations for the async path
+HISTORY_CHAR_CAP = int(os.environ.get("PHONE_HISTORY_CHAR_CAP", "90000"))  # cap replayed chat history so a long
+#                                                        # phone thread can't overflow num_ctx and evict the persona
+def _parse_keep_alive(v):
+    """Ollama needs keep_alive as a NUMBER (-1 forever, 0 unload, N seconds) or a duration string
+    WITH a unit ("30m"). The bare string "-1" is rejected ('missing unit in duration'), so coerce
+    a plain integer to int and pass a unit-bearing string through unchanged."""
+    v = (v or "-1").strip() or "-1"               # a blank/whitespace value must fall back, not become "" (Ollama 400)
+    try:
+        return int(v)
+    except ValueError:
+        return v
+KEEP_ALIVE = _parse_keep_alive(os.environ.get("PHONE_KEEP_ALIVE", "-1"))  # pin model resident: no cold 60s first query
+VISION_MODEL = os.environ.get("PHONE_VISION_MODEL", "").strip()  # opt-in: pull a small VLM (e.g. qwen2.5vl:7b) to enable see_screen
 ROOT = Path(__file__).resolve().parent
 
 # reuse the desktop proxy's memory injection (import does NOT start its server)
@@ -66,6 +87,16 @@ try:
 except Exception as e:  # memory optional - never fatal
     build_context = None
     print("[phone_agent] memory injection unavailable: %s" % e, file=sys.stderr)
+
+# reuse the desktop proxy's REMEMBER harvester so findings made FROM THE PHONE are also persisted
+# (the persona already asks the model to write "REMEMBER: <fact>"; without this the phone discarded them)
+try:
+    from local_proxy import save_finding as _save_finding, _REMEMBER, HARVEST_MAX_PER_TURN as _HARVEST_MAX
+except Exception as e:
+    _save_finding = None
+    _REMEMBER = None
+    _HARVEST_MAX = 5
+    print("[phone_agent] REMEMBER harvest unavailable: %s" % e, file=sys.stderr)
 
 try:
     import rag  # semantic search over Jep's codebase + vault
@@ -316,18 +347,130 @@ def tool_email_read(args):
     return "From: %s\nDate: %s\nSubject: %s\n%s" % (r["sender"], r["date"], r["subject"], r["body"][:5000])
 
 
+def tool_find_in_files(args):
+    """Exact text / regex search across files (ripgrep). Finds WHERE a string, function name, or
+    symbol appears - complements search_knowledge (which is semantic, not literal)."""
+    pat = (args or {}).get("pattern", "").strip()
+    if not pat:
+        return "(no pattern given)"
+    root = (args or {}).get("path", ".").strip() or "."
+    glob = (args or {}).get("glob", "").strip()
+    rg = shutil.which("rg")
+    if rg:
+        cmd = [rg, "--line-number", "--no-heading", "--color", "never", "-m", "300"]
+        if glob:
+            cmd += ["--glob", glob]
+        cmd += ["--", pat, root]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                               encoding="utf-8", errors="replace")
+            if p.returncode not in (0, 1):        # rg: 0=matches, 1=no matches, 2+=error (bad regex, unreadable path)
+                return "(search error: %s)" % ((p.stderr or "").strip()[:300] or "rg exit %d" % p.returncode)
+            out = (p.stdout or "").strip()
+            return out[:TOOL_RESULT_CAP] if out else "(no matches)"
+        except Exception as e:
+            return "(search error: %s)" % e
+    # fallback: python regex walk (no ripgrep on PATH) - time-bounded, skips huge/binary files
+    try:
+        rx = re.compile(pat)
+    except re.error as e:
+        return "(bad regex: %s)" % e
+    hits, seen, stop = [], 0, time.time() + 60
+    for dp, _dn, fn in os.walk(root):
+        if any(s in dp for s in (".git", "target", "node_modules", "__pycache__")):
+            continue
+        if time.time() > stop or seen >= 300:
+            break
+        for name in fn:
+            fp = os.path.join(dp, name)
+            try:
+                if os.path.getsize(fp) > 2_000_000:   # skip huge/binary files a literal search won't want
+                    continue
+                for i, line in enumerate(Path(fp).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                    if rx.search(line):
+                        hits.append("%s:%d:%s" % (fp, i, line.strip()[:200]))
+                        seen += 1
+                        if seen >= 300:
+                            break
+            except Exception:
+                continue
+        if seen >= 300 or time.time() > stop:
+            break
+    return ("\n".join(hits))[:TOOL_RESULT_CAP] if hits else "(no matches)"
+
+
+def tool_remember_fact(args):
+    """Save a durable fact to Jep's memory so it is recalled in future chats (phone AND terminal)."""
+    if _save_finding is None:
+        return "(memory store unavailable)"
+    fact = " ".join((args or {}).get("fact", "").split())
+    if len(fact) < 20:
+        return "(fact too short to save - give a fuller statement, ~20+ characters)"
+    if len(fact) > 400:                          # save_finding silently drops >400; tell the model instead of lying
+        return "(fact too long - condense it to 400 characters or fewer, then save again)"
+    try:
+        _save_finding(fact)
+        return "Saved to memory: %s" % fact[:120]
+    except Exception as e:
+        return "(could not save: %s)" % e
+
+
+def tool_see_screen(args):
+    """Screenshot THIS PC and describe it via a local vision model (opt-in: set PHONE_VISION_MODEL to
+    a pulled VLM such as qwen2.5vl:7b). Lets Jep ask 'what is on screen', 'did the render finish',
+    'is there an error dialog' while away - fully offline."""
+    if not VISION_MODEL:
+        return ("(see_screen is off. To enable: pull a small vision model and set PHONE_VISION_MODEL, e.g. "
+                "`ollama pull qwen2.5vl:7b` then setx PHONE_VISION_MODEL qwen2.5vl:7b and restart the server.)")
+    png = str(Path(tempfile.gettempdir()) / "phone_screen.png")
+    try:
+        Path(png).unlink(missing_ok=True)         # remove any stale capture so a failed grab can't be described
+    except Exception:
+        pass
+    cap = (
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+        "$b=[System.Windows.Forms.SystemInformation]::VirtualScreen;"
+        "$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height;"
+        "$g=[System.Drawing.Graphics]::FromImage($bmp);"
+        "$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size);"
+        "$bmp.Save('%s',[System.Drawing.Imaging.ImageFormat]::Png);$g.Dispose();$bmp.Dispose()"
+        % png.replace("\\", "\\\\"))
+    grab = _run(cap, timeout=30)
+    try:
+        b64 = base64.b64encode(Path(png).read_bytes()).decode()
+    except Exception as e:
+        return "(could not capture the screen: %s; %s)" % (e, grab)
+    q = (args or {}).get("question", "").strip() or (
+        "Describe this screen: visible apps and windows, any dialogs or errors, progress bars and "
+        "their percentage, and the key on-screen text.")
+    # SHORT keep_alive for the VLM: it must NOT pin ~6GB in VRAM alongside the -1-pinned coder and
+    # starve every later chat. It unloads a few minutes after use; the coder keeps its pin.
+    body = {"model": VISION_MODEL, "keep_alive": os.environ.get("PHONE_VISION_KEEP_ALIVE", "2m"),
+            "stream": False, "messages": [{"role": "user", "content": q, "images": [b64]}]}
+    try:
+        req = urllib.request.Request(OLLAMA + "/api/chat", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            return (json.load(resp).get("message", {}) or {}).get("content", "") or "(vision model returned nothing)"
+    except Exception as e:
+        return "(vision model error with %s: %s)" % (VISION_MODEL, e)
+
+
 TOOLS = {
     "get_system_info": tool_system_info,
     "run_command": tool_run_command,
     "read_file": tool_read_file,
     "list_dir": tool_list_dir,
+    "find_in_files": tool_find_in_files,
     "web_search": tool_web_search,
     "web_fetch": tool_web_fetch,
     "crawl_site": tool_crawl_site,
     "learn_web": tool_learn_web,
     "search_knowledge": tool_search_knowledge,
+    "remember_fact": tool_remember_fact,
     "email_search": tool_email_search,
     "email_read": tool_email_read,
+    "see_screen": tool_see_screen,
 }
 
 TOOL_SPECS = [
@@ -406,6 +549,32 @@ TOOL_SPECS = [
         "name": "email_read", "description": "Read the full text of one email by its uid (READ-ONLY).",
         "parameters": {"type": "object", "properties": {
             "uid": {"type": "string"}}, "required": ["uid"]}}},
+    {"type": "function", "function": {
+        "name": "find_in_files", "description":
+        "Search files for EXACT text or a regex (ripgrep) and return file:line matches. Use to find "
+        "WHERE a string, function name, symbol, or error message appears in his code - the literal "
+        "counterpart to search_knowledge (which is semantic). Default root is the current directory.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "text or regular expression to find"},
+            "path": {"type": "string", "description": "directory to search (default '.')"},
+            "glob": {"type": "string", "description": "optional file filter, e.g. '*.rs' or '*.py'"}},
+            "required": ["pattern"]}}},
+    {"type": "function", "function": {
+        "name": "remember_fact", "description":
+        "Save a durable fact to Jep's memory so you recall it in FUTURE chats (phone and terminal). "
+        "Use when he tells you to remember something, or when you learn a lasting fact about him, his "
+        "setup, or his projects. State the fact fully and self-contained (~20+ characters).",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string", "description": "the fact to remember, stated fully"}},
+            "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "see_screen", "description":
+        "Look at the PC screen RIGHT NOW: take a screenshot and describe what is on it. Use when Jep "
+        "asks what is on screen, whether something visibly finished or failed (a render, an upload, a "
+        "build), or whether an error/dialog is showing. Optionally pass a specific question about the "
+        "screen. (Requires a local vision model; returns setup instructions if none is configured.)",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "optional: what to look for on the screen"}}}}},
 ]
 
 
@@ -435,16 +604,50 @@ def _system_block(messages):
     return "\n\n".join(parts)
 
 
-def _ollama_chat(messages, tools=None):
-    body = {"model": MODEL, "messages": messages, "stream": False,
+def _ollama_chat(messages, tools=None, on_delta=None):
+    """Call the model. Normally non-streaming (returns the full JSON). When on_delta is given AND no
+    tools are offered, stream the generation and call on_delta(text_so_far) as tokens arrive, so the
+    phone can show the answer forming instead of a spinner - then return the same {'message': {...}}
+    shape the non-stream path returns, so callers are unchanged."""
+    streaming = on_delta is not None and not tools
+    body = {"model": MODEL, "messages": messages, "stream": streaming, "keep_alive": KEEP_ALIVE,
             "options": {"num_ctx": NUM_CTX, "temperature": 0.6}}
     if tools:
         body["tools"] = tools
     req = urllib.request.Request(OLLAMA + "/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
+    timeout = int(os.environ.get("PHONE_TIMEOUT", "600"))
     try:
-        with urllib.request.urlopen(req, timeout=int(os.environ.get("PHONE_TIMEOUT", "600"))) as r:
-            return json.load(r)
+        if not streaming:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        # streaming: Ollama emits one JSON object per line; accumulate content and report progress
+        acc = []
+        final = {}
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("error"):               # Ollama streams an error object mid-stream; don't swallow it
+                    raise RuntimeError("Ollama stream error: %s" % obj["error"])
+                piece = (obj.get("message", {}) or {}).get("content", "") or ""
+                if piece:
+                    acc.append(piece)
+                    try:
+                        on_delta("".join(acc))
+                    except Exception:
+                        pass
+                if obj.get("done"):
+                    final = obj
+        msg = final.get("message", {}) or {}
+        msg["content"] = "".join(acc)
+        final["message"] = msg
+        return final
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:200]
         raise RuntimeError("Ollama HTTP %s: %s" % (e.code, detail))
@@ -485,8 +688,51 @@ def _strip_tool_calls(text):
     return t.strip()
 
 
-def run_agent(client_messages):
-    """Returns the final assistant text. Injects memory, runs the tool loop on the host."""
+def _cap_history(msgs, cap=HISTORY_CHAR_CAP):
+    """Keep the system head, the ORIGINAL question, and the most RECENT turns within `cap` chars,
+    dropping the oldest MIDDLE turns. A long phone thread (or a big paginated read within one job)
+    must never push the persona + injected memory + question out of num_ctx - Ollama does not error
+    on overflow, it silently evicts the head. Never leave a role:'tool' result without its preceding
+    assistant(tool_calls) parent - that 400s /api/chat."""
+    if len(msgs) <= 2:
+        return msgs
+    head = msgs[0]
+    fu = next((i for i, m in enumerate(msgs) if i > 0 and m.get("role") == "user"), None)
+    pinned = [head] + ([msgs[fu]] if fu is not None else [])
+    tail = list(msgs[fu + 1:] if fu is not None else msgs[1:])
+    total = sum(len(str(m.get("content", ""))) for m in pinned) + sum(len(str(m.get("content", ""))) for m in tail)
+    while len(tail) > 1 and total > cap:
+        total -= len(str(tail.pop(0).get("content", "")))
+    while tail and tail[0].get("role") == "tool":     # never start with an orphaned tool result
+        tail.pop(0)
+    return pinned + tail
+
+
+def _harvest_remember(text):
+    """Persist any 'REMEMBER: <fact>' lines the model emitted, so findings made FROM THE PHONE
+    accumulate into the fact store exactly like the desktop terminal does (deduped + capped by
+    save_finding). Without this, every fact learned on the phone was silently discarded."""
+    if not (_save_finding and _REMEMBER and text):
+        return
+    saved = 0
+    for m in _REMEMBER.finditer(text):
+        if saved >= _HARVEST_MAX:
+            break
+        try:
+            _save_finding(m.group(1))
+        except Exception:
+            pass
+        saved += 1
+
+
+def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS,
+              progress=None, cancel=None):
+    """Returns (final_text, tools_used). Injects memory, runs the tool loop on the host.
+
+    wall_budget / max_iters let the async /ask (phone) path run far longer than the SSE path, which
+    was built to wait minutes. progress(text) streams the final answer as it generates so the phone
+    shows words forming instead of a spinner. cancel() (checked at each tool boundary) lets a Stop
+    button abort - the model call in flight can't be interrupted, so it takes effect between steps."""
     msgs = [{"role": "system", "content": _system_block(client_messages)}]
     for m in client_messages:
         if m.get("role") in ("user", "assistant") and m.get("content"):
@@ -494,18 +740,31 @@ def run_agent(client_messages):
             if isinstance(c, list):
                 c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
             msgs.append({"role": m["role"], "content": c})
+    msgs = _cap_history(msgs)
 
     tools_used = []
-    deadline = time.time() + WALL_BUDGET
-    for _ in range(MAX_TOOL_ITERS):
-        resp = _ollama_chat(msgs, tools=TOOL_SPECS)
+    executed = {}                                     # (name,args) already run this turn -> breaks identical-call loops
+    DEDUP_EXEMPT = {"run_command", "see_screen", "get_system_info"}  # time-varying: a repeat may be legitimate
+    deadline = time.time() + wall_budget
+    for _ in range(max_iters):
+        if cancel and cancel():
+            break
+        msgs = _cap_history(msgs)                      # re-cap EACH iteration: paginated reads / long jobs grow msgs
+        resp = _ollama_chat(msgs, tools=TOOL_SPECS)    # past num_ctx mid-loop, and Ollama silently evicts the head
         msg = resp.get("message", {}) or {}
         content = msg.get("content", "") or ""
         calls = msg.get("tool_calls") or []
         if not calls:                                 # model may have written the call as TEXT - recover it
             calls = _parse_text_tool_calls(content)
         if not calls:
-            return _strip_tool_calls(content) or "(the model returned an empty reply)", tools_used
+            final = _strip_tool_calls(content) or "(the model returned an empty reply)"
+            if progress:                              # show it the instant it's ready (already generated)
+                try:
+                    progress(final)
+                except Exception:
+                    pass
+            _harvest_remember(final)
+            return final, tools_used
         # record the assistant's tool-call turn (leaked markup stripped), then execute each call
         msgs.append({"role": "assistant", "content": _strip_tool_calls(content), "tool_calls": calls})
         for call in calls:
@@ -520,6 +779,19 @@ def run_agent(client_messages):
             if not isinstance(args, dict):        # a stray list/scalar must not crash the turn
                 args = {}
             tools_used.append(name)
+            if cancel and cancel():               # Stop pressed mid-turn: skip the remaining side-effectful calls
+                msgs.append({"role": "tool", "tool_name": name, "content": "(cancelled by user - stopped)"})
+                continue
+            try:
+                key = (name, json.dumps(args, sort_keys=True, default=str))
+            except Exception:
+                key = (name, str(args))
+            # dedupe only PURE read tools; a repeat of a time-varying tool (run_command etc.) may be legitimate
+            if name not in DEDUP_EXEMPT and key in executed:   # Qwen3-Coder re-issues identical calls; skip + nudge on
+                msgs.append({"role": "tool", "tool_name": name, "content":
+                             "(duplicate of an earlier call - its result is already above; take a DIFFERENT "
+                             "action or give your final answer now)"})
+                continue
             handler = TOOLS.get(name)
             if not handler:
                 result = "(unknown tool: %s)" % name
@@ -528,18 +800,25 @@ def run_agent(client_messages):
                     result = handler(args)
                 except Exception as e:            # one bad tool call self-corrects, never kills the turn
                     result = "(tool error in %s: %s: %s)" % (name, type(e).__name__, e)
+            if not (isinstance(result, str) and result.startswith("(tool error")):
+                executed[key] = True              # only cache SUCCESS, so a transient error can be retried
+            if name == "run_command":             # a command may have changed state cached read results depend on
+                executed = {k: v for k, v in executed.items() if k[0] in DEDUP_EXEMPT}
             # read_file gets a bigger cap so a "read it fully" actually delivers the whole page, not 6KB
             rcap = READ_FILE_PAGE + 400 if name == "read_file" else TOOL_RESULT_CAP
             msgs.append({"role": "tool", "content": str(result)[:rcap], "tool_name": name})
         if time.time() > deadline:                # stop looping once we blow the time budget
             break
-    # out of iterations or time - force a final answer with NO tools offered, so the model must
-    # produce text instead of spiralling into another tool call.
-    resp = _ollama_chat(msgs + [{"role": "user",
+    # out of iterations / time / cancelled - force a final answer with NO tools offered, so the model
+    # must produce text instead of spiralling into another tool call. Stream it if the caller wants.
+    fin = _cap_history(msgs + [{"role": "user",
             "content": "Now give me your final answer in plain language, using what the tools returned so far. "
-                       "Do NOT emit any tool-call markup; just the answer."}],
-            tools=None)
-    return _strip_tool_calls((resp.get("message", {}) or {}).get("content", "")) or "(no final answer)", tools_used
+                       "Do NOT emit any tool-call markup; just the answer."}])
+    resp = _ollama_chat(fin, tools=None,
+                        on_delta=(lambda t: progress(_strip_tool_calls(t))) if progress else None)
+    final = _strip_tool_calls((resp.get("message", {}) or {}).get("content", "")) or "(no final answer)"
+    _harvest_remember(final)
+    return final, tools_used
 
 
 # --------------------------------------------------------------------------- #
@@ -601,11 +880,24 @@ def _start_job(messages):
     jid = uuid.uuid4().hex
     with _JOBS_LOCK:
         _job_gc(time.time())
-        _JOBS[jid] = {"status": "pending", "text": "", "born": time.time(), "tools": []}
+        _JOBS[jid] = {"status": "pending", "text": "", "born": time.time(), "tools": [], "cancel": False}
+
+    def _progress(partial):
+        # stream the final answer into the job so /poll can hand the phone text as it forms
+        with _JOBS_LOCK:
+            j = _JOBS.get(jid)
+            if j and j["status"] != "done":
+                j["status"] = "streaming"
+                j["text"] = partial
+
+    def _cancel():
+        j = _JOBS.get(jid)
+        return bool(j and j.get("cancel"))
 
     def _worker():
-        try:
-            text, tools = run_agent(messages)
+        try:                                  # the phone path waits minutes: bigger budget + more iterations
+            text, tools = run_agent(messages, wall_budget=JOB_WALL_BUDGET, max_iters=JOB_MAX_ITERS,
+                                    progress=_progress, cancel=_cancel)
         except Exception as e:
             text, tools = "Sorry - I hit an error: %s: %s" % (type(e).__name__, e), []
         with _JOBS_LOCK:
@@ -631,7 +923,11 @@ header small{margin-left:auto;color:var(--mut);font-weight:400;font-size:12px}
 .me{align-self:flex-end;background:var(--me);border-bottom-right-radius:5px}
 .ai{align-self:flex-start;background:var(--ai);border-bottom-left-radius:5px}
 .ai pre,.ai code{background:#0d0f14;border-radius:8px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
-.ai pre{padding:10px;overflow-x:auto}.ai code{padding:1px 5px}
+.ai pre{padding:10px;overflow-x:auto;margin:6px 0}.ai code{padding:1px 5px}
+.ai .h{font-weight:600;margin:7px 0 2px}.ai .li{margin:1px 0 1px 6px}
+.ai .cb{position:relative}.ai .cb pre{padding-top:26px}
+.cp{position:absolute;top:5px;right:6px;background:#2a2e38;color:var(--tx);font-size:11px;padding:3px 9px;border-radius:6px;font-weight:500}
+.retry{background:var(--acc);color:#04122e;font-size:13px;padding:5px 12px;border-radius:8px;margin-top:6px}
 .think{align-self:flex-start;color:var(--mut);font-style:italic}
 form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid #23262e}
 textarea{flex:1;resize:none;max-height:120px;background:#0d0f14;color:var(--tx);border:1px solid #2a2e38;border-radius:12px;padding:10px 12px;font:inherit}
@@ -667,7 +963,30 @@ function loadChats(){try{return JSON.parse(localStorage.getItem(CKEY))||[]}catch
 function saveChats(){try{localStorage.setItem(CKEY,JSON.stringify(chats.slice(0,50)))}catch(_){}}
 let chats=loadChats(),curId=localStorage.getItem(CURKEY);
 const cur=()=>chats.find(c=>c.id===curId);
-function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+// ---- lightweight, XSS-safe markdown for the coder model's replies (escape FIRST, never raw innerHTML) ----
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
+function inlineMd(s){s=esc(s);
+  s=s.replace(/`([^`]+)`/g,(m,c)=>"<code>"+c+"</code>");
+  s=s.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+  s=s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s"']+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;}
+function md(text){const parts=String(text).split(/```(\w*)\n?([\s\S]*?)```/g);let html="";
+  for(let i=0;i<parts.length;i++){
+    if(i%3===0){const prose=parts[i];if(!prose)continue;
+      for(const ln of prose.split("\n")){
+        const h=ln.match(/^(#{1,4})\s+(.*)$/);if(h){html+="<div class=h>"+inlineMd(h[2])+"</div>";continue;}
+        const li=ln.match(/^\s*[-*]\s+(.*)$/);if(li){html+="<div class=li>• "+inlineMd(li[1])+"</div>";continue;}
+        html+=inlineMd(ln)+"<br>";}
+    }else if(i%3===2){html+='<div class=cb><button class=cp>Copy</button><pre><code>'+esc(parts[i])+'</code></pre></div>';}}
+  return html;}
+function copyText(t){try{const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";
+  document.body.appendChild(ta);ta.focus();ta.select();document.execCommand("copy");document.body.removeChild(ta);}catch(_){}}
+function wireCopy(d){d.querySelectorAll(".cp").forEach(b=>{b.onclick=()=>{const code=b.parentNode.querySelector("code");
+  if(code)copyText(code.textContent);b.textContent="Copied";setTimeout(()=>b.textContent="Copy",1200);};});}
+function renderAi(d,txt){d.className="msg ai";d.innerHTML=md(txt);wireCopy(d);}
+function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;
+  if(cls==="ai")renderAi(d,txt);else d.textContent=txt;
+  log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
 function render(){log.innerHTML="";const c=cur();if(c)for(const m of c.messages)add(m.role==="user"?"me":"ai",m.content);}
 function renderChats(){chatsEl.innerHTML="";for(const c of chats){const r=document.createElement("div");r.className="crow"+(c.id===curId?" cur":"");
   const t=document.createElement("div");t.className="t";t.textContent=c.title||"New chat";
@@ -686,22 +1005,39 @@ inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function jget(u){return fetch(u,{headers:{"Authorization":"Bearer "+tok}});}
+// While a job runs, the Send button becomes Stop (the phone can bail out); on error, a real Retry re-sends
+// the SAME messages without duplicating the question.
+let jobCtl=null;
+function setSending(on){btn.textContent=on?"Stop":"Send";if(!on){jobCtl=null;st.textContent="ready";}}
+function errBubble(c,msg){const d=add("ai","Error"+(msg?": "+msg:"")+".");
+  const rb=document.createElement("button");rb.className="retry";rb.textContent="Retry";
+  rb.onclick=()=>{d.remove();sendCurrent(c);};d.appendChild(document.createElement("br"));d.appendChild(rb);}
 // SUBMIT then POLL: the query runs on the PC; each poll is a tiny request, surviving phone sleep/app-switch.
-f.addEventListener("submit",async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;
-  const c=cur();if(!c){newChat();return f.requestSubmit();}
-  add("me",q);c.messages.push({role:"user",content:q});persist();inp.value="";inp.style.height="auto";
-  btn.disabled=true;const th=add("think","working...");
+// Re-usable so Retry can resend c.messages verbatim without pushing another user turn.
+async function sendCurrent(c){
+  const ctl={stop:false};jobCtl=ctl;setSending(true);const th=add("think","working...");
   try{
     const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
     if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};return;}
     const {job_id}=await r.json();let fails=0;
-    while(true){await sleep(3000);let j;
+    while(true){
+      if(ctl.stop){try{await jget("/cancel?id="+job_id);}catch(_){}th.className="msg ai";th.textContent="(stopped)";break;}
+      await sleep(2500);let j;
       try{const p=await jget("/poll?id="+job_id);if(p.status===404)throw new Error("expired");j=await p.json();fails=0;}
-      catch(_){fails++;if(fails>60){th.remove();add("ai","Lost the server. Tap Send to retry.");break;}continue;}
-      if(j.status==="done"){th.remove();const ans=j.content||"(empty reply)";add("ai",ans);c.messages.push({role:"assistant",content:ans});persist();break;}
-      th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";}
-  }catch(err){th.remove();add("ai","Error: "+err.message+" - tap Send to retry.");}
-  finally{btn.disabled=false;st.textContent="ready";inp.focus();}
+      catch(_){fails++;if(fails>60){th.remove();errBubble(c,"lost the server");break;}continue;}
+      if(j.status==="done"){const ans=j.content||"(empty reply)";renderAi(th,ans);c.messages.push({role:"assistant",content:ans});persist();log.scrollTop=log.scrollHeight;break;}
+      if(j.status==="streaming"&&j.partial){th.className="msg ai";th.textContent=j.partial;log.scrollTop=log.scrollHeight;st.textContent="writing "+(j.elapsed||0)+"s";}
+      else{th.className="msg think";th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";}
+    }
+  }catch(err){th.remove();errBubble(c,err.message);}
+  finally{setSending(false);inp.focus();}
+}
+f.addEventListener("submit",async e=>{e.preventDefault();
+  if(jobCtl){jobCtl.stop=true;return;}                 // Stop mode: cancel the in-flight job, start nothing new
+  const q=inp.value.trim();if(!q)return;
+  const c=cur();if(!c){newChat();return f.requestSubmit();}
+  add("me",q);c.messages.push({role:"user",content:q});persist();inp.value="";inp.style.height="auto";
+  sendCurrent(c);
 });
 </script></body></html>"""
 
@@ -745,12 +1081,25 @@ class Handler(BaseHTTPRequestHandler):
                 job = _JOBS.get(jid)
                 if job and job["status"] == "done":
                     _JOBS.pop(jid, None)                  # one-shot: hand the answer over then forget it
+                elif job:
+                    snap = {"status": job["status"], "text": job.get("text", ""),
+                            "elapsed": int(time.time() - job["born"])}
             if not job:
                 self._send(404, b'{"error":"no such job"}')
             elif job["status"] == "done":
                 self._send(200, json.dumps({"status": "done", "content": job["text"]}).encode())
+            elif snap["status"] == "streaming":          # hand over the partial answer as it forms
+                self._send(200, json.dumps({"status": "streaming", "partial": snap["text"],
+                                            "elapsed": snap["elapsed"]}).encode())
             else:
-                self._send(200, json.dumps({"status": "pending", "elapsed": int(time.time() - job["born"])}).encode())
+                self._send(200, json.dumps({"status": "pending", "elapsed": snap["elapsed"]}).encode())
+        elif self.path.startswith("/cancel"):              # Stop button: abort the job at its next tool boundary
+            jid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            with _JOBS_LOCK:
+                job = _JOBS.get(jid)
+                if job:
+                    job["cancel"] = True
+            self._send(200, json.dumps({"cancelled": bool(job)}).encode())
         elif self.path.rstrip("/") in ("/v1/models", "/models"):
             data = json.dumps({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "jep"}]}).encode()
@@ -829,14 +1178,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _oa_nonstream(text))
 
 
+def _warm():
+    """Keep the chat model (and embed model) resident so the FIRST phone query of the day isn't a
+    cold ~60s load. Pings a load-only request at startup and every ~10 min, so if another job evicts
+    the model it reloads while idle instead of on Jep's next question. Best-effort; never fatal."""
+    embed_model = getattr(rag, "EMBED_MODEL", "nomic-embed-text") if rag else None
+    while True:
+        try:                                          # load-only: empty prompt returns once resident
+            urllib.request.urlopen(urllib.request.Request(
+                OLLAMA + "/api/generate",
+                data=json.dumps({"model": MODEL, "keep_alive": KEEP_ALIVE, "prompt": ""}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=180).read()
+        except Exception as e:
+            print("[phone_agent] warm ping failed: %s" % e, file=sys.stderr)
+        if embed_model:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    OLLAMA + "/api/embed",
+                    data=json.dumps({"model": embed_model, "keep_alive": KEEP_ALIVE, "input": ["warm"]}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST"), timeout=120).read()
+            except Exception:
+                pass
+        time.sleep(600)
+
+
 def main():
-    print("[phone_agent] :%d -> Ollama %s | model=%s | memory=%s | auth=%s | tools=%s"
+    print("[phone_agent] :%d -> Ollama %s | model=%s | memory=%s | auth=%s | keep_alive=%s | vision=%s | tools=%s"
           % (PORT, OLLAMA, MODEL, "on" if build_context else "off",
-             "token" if PHONE_AGENT_TOKEN else "OPEN", ",".join(TOOLS)), file=sys.stderr)
+             "token" if PHONE_AGENT_TOKEN else "OPEN", KEEP_ALIVE, VISION_MODEL or "off",
+             ",".join(TOOLS)), file=sys.stderr)
     if not PHONE_AGENT_TOKEN:
         print("[phone_agent] WARNING: PHONE_AGENT_TOKEN is unset - host tools (PowerShell, file read) "
               "are exposed UNAUTHENTICATED on :%d. Set PHONE_AGENT_TOKEN to require a Bearer token." % PORT,
               file=sys.stderr)
+    threading.Thread(target=_warm, daemon=True).start()   # pin the model warm in the background
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

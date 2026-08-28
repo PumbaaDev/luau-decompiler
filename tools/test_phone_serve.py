@@ -69,6 +69,13 @@ rec("email tool (Gmail)", a is not None and "currys" in (a or "").lower(), note 
 # 8. web tool
 a, note = ask_poll("Use web_search to find the official Luau language website URL.")
 rec("web_search tool", a is not None and "luau" in (a or "").lower(), note + " | " + (a or "")[:50])
+# 9. find_in_files tool (new): literal code search
+a, note = ask_poll("Use find_in_files to find where 'def run_agent' is defined in the tools folder.")
+rec("find_in_files tool", a is not None and "phone_agent" in (a or "").lower(), note + " | " + (a or "")[:50])
+# 10. remember_fact tool (new): must not error (persistence verified out-of-band)
+a, note = ask_poll("Use remember_fact to remember that Jep's favourite test marker is Zeta-Quokka-7788.")
+rec("remember_fact tool", a is not None and any(w in (a or "").lower() for w in ("saved", "remember", "quokka")),
+    note + " | " + (a or "")[:50])
 
 ok = sum(1 for _, o, _ in rows if o)
 print("\nRESULT (real phone path via Serve): %d/%d passed" % (ok, len(rows)), file=sys.stderr)

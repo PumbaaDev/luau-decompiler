@@ -38,6 +38,19 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "nomic-embed-text")
+
+
+def _keep_alive():
+    """Ollama needs keep_alive as a NUMBER (-1 forever) or a unit-bearing string; the bare '-1' string
+    is rejected. Pin the embed model resident by default so the first search of the day isn't cold."""
+    v = os.environ.get("RAG_KEEP_ALIVE", "-1").strip()
+    if not v:                                     # blank env var must not become "" (Ollama rejects it -> HTTP 400)
+        return -1
+    try:
+        return int(v)
+    except ValueError:
+        return v
+KEEP_ALIVE = _keep_alive()
 IDX_DIR = ROOT / "goal"
 META_PATH = IDX_DIR / "rag_index.jsonl"
 VEC_PATH = IDX_DIR / "rag_vectors.npy"
@@ -59,7 +72,7 @@ MAX_FILE_BYTES = 400_000   # skip giant generated files
 
 
 def _embed(text: str, timeout: int = 60) -> list[float]:
-    body = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode()
+    body = json.dumps({"model": EMBED_MODEL, "prompt": text, "keep_alive": KEEP_ALIVE}).encode()
     req = urllib.request.Request(OLLAMA + "/api/embeddings", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -70,7 +83,8 @@ def _embed_batch(texts, timeout: int = 180) -> list[list[float]]:
     """Embed many chunks in ONE call via Ollama's /api/embed (array input). ~15-28x faster than
     one HTTP round-trip per chunk: measured 39 embeds/s batched vs ~2/s single on the 5060 Ti.
     Applies the same 'search_document: ' prefix as the single path so vectors stay consistent."""
-    body = json.dumps({"model": EMBED_MODEL, "input": ["search_document: " + t for t in texts]}).encode()
+    body = json.dumps({"model": EMBED_MODEL, "keep_alive": KEEP_ALIVE,
+                       "input": ["search_document: " + t for t in texts]}).encode()
     req = urllib.request.Request(OLLAMA + "/api/embed", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
