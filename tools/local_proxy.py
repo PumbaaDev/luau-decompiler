@@ -126,6 +126,86 @@ except Exception as e:  # skills optional
     build_injection = None
     print("[proxy] skills unavailable: %s" % e, file=sys.stderr)
 
+# -- episode memory: successful tool-loops recorded by phone_agent ------------
+# episodes.jsonl holds one line per CLEANLY completed agent run: the task, the tool trace that
+# worked, the outcome. Loaded as fact-LIKE units so mem.retrieve() scores them with NO new
+# retrieval code - but kept OUT of _FACTS on purpose: an episode is a labelled past APPROACH,
+# never a world-fact claim, so it must not enter the facts block ("these outrank anything you
+# assume") nor the entity-coverage set behind mem's anti-bluff path. Absent file = no episodes,
+# everything else unchanged.
+EPISODES_PATH = Path(__file__).resolve().parent / "local_mem" / "episodes.jsonl"
+# Floor for injecting an episode. Episodes score at authority weight 1.0 (assumed), so mem's
+# FACT_MIN=12 (tuned for 3.0-weighted measured facts) is ~3x too strict; retrieve() already
+# discards zero-overlap units, this floor just keeps a single shared common word from dragging
+# in an unrelated episode. One entity hit (8.0) or two decent term matches clears it.
+EPISODE_MIN = float(os.environ.get("UNIFIED_EPISODE_MIN", "3.0"))
+EPISODE_MAX_CHARS = int(os.environ.get("UNIFIED_EPISODE_MAX", "900"))  # one episode can't starve the facts
+_EPISODE_HEADER = "=== A PAST SESSION SOLVED A SIMILAR TASK (approach, not fact) ===\n"
+_EPISODES: list = []
+_EPISODES_MTIME = -1.0            # sentinel: differs from both a real mtime and the None of "no file"
+_EPISODES_LOCK = threading.Lock()
+
+
+def _load_episodes() -> list:
+    """Parse episodes.jsonl into retrieval units shaped like mem facts. Per-line tolerant:
+    one corrupt line skips, never kills the load."""
+    import datetime as _dt
+    units = []
+    try:
+        if not EPISODES_PATH.exists():
+            return []
+        for i, ln in enumerate(EPISODES_PATH.read_text(encoding="utf-8", errors="replace").splitlines()):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            task = " ".join(str(rec.get("task", "")).split())[:200]
+            outcome = " ".join(str(rec.get("outcome", "")).split())[:300]
+            steps = []
+            for t in (rec.get("tools") or []):
+                if isinstance(t, (list, tuple)) and t:
+                    arg = " ".join(str(t[1]).split())[:60] if len(t) > 1 and t[1] else ""
+                    err = len(t) > 2 and str(t[2]) == "err"
+                    steps.append("%s(%s)%s" % (t[0], arg, "!err" if err else ""))
+            if not (task and steps):
+                continue
+            try:                                       # ts -> date so mem._recency ranks newer episodes up
+                updated = _dt.date.fromtimestamp(float(rec.get("ts", 0) or 0)).isoformat()
+            except Exception:
+                updated = ""
+            body = ("TASK: %s | APPROACH THAT WORKED: %s | OUTCOME: %s"
+                    % (task, " -> ".join(steps), outcome))
+            units.append({"id": "episode:%d" % i, "title": task[:70], "type": "episode",
+                          "authority": "assumed", "aliases": [], "tags": ["episode"],
+                          "updated": updated, "supersedes": [], "links": [], "body": body})
+    except Exception as e:
+        log("episode load failed: %s" % e)
+    return units
+
+
+def _episodes_current() -> list:
+    """The episode units, hot-reloaded whenever the file's mtime changes - so an episode a phone
+    job just wrote is retrievable without restarting the proxy. One stat() per turn; any failure
+    returns the last good list."""
+    global _EPISODES, _EPISODES_MTIME
+    try:
+        mt = EPISODES_PATH.stat().st_mtime if EPISODES_PATH.exists() else None
+        with _EPISODES_LOCK:
+            if mt != _EPISODES_MTIME:
+                _EPISODES = _load_episodes()
+                _EPISODES_MTIME = mt
+            return _EPISODES
+    except Exception:
+        return _EPISODES
+
+
+_episodes_current()                                    # startup load (absent file -> empty, no-op)
+
 # A routing marker is honoured ONLY as a standalone token at the very start or end
 # of the message. This ignores @cloud/@local inside pasted code, an email like
 # bob@cloud.example, or a log line, and never rewrites content in the middle.
@@ -237,11 +317,13 @@ _SEP = 3                  # inject_system joins with "\n" (preamble) + "\n\n" (b
 
 def build_context(task: str):
     """(context, n_facts, skill_name) for this turn. The WHOLE injection (preamble + facts +
-    skill + joiners) is bounded by INJECT_MAX_CHARS: the skill is capped to SKILL_MAX_CHARS
-    INCLUDING its truncation suffix, then facts fill the REMAINING room highest-scoring first
-    and STOP at the first that does not fit (strict score-order head - never back-fills a lower
-    fact past a dropped higher one, which would invert the 'these outrank anything you assume'
-    ranking). Best-effort: any failure degrades to empty, never breaks the request."""
+    skill + episode + joiners) is bounded by INJECT_MAX_CHARS: the skill is capped to
+    SKILL_MAX_CHARS INCLUDING its truncation suffix, AT MOST ONE past episode (a recorded
+    tool-loop that worked, its own header, capped to EPISODE_MAX_CHARS) is reserved next, then
+    facts fill the REMAINING room highest-scoring first and STOP at the first that does not fit
+    (strict score-order head - never back-fills a lower fact past a dropped higher one, which
+    would invert the 'these outrank anything you assume' ranking). Best-effort: any failure
+    degrades to empty, never breaks the request."""
     nfacts, skill_name, dropped = 0, "-", 0
     budget = max(1000, INJECT_MAX_CHARS - len(_PREAMBLE) - _SEP)
 
@@ -260,6 +342,23 @@ def build_context(task: str):
     except Exception as e:
         log("skill inject failed: %s" % e)
 
+    episode_block = ""
+    try:
+        eps = _episodes_current()
+        if eps and retrieve and task:
+            ehits = retrieve(eps, task, 1)                    # mem's scorer, unchanged: at most ONE episode
+            if ehits and ehits[0][0] >= EPISODE_MIN:
+                ebody = (ehits[0][1].get("body") or "").strip()
+                eroom = (min(EPISODE_MAX_CHARS, budget - (len(skill_block) + 2 if skill_block else 0))
+                         - len(_EPISODE_HEADER))
+                if len(ebody) > eroom:
+                    ebody = ebody[:max(0, eroom - 6)].rstrip() + " [...]"
+                if ebody and eroom > 120:                     # too little room to be useful -> drop, don't squeeze
+                    episode_block = _EPISODE_HEADER + ebody
+                    log("episode injected: %s (score %.1f)" % (ehits[0][1].get("id"), ehits[0][0]))
+    except Exception as e:
+        log("episode inject failed: %s" % e)
+
     facts_block = ""
     try:
         if _FACTS and retrieve:
@@ -268,7 +367,8 @@ def build_context(task: str):
                 top = hits[0][0]                       # drop the weak tail: a trivial
                 floor = max(FACT_MIN, FACT_REL * top)  # turn should not pull 14 facts
                 hits = [(s, f) for s, f in hits if s >= floor]
-            facts_budget = budget - (len(skill_block) + 2 if skill_block else 0)
+            facts_budget = (budget - (len(skill_block) + 2 if skill_block else 0)
+                            - (len(episode_block) + 2 if episode_block else 0))
             lines, used = [], len(_FACTS_HEADER)
             for _, f in hits:                          # hits are highest-score first
                 line = "- [%s | %s] %s" % (f.get("id", "?"), f.get("authority", "?"),
@@ -290,7 +390,7 @@ def build_context(task: str):
     except Exception as e:
         log("memory retrieve failed: %s" % e)
 
-    blocks = [b for b in (facts_block, skill_block) if b]
+    blocks = [b for b in (facts_block, episode_block, skill_block) if b]
     if not blocks:
         # No fact/skill hit, but strip_harness_identity already removed the "Claude agent" line,
         # so returning "" would leave the model with NO identity at all - inject the uncensored
@@ -794,9 +894,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     nfacts = len(_FACTS) if _FACTS else 0
     log("unified proxy on :%d -> %s | LOCAL ONLY default=%s local=%s think=%s | %d retrieval units "
-        "(%d curated facts + %d vault chunks), skills=%s"
+        "(%d curated facts + %d vault chunks), %d episodes, skills=%s"
         % (PORT, UPSTREAM, DEFAULT_ROUTE, LOCAL_MODEL, THINK_MODEL, nfacts,
-           nfacts - _VAULT_N, _VAULT_N, "on" if build_injection else "off"))
+           nfacts - _VAULT_N, _VAULT_N, len(_episodes_current()), "on" if build_injection else "off"))
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
     return 0
 

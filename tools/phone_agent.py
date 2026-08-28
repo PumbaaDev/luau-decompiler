@@ -81,6 +81,16 @@ KEEP_ALIVE = _parse_keep_alive(os.environ.get("PHONE_KEEP_ALIVE", "-1"))  # pin 
 VISION_MODEL = os.environ.get("PHONE_VISION_MODEL", "").strip()  # opt-in: pull a small VLM (e.g. qwen2.5vl:7b) to enable see_screen
 ROOT = Path(__file__).resolve().parent
 
+# EPISODE MEMORY: when a tool-loop reaches a CLEAN final answer (not the wall-budget/cancel forced
+# exit, and the last tool did not error), one compact json line - the task, the tool trace that
+# worked, the outcome - is appended here. local_proxy.build_context reads it back so a future
+# session can be shown "a past session solved a similar task like this". FIFO-capped; if the file
+# is absent the feature is simply dormant.
+EPISODES_PATH = ROOT / "local_mem" / "episodes.jsonl"
+EPISODES_CAP = int(os.environ.get("PHONE_EPISODES_CAP", "500"))
+EPISODE_TRACE_MAX = 20                        # keep the episode line compact even on a 30-iter job
+_EPISODES_LOCK = threading.Lock()             # concurrent jobs must not interleave the rewrite
+
 # reuse the desktop proxy's memory injection (import does NOT start its server)
 try:
     from local_proxy import build_context
@@ -725,6 +735,65 @@ def _harvest_remember(text):
         saved += 1
 
 
+# --------------------------------------------------------------------------- #
+# episode memory: record tool-loops that WORKED so future sessions can reuse the approach
+# --------------------------------------------------------------------------- #
+_TRACE_KEY_ARGS = ("path", "query", "pattern", "command", "url", "uid", "fact", "question")
+
+
+def _trace_arg(args):
+    """The ONE most informative argument of a tool call, for the compact episode trace."""
+    if not isinstance(args, dict):
+        return ""
+    for k in _TRACE_KEY_ARGS:
+        v = args.get(k)
+        if v:
+            return " ".join(str(v).split())[:80]
+    for v in args.values():
+        if v:
+            return " ".join(str(v).split())[:80]
+    return ""
+
+
+def _trace_status(result):
+    """'ok'|'err' for the trace. Every tool reports failure as a leading '(...)' marker
+    ('(tool error...', '(cannot read...', '(command timed out...'), so classify on that -
+    a plain '(no matches)' / '(no output)' is a legitimate empty result, not an error."""
+    r = str(result)
+    if r.startswith("(") and ("error" in r[:100].lower() or "timed out" in r[:100].lower()
+                              or r.startswith(("(cannot ", "(unknown tool", "(bad "))):
+        return "err"
+    return "ok"
+
+
+def _save_episode(task, trace, answer):
+    """Append ONE episode line {ts, task, tools, outcome} to episodes.jsonl, FIFO-capped at
+    EPISODES_CAP (oldest lines drop first). Called ONLY on a clean completion. Best-effort:
+    a failure here logs and never breaks the answer being returned."""
+    if not (task and trace and answer):
+        return
+    rec = {"ts": time.time(),
+           "task": " ".join(task.split())[:200],
+           "tools": [list(t) for t in trace[:EPISODE_TRACE_MAX]],
+           "outcome": " ".join(answer.split())[:300]}
+    try:
+        line = json.dumps(rec, ensure_ascii=False)
+        with _EPISODES_LOCK:
+            EPISODES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            lines = []
+            if EPISODES_PATH.exists():
+                lines = [ln for ln in EPISODES_PATH.read_text(encoding="utf-8",
+                                                              errors="replace").splitlines() if ln.strip()]
+            lines.append(line)
+            if len(lines) > EPISODES_CAP:
+                lines = lines[-EPISODES_CAP:]          # FIFO: the newest N survive
+            tmp = EPISODES_PATH.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(tmp, EPISODES_PATH)             # atomic: a reader never sees a half-written file
+    except Exception as e:
+        print("[phone_agent] episode save failed: %s" % e, file=sys.stderr)
+
+
 def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS,
               progress=None, cancel=None):
     """Returns (final_text, tools_used). Injects memory, runs the tool loop on the host.
@@ -743,6 +812,8 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
     msgs = _cap_history(msgs)
 
     tools_used = []
+    task_text = _last_user_text(client_messages)      # what this episode was about, for episode memory
+    trace = []                                        # (tool, key arg, ok|err) per EXECUTED call, in order
     executed = {}                                     # (name,args) already run this turn -> breaks identical-call loops
     DEDUP_EXEMPT = {"run_command", "see_screen", "get_system_info"}  # time-varying: a repeat may be legitimate
     deadline = time.time() + wall_budget
@@ -757,13 +828,19 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
         if not calls:                                 # model may have written the call as TEXT - recover it
             calls = _parse_text_tool_calls(content)
         if not calls:
-            final = _strip_tool_calls(content) or "(the model returned an empty reply)"
+            answer = _strip_tool_calls(content)
+            final = answer or "(the model returned an empty reply)"
             if progress:                              # show it the instant it's ready (already generated)
                 try:
                     progress(final)
                 except Exception:
                     pass
             _harvest_remember(final)
+            # CLEAN completion: a real answer, reached inside the loop (not the forced exit below),
+            # after at least one tool ran and the LAST tool succeeded -> record the episode so the
+            # approach that worked is retrievable for similar future tasks.
+            if trace and answer and trace[-1][2] == "ok":
+                _save_episode(task_text, trace, answer)
             return final, tools_used
         # record the assistant's tool-call turn (leaked markup stripped), then execute each call
         msgs.append({"role": "assistant", "content": _strip_tool_calls(content), "tool_calls": calls})
@@ -800,6 +877,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
                     result = handler(args)
                 except Exception as e:            # one bad tool call self-corrects, never kills the turn
                     result = "(tool error in %s: %s: %s)" % (name, type(e).__name__, e)
+            trace.append((name, _trace_arg(args), _trace_status(result)))  # executed calls only
             if not (isinstance(result, str) and result.startswith("(tool error")):
                 executed[key] = True              # only cache SUCCESS, so a transient error can be retried
             if name == "run_command":             # a command may have changed state cached read results depend on
