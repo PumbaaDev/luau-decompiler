@@ -6,7 +6,8 @@ corpus so the local model can actually pull the relevant Rust/Python source or v
 question, in depth, instead of guessing. Fully local: embeds with Ollama's nomic-embed-text, stores
 vectors in a plain .npy + .jsonl (numpy is the only dep), searches by cosine similarity.
 
-    python tools/rag.py index                 # (re)build the index over the corpus
+    python tools/rag.py refresh               # incremental corpus update; ingested chunks survive
+    python tools/rag.py index                 # alias for refresh (index --full = destructive rebuild)
     python tools/rag.py search "how does the lifter handle DUPCLOSURE" [k]
     python tools/rag.py stats
 
@@ -123,7 +124,9 @@ def _iter_files():
 
 
 def build_index():
-    """Full rebuild from the corpus. Exclusive: holds the single-writer lock for the whole run so an
+    """Full rebuild from the corpus - DESTRUCTIVE: the store is rewritten from _iter_files() alone,
+    so every ingested web:/roblox:/digest: chunk is dropped. Only reachable via `index --full`; the
+    safe default is refresh_index(). Exclusive: holds the single-writer lock for the whole run so an
     ingest can't interleave with the from-scratch overwrite."""
     if not _acquire_lock():
         raise RuntimeError("another indexer holds %s - refusing to rebuild concurrently" % LOCK_PATH)
@@ -135,22 +138,24 @@ def build_index():
 
 def _build_index_locked():
     IDX_DIR.mkdir(exist_ok=True)
-    chunks = []   # (source, text)
+    chunks = []   # (source, text, fhash)
     seen = set()
     for p in _iter_files():
         try:
             if p.stat().st_size > MAX_FILE_BYTES:
                 continue
-            txt = p.read_text(encoding="utf-8", errors="replace")
+            raw = p.read_bytes()
         except Exception:
             continue
+        txt = raw.decode("utf-8", errors="replace")
+        fh = _file_fingerprint(raw)
         rel = str(p).replace(str(ROOT) + os.sep, "")
         for c in _chunk(txt, rel):
             key = _dedup_key(rel, c)
             if key in seen:
                 continue
             seen.add(key)
-            chunks.append((rel, c))
+            chunks.append((rel, c, fh))
     print("indexing %d chunks from the corpus..." % len(chunks), file=sys.stderr)
 
     vecs, meta = [], []
@@ -158,15 +163,15 @@ def _build_index_locked():
     for i in range(0, len(chunks), 64):                # BATCH embed (one HTTP call per 64) not per-chunk
         part = chunks[i:i + 64]
         try:
-            embs = _embed_batch([c for _, c in part])
+            embs = _embed_batch([c for _, c, _ in part])
         except Exception as ex:
             print("  batch embed failed at %d: %s" % (i, ex), file=sys.stderr)
             embs = []
-        for (src, c), e in zip(part, embs):
+        for (src, c, fh), e in zip(part, embs):
             if not e:
                 continue
             vecs.append(e)
-            meta.append({"source": src, "text": c})
+            meta.append({"source": src, "text": c, "fhash": fh})
         if i and i % 1600 == 0:
             print("  %d/%d (%.0fs)" % (i, len(chunks), time.time() - t0), file=sys.stderr)
 
@@ -184,6 +189,140 @@ def _build_index_locked():
     _CACHE["vecs"], _CACHE["meta"] = arr, meta                   # refresh cache to the rebuilt store
     print("indexed %d chunks -> %s (%.0fs)" % (len(meta), VEC_PATH.name, time.time() - t0), file=sys.stderr)
     return len(meta)
+
+
+# ---------------------- incremental refresh (the safe default for `index`) ---------------------- #
+# Sources with these prefixes were INGESTED (crawled sites, the Roblox corpus, the codebase digest),
+# not derived from _iter_files(); a refresh must carry every one of them through untouched.
+PRESERVE_PREFIXES = ("web:", "roblox:", "digest:")
+
+
+def _file_fingerprint(raw: bytes) -> str:
+    """Whole-file sha1 stored on every own-corpus chunk (the 'fhash' meta field) so refresh can prove
+    a file unchanged and keep its rows + vectors byte-identical instead of re-embedding them."""
+    return hashlib.sha1(raw).hexdigest()
+
+
+def refresh_index():
+    """NON-DESTRUCTIVE incremental refresh of the own-corpus slice of the store. Unchanged files keep
+    their existing rows AND vectors; changed/new files re-chunk + re-embed; deleted files drop their
+    rows; ingested web:/roblox:/digest: chunks always survive. Bare `index` aliases here because the
+    old default (a from-scratch rebuild) would have destroyed all ~86k ingested chunks."""
+    if not _acquire_lock():
+        raise RuntimeError("another indexer holds %s - refusing to refresh concurrently" % LOCK_PATH)
+    try:
+        return _refresh_index_locked()
+    finally:
+        _release_lock()
+
+
+def _refresh_scan(meta, keep_mask, own_rows):
+    """Walk the corpus and decide per file: unchanged (keep its rows via the mask) or changed / new /
+    legacy-without-fhash (queue its chunks for re-embed). Mutates own_rows via pop so that whatever
+    remains afterwards is exactly the DELETED sources. Returns (to_embed, stale_rows, stats)."""
+    to_embed, stale_rows = [], {}             # stale_rows: re-embedding source -> its existing rows
+    stats = {"kept": 0, "reembed": 0}
+    seen = set()
+    for p in _iter_files():
+        try:
+            if p.stat().st_size > MAX_FILE_BYTES:
+                continue
+            raw = p.read_bytes()
+        except Exception:
+            continue
+        rel = str(p).replace(str(ROOT) + os.sep, "")
+        fh = _file_fingerprint(raw)
+        rows = own_rows.pop(rel, None)
+        if rows is not None and all(meta[i].get("fhash") == fh for i in rows):
+            keep_mask[rows] = True            # unchanged: rows + vectors survive exactly as they are
+            stats["kept"] += 1
+            continue
+        if rows is not None:                  # changed, or legacy rows without fhash -> re-embed
+            stale_rows[rel] = rows
+        stats["reembed"] += 1
+        for c in _chunk(raw.decode("utf-8", errors="replace"), rel):
+            key = _dedup_key(rel, c)
+            if key in seen:
+                continue
+            seen.add(key)
+            to_embed.append((rel, c, fh))
+    return to_embed, stale_rows, stats
+
+
+def _refresh_embed(to_embed):
+    """Batch-embed the queued chunks. Returns (new_v, new_m, failed_sources); a source whose chunks
+    ALL failed to embed is reported so its stale rows can be kept rather than silently dropped."""
+    new_v, new_m = [], []
+    for i in range(0, len(to_embed), 64):              # BATCH embed (one HTTP call per 64) not per-chunk
+        part = to_embed[i:i + 64]
+        try:
+            embs = _embed_batch([c for _, c, _ in part])
+        except Exception as ex:
+            print("  batch embed failed at %d: %s" % (i, ex), file=sys.stderr)
+            embs = []
+        for (src, c, fh), e in zip(part, embs):
+            if not e:
+                continue
+            v = np.asarray(e, dtype=np.float32)
+            v /= (np.linalg.norm(v) + 1e-8)
+            new_v.append(v)
+            new_m.append({"source": src, "text": c, "fhash": fh})
+    failed = {s for s, _, _ in to_embed} - {m["source"] for m in new_m}
+    return new_v, new_m, failed
+
+
+def _refresh_index_locked():
+    IDX_DIR.mkdir(exist_ok=True)
+    t0 = time.time()
+    vecs, meta = _write_load()                # fresh disk snapshot; _load aligned vecs<->meta already
+    keep_mask = np.zeros(len(meta), dtype=bool)
+    own_rows = {}                             # own-corpus source -> row indices
+    for i, m in enumerate(meta):
+        src = str(m.get("source", ""))
+        if src.startswith(PRESERVE_PREFIXES):
+            keep_mask[i] = True               # ingested knowledge: preserved outright
+        else:
+            own_rows.setdefault(src, []).append(i)
+
+    to_embed, stale_rows, stats = _refresh_scan(meta, keep_mask, own_rows)
+    print("refresh: %d files unchanged, %d to re-embed (%d chunks), %d deleted"
+          % (stats["kept"], stats["reembed"], len(to_embed), len(own_rows)), file=sys.stderr)
+
+    new_v, new_m, failed = _refresh_embed(to_embed)
+    for src in failed:                        # an embed failure must not destroy a file's existing rows
+        rows = stale_rows.get(src)
+        if rows:
+            keep_mask[rows] = True
+            print("refresh: embed failed for %s - keeping its %d existing chunks" % (src, len(rows)),
+                  file=sys.stderr)
+
+    if not new_m and bool(keep_mask.all()):   # nothing changed - do not rewrite (or invalidate BM25)
+        print("refresh: store already current (%d chunks), nothing to write (%.0fs)"
+              % (len(meta), time.time() - t0), file=sys.stderr)
+        return 0
+    kept_m = [m for m, k in zip(meta, keep_mask) if k]
+    allm = kept_m + new_m
+    if not allm:                              # never overwrite the store with an empty one
+        print("refresh: 0 chunks would remain, leaving existing store untouched", file=sys.stderr)
+        return 0
+    kept_v = vecs[keep_mask]
+    allv = np.vstack([kept_v, np.asarray(new_v, dtype=np.float32)]) if new_v else kept_v
+    _atomic_save_vecs(allv)
+    tmp = META_PATH.parent / (META_PATH.name + ".tmp")           # atomic meta swap to match
+    with tmp.open("w", encoding="utf-8") as f:
+        for m in allm:
+            f.write(json.dumps(m) + "\n")
+    os.replace(tmp, META_PATH)
+    _CACHE["vecs"], _CACHE["meta"] = allv, allm                  # refresh cache to the new store
+    _BM.update({"N": None, "postings": None, "doclen": None, "avgdl": 0.0})
+    try:
+        BM25_PATH.unlink()                    # store changed: force BM25 rebuild (size-key can go stale)
+    except OSError:
+        pass
+    print("refresh: %d chunks (%d preserved/unchanged, %d re-embedded, %d dropped) (%.0fs)"
+          % (len(allm), len(kept_m), len(new_m), len(meta) - len(kept_m), time.time() - t0),
+          file=sys.stderr)
+    return len(new_m)
 
 
 _CACHE = {"vecs": None, "meta": None}
@@ -586,10 +725,13 @@ def format_hits(hits) -> str:
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: rag.py index | search <query> [k] | stats"); return 2
+        print("usage: rag.py refresh | index [--full] | search <query> [k] | stats"); return 2
     cmd = sys.argv[1]
-    if cmd == "index":
-        build_index()
+    if cmd in ("index", "refresh"):
+        if cmd == "index" and "--full" in sys.argv[2:]:
+            build_index()                     # explicit destructive rebuild: drops ingested chunks
+        else:
+            refresh_index()                   # bare `index` = safe incremental refresh
     elif cmd == "search":
         if len(sys.argv) < 3:
             print("usage: rag.py search <query> [k]"); return 2
