@@ -93,22 +93,28 @@ def _embed_batch(texts, timeout: int = 180) -> list[list[float]]:
 
 
 def _chunk(text: str, path: str):
-    """Split into ~CHUNK_CHARS windows with overlap, on line boundaries where possible."""
+    """Split into ~CHUNK_CHARS windows with overlap, on line boundaries where possible.
+    Returns (piece, start_line) pairs - start_line is the 1-based line of the piece's first
+    non-whitespace char, so retrieval can cite file:line instead of just the file."""
     text = text.replace("\r\n", "\n")
     if len(text) <= CHUNK_CHARS:
-        return [text] if text.strip() else []
-    out, i = [], 0
+        return [(text, 1)] if text.strip() else []
+    out, i, line = [], 0, 1
     while i < len(text):
         end = min(i + CHUNK_CHARS, len(text))
         nl = text.rfind("\n", i + CHUNK_CHARS - 300, end)   # prefer to break on a newline
         if nl > i:
             end = nl
-        piece = text[i:end].strip()
+        raw = text[i:end]
+        piece = raw.strip()
         if piece:
-            out.append(piece)
+            lead = len(raw) - len(raw.lstrip())             # strip may skip leading blank lines
+            out.append((piece, line + raw[:lead].count("\n")))
         if end >= len(text):
             break
-        i = max(end - CHUNK_OVERLAP, i + 1)
+        nxt = max(end - CHUNK_OVERLAP, i + 1)
+        line += text.count("\n", i, nxt)                    # walk the line counter with the offset
+        i = nxt
     return out
 
 
@@ -138,7 +144,7 @@ def build_index():
 
 def _build_index_locked():
     IDX_DIR.mkdir(exist_ok=True)
-    chunks = []   # (source, text, fhash)
+    chunks = []   # (source, text, start_line, fhash)
     seen = set()
     for p in _iter_files():
         try:
@@ -150,12 +156,12 @@ def _build_index_locked():
         txt = raw.decode("utf-8", errors="replace")
         fh = _file_fingerprint(raw)
         rel = str(p).replace(str(ROOT) + os.sep, "")
-        for c in _chunk(txt, rel):
+        for c, ln in _chunk(txt, rel):
             key = _dedup_key(rel, c)
             if key in seen:
                 continue
             seen.add(key)
-            chunks.append((rel, c, fh))
+            chunks.append((rel, c, ln, fh))
     print("indexing %d chunks from the corpus..." % len(chunks), file=sys.stderr)
 
     vecs, meta = [], []
@@ -163,15 +169,15 @@ def _build_index_locked():
     for i in range(0, len(chunks), 64):                # BATCH embed (one HTTP call per 64) not per-chunk
         part = chunks[i:i + 64]
         try:
-            embs = _embed_batch([c for _, c, _ in part])
+            embs = _embed_batch([c for _, c, _, _ in part])
         except Exception as ex:
             print("  batch embed failed at %d: %s" % (i, ex), file=sys.stderr)
             embs = []
-        for (src, c, fh), e in zip(part, embs):
+        for (src, c, ln, fh), e in zip(part, embs):
             if not e:
                 continue
             vecs.append(e)
-            meta.append({"source": src, "text": c, "fhash": fh})
+            meta.append({"source": src, "text": c, "line": ln, "fhash": fh})
         if i and i % 1600 == 0:
             print("  %d/%d (%.0fs)" % (i, len(chunks), time.time() - t0), file=sys.stderr)
 
@@ -240,12 +246,12 @@ def _refresh_scan(meta, keep_mask, own_rows):
         if rows is not None:                  # changed, or legacy rows without fhash -> re-embed
             stale_rows[rel] = rows
         stats["reembed"] += 1
-        for c in _chunk(raw.decode("utf-8", errors="replace"), rel):
+        for c, ln in _chunk(raw.decode("utf-8", errors="replace"), rel):
             key = _dedup_key(rel, c)
             if key in seen:
                 continue
             seen.add(key)
-            to_embed.append((rel, c, fh))
+            to_embed.append((rel, c, ln, fh))
     return to_embed, stale_rows, stats
 
 
@@ -256,18 +262,18 @@ def _refresh_embed(to_embed):
     for i in range(0, len(to_embed), 64):              # BATCH embed (one HTTP call per 64) not per-chunk
         part = to_embed[i:i + 64]
         try:
-            embs = _embed_batch([c for _, c, _ in part])
+            embs = _embed_batch([c for _, c, _, _ in part])
         except Exception as ex:
             print("  batch embed failed at %d: %s" % (i, ex), file=sys.stderr)
             embs = []
-        for (src, c, fh), e in zip(part, embs):
+        for (src, c, ln, fh), e in zip(part, embs):
             if not e:
                 continue
             v = np.asarray(e, dtype=np.float32)
             v /= (np.linalg.norm(v) + 1e-8)
             new_v.append(v)
-            new_m.append({"source": src, "text": c, "fhash": fh})
-    failed = {s for s, _, _ in to_embed} - {m["source"] for m in new_m}
+            new_m.append({"source": src, "text": c, "line": ln, "fhash": fh})
+    failed = {s for s, _, _, _ in to_embed} - {m["source"] for m in new_m}
     return new_v, new_m, failed
 
 
@@ -465,7 +471,44 @@ def retrieve(query: str, k: int = 5, semantic_k: int = 40, keyword_k: int = 40, 
     if not fused:
         return []
     order = sorted(fused.items(), key=lambda kv: -kv[1])[:k]
-    return [{"source": meta[i]["source"], "score": float(s), "text": meta[i]["text"]} for i, s in order]
+    hits = [{"source": meta[i]["source"], "score": float(s), "text": meta[i]["text"],
+             "line": meta[i].get("line")} for i, s in order]     # .get: pre-'line' rows degrade to None
+    return _merge_hits(hits)
+
+
+def _merge_hits(hits):
+    """Merge hits from the same source whose line ranges touch or overlap into ONE hit. Chunks
+    overlap by CHUNK_OVERLAP chars, so adjacent windows of one hot file often both surface as
+    near-duplicate hits; stitching them gives the model one coherent span instead. Keeps the MAX
+    fused score. Hits without a stored line (pre-'line' meta) pass through untouched - adjacency
+    can't be proven for them."""
+    by_src, passthrough, merged = {}, [], []
+    for h in hits:
+        if h.get("line") is None:
+            passthrough.append(h)
+        else:
+            by_src.setdefault(h["source"], []).append(h)
+    for group in by_src.values():
+        group.sort(key=lambda h: h["line"])
+        cur = dict(group[0])
+        cur_end = cur["line"] + cur["text"].count("\n")          # last line covered by cur's text
+        for h in group[1:]:
+            h_end = h["line"] + h["text"].count("\n")
+            if h["line"] <= cur_end + 1:                         # contiguous or overlapping - merge
+                drop = cur_end - h["line"] + 1                   # h's leading lines already in cur
+                tail = h["text"].split("\n")[max(drop, 0):]
+                if tail:
+                    cur["text"] += "\n" + "\n".join(tail)
+                cur["score"] = max(cur["score"], h["score"])
+                cur_end = max(cur_end, h_end)
+            else:
+                merged.append(cur)
+                cur = dict(h)
+                cur_end = h_end
+        merged.append(cur)
+    out = merged + passthrough
+    out.sort(key=lambda h: -h["score"])
+    return out
 
 
 def append_pages(pages, source_prefix="web:"):
@@ -478,28 +521,28 @@ def append_pages(pages, source_prefix="web:"):
     except Exception:
         meta0 = []
     seen = {_dedup_key(m["source"], m["text"]) for m in meta0}
-    todo = []   # (src, chunk) - unique chunks to embed
+    todo = []   # (src, chunk, start_line) - unique chunks to embed
     for url, title, text in pages:
         src = source_prefix + url
-        for c in _chunk(text, src):
+        for c, ln in _chunk(text, src):
             key = _dedup_key(src, c)
             if key in seen:
                 continue
             seen.add(key)
-            todo.append((src, c))
-    pending = []   # (src, chunk, vec)
+            todo.append((src, c, ln))
+    pending = []   # (src, chunk, start_line, vec)
     for i in range(0, len(todo), 64):                  # BATCH embed (one HTTP call per 64) not per-chunk
         part = todo[i:i + 64]
         try:
-            embs = _embed_batch([c for _, c in part])
+            embs = _embed_batch([c for _, c, _ in part])
         except Exception:
             embs = []
-        for (src, c), e in zip(part, embs):
+        for (src, c, ln), e in zip(part, embs):
             if not e:
                 continue
             v = np.asarray(e, dtype=np.float32)
             v /= (np.linalg.norm(v) + 1e-8)
-            pending.append((src, c, v))
+            pending.append((src, c, ln, v))
     if not pending:
         return 0
     # WRITE under the single-writer lock, off a FRESH disk snapshot (never a stale cache), atomically.
@@ -509,13 +552,13 @@ def append_pages(pages, source_prefix="web:"):
         vecs, meta = _write_load()
         have = {_dedup_key(m["source"], m["text"]) for m in meta}
         add_v, add_m = [], []
-        for src, c, v in pending:
+        for src, c, ln, v in pending:
             k = _dedup_key(src, c)
             if k in have:                          # another writer added it between embed and write
                 continue
             have.add(k)
             add_v.append(v)
-            add_m.append({"source": src, "text": c})
+            add_m.append({"source": src, "text": c, "line": ln})
         if not add_m:
             return 0
         stacked = np.asarray(add_v, dtype=np.float32)
@@ -651,7 +694,7 @@ def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=6
     print("ingest_dir: %d %s files under %s" % (len(files), "/".join(exts), root), file=sys.stderr)
 
     buf_v, buf_m = [], []                     # embedded, awaiting disk flush
-    pend_src, pend_txt = [], []               # chunks awaiting a batch embed call
+    pend_src, pend_txt, pend_line = [], [], []   # chunks awaiting a batch embed call
     state = {"added": 0, "skipped_compiled": 0, "fi": 0}
     t0 = time.time()
 
@@ -663,15 +706,16 @@ def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=6
         except Exception as ex:
             print("  batch embed failed (%s), skipping %d chunks" % (ex, len(pend_txt)), file=sys.stderr)
             embs = []
-        for c, src, e in zip(pend_txt, pend_src, embs):
+        for c, src, ln, e in zip(pend_txt, pend_src, pend_line, embs):
             if not e:
                 continue
             v = np.asarray(e, dtype=np.float32)
             v /= (np.linalg.norm(v) + 1e-8)
             buf_v.append(v)
-            buf_m.append({"source": src, "text": c})
+            buf_m.append({"source": src, "text": c, "line": ln})
         pend_src.clear()
         pend_txt.clear()
+        pend_line.clear()
 
     def maybe_flush():
         if len(buf_v) >= flush_every:
@@ -695,13 +739,14 @@ def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=6
         except Exception:
             continue
         src = source_prefix + str(p.relative_to(root)).replace("\\", "/")
-        for c in _chunk(txt, src):
+        for c, ln in _chunk(txt, src):
             key = _dedup_key(src, c)
             if key in keys:
                 continue
             keys.add(key)
             pend_src.append(src)
             pend_txt.append(c)
+            pend_line.append(ln)
             if len(pend_txt) >= batch:
                 do_embed()
                 maybe_flush()
@@ -714,12 +759,25 @@ def _ingest_dir_locked(root, exts, source_prefix, flush_every, max_file, batch=6
     return state["added"]
 
 
-def format_hits(hits) -> str:
+def format_hits(hits, budget: int = 6000) -> str:
+    """Render hits WHOLE until the character budget is spent, then say how many were cut - a hit
+    sliced mid-chunk reads like truncated source and misleads the model. The first hit always goes
+    out even if it alone exceeds the budget (an empty answer helps nobody). Header carries the
+    1-based start line when the chunk has one: '--- crates/luau-core/src/lifter.rs:L840 (...)'."""
     if not hits:
         return "(nothing relevant found in the codebase/notes)"
-    out = []
-    for h in hits:
-        out.append("--- %s  (relevance %.2f)\n%s" % (h["source"], h["score"], h["text"]))
+    out, used = [], 0
+    for n, h in enumerate(hits):
+        ln = h.get("line")
+        head = ("--- %s:L%d (relevance %.2f)" % (h["source"], ln, h["score"]) if ln
+                else "--- %s (relevance %.2f)" % (h["source"], h["score"]))
+        block = head + "\n" + h["text"]
+        cost = len(block) + (2 if out else 0)              # +2 for the "\n\n" joiner
+        if out and used + cost > budget:
+            out.append("(+%d more hits, refine the query)" % (len(hits) - n))
+            break
+        out.append(block)
+        used += cost
     return "\n\n".join(out)
 
 
