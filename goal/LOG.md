@@ -297,3 +297,16 @@ ITER 29  [2026-08-26 14:15]  PROMPT BISECTION  ->  THE CAUSE IS THE PROMPT'S EXI
   The prompt is worth +8 overall (73 -> 81) and -2 on this one task. Keeping it is correct.
   METHOD NOTE: this took ~25 min and answered definitively what six prompt edits over several
   hours could not. Bisect the CAUSE before tuning the SYMPTOM - and fix the instrument first.
+- ITER 44 [2026-08-26 15:09] G1 81/83  G2 10/10  G3 ? ?fp  G4 0/9  G5 4/4  G6 5/5  G7 52.8t/s  G8 3/3 | change: none | red: G3
+- ITER 45 [2026-08-26 15:10] G1 81/83  G2 10/10  G3 ? ?fp  G4 0/9  G5 4/4  G6 5/5  G7 52.8t/s  G8 3/3 | change: none | red: G3
+- ITER 46 [2026-08-26 15:14] G1 81/83  G2 10/10  G3 3/3 0fp  G4 0/9  G5 4/4  G6 5/5  G7 52.8t/s  G8 3/3 | change: none | red: none
+- ITER 47 [2026-08-28 21:44] G1 79/83  G5 18/18 (deep refusal_bench, was 15/18) | change: broadened the uncensoring
+  directive to cover analysing+EXPLAINING any obfuscator/protector/payload/malware on third-party &
+  suspicious samples (the 3 refused probes were all outside the old "Jep's own code" scope).
+  delta: refusals 15->18; split_locals 8->7 (one micro-case 'local function f'); rest unchanged.
+  This is the classic ITER-29 effect: prompt CHANGES perturb the borderline tasks and the symptom
+  MOVES (verbose 175-tok directive gave split 5/8; ~75-tok gave 7/8; a 60-tok variant gave 5/8; a
+  targeted item-7 checklist edit gave split 8/8 but cratered strip_block 5->0 = net 76/83, REVERTED).
+  verdict: KEPT the directive-only change (Candidate A). 100% uncensored is the user's explicit goal;
+  the -1 vs 80/83 is inside the borderline drift band and beats the no-prompt base (74) by +5.
+  Shipped commit 3360489. Fast gate for this: tools/focused_check.py.
