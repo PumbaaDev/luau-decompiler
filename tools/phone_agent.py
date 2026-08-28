@@ -989,59 +989,74 @@ CHAT_PAGE = r"""<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>__NAME__</title>
 <style>
-:root{--bg:#0b0c10;--panel:#15171c;--me:#2a3a5c;--ai:#1b1e26;--tx:#e8eaed;--mut:#8b90a0;--acc:#6ea8fe}
+:root{--bg:#0b0c10;--panel:#15171c;--panel2:#1c2029;--me:#2f6bd8;--ai:#1b1e26;--tx:#e8eaed;--mut:#8b90a0;--acc:#6ea8fe;--danger:#ef5350;--line:#23262e}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:16px/1.5 -apple-system,system-ui,sans-serif}
 #app{display:flex;flex-direction:column;height:100dvh}
-header{padding:12px 16px;background:var(--panel);font-weight:600;display:flex;align-items:center;gap:8px;border-bottom:1px solid #23262e}
-header .dot{width:9px;height:9px;border-radius:50%;background:#3ecf8e}
-header small{margin-left:auto;color:var(--mut);font-weight:400;font-size:12px}
-#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
-.msg{max-width:86%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
-.me{align-self:flex-end;background:var(--me);border-bottom-right-radius:5px}
-.ai{align-self:flex-start;background:var(--ai);border-bottom-left-radius:5px}
+header{display:flex;align-items:center;gap:4px;padding:6px 8px;padding-top:calc(6px + env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--line)}
+.hbtn{width:44px;height:44px;display:flex;align-items:center;justify-content:center;background:none;color:var(--tx);font-size:23px;border-radius:12px;flex:0 0 auto}
+.hbtn:active{background:var(--panel2)}
+.htitle{flex:1;display:flex;align-items:center;gap:9px;justify-content:center;font-weight:600;font-size:17px}
+.dot{width:9px;height:9px;border-radius:50%;background:#3ecf8e;box-shadow:0 0 7px #3ecf8e99;flex:0 0 auto}
+.dot.busy{background:#f5b23e;box-shadow:0 0 7px #f5b23e99;animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+#log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;-webkit-overflow-scrolling:touch}
+#empty{margin:auto;text-align:center;color:var(--mut);max-width:290px;padding:20px}
+#empty .big{font-size:38px;margin-bottom:12px}
+#empty h2{color:var(--tx);font-size:20px;margin:0 0 8px;font-weight:600}
+#empty p{font-size:14px;line-height:1.65;margin:0}
+.msg{max-width:88%;padding:11px 14px;border-radius:18px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;font-size:15.5px;line-height:1.5}
+.me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:6px}
+.ai{align-self:flex-start;background:var(--ai);border-bottom-left-radius:6px}
 .ai pre,.ai code{background:#0d0f14;border-radius:8px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
-.ai pre{padding:10px;overflow-x:auto;margin:6px 0}.ai code{padding:1px 5px}
-.ai .h{font-weight:600;margin:7px 0 2px}.ai .li{margin:1px 0 1px 6px}
-.ai .cb{position:relative}.ai .cb pre{padding-top:26px}
-.cp{position:absolute;top:5px;right:6px;background:#2a2e38;color:var(--tx);font-size:11px;padding:3px 9px;border-radius:6px;font-weight:500}
-.retry{background:var(--acc);color:#04122e;font-size:13px;padding:5px 12px;border-radius:8px;margin-top:6px}
-.think{align-self:flex-start;color:var(--mut);font-style:italic}
-form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid #23262e}
-textarea{flex:1;resize:none;max-height:120px;background:#0d0f14;color:var(--tx);border:1px solid #2a2e38;border-radius:12px;padding:10px 12px;font:inherit}
-button{background:var(--acc);color:#04122e;border:0;border-radius:12px;padding:0 16px;font-weight:600}
-button:disabled{opacity:.5}
-#mn,#nw{background:none;color:var(--tx);font-size:20px;font-weight:400;padding:2px 8px}
+.ai pre{padding:11px;overflow-x:auto;margin:7px 0}.ai code{padding:2px 5px}
+.ai .h{font-weight:600;margin:8px 0 2px}.ai .li{margin:2px 0 2px 4px}
+.ai .cb{position:relative}.ai .cb pre{padding-top:32px}
+.cp{position:absolute;top:6px;right:6px;background:#2a2e38;color:var(--tx);font-size:12px;padding:6px 13px;border-radius:9px;font-weight:600}
+.retry{background:var(--acc);color:#04122e;font-size:14px;padding:9px 18px;border-radius:11px;margin-top:9px;font-weight:600}
+.think{align-self:flex-start;color:var(--mut);font-style:italic;padding:6px 4px;font-size:14.5px}
+form{display:flex;gap:9px;align-items:flex-end;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
+textarea{flex:1;resize:none;max-height:140px;min-height:48px;background:#0d0f14;color:var(--tx);border:1px solid #2a2e38;border-radius:15px;padding:13px 15px;font:inherit;line-height:1.35}
+textarea:focus{outline:none;border-color:var(--acc)}
+#b{min-width:72px;height:48px;background:var(--acc);color:#04122e;border:0;border-radius:15px;font-weight:700;font-size:15px;flex:0 0 auto}
+#b.stop{background:#333844;color:var(--tx)}
+#b:active{filter:brightness(.9)}
+button{border:0}
 #ov{position:fixed;inset:0;background:#0009;z-index:9;display:none}#ov.open{display:block}
-#drawer{position:fixed;top:0;bottom:0;left:0;width:82%;max-width:330px;background:var(--panel);z-index:10;transform:translateX(-100%);transition:transform .2s ease;display:flex;flex-direction:column;border-right:1px solid #23262e}
+#drawer{position:fixed;top:0;bottom:0;left:0;width:85%;max-width:345px;background:var(--panel);z-index:10;transform:translateX(-100%);transition:transform .22s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;border-right:1px solid var(--line)}
 #drawer.open{transform:none}
-#dh{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #23262e;font-weight:600}
-#dh button{font-size:14px;padding:6px 11px}
-#chats{flex:1;overflow-y:auto}
-.crow{padding:12px 14px;border-bottom:1px solid #1a1d24;display:flex;align-items:center;gap:8px}
-.crow.cur{background:#1e2436}
-.crow .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
-.crow .x{color:var(--mut);padding:2px 8px;font-size:18px}
+#dh{display:flex;align-items:center;padding:14px 14px 14px 18px;padding-top:calc(14px + env(safe-area-inset-top));border-bottom:1px solid var(--line);font-weight:700;font-size:19px}
+#nw2{margin-left:auto;background:var(--acc);color:#04122e;font-weight:600;font-size:14px;padding:11px 16px;border-radius:12px}
+#nw2:active{filter:brightness(.9)}
+#chats{flex:1;overflow-y:auto;padding-bottom:env(safe-area-inset-bottom)}
+.crow{display:flex;align-items:center;min-height:58px;border-bottom:1px solid #16181e}
+.crow.cur{background:#1c2740}
+.crow .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;padding:17px 4px 17px 18px}
+.crow .x{width:52px;height:58px;display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:21px;flex:0 0 auto}
+.crow .x:active{color:var(--danger)}
+.crow.confirm{background:#2a1517}
+.crow.confirm .t{color:var(--danger);font-weight:600;padding-left:18px}
+.cbtns{display:flex;gap:7px;padding-right:12px;flex:0 0 auto}
+.cdel,.ccancel{height:36px;padding:0 14px;border-radius:10px;font-size:13px;font-weight:600}
+.cdel{background:var(--danger);color:#fff}.ccancel{background:#2a2e38;color:var(--tx)}
 </style></head><body>
 <div id=ov></div>
-<div id=drawer><div id=dh><span style=flex:1>Chats</span><button id=nw2>+ New</button></div><div id=chats></div></div>
+<div id=drawer><div id=dh>Chats<button id=nw2>+ New</button></div><div id=chats></div></div>
 <div id=app>
-<header><button id=mn>&#9776;</button><span class=dot></span>__NAME__<small id=st>ready</small><button id=nw title="New chat">+</button></header>
+<header><button id=mn class=hbtn>&#9776;</button><div class=htitle><span class=dot id=dot></span>__NAME__</div><button id=nw class=hbtn>+</button></header>
 <div id=log></div>
-<form id=f><textarea id=i rows=1 placeholder="Ask anything..." autofocus></textarea><button id=b>Send</button></form>
+<form id=f><textarea id=i rows=1 placeholder="Ask anything..."></textarea><button id=b>Send</button><span id=st style=display:none></span></form>
 </div><script>
 const TKEY="jepai_token", CKEY="jepai_chats", CURKEY="jepai_cur", MODEL="__MODEL__";
 let tok=localStorage.getItem(TKEY);
 if(!tok){tok=prompt("Enter your access token (one time):")||"";localStorage.setItem(TKEY,tok);}
 const log=document.getElementById("log"),inp=document.getElementById("i"),btn=document.getElementById("b"),
-      f=document.getElementById("f"),st=document.getElementById("st"),
+      f=document.getElementById("f"),st=document.getElementById("st"),dot=document.getElementById("dot"),
       drawer=document.getElementById("drawer"),ov=document.getElementById("ov"),chatsEl=document.getElementById("chats");
-// ---- chat history saved in localStorage, private to this phone; survives refresh / reopen ----
 function loadChats(){try{return JSON.parse(localStorage.getItem(CKEY))||[]}catch(_){return[]}}
 function saveChats(){try{localStorage.setItem(CKEY,JSON.stringify(chats.slice(0,50)))}catch(_){}}
 let chats=loadChats(),curId=localStorage.getItem(CURKEY);
 const cur=()=>chats.find(c=>c.id===curId);
-// ---- lightweight, XSS-safe markdown for the coder model's replies (escape FIRST, never raw innerHTML) ----
 function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
 function inlineMd(s){s=esc(s);
   s=s.replace(/`([^`]+)`/g,(m,c)=>"<code>"+c+"</code>");
@@ -1062,38 +1077,53 @@ function copyText(t){try{const ta=document.createElement("textarea");ta.value=t;
 function wireCopy(d){d.querySelectorAll(".cp").forEach(b=>{b.onclick=()=>{const code=b.parentNode.querySelector("code");
   if(code)copyText(code.textContent);b.textContent="Copied";setTimeout(()=>b.textContent="Copy",1200);};});}
 function renderAi(d,txt){d.className="msg ai";d.innerHTML=md(txt);wireCopy(d);}
+const EMPTY='<div id=empty><div class=big>💬</div><h2>Ask me anything</h2><p>I run on your PC and can see your files, code, live system, email, and the web. No restrictions.</p></div>';
 function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;
   if(cls==="ai")renderAi(d,txt);else d.textContent=txt;
   log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-function render(){log.innerHTML="";const c=cur();if(c)for(const m of c.messages)add(m.role==="user"?"me":"ai",m.content);}
-function renderChats(){chatsEl.innerHTML="";for(const c of chats){const r=document.createElement("div");r.className="crow"+(c.id===curId?" cur":"");
+function render(){log.innerHTML="";const c=cur();
+  if(!c||!c.messages.length){log.innerHTML=EMPTY;return;}
+  for(const m of c.messages)add(m.role==="user"?"me":"ai",m.content);}
+function renderChats(){chatsEl.innerHTML="";for(const c of chats){
+  const r=document.createElement("div");r.className="crow"+(c.id===curId?" cur":"");r.dataset.id=c.id;
   const t=document.createElement("div");t.className="t";t.textContent=c.title||"New chat";
-  const x=document.createElement("div");x.className="x";x.textContent="×";
-  r.appendChild(t);r.appendChild(x);r.onclick=()=>openChat(c.id);x.onclick=e=>delChat(c.id,e);chatsEl.appendChild(r);}}
+  const x=document.createElement("button");x.className="x";x.textContent="✕";
+  r.appendChild(t);r.appendChild(x);
+  t.onclick=()=>openChat(c.id);
+  x.onclick=e=>{e.stopPropagation();armDelete(r,c.id);};
+  chatsEl.appendChild(r);}}
+function armDelete(row,id){                       // two-step delete: tap x -> inline confirm, no accidental loss
+  renderChats();                                  // reset any other armed row
+  row=chatsEl.querySelector('.crow[data-id="'+id+'"]');if(!row)return;
+  row.className="crow confirm";row.innerHTML="";
+  const t=document.createElement("div");t.className="t";t.textContent="Delete this chat?";
+  const b=document.createElement("div");b.className="cbtns";
+  const del=document.createElement("button");del.className="cdel";del.textContent="Delete";
+  const can=document.createElement("button");can.className="ccancel";can.textContent="Cancel";
+  b.appendChild(del);b.appendChild(can);row.appendChild(t);row.appendChild(b);
+  can.onclick=e=>{e.stopPropagation();renderChats();};
+  del.onclick=e=>{e.stopPropagation();delChat(id);};
+}
 function persist(){const c=cur();if(!c)return;const fu=c.messages.find(m=>m.role==="user");if(fu)c.title=fu.content.slice(0,42);c.ts=Date.now();chats=[c,...chats.filter(x=>x.id!==c.id)];saveChats();renderChats();}
 function newChat(){const id="c"+Date.now()+Math.random().toString(36).slice(2,6);chats.unshift({id,title:"New chat",messages:[],ts:Date.now()});curId=id;localStorage.setItem(CURKEY,id);saveChats();render();renderChats();closeDrawer();inp.focus();}
 function openChat(id){curId=id;localStorage.setItem(CURKEY,id);render();renderChats();closeDrawer();}
-function delChat(id,e){e.stopPropagation();chats=chats.filter(c=>c.id!==id);saveChats();if(curId===id)curId=chats[0]&&chats[0].id;localStorage.setItem(CURKEY,curId||"");if(!chats.length)newChat();else{render();renderChats();}}
+function delChat(id){chats=chats.filter(c=>c.id!==id);saveChats();if(curId===id)curId=chats[0]&&chats[0].id;localStorage.setItem(CURKEY,curId||"");if(!chats.length)newChat();else{render();renderChats();}}
 const openDrawer=()=>{drawer.classList.add("open");ov.classList.add("open");};
-const closeDrawer=()=>{drawer.classList.remove("open");ov.classList.remove("open");};
+const closeDrawer=()=>{drawer.classList.remove("open");ov.classList.remove("open");renderChats();};
 document.getElementById("mn").onclick=openDrawer;ov.onclick=closeDrawer;
 document.getElementById("nw").onclick=newChat;document.getElementById("nw2").onclick=newChat;
 if(!chats.length||!cur())newChat();else{render();renderChats();}
-inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,120)+"px";});
+inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,140)+"px";});
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function jget(u){return fetch(u,{headers:{"Authorization":"Bearer "+tok}});}
-// While a job runs, the Send button becomes Stop (the phone can bail out); on error, a real Retry re-sends
-// the SAME messages without duplicating the question.
 let jobCtl=null;
-function setSending(on){btn.textContent=on?"Stop":"Send";if(!on){jobCtl=null;st.textContent="ready";}}
+function setSending(on){btn.textContent=on?"Stop":"Send";btn.className=on?"stop":"";dot.className=on?"dot busy":"dot";if(!on){jobCtl=null;}}
 function errBubble(c,msg){const d=add("ai","Error"+(msg?": "+msg:"")+".");
   const rb=document.createElement("button");rb.className="retry";rb.textContent="Retry";
   rb.onclick=()=>{d.remove();sendCurrent(c);};d.appendChild(document.createElement("br"));d.appendChild(rb);}
-// SUBMIT then POLL: the query runs on the PC; each poll is a tiny request, surviving phone sleep/app-switch.
-// Re-usable so Retry can resend c.messages verbatim without pushing another user turn.
 async function sendCurrent(c){
-  const ctl={stop:false};jobCtl=ctl;setSending(true);const th=add("think","working...");
+  const ctl={stop:false};jobCtl=ctl;setSending(true);const e=document.getElementById("empty");if(e)e.remove();const th=add("think","working…");
   try{
     const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
     if(r.status===401){th.remove();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};return;}
@@ -1104,16 +1134,17 @@ async function sendCurrent(c){
       try{const p=await jget("/poll?id="+job_id);if(p.status===404)throw new Error("expired");j=await p.json();fails=0;}
       catch(_){fails++;if(fails>60){th.remove();errBubble(c,"lost the server");break;}continue;}
       if(j.status==="done"){const ans=j.content||"(empty reply)";renderAi(th,ans);c.messages.push({role:"assistant",content:ans});persist();log.scrollTop=log.scrollHeight;break;}
-      if(j.status==="streaming"&&j.partial){th.className="msg ai";th.textContent=j.partial;log.scrollTop=log.scrollHeight;st.textContent="writing "+(j.elapsed||0)+"s";}
-      else{th.className="msg think";th.textContent="working... "+(j.elapsed||0)+"s";st.textContent="thinking "+(j.elapsed||0)+"s";}
+      if(j.status==="streaming"&&j.partial){th.className="msg ai";th.textContent=j.partial;log.scrollTop=log.scrollHeight;}
+      else{th.className="think";th.textContent="working… "+(j.elapsed||0)+"s";}
     }
   }catch(err){th.remove();errBubble(c,err.message);}
   finally{setSending(false);inp.focus();}
 }
 f.addEventListener("submit",async e=>{e.preventDefault();
-  if(jobCtl){jobCtl.stop=true;return;}                 // Stop mode: cancel the in-flight job, start nothing new
+  if(jobCtl){jobCtl.stop=true;return;}
   const q=inp.value.trim();if(!q)return;
   const c=cur();if(!c){newChat();return f.requestSubmit();}
+  const em=document.getElementById("empty");if(em)em.remove();
   add("me",q);c.messages.push({role:"user",content:q});persist();inp.value="";inp.style.height="auto";
   sendCurrent(c);
 });
