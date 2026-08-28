@@ -572,6 +572,56 @@ def _oa_stream_content(text):
     yield b"data: [DONE]\n\n"
 
 
+CHAT_PAGE = r"""<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>__NAME__</title>
+<style>
+:root{--bg:#0b0c10;--panel:#15171c;--me:#2a3a5c;--ai:#1b1e26;--tx:#e8eaed;--mut:#8b90a0;--acc:#6ea8fe}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:16px/1.5 -apple-system,system-ui,sans-serif}
+#app{display:flex;flex-direction:column;height:100dvh}
+header{padding:12px 16px;background:var(--panel);font-weight:600;display:flex;align-items:center;gap:8px;border-bottom:1px solid #23262e}
+header .dot{width:9px;height:9px;border-radius:50%;background:#3ecf8e}
+header small{margin-left:auto;color:var(--mut);font-weight:400;font-size:12px}
+#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:86%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+.me{align-self:flex-end;background:var(--me);border-bottom-right-radius:5px}
+.ai{align-self:flex-start;background:var(--ai);border-bottom-left-radius:5px}
+.ai pre,.ai code{background:#0d0f14;border-radius:8px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.ai pre{padding:10px;overflow-x:auto}.ai code{padding:1px 5px}
+.think{align-self:flex-start;color:var(--mut);font-style:italic}
+form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid #23262e}
+textarea{flex:1;resize:none;max-height:120px;background:#0d0f14;color:var(--tx);border:1px solid #2a2e38;border-radius:12px;padding:10px 12px;font:inherit}
+button{background:var(--acc);color:#04122e;border:0;border-radius:12px;padding:0 16px;font-weight:600}
+button:disabled{opacity:.5}
+</style></head><body><div id=app>
+<header><span class=dot></span>__NAME__<small id=st>ready</small></header>
+<div id=log></div>
+<form id=f><textarea id=i rows=1 placeholder="Ask anything..." autofocus></textarea><button id=b>Send</button></form>
+</div><script>
+const KEY="jepai_token", MODEL="__MODEL__";
+let tok=localStorage.getItem(KEY), msgs=[];
+if(!tok){tok=prompt("Enter your access token (one time):")||"";localStorage.setItem(KEY,tok);}
+const log=document.getElementById("log"),inp=document.getElementById("i"),btn=document.getElementById("b"),
+      f=document.getElementById("f"),st=document.getElementById("st");
+function add(cls,txt){const d=document.createElement("div");d.className="msg "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,120)+"px";});
+inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
+f.addEventListener("submit",async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;
+  add("me",q);msgs.push({role:"user",content:q});inp.value="";inp.style.height="auto";
+  btn.disabled=true;st.textContent="thinking...";const th=add("think","typing...");
+  try{const r=await fetch("/v1/chat/completions",{method:"POST",
+      headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
+      body:JSON.stringify({model:MODEL,messages:msgs,stream:false})});
+    if(r.status===401){th.remove();add("ai","Unauthorized - wrong token. Tap here to re-enter.").onclick=()=>{localStorage.removeItem(KEY);location.reload();};return;}
+    const j=await r.json();const a=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||"(empty reply)";
+    th.remove();add("ai",a);msgs.push({role:"assistant",content:a});
+  }catch(err){th.remove();add("ai","Error: "+err.message);}
+  finally{btn.disabled=false;st.textContent="ready";inp.focus();}
+});
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -598,7 +648,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path == "/health":                       # unauthenticated liveness ping (no host access)
+        if self.path in ("/", "/chat", "/index.html"):    # self-contained mobile chat page (no Docker/OWUI needed)
+            page = CHAT_PAGE.replace("__NAME__", "Jep's AI").replace("__MODEL__", MODEL_ID)
+            self._send(200, page.encode("utf-8"), ctype="text/html; charset=utf-8")
+        elif self.path == "/health":                      # unauthenticated liveness ping (no host access)
             self._send(200, json.dumps({"status": "ok", "model": MODEL, "memory": bool(build_context)}).encode())
         elif not self._authorized():
             self._send(401, b'{"error":"unauthorized"}')
