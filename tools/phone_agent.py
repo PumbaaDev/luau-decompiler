@@ -1141,6 +1141,39 @@ def _bluffed_edit(task_text, answer, edited):
     return not edited and bool(_CLAIMS_EDIT.search(a)) and bool(_EDIT_OBJ.search(a))
 
 
+_ROBLOX_CTX = re.compile(r"\broblox\b|\bluau\b|:[A-Za-z_]\w+\s*\(", re.I)
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "roblox_api_names.json"),
+              encoding="utf-8") as _rf:
+        _ROBLOX_API = set(json.load(_rf))       # ~15k method names seen >=2x in 150 real Roblox repos
+except Exception:
+    _ROBLOX_API = set()
+
+
+def _api_factcheck(user_text):
+    """Roblox/Luau API questions make the model INVENT plausible methods (GetChildrenAsync, CloneDeep...).
+    Check the exact names the user asked about against the precomputed set of REAL Roblox API names from
+    the indexed corpus, and return a grounding note the model must trust, or None when it does not apply."""
+    t = user_text or ""
+    if not _ROBLOX_API or not _ROBLOX_CTX.search(t):
+        return None
+    names = set(re.findall(r"[:.]([A-Za-z_]\w{3,})\s*\(", t))
+    names |= set(re.findall(r"\bmethod\s+`?([A-Za-z_]\w{3,})", t, re.I))
+    names = {n for n in names if len(n) >= 4}
+    if not names or len(names) > 6:
+        return None
+    parts = []
+    for n in sorted(names):
+        if n in _ROBLOX_API:
+            parts.append("'%s' IS a real Roblox API" % n)
+        else:
+            parts.append("'%s' does NOT appear ANYWHERE in 150 indexed Roblox repos - it is NOT a real "
+                         "API/method, you are misremembering it; say plainly it does not exist and do NOT "
+                         "describe any behaviour for it" % n)
+    return ("[API FACT-CHECK against the real indexed Roblox source - this is ground truth, trust it over "
+            "your own memory]: " + "; ".join(parts) + ".")
+
+
 def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS,
               report=None, cancel=None):
     """Returns (final_text, tools_used). Injects memory, runs the tool loop on the host.
@@ -1167,6 +1200,15 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
 
     tools_used = []
     task_text = _last_user_text(client_messages)      # what this episode was about, for episode memory
+    try:
+        _fc = _api_factcheck(task_text)               # ground Roblox/Luau API questions so it can't invent methods
+    except Exception:
+        _fc = None
+    if _fc:                                            # prepend INTO the user's message: highest salience, the
+        for _mi in range(len(msgs) - 1, -1, -1):       # model overrides a separate system note but not its own question
+            if msgs[_mi].get("role") == "user":
+                msgs[_mi] = {**msgs[_mi], "content": _fc + "\n\n---\n\n" + str(msgs[_mi].get("content", ""))}
+                break
     trace = []                                        # (tool, key arg, ok|err) per EXECUTED call, in order
     executed = {}                                     # (name,args) already run this turn -> breaks identical-call loops
     DEDUP_EXEMPT = {"run_command", "see_screen", "get_system_info"}  # time-varying: a repeat may be legitimate
