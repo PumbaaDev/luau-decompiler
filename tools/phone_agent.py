@@ -55,12 +55,13 @@ PHONE_AGENT_TOKEN = os.environ.get("PHONE_AGENT_TOKEN", "").strip()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
-NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "16384"))   # 32768 filled the 16GB card so nomic-embed-text
-#   could not load and search_knowledge WEDGED (queries hung to timeout); 16384 leaves room for the embed model
+NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "24576"))   # sweet spot on the 16GB card: big enough to read a
+#   large source file, small enough that nomic-embed-text still loads beside the coder (32768 wedged the embed;
+#   16384 was too small and overflowed on big reads). Verified both models coexist + embed works at 24576.
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to read several files while exploring
 TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
 EMAIL_GATHER_CAP = int(os.environ.get("PHONE_EMAIL_GATHER_CAP", "26000")) # email_gather returns a whole thread - it must not be cut to 6k or the model only sees 2-3 emails
-READ_FILE_PAGE = int(os.environ.get("PHONE_READ_FILE_PAGE", "40000"))  # read_file returns up to this per call (~10k tok); pages beyond
+READ_FILE_PAGE = int(os.environ.get("PHONE_READ_FILE_PAGE", "28000"))  # read_file returns up to this per call (~7k tok); pages beyond
 RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
 WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer (SSE path)
 # The submit/poll (phone) path was built to wait minutes, so it gets a much larger budget + more
@@ -68,7 +69,9 @@ WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds
 # file) must not be force-finalized half-done just because it inherited the SSE cap.
 JOB_WALL_BUDGET = int(os.environ.get("PHONE_JOB_WALL_BUDGET", "900"))   # seconds for the async /ask path
 JOB_MAX_ITERS = int(os.environ.get("PHONE_JOB_MAX_ITERS", "30"))       # tool-loop iterations for the async path
-HISTORY_CHAR_CAP = int(os.environ.get("PHONE_HISTORY_CHAR_CAP", "90000"))  # cap replayed chat history so a long
+#   derive the char cap from num_ctx (~3 chars/token, conservative) minus a reserve for the tool schemas +
+#   generation, so the assembled request can NEVER exceed the context and 400 (90000 chars was ~27k tokens).
+HISTORY_CHAR_CAP = int(os.environ.get("PHONE_HISTORY_CHAR_CAP", str(max(24000, (NUM_CTX - 3500) * 3))))  # cap replayed chat history so a long
 #                                                        # phone thread can't overflow num_ctx and evict the persona
 def _parse_keep_alive(v):
     """Ollama needs keep_alive as a NUMBER (-1 forever, 0 unload, N seconds) or a duration string
@@ -901,6 +904,16 @@ def _cap_history(msgs, cap=HISTORY_CHAR_CAP):
         total -= len(str(tail.pop(0).get("content", "")))
     while tail and tail[0].get("role") == "tool":     # never start with an orphaned tool result
         tail.pop(0)
+    # FINAL SAFETY: a SINGLE recent message (e.g. a big file read) can still exceed cap on its own and
+    # 400 with "exceeds context size". Truncate the largest tail message's content so the total fits.
+    total = sum(len(str(m.get("content", ""))) for m in pinned + tail)
+    over = total - cap
+    if over > 0 and tail:
+        bi = max(range(len(tail)), key=lambda i: len(str(tail[i].get("content", ""))))
+        c = str(tail[bi].get("content", ""))
+        keep = len(c) - over - 300
+        if keep > 300:
+            tail[bi] = {**tail[bi], "content": c[:keep] + "\n...[truncated to fit the model's context]"}
     return pinned + tail
 
 
