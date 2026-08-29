@@ -1145,6 +1145,7 @@ def _bluffed_edit(task_text, answer, edited):
 _ROBLOX_CTX = re.compile(r"\broblox\b|\bluau\b|:[A-Za-z_]\w+\s*\(", re.I)
 _GRADE_Q = re.compile(r"\b(grade|grades|mark|marks|resit|result|results|score|scored|module|modules|"
                       r"classification|my degree|failed|passed)\b", re.I)
+_EMAIL_Q = re.compile(r"\b(email|emails|e-mail|inbox|my mail)\b", re.I)
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "roblox_api_names.json"),
               encoding="utf-8") as _rf:
@@ -1211,6 +1212,12 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
         _fc = ("[Note: his grades / results / module marks are in your search_knowledge (indexed from his "
                "own records), NOT in his email. search_knowledge for them and quote the exact figures; do "
                "NOT search his email for grades.]")
+    if not _fc and _EMAIL_Q.search(task_text or ""):  # email requests: it invents fake criteria + contradicts itself
+        _fc = ("[He wants to SEE his emails, not an analysis. Present them plainly and factually. Do NOT "
+               "invent any criterion, filter, length, or condition he did NOT explicitly ask for, and never "
+               "state the emails do or do not 'match' something he never asked about. One short factual "
+               "intro (who/when/what), then the emails. If he said ALL his emails, note you are showing the "
+               "most relevant/recent since there may be too many to list every one.]")
     if _fc:                                            # prepend INTO the user's message: highest salience, the
         for _mi in range(len(msgs) - 1, -1, -1):       # model overrides a separate system note but not its own question
             if msgs[_mi].get("role") == "user":
