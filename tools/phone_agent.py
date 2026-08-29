@@ -835,34 +835,42 @@ def _activity_label(name, args):
     return base + (": " + hint[:48] if hint else "")
 
 
-_STATS = {"t": 0.0, "data": {}}
+_STATS = {"t": 0.0, "data": {}, "fresh": False, "busy": False}
 _STATS_LOCK = threading.Lock()
+_STATS_TTL = 6                                          # > the 5s client poll, so steady-state serves from cache
 
 
 def _gpu_stats():
-    """Cached GPU snapshot (temp / util / VRAM) for the 5060 Ti plus the running token total.
-    nvidia-smi is spawned at most every 3s so /stats polling stays cheap."""
-    now = time.time()
+    """Cached GPU snapshot (temp / util / VRAM) for the 5060 Ti plus the running token total. nvidia-smi
+    is spawned by at most ONE thread at a time (single-flight); concurrent pollers get the last snapshot,
+    and an empty result is cached too so a failing nvidia-smi backs off instead of spawning per poll."""
     with _STATS_LOCK:
-        if now - _STATS["t"] < 3 and _STATS["data"]:
+        if (time.time() - _STATS["t"] < _STATS_TTL and _STATS["fresh"]) or _STATS["busy"]:
             return dict(_STATS["data"], tokens=_TOTAL_TOKENS)
-    smi = _run(("& \"$env:WINDIR\\System32\\nvidia-smi.exe\" "
-                "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total "
-                "--format=csv,noheader,nounits"), timeout=8)
-    best = None
-    for row in (smi or "").splitlines():
-        parts = [p.strip() for p in row.split(",")]
-        if len(parts) >= 4:
-            try:
-                vals = [int(float(p)) for p in parts[:4]]
-            except ValueError:
-                continue
-            if best is None or vals[3] > best[3]:     # the GPU with the most VRAM = the 5060 Ti
-                best = vals
-    data = {"temp": best[0], "util": best[1], "vram_used": best[2], "vram_total": best[3]} if best else {}
-    with _STATS_LOCK:
-        _STATS["t"] = now
-        _STATS["data"] = data
+        _STATS["busy"] = True                          # this thread owns the refresh; others serve the cache
+    data = {}
+    try:
+        smi = _run(("& \"$env:WINDIR\\System32\\nvidia-smi.exe\" "
+                    "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total "
+                    "--format=csv,noheader,nounits"), timeout=8)
+        best = None
+        for row in (smi or "").splitlines():
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) >= 4:
+                try:
+                    vals = [int(float(p)) for p in parts[:4]]
+                except ValueError:
+                    continue
+                if best is None or vals[3] > best[3]:  # the GPU with the most VRAM = the 5060 Ti
+                    best = vals
+        if best:
+            data = {"temp": best[0], "util": best[1], "vram_used": best[2], "vram_total": best[3]}
+    finally:
+        with _STATS_LOCK:
+            _STATS["data"] = data
+            _STATS["t"] = time.time()                  # stamp AFTER the spawn, and cache even an empty result
+            _STATS["fresh"] = True
+            _STATS["busy"] = False
     return dict(data, tokens=_TOTAL_TOKENS)
 
 
@@ -901,6 +909,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
         if cancel and cancel():
             break
         msgs = _cap_history(msgs)                      # re-cap EACH iteration: paginated reads / long jobs grow msgs
+        _rep(activity="thinking", tokens=tokens)       # reset the label so /poll isn't stuck on the last tool
         resp = _ollama_chat(msgs, tools=TOOL_SPECS)    # past num_ctx mid-loop, and Ollama silently evicts the head
         delta = _tokens_of(resp); tokens += delta; _bump_total(delta); _rep(tokens=tokens)
         msg = resp.get("message", {}) or {}
@@ -970,6 +979,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
     fin = _cap_history(msgs + [{"role": "user",
             "content": "Now give me your final answer in plain language, using what the tools returned so far. "
                        "Do NOT emit any tool-call markup; just the answer."}])
+    _rep(activity="writing the answer", tokens=tokens)
     resp = _ollama_chat(fin, tools=None,
                         on_delta=(lambda t: _rep(partial=_strip_tool_calls(t), tokens=tokens)) if report else None)
     _bump_total(_tokens_of(resp)); tokens += _tokens_of(resp)
@@ -1147,11 +1157,12 @@ const log=document.getElementById("log"),inp=document.getElementById("i"),btn=do
       f=document.getElementById("f"),dot=document.getElementById("dot"),
       drawer=document.getElementById("drawer"),ov=document.getElementById("ov"),chatsEl=document.getElementById("chats"),statsEl=document.getElementById("stats");
 function fmtTok(n){n=n||0;return n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":(""+n);}
-async function pollStats(){try{const r=await jget("/stats");const s=await r.json();if(!s||s.temp==null)return;
+let statsBusy=false;
+async function pollStats(){if(statsBusy)return;statsBusy=true;try{const r=await jget("/stats");const s=await r.json();if(!s||s.temp==null)return;
   statsEl.innerHTML='<span>\u{1F321} <b class="'+(s.temp>=78?"hot":"")+'">'+s.temp+'°</b></span>'+
     '<span>GPU <b>'+s.util+'%</b></span>'+
     '<span><b>'+(s.vram_used/1024).toFixed(1)+'</b>/'+Math.round(s.vram_total/1024)+' GB</span>'+
-    '<span><b>'+fmtTok(s.tokens)+'</b> tok</span>';}catch(_){}}
+    '<span><b>'+fmtTok(s.tokens)+'</b> tok</span>';}catch(_){}finally{statsBusy=false;}}
 function loadChats(){try{return JSON.parse(localStorage.getItem(CKEY))||[]}catch(_){return[]}}
 function saveChats(){try{localStorage.setItem(CKEY,JSON.stringify(chats.slice(0,50)))}catch(_){}}
 let chats=loadChats(),curId=localStorage.getItem(CURKEY);
@@ -1187,12 +1198,13 @@ function syncControls(){const running=!!jobs[curId];
   dot.className=Object.keys(jobs).length?"dot busy":"dot";}
 function paintLive(){const cur0=document.getElementById("live");
   if(!jobs[curId]){if(cur0)cur0.remove();return;}
+  const stick=log.scrollHeight-log.scrollTop-log.clientHeight<80;   // only auto-scroll if already near the bottom
   const j=jobs[curId];let b=cur0;
   if(!b){b=document.createElement("div");b.id="live";log.appendChild(b);}
   const meta=fmtTok(j.tokens||0)+" tok · "+(j.elapsed||0)+"s";
   if(j.phase==="streaming"&&j.partial){b.className="msg ai";b.textContent=j.partial;}
   else{b.className="think";b.textContent=(j.activity||"thinking…")+" · "+meta;}
-  log.scrollTop=log.scrollHeight;}
+  if(stick)log.scrollTop=log.scrollHeight;}
 function render(){log.innerHTML="";const c=cur();
   if(!c||(!c.messages.length&&!jobs[curId])){log.innerHTML=EMPTY;syncControls();return;}
   for(const m of c.messages)add(m.role==="user"?"me":"ai",m.content);
@@ -1207,6 +1219,7 @@ function renderChats(){chatsEl.innerHTML="";for(const c of chats){
   t.onclick=()=>openChat(c.id);
   x.onclick=e=>{e.stopPropagation();armDelete(r,c.id);};
   chatsEl.appendChild(r);}}
+function drawList(){if(!chatsEl.querySelector('.crow.confirm'))renderChats();}  // background rebuild that spares an open delete-confirm
 function armDelete(row,id){renderChats();
   row=chatsEl.querySelector('.crow[data-id="'+id+'"]');if(!row)return;
   row.className="crow confirm";row.innerHTML="";
@@ -1217,7 +1230,7 @@ function armDelete(row,id){renderChats();
   b.appendChild(del);b.appendChild(can);row.appendChild(t);row.appendChild(b);
   can.onclick=e=>{e.stopPropagation();renderChats();};
   del.onclick=e=>{e.stopPropagation();delChat(id);};}
-function persist(c){c=c||cur();if(!c)return;const fu=c.messages.find(m=>m.role==="user");if(fu)c.title=fu.content.slice(0,42);c.ts=Date.now();chats=[c,...chats.filter(x=>x.id!==c.id)];saveChats();renderChats();}
+function persist(c){c=c||cur();if(!c)return;const fu=c.messages.find(m=>m.role==="user");if(fu)c.title=fu.content.slice(0,42);c.ts=Date.now();chats=[c,...chats.filter(x=>x.id!==c.id)];saveChats();drawList();}
 function newChat(){const id="c"+Date.now()+Math.random().toString(36).slice(2,6);chats.unshift({id,title:"New chat",messages:[],ts:Date.now()});curId=id;localStorage.setItem(CURKEY,id);saveChats();render();renderChats();closeDrawer();inp.focus();}
 function openChat(id){curId=id;localStorage.setItem(CURKEY,id);render();renderChats();closeDrawer();}
 function delChat(id){const j=jobs[id];if(j){j.ctl.stop=true;try{jget("/cancel?id="+j.jobId);}catch(_){}}delete jobs[id];
@@ -1238,13 +1251,16 @@ function errBubble(c,msg){const d=add("ai","Error"+(msg?": "+msg:"")+".");
 // Each chat owns its job. The poll loop updates jobs[id] and only touches the DOM when that chat is
 // the one on screen, so switching chats keeps every task's timer and Stop button correct.
 async function sendCurrent(c){
+  if(jobs[c.id])return;                                // one job per chat: ignore a stale Retry during a run
   const id=c.id,ctl={stop:false};jobs[id]={ctl,phase:"working",elapsed:0,partial:""};
   if(id===curId){const em=document.getElementById("empty");if(em)em.remove();paintLive();}
-  syncControls();renderChats();let result=null;
+  syncControls();drawList();let result=null;
   try{
     const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
-    if(r.status===401){delete jobs[id];if(id===curId){paintLive();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};}syncControls();renderChats();return;}
-    const {job_id}=await r.json();if(jobs[id])jobs[id].jobId=job_id;let fails=0;
+    if(r.status===401){delete jobs[id];if(id===curId){paintLive();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};}syncControls();drawList();return;}
+    const {job_id}=await r.json();
+    if(!jobs[id]||ctl.stop){jget("/cancel?id="+job_id).catch(()=>{});if(id===curId)render();drawList();return;}  // deleted/stopped during /ask: cancel the REAL server job
+    jobs[id].jobId=job_id;let fails=0;
     while(jobs[id]){
       if(ctl.stop){try{await jget("/cancel?id="+job_id);}catch(_){}result={stopped:1};break;}
       await sleep(2500);let j;
@@ -1257,20 +1273,22 @@ async function sendCurrent(c){
       if(id===curId)paintLive();
     }
   }catch(err){result={error:err.message};}
-  if(!jobs[id]){if(id===curId){render();}renderChats();return;}  // chat deleted mid-run
+  if(!jobs[id]){if(id===curId){render();}drawList();return;}  // chat deleted mid-run
   delete jobs[id];
   if(result&&result.answer){c.messages.push({role:"assistant",content:result.answer});persist(c);}
+  else if(result&&result.error&&id!==curId){c.messages.push({role:"assistant",content:"(failed: "+result.error+" - resend to retry)"});persist(c);}  // background error must not vanish
   if(id===curId){
     if(result&&result.error){const b=document.getElementById("live");if(b)b.remove();errBubble(c,result.error);}
     else render();
   }
-  syncControls();renderChats();if(id===curId)inp.focus();
+  syncControls();drawList();if(id===curId)inp.focus();
 }
 f.addEventListener("submit",e=>{e.preventDefault();
   if(jobs[curId]){jobs[curId].ctl.stop=true;return;}         // this chat is running -> Stop
   const q=inp.value.trim();if(!q)return;
   let c=cur();if(!c){newChat();c=cur();}
   const em=document.getElementById("empty");if(em)em.remove();
+  [...log.querySelectorAll(".retry")].forEach(b=>{if(b.parentNode)b.parentNode.remove();});  // clear stale error+Retry bubbles
   add("me",q);c.messages.push({role:"user",content:q});persist(c);inp.value="";inp.style.height="auto";
   sendCurrent(c);
 });
