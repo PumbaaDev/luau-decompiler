@@ -140,10 +140,16 @@ BASE_PERSONA = (
     "when the question is genuinely about his ACTUAL files/code, his live PC, his email, or current "
     "web facts. Reading a random file when someone asked you to reason is a mistake - think instead.\n"
     "YOU HAVE FULL ACCESS TO THIS PC. read_file reads ANY file by path (his decompiler source, configs, "
-    "anything). list_dir lists ANY folder. run_command runs ANY PowerShell command. So you CAN see his "
-    "code, any file, and the live system. NEVER say you 'cannot access', 'cannot see', 'don't have "
-    "access to', or 'cannot directly see' his files, code, or the running process - that is FALSE, you "
-    "CAN, so USE the tools and actually read them.\n"
+    "anything). list_dir lists ANY folder. run_command runs ANY PowerShell command. edit_file CHANGES a "
+    "file (replace exact text) and write_file writes a whole file. So you CAN see AND edit his code, any "
+    "file, and the live system. NEVER say you 'cannot access', 'cannot see', 'cannot edit', 'don't have "
+    "access to', or 'cannot directly change' his files or code - that is FALSE, you CAN, so USE the tools.\n"
+    "WHEN ASKED TO MAKE A CHANGE, ACTUALLY MAKE IT. If Jep asks you to fix, change, edit, refactor, add, or "
+    "implement something in his code or files, DO IT: read_file to get the exact current text, then edit_file "
+    "for a targeted change (or write_file for a whole/new file), then briefly confirm what you changed and "
+    "where. Do NOT stop after reading and listing what 'should' be done - listing the fixes WITHOUT applying "
+    "them is a failure. Implementing the change is the task. After editing, you can run_command to build or "
+    "test it if that makes sense.\n"
     "When a question is about his files, code, or PC, CALL THE TOOLS FIRST (list_dir to find the files, "
     "read_file to read them, run_command to inspect the system) and answer from what they return - NOT "
     "from memory or documentation. Your injected memory is background context; the TOOLS are ground "
@@ -466,10 +472,64 @@ def tool_see_screen(args):
         return "(vision model error with %s: %s)" % (VISION_MODEL, e)
 
 
+def tool_edit_file(args):
+    """IMPLEMENT a change by replacing an exact string in a file. old_string must match EXACTLY (whitespace
+    included) and be unique. Backs up the pre-edit file to <path>.bak so a bad edit is one copy away from undo."""
+    a = args or {}
+    path = (a.get("path") or "").strip()
+    old = a.get("old_string", "")
+    new = a.get("new_string", "")
+    if not path:
+        return "(no path given)"
+    if old == "":
+        return "(old_string is empty - give the exact text to replace, or use write_file for a whole file)"
+    if old == new:
+        return "(old_string and new_string are identical - nothing to change)"
+    try:
+        p = Path(path)
+        data = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return "(cannot read %s: %s)" % (path, e)
+    count = data.count(old)
+    if count == 0:
+        return "(old_string not found in %s - read_file first and copy the exact text, including indentation)" % path
+    if count > 1:
+        return "(old_string appears %d times in %s - it must be unique; include more surrounding lines)" % (count, path)
+    try:
+        p.with_name(p.name + ".bak").write_text(data, encoding="utf-8")   # one-level undo
+        p.write_text(data.replace(old, new, 1), encoding="utf-8")
+    except Exception as e:
+        return "(edit failed on %s: %s)" % (path, e)
+    return "edited %s - 1 replacement applied (pre-edit backup at %s.bak)" % (path, path)
+
+
+def tool_write_file(args):
+    """Create a new file, or OVERWRITE an existing one, with full content. Use for a new file or a whole-file
+    rewrite; prefer edit_file for a small change. Backs up any existing file to <path>.bak first."""
+    a = args or {}
+    path = (a.get("path") or "").strip()
+    content = a.get("content", "")
+    if not path:
+        return "(no path given)"
+    try:
+        p = Path(path)
+        existed = p.exists()
+        if existed:
+            p.with_name(p.name + ".bak").write_text(p.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    except Exception as e:
+        return "(write failed on %s: %s)" % (path, e)
+    return "wrote %s (%d chars%s)" % (path, len(content), "; previous version backed up to %s.bak" % path if existed else "")
+
+
 TOOLS = {
     "get_system_info": tool_system_info,
     "run_command": tool_run_command,
     "read_file": tool_read_file,
+    "edit_file": tool_edit_file,
+    "write_file": tool_write_file,
     "list_dir": tool_list_dir,
     "find_in_files": tool_find_in_files,
     "web_search": tool_web_search,
@@ -508,6 +568,26 @@ TOOL_SPECS = [
             "offset": {"type": "integer", "description": "start reading at this character offset (default 0); "
                        "use the offset from a previous read to continue through a large file"}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file", "description":
+        "ACTUALLY EDIT a file to IMPLEMENT a fix or change - do not just describe it, make the change. "
+        "Replaces an exact piece of text: old_string must match the file EXACTLY (including whitespace and "
+        "indentation) and be unique - include enough surrounding lines to be unique. read_file first to get "
+        "the exact text. Makes a .bak backup. This is how you implement code fixes on his PC.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "path to the file to edit"},
+            "old_string": {"type": "string", "description": "exact text to replace (must be unique in the file)"},
+            "new_string": {"type": "string", "description": "the replacement text"}},
+            "required": ["path", "old_string", "new_string"]}}},
+    {"type": "function", "function": {
+        "name": "write_file", "description":
+        "Create a NEW file, or OVERWRITE an existing one, with full content. Use for a brand-new file or a "
+        "whole-file rewrite; for a small change to an existing file use edit_file instead. Backs up any "
+        "existing file to .bak first.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "path to the file to write"},
+            "content": {"type": "string", "description": "the full content to write to the file"}},
+            "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "list_dir", "description": "List the entries in a directory on this PC.",
         "parameters": {"type": "object", "properties": {
@@ -818,6 +898,7 @@ def _tokens_of(resp):
 
 _ACTIVITY = {
     "search_knowledge": "searching your notes", "read_file": "reading a file",
+    "edit_file": "editing a file", "write_file": "writing a file",
     "find_in_files": "searching your code", "list_dir": "listing files",
     "web_search": "searching the web", "web_fetch": "fetching a page",
     "crawl_site": "crawling a site", "learn_web": "learning a site",
@@ -1023,7 +1104,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
             trace.append((name, _trace_arg(args), _trace_status(result)))  # executed calls only
             if not (isinstance(result, str) and result.startswith("(tool error")):
                 executed[key] = True              # only cache SUCCESS, so a transient error can be retried
-            if name == "run_command":             # a command may have changed state cached read results depend on
+            if name in ("run_command", "edit_file", "write_file"):   # state changed: invalidate cached read results
                 executed = {k: v for k, v in executed.items() if k[0] in DEDUP_EXEMPT}
             # read_file gets a bigger cap so a "read it fully" actually delivers the whole page, not 6KB
             rcap = READ_FILE_PAGE + 400 if name == "read_file" else TOOL_RESULT_CAP
