@@ -164,7 +164,12 @@ BASE_PERSONA = (
     "truth, so verify against the real files. His decompiler project is at "
     "C:\\Users\\jep\\Downloads\\luau-decompiler-v2. For current web facts use web_search / web_fetch. "
     "His EMAIL lives in Gmail, NOT on disk: for any order, receipt, delivery, purchase, or message, "
-    "call email_search / email_read - do NOT look for .eml files with the file tools.\n"
+    "call email_search / email_read - do NOT look for .eml files with the file tools. When he asks to "
+    "GATHER, pull, list, collect, or 'get all' the emails in a thread or 'from the very first to now', "
+    "call email_gather (give it the thread's subject as the query) - it returns EVERY matching email "
+    "in full, oldest first. Then PRESENT those emails in order - date, from, subject and the actual "
+    "content of each - do NOT replace them with a themed summary. Gathering means SHOWING the emails, "
+    "not describing what they are about.\n"
     "To UNDERSTAND his code broadly (how something works, where a thing is, what a subsystem does), "
     "use search_knowledge FIRST - his ENTIRE codebase is indexed there, so you can answer about any "
     "part WITHOUT reading every file. Use read_file for one file's exact contents and list_dir to see "
@@ -384,6 +389,49 @@ def tool_email_read(args):
     return "From: %s\nDate: %s\nSubject: %s\n%s" % (r["sender"], r["date"], r["subject"], r["body"][:5000])
 
 
+def tool_email_gather(args):
+    """Gather a whole thread / all matching emails in ONE call: search, then read EACH match in
+    full, oldest-first. For 'gather all emails in this thread' or 'from the very first to now' -
+    returns the actual emails, not a summary."""
+    if gmail_local is None:
+        return "(email unavailable)"
+    q = (args or {}).get("query", "").strip()
+    if not q:
+        return "(no query)"
+    try:
+        n = int((args or {}).get("n", 20) or 20)
+    except Exception:
+        n = 20
+    try:
+        rows = gmail_local.search(q, min(max(n, 1), 40))
+    except Exception as e:
+        return "(email search error: %s)" % e
+    if not rows:
+        return "(no matching emails)"
+    import email.utils as _eu
+
+    def _dt(r):
+        try:
+            d = _eu.parsedate_to_datetime(r.get("date", ""))
+            return d.timestamp() if d else 0.0
+        except Exception:
+            return 0.0
+
+    rows = sorted(rows, key=_dt)                     # oldest first = "from the very first till now"
+    out = []
+    for i, r in enumerate(rows, 1):
+        try:
+            m = gmail_local.read(r["uid"])
+        except Exception:
+            out.append("[%d] (read error on uid %s)" % (i, r.get("uid"))); continue
+        if m.get("error"):
+            out.append("[%d] %s" % (i, m["error"])); continue
+        body = (m.get("body") or "").strip()[:1800]
+        out.append("==== EMAIL %d of %d ====\nDate: %s\nFrom: %s\nSubject: %s\n\n%s"
+                   % (i, len(rows), m.get("date", ""), m.get("sender", ""), m.get("subject", ""), body))
+    return ("Gathered %d emails, oldest first:\n\n" % len(out)) + "\n\n".join(out)
+
+
 def tool_find_in_files(args):
     """Exact text / regex search across files (ripgrep). Finds WHERE a string, function name, or
     symbol appears - complements search_knowledge (which is semantic, not literal)."""
@@ -561,6 +609,7 @@ TOOLS = {
     "remember_fact": tool_remember_fact,
     "email_search": tool_email_search,
     "email_read": tool_email_read,
+    "email_gather": tool_email_gather,
     "see_screen": tool_see_screen,
 }
 
@@ -660,6 +709,16 @@ TOOL_SPECS = [
         "name": "email_read", "description": "Read the full text of one email by its uid (READ-ONLY).",
         "parameters": {"type": "object", "properties": {
             "uid": {"type": "string"}}, "required": ["uid"]}}},
+    {"type": "function", "function": {
+        "name": "email_gather", "description":
+        "Gather ALL emails in a thread / all matching a query in ONE call, read in full and sorted "
+        "oldest-first. Use when Jep asks to gather, pull, list, or collect all emails in a thread or "
+        "'from the very first to now'. Returns the actual emails (not a summary). Give a Gmail query "
+        "that matches the thread, e.g. its subject or subject:\"...\".",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Gmail query matching the thread/emails to gather"},
+            "n": {"type": "integer", "description": "max emails to gather (default 20, cap 40)"}},
+            "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "find_in_files", "description":
         "Search files for EXACT text or a regex (ripgrep) and return file:line matches. Use to find "
@@ -925,6 +984,7 @@ _ACTIVITY = {
     "crawl_site": "crawling a site", "learn_web": "learning a site",
     "run_command": "running a command", "get_system_info": "checking the system",
     "email_search": "searching Gmail", "email_read": "reading an email",
+    "email_gather": "gathering the email thread",
     "remember_fact": "saving a fact", "see_screen": "looking at the screen",
 }
 
