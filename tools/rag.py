@@ -200,7 +200,7 @@ def _build_index_locked():
 # ---------------------- incremental refresh (the safe default for `index`) ---------------------- #
 # Sources with these prefixes were INGESTED (crawled sites, the Roblox corpus, the codebase digest),
 # not derived from _iter_files(); a refresh must carry every one of them through untouched.
-PRESERVE_PREFIXES = ("web:", "roblox:", "digest:")
+PRESERVE_PREFIXES = ("web:", "roblox:", "digest:", "jep:", "log:")  # ingested knowledge refresh must keep
 
 
 def _file_fingerprint(raw: bytes) -> str:
