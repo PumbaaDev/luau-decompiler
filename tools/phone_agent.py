@@ -838,6 +838,44 @@ def _activity_label(name, args):
 _STATS = {"t": 0.0, "data": {}, "fresh": False, "busy": False}
 _STATS_LOCK = threading.Lock()
 _STATS_TTL = 6                                          # > the 5s client poll, so steady-state serves from cache
+LHM_URL = os.environ.get("PHONE_LHM_URL", "http://localhost:8085/data.json")
+
+
+def _lhm_cpu_temp():
+    """CPU package temperature from LibreHardwareMonitor's web server, or None if LHM isn't running.
+    LHM must run elevated (kernel driver) to read CPU temps - see the one-time
+    C:\\Users\\jep\\LibreHardwareMonitor\\Enable-CPU-Temp.bat. Until then this returns None and the
+    phone simply omits CPU temp; connection-refused is instant, so it never slows /stats."""
+    try:
+        with urllib.request.urlopen(LHM_URL, timeout=2) as r:
+            root = json.load(r)
+    except Exception:
+        return None
+    pkg, cores = [None], []
+
+    def walk(n):
+        txt = n.get("Text") or ""
+        val = n.get("Value") or ""
+        if "\u00b0C" in val:
+            try:
+                t = float(val.split("\u00b0")[0].strip().replace(",", "."))
+            except Exception:
+                t = None
+            if t is not None:
+                if "CPU Package" in txt:
+                    pkg[0] = t
+                elif "CPU Core" in txt:
+                    cores.append(t)
+        for c in (n.get("Children") or []):
+            walk(c)
+
+    try:
+        walk(root)
+    except Exception:
+        return None
+    if pkg[0] is not None:
+        return int(round(pkg[0]))
+    return int(round(max(cores))) if cores else None
 
 
 def _gpu_stats():
@@ -880,6 +918,9 @@ def _gpu_stats():
                 data["ram_total"] = round(float(cp[2]), 1)
         except Exception:
             pass
+        ct = _lhm_cpu_temp()                            # real CPU temp via LibreHardwareMonitor, if running
+        if ct is not None:
+            data["cpu_temp"] = ct
     finally:
         with _STATS_LOCK:
             _STATS["data"] = data
@@ -1178,7 +1219,7 @@ async function pollStats(){if(statsBusy)return;statsBusy=true;try{const r=await 
   if(s.temp!=null)h+='<span>\u{1F321} <b class="'+(s.temp>=78?"hot":"")+'">'+s.temp+'°</b></span>'+
     '<span>GPU <b>'+s.util+'%</b></span>'+
     '<span><b>'+(s.vram_used/1024).toFixed(1)+'</b>/'+Math.round(s.vram_total/1024)+' GB</span>';
-  if(s.cpu!=null)h+='<span>CPU <b>'+s.cpu+'%</b></span>';
+  if(s.cpu!=null)h+='<span>CPU <b>'+s.cpu+'%</b>'+(s.cpu_temp!=null?' <b class="'+(s.cpu_temp>=85?"hot":"")+'">'+s.cpu_temp+'°</b>':'')+'</span>';
   if(s.ram_used!=null)h+='<span>RAM <b>'+Math.round(s.ram_used)+'</b>/'+Math.round(s.ram_total)+'</span>';
   h+='<span><b>'+fmtTok(s.tokens)+'</b> tok</span>';
   statsEl.innerHTML=h;}catch(_){}finally{statsBusy=false;}}
