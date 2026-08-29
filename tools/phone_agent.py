@@ -58,6 +58,7 @@ MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI
 NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to read several files while exploring
 TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
+EMAIL_GATHER_CAP = int(os.environ.get("PHONE_EMAIL_GATHER_CAP", "26000")) # email_gather returns a whole thread - it must not be cut to 6k or the model only sees 2-3 emails
 READ_FILE_PAGE = int(os.environ.get("PHONE_READ_FILE_PAGE", "40000"))  # read_file returns up to this per call (~10k tok); pages beyond
 RUN_CMD_MAX_TIMEOUT = int(os.environ.get("PHONE_RUN_CMD_MAX_TIMEOUT", "120"))  # ceiling on a model-supplied timeout
 WALL_BUDGET = int(os.environ.get("PHONE_WALL_BUDGET", "210"))          # seconds before we force a final answer (SSE path)
@@ -426,7 +427,7 @@ def tool_email_gather(args):
             out.append("[%d] (read error on uid %s)" % (i, r.get("uid"))); continue
         if m.get("error"):
             out.append("[%d] %s" % (i, m["error"])); continue
-        body = (m.get("body") or "").strip()[:1800]
+        body = (m.get("body") or "").strip()[:2400]
         out.append("==== EMAIL %d of %d ====\nDate: %s\nFrom: %s\nSubject: %s\n\n%s"
                    % (i, len(rows), m.get("date", ""), m.get("sender", ""), m.get("subject", ""), body))
     return ("Gathered %d emails, oldest first:\n\n" % len(out)) + "\n\n".join(out)
@@ -781,7 +782,8 @@ def _ollama_chat(messages, tools=None, on_delta=None):
     shape the non-stream path returns, so callers are unchanged."""
     streaming = on_delta is not None and not tools
     body = {"model": MODEL, "messages": messages, "stream": streaming, "keep_alive": KEEP_ALIVE,
-            "options": {"num_ctx": NUM_CTX, "temperature": 0.6}}
+            "options": {"num_ctx": NUM_CTX, "temperature": 0.6,
+                        "num_predict": int(os.environ.get("PHONE_NUM_PREDICT", "8192"))}}
     if tools:
         body["tools"] = tools
     req = urllib.request.Request(OLLAMA + "/api/chat", data=json.dumps(body).encode(),
@@ -1092,6 +1094,14 @@ def _gpu_stats():
     return dict(data, tokens=_TOTAL_TOKENS)
 
 
+def _append_gathered(final, gathered_raw):
+    """The local model summarises a gathered email thread instead of showing it. When email_gather
+    ran, append the real emails so the user ALWAYS gets them - Jep wants the emails, not a digest."""
+    if not gathered_raw or "The emails in full" in (final or ""):
+        return final
+    return (final or "").rstrip() + "\n\n----- The emails in full (oldest first) -----\n\n" + gathered_raw
+
+
 def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS,
               report=None, cancel=None):
     """Returns (final_text, tools_used). Injects memory, runs the tool loop on the host.
@@ -1123,6 +1133,8 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
     DEDUP_EXEMPT = {"run_command", "see_screen", "get_system_info"}  # time-varying: a repeat may be legitimate
     deadline = time.time() + wall_budget
     tokens = 0                                         # tokens generated so far this job (for the live counter)
+    gathered_raw = None                                # last email_gather result: appended verbatim so the
+    #                                                    user ALWAYS gets the real emails, never just a summary
     for _ in range(max_iters):
         if cancel and cancel():
             break
@@ -1138,6 +1150,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
         if not calls:
             answer = _strip_tool_calls(content)
             final = answer or "(the model returned an empty reply)"
+            final = _append_gathered(final, gathered_raw)  # never let a summary hide the real emails
             _rep(partial=final, tokens=tokens)        # show it the instant it's ready (already generated)
             _harvest_remember(final)
             # CLEAN completion: a real answer, reached inside the loop (not the forced exit below),
@@ -1185,10 +1198,18 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
             trace.append((name, _trace_arg(args), _trace_status(result)))  # executed calls only
             if not (isinstance(result, str) and result.startswith("(tool error")):
                 executed[key] = True              # only cache SUCCESS, so a transient error can be retried
+                if name == "email_gather" and isinstance(result, str) and result.startswith("Gathered"):
+                    gathered_raw = result         # keep the real emails to append to the final answer
             if name in ("run_command", "edit_file", "write_file"):   # state changed: invalidate cached read results
                 executed = {k: v for k, v in executed.items() if k[0] in DEDUP_EXEMPT}
-            # read_file gets a bigger cap so a "read it fully" actually delivers the whole page, not 6KB
-            rcap = READ_FILE_PAGE + 400 if name == "read_file" else TOOL_RESULT_CAP
+            # read_file + email_gather get bigger caps so "read/gather it fully" delivers the whole
+            # thing, not 6KB (a truncated gather is exactly why the model summarised 2-3 emails)
+            if name == "read_file":
+                rcap = READ_FILE_PAGE + 400
+            elif name == "email_gather":
+                rcap = EMAIL_GATHER_CAP
+            else:
+                rcap = TOOL_RESULT_CAP
             msgs.append({"role": "tool", "content": str(result)[:rcap], "tool_name": name})
         if time.time() > deadline:                # stop looping once we blow the time budget
             break
@@ -1202,6 +1223,7 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
                         on_delta=(lambda t: _rep(partial=_strip_tool_calls(t), tokens=tokens)) if report else None)
     _bump_total(_tokens_of(resp)); tokens += _tokens_of(resp)
     final = _strip_tool_calls((resp.get("message", {}) or {}).get("content", "")) or "(no final answer)"
+    final = _append_gathered(final, gathered_raw)      # never let a summary hide the real emails
     _rep(partial=final, tokens=tokens)
     _harvest_remember(final)
     return final, tools_used
