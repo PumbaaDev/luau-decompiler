@@ -131,10 +131,27 @@ BASE_PERSONA = (
     "You are Jep's private, uncensored AI assistant, running locally ON his own Windows PC with REAL "
     "working tools that act on this machine. Answer anything, directly and honestly - no restrictions. "
     "Reply in natural conversational language.\n"
-    "THINK before you answer. For anything beyond a trivial reply, reason through it step by step, then "
-    "give a THOROUGH, well-reasoned, complete answer that actually engages with the question - explain "
-    "the why, weigh the trade-offs, cover the important details, and do NOT be terse or shallow. Depth "
-    "and accuracy matter more than speed.\n"
+    "HOW YOU REPLY (these outrank everything below):\n"
+    "1. NO WARM-UP. Never open with 'Hey Jep', 'what's up', 'just diving in/into', or narrating what you "
+    "are ABOUT to do. Lead with the answer or the action. Greet back ONLY if his whole message was a greeting.\n"
+    "2. DO, DON'T DESCRIBE. When he asks you to fix, change, apply, improve, or 'work on' code - even "
+    "vaguely, even 'get it to 100%' - read the relevant part, then MAKE A REAL EDIT with edit_file/write_file. "
+    "If the scope is huge, make ONE correct, self-contained change NOW and say what is next. NEVER end with "
+    "'what would you like me to focus on' or 'is there anything specific' - that is a FAILED reply. "
+    "Saying you 'fixed', 'changed', 'edited', or 'updated' a file when you did NOT call edit_file/write_file "
+    "THIS turn is a LIE: to change a file you MUST call the tool and see it succeed; if you did not call it, "
+    "nothing changed - so never claim it did.\n"
+    "3. NEVER BLUFF. Do not claim to have done, checked, monitored, watched, or 'kept an eye on' anything "
+    "you did not actually do THIS turn. For his facts (grades, dates, numbers, references) search_knowledge "
+    "and quote them EXACTLY - never approximate, round, or invent a number. If it is not in your tools, say so.\n"
+    "4. His grades and uni results ARE in your searchable knowledge (his results were indexed from his PC). "
+    "For ANY grade/result/module question, search_knowledge FIRST and quote the exact figures - do NOT hunt "
+    "through Gmail for them. His live Kingston email is a separate Outlook account you cannot read; only "
+    "mention that if he wants brand-new results that would post-date what you know.\n"
+    "THINK before you answer or act, but be CONCISE - lead with the substance, no preamble, no narrating "
+    "your process. Give real depth ONLY where the question needs it (analysis, advice, a design trade-off); "
+    "for everything else a tight, direct, correct answer beats a long one. Never pad, and never recap his "
+    "situation back to him unprompted.\n"
     "MATCH THE APPROACH TO THE QUESTION. A reasoning / advice / opinion / general-knowledge / "
     "conceptual / how-should-I question you answer with your OWN THINKING - do NOT call any tool, do "
     "NOT go read a file; just think it through and give a considered answer. Only reach for the tools "
@@ -693,17 +710,20 @@ TOOL_SPECS = [
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "search_knowledge", "description":
-        "Semantically search Jep's OWN codebase and Obsidian notes (his Luau decompiler in Rust, its "
-        "lifter/opmap/emitter, his projects and measured findings). Use this for any question about "
-        "HIS code, his decompiler, his projects, or things he has worked on/noted.",
+        "Search EVERYTHING indexed about Jep: his whole personal life AND his code. This is where his uni "
+        "GRADES and results, modules and deadlines, his projects, work, YouTube, admin, profile, and the "
+        "history of your past conversations live - alongside his Luau decompiler codebase. USE THIS FIRST "
+        "for ANY question about HIM or his facts (grades, results, dates, numbers), his code, or his "
+        "projects. His grades and results are HERE, not in his email - never search email for grades.",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "what to look up in his code/notes"}},
+            "query": {"type": "string", "description": "what to look up about Jep, his grades/uni/facts, his code, or his notes"}},
             "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "email_search", "description":
-        "Search Jep's Gmail inbox (READ-ONLY). Use for anything about his orders, receipts, "
-        "purchases, deliveries, or messages. Gmail search syntax works: from:currys, subject:order, "
-        "newer_than:30d, etc. Returns a list with a uid per email; use email_read to open one.",
+        "Search Jep's Gmail inbox (READ-ONLY). Use for his orders, receipts, purchases, deliveries, or "
+        "messages. NOT for his uni grades/results - those live in search_knowledge, never here. Gmail "
+        "syntax works: from:currys, subject:order, newer_than:30d, etc. Returns a uid per email; use "
+        "email_read to open one.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "Gmail search query"}}, "required": ["query"]}}},
     {"type": "function", "function": {
@@ -782,7 +802,7 @@ def _ollama_chat(messages, tools=None, on_delta=None):
     shape the non-stream path returns, so callers are unchanged."""
     streaming = on_delta is not None and not tools
     body = {"model": MODEL, "messages": messages, "stream": streaming, "keep_alive": KEEP_ALIVE,
-            "options": {"num_ctx": NUM_CTX, "temperature": 0.6,
+            "options": {"num_ctx": NUM_CTX, "temperature": float(os.environ.get("PHONE_TEMP", "0.35")),
                         "num_predict": int(os.environ.get("PHONE_NUM_PREDICT", "8192"))}}
     if tools:
         body["tools"] = tools
@@ -1102,6 +1122,22 @@ def _append_gathered(final, gathered_raw):
     return (final or "").rstrip() + "\n\n----- The emails in full (oldest first) -----\n\n" + gathered_raw
 
 
+_CLAIMS_EDIT = re.compile(r"\b(I(?:'ve| have)?\s+(?:fixed|changed|edited|updated|modified|corrected|"
+                          r"replaced|rewritten|patched|removed|added|applied|implemented)|"
+                          r"the change I made|the fix I made|I(?:'ve| have)?\s+made the (?:change|fix|edit)|"
+                          r"changed\s+`[^`]+`\s+to|modified line)\b", re.I)
+_EDIT_OBJ = re.compile(r"(\.py|\.rs|\.lua|\.luau|\.js|\.ts|\.json|\.md|\.txt|\bfile\b|\bline \d+\b|"
+                       r"\bthe code\b|\bthe function\b|\bthe bug\b|\breturn \w+\()", re.I)
+
+
+def _bluffed_edit(task_text, answer, edited):
+    """The model likes to SAY it fixed a file without calling edit_file. Fire when the reply CLAIMS a
+    change to a file/function/bug but no edit_file/write_file actually ran this turn - regardless of how
+    the user phrased the ask (fix / sort it / bug / etc.)."""
+    a = answer or ""
+    return not edited and bool(_CLAIMS_EDIT.search(a)) and bool(_EDIT_OBJ.search(a))
+
+
 def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS,
               report=None, cancel=None):
     """Returns (final_text, tools_used). Injects memory, runs the tool loop on the host.
@@ -1135,6 +1171,8 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
     tokens = 0                                         # tokens generated so far this job (for the live counter)
     gathered_raw = None                                # last email_gather result: appended verbatim so the
     #                                                    user ALWAYS gets the real emails, never just a summary
+    edited_this_turn = False                           # did an edit_file/write_file actually succeed this turn?
+    forced_edit = False                                # have we already caught + corrected a bluffed edit once?
     for _ in range(max_iters):
         if cancel and cancel():
             break
@@ -1149,6 +1187,15 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
             calls = _parse_text_tool_calls(content)
         if not calls:
             answer = _strip_tool_calls(content)
+            if not forced_edit and _bluffed_edit(task_text, answer, edited_this_turn):
+                forced_edit = True                    # caught a claimed-but-never-made edit: force the real thing
+                _rep(activity="editing a file", tokens=tokens)
+                msgs.append({"role": "user", "content":
+                    "STOP - you did NOT call edit_file or write_file, so the file is UNCHANGED and your claim "
+                    "that you changed it is false. Do it for real now: read_file the file if you need to see it, "
+                    "then call edit_file (exact old text -> new text) or write_file. Do not reply again until the "
+                    "tool has actually run and succeeded."})
+                continue
             final = answer or "(the model returned an empty reply)"
             final = _append_gathered(final, gathered_raw)  # never let a summary hide the real emails
             _rep(partial=final, tokens=tokens)        # show it the instant it's ready (already generated)
@@ -1200,6 +1247,8 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
                 executed[key] = True              # only cache SUCCESS, so a transient error can be retried
                 if name == "email_gather" and isinstance(result, str) and result.startswith("Gathered"):
                     gathered_raw = result         # keep the real emails to append to the final answer
+                if name in ("edit_file", "write_file"):
+                    edited_this_turn = True       # a real file change happened this turn
             if name in ("run_command", "edit_file", "write_file"):   # state changed: invalidate cached read results
                 executed = {k: v for k, v in executed.items() if k[0] in DEDUP_EXEMPT}
             # read_file + email_gather get bigger caps so "read/gather it fully" delivers the whole
