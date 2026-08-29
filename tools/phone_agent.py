@@ -1206,7 +1206,7 @@ textarea:focus{outline:none;border-color:var(--acc)}
 <div id=log></div>
 <form id=f><textarea id=i rows=1 placeholder="Ask anything..."></textarea><button id=b>Send</button></form>
 </div><script>
-const TKEY="jepai_token", CKEY="jepai_chats", CURKEY="jepai_cur", MODEL="__MODEL__";
+const TKEY="jepai_token", CKEY="jepai_chats", CURKEY="jepai_cur", MODEL="__MODEL__", RUNKEY="jepai_running";
 let tok=localStorage.getItem(TKEY);
 if(!tok){tok=prompt("Enter your access token (one time):")||"";localStorage.setItem(TKEY,tok);}
 const log=document.getElementById("log"),inp=document.getElementById("i"),btn=document.getElementById("b"),
@@ -1301,6 +1301,7 @@ const closeDrawer=()=>{drawer.classList.remove("open");ov.classList.remove("open
 document.getElementById("mn").onclick=openDrawer;ov.onclick=closeDrawer;
 document.getElementById("nw").onclick=newChat;document.getElementById("nw2").onclick=newChat;
 if(!chats.length||!cur())newChat();else{render();renderChats();}
+setTimeout(()=>resumeAll(),0);   // re-attach to any job still running on the server (after a reload)
 inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,140)+"px";});
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -1310,21 +1311,22 @@ function errBubble(c,msg){const d=add("ai","Error"+(msg?": "+msg:"")+".");
   rb.onclick=()=>{d.remove();sendCurrent(c);};d.appendChild(document.createElement("br"));d.appendChild(rb);}
 // Each chat owns its job. The poll loop updates jobs[id] and only touches the DOM when that chat is
 // the one on screen, so switching chats keeps every task's timer and Stop button correct.
-async function sendCurrent(c){
-  if(jobs[c.id])return;                                // one job per chat: ignore a stale Retry during a run
-  const id=c.id,ctl={stop:false};jobs[id]={ctl,phase:"working",elapsed:0,partial:""};
+// The running job's server id is persisted PER CHAT so a full tab reload / app-kill can re-attach to
+// the still-running server job and keep updating live (iOS discards backgrounded tabs).
+function loadRun(){try{return JSON.parse(localStorage.getItem(RUNKEY))||{}}catch(_){return{}}}
+function setRun(id,jid){try{const m=loadRun();m[id]=jid;localStorage.setItem(RUNKEY,JSON.stringify(m));}catch(_){}}
+function clearRun(id){try{const m=loadRun();delete m[id];localStorage.setItem(RUNKEY,JSON.stringify(m));}catch(_){}}
+// Poll an EXISTING server job to completion, updating jobs[c.id] live. Used by a fresh send AND by a
+// resume-after-reload, so live updates never stop when the phone leaves and returns to the app.
+async function pollJob(c,job_id){
+  const id=c.id,ctl=jobs[id].ctl;jobs[id].jobId=job_id;setRun(id,job_id);
   if(id===curId){const em=document.getElementById("empty");if(em)em.remove();paintLive();}
-  syncControls();drawList();let result=null;
+  syncControls();drawList();let result=null,fails=0;
   try{
-    const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
-    if(r.status===401){delete jobs[id];if(id===curId){paintLive();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};}syncControls();drawList();return;}
-    const {job_id}=await r.json();
-    if(!jobs[id]||ctl.stop){jget("/cancel?id="+job_id).catch(()=>{});if(id===curId)render();drawList();return;}  // deleted/stopped during /ask: cancel the REAL server job
-    jobs[id].jobId=job_id;let fails=0;
     while(jobs[id]){
-      if(ctl.stop){try{await jget("/cancel?id="+job_id);}catch(_){}result={stopped:1};break;}
+      if(ctl.stop){jget("/cancel?id="+job_id).catch(()=>{});result={stopped:1};break;}
       await sleep(2500);let j;
-      try{const p=await jget("/poll?id="+job_id);if(p.status===404)throw new Error("expired");j=await p.json();fails=0;}
+      try{const p=await jget("/poll?id="+job_id);if(p.status===404){result={};break;}j=await p.json();fails=0;}  // 404 = job gone/delivered: clear quietly
       catch(_){fails++;if(fails>60){result={error:"lost the server"};break;}continue;}
       if(!jobs[id])break;
       if(j.status==="done"){result={answer:j.content||"(empty reply)"};break;}
@@ -1333,16 +1335,33 @@ async function sendCurrent(c){
       if(id===curId)paintLive();
     }
   }catch(err){result={error:err.message};}
-  if(!jobs[id]){if(id===curId){render();}drawList();return;}  // chat deleted mid-run
+  clearRun(id);
+  if(!jobs[id]){if(id===curId)render();drawList();return;}   // chat deleted mid-run
   delete jobs[id];
   if(result&&result.answer){c.messages.push({role:"assistant",content:result.answer});persist(c);}
-  else if(result&&result.error&&id!==curId){c.messages.push({role:"assistant",content:"(failed: "+result.error+" - resend to retry)"});persist(c);}  // background error must not vanish
+  else if(result&&result.error&&id!==curId){c.messages.push({role:"assistant",content:"(failed: "+result.error+" - resend to retry)"});persist(c);}
   if(id===curId){
     if(result&&result.error){const b=document.getElementById("live");if(b)b.remove();errBubble(c,result.error);}
     else render();
   }
   syncControls();drawList();if(id===curId)inp.focus();
 }
+async function sendCurrent(c){
+  if(jobs[c.id])return;                                // one job per chat: ignore a stale Retry during a run
+  const id=c.id;jobs[id]={ctl:{stop:false},phase:"working",elapsed:0,partial:"",tokens:0,activity:""};
+  if(id===curId){const em=document.getElementById("empty");if(em)em.remove();paintLive();}
+  syncControls();drawList();let job_id;
+  try{
+    const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({messages:c.messages})});
+    if(r.status===401){delete jobs[id];if(id===curId){paintLive();const d=add("ai","Unauthorized - wrong token. Tap to re-enter.");d.style.cursor="pointer";d.onclick=()=>{localStorage.removeItem(TKEY);location.reload();};}syncControls();drawList();return;}
+    job_id=(await r.json()).job_id;
+  }catch(err){delete jobs[id];if(id===curId)errBubble(c,err.message);syncControls();drawList();return;}
+  if(!jobs[id]||jobs[id].ctl.stop){jget("/cancel?id="+job_id).catch(()=>{});delete jobs[id];if(id===curId)render();drawList();return;}
+  pollJob(c,job_id);
+}
+// re-attach to still-running server jobs after a reload or when the app returns to the foreground
+function resumeJob(c,job_id){if(jobs[c.id])return;jobs[c.id]={ctl:{stop:false},phase:"working",elapsed:0,partial:"",tokens:0,activity:""};pollJob(c,job_id);}
+function resumeAll(){const m=loadRun();for(const id in m){const c=chats.find(x=>x.id===id);if(c&&!jobs[id])resumeJob(c,m[id]);else if(!c)clearRun(id);}}
 f.addEventListener("submit",e=>{e.preventDefault();
   if(jobs[curId]){jobs[curId].ctl.stop=true;return;}         // this chat is running -> Stop
   const q=inp.value.trim();if(!q)return;
@@ -1352,6 +1371,8 @@ f.addEventListener("submit",e=>{e.preventDefault();
   add("me",q);c.messages.push({role:"user",content:q});persist(c);inp.value="";inp.style.height="auto";
   sendCurrent(c);
 });
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")resumeAll();});  // app back in foreground -> reconnect any running job
+window.addEventListener("pageshow",()=>resumeAll());
 pollStats();setInterval(pollStats,5000);
 </script></body></html>"""
 
