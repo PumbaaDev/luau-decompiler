@@ -55,7 +55,8 @@ PHONE_AGENT_TOKEN = os.environ.get("PHONE_AGENT_TOKEN", "").strip()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.environ.get("PHONE_MODEL", "uncensored-coder:latest")
 MODEL_ID = os.environ.get("PHONE_MODEL_ID", "jep-assistant")   # what Open WebUI shows
-NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "32768"))
+NUM_CTX = int(os.environ.get("PHONE_NUM_CTX", "16384"))   # 32768 filled the 16GB card so nomic-embed-text
+#   could not load and search_knowledge WEDGED (queries hung to timeout); 16384 leaves room for the embed model
 MAX_TOOL_ITERS = int(os.environ.get("PHONE_MAX_TOOL_ITERS", "10"))     # room to read several files while exploring
 TOOL_RESULT_CAP = int(os.environ.get("PHONE_TOOL_RESULT_CAP", "6000")) # per tool result; 10 iters x 6k stays under 32k num_ctx
 EMAIL_GATHER_CAP = int(os.environ.get("PHONE_EMAIL_GATHER_CAP", "26000")) # email_gather returns a whole thread - it must not be cut to 6k or the model only sees 2-3 emails
@@ -1142,6 +1143,8 @@ def _bluffed_edit(task_text, answer, edited):
 
 
 _ROBLOX_CTX = re.compile(r"\broblox\b|\bluau\b|:[A-Za-z_]\w+\s*\(", re.I)
+_GRADE_Q = re.compile(r"\b(grade|grades|mark|marks|resit|result|results|score|scored|module|modules|"
+                      r"classification|my degree|failed|passed)\b", re.I)
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "roblox_api_names.json"),
               encoding="utf-8") as _rf:
@@ -1204,6 +1207,10 @@ def run_agent(client_messages, wall_budget=WALL_BUDGET, max_iters=MAX_TOOL_ITERS
         _fc = _api_factcheck(task_text)               # ground Roblox/Luau API questions so it can't invent methods
     except Exception:
         _fc = None
+    if not _fc and _GRADE_Q.search(task_text or ""):  # grades question: steer tool choice inline (it sometimes hits email)
+        _fc = ("[Note: his grades / results / module marks are in your search_knowledge (indexed from his "
+               "own records), NOT in his email. search_knowledge for them and quote the exact figures; do "
+               "NOT search his email for grades.]")
     if _fc:                                            # prepend INTO the user's message: highest salience, the
         for _mi in range(len(msgs) - 1, -1, -1):       # model overrides a separate system note but not its own question
             if msgs[_mi].get("role") == "user":

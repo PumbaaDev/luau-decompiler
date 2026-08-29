@@ -27,7 +27,7 @@ def _get(p):
     return json.loads(urllib.request.urlopen(urllib.request.Request(BASE + p, headers=H), timeout=30).read())
 
 
-def ask(q, timeout=190):
+def ask(q, timeout=260):
     jid = _post("/ask", {"messages": [{"role": "user", "content": q}]})["job_id"]
     t0 = time.time(); acts = []
     while time.time() - t0 < timeout:
