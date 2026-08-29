@@ -865,6 +865,21 @@ def _gpu_stats():
                     best = vals
         if best:
             data = {"temp": best[0], "util": best[1], "vram_used": best[2], "vram_total": best[3]}
+        # CPU load + system RAM. (CPU TEMPERATURE is deliberately omitted: Windows does not expose it
+        # without admin rights or vendor tooling like LibreHardwareMonitor - MSAcpi_ThermalZoneTemperature
+        # returns Access denied - so it is left out rather than shown as a fake number.)
+        cr = _run("$os=Get-CimInstance Win32_OperatingSystem;"
+                  "$c=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;"
+                  "$u=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,1);"
+                  "$t=[math]::Round($os.TotalVisibleMemorySize/1MB,1);'{0}|{1}|{2}' -f $c,$u,$t", timeout=8)
+        try:
+            cp = (cr or "").strip().split("|")
+            if len(cp) == 3 and cp[0].strip():
+                data["cpu"] = int(float(cp[0]))
+                data["ram_used"] = round(float(cp[1]), 1)
+                data["ram_total"] = round(float(cp[2]), 1)
+        except Exception:
+            pass
     finally:
         with _STATS_LOCK:
             _STATS["data"] = data
@@ -1158,11 +1173,15 @@ const log=document.getElementById("log"),inp=document.getElementById("i"),btn=do
       drawer=document.getElementById("drawer"),ov=document.getElementById("ov"),chatsEl=document.getElementById("chats"),statsEl=document.getElementById("stats");
 function fmtTok(n){n=n||0;return n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":(""+n);}
 let statsBusy=false;
-async function pollStats(){if(statsBusy)return;statsBusy=true;try{const r=await jget("/stats");const s=await r.json();if(!s||s.temp==null)return;
-  statsEl.innerHTML='<span>\u{1F321} <b class="'+(s.temp>=78?"hot":"")+'">'+s.temp+'°</b></span>'+
+async function pollStats(){if(statsBusy)return;statsBusy=true;try{const r=await jget("/stats");const s=await r.json();if(!s||(s.temp==null&&s.cpu==null))return;
+  let h='';
+  if(s.temp!=null)h+='<span>\u{1F321} <b class="'+(s.temp>=78?"hot":"")+'">'+s.temp+'°</b></span>'+
     '<span>GPU <b>'+s.util+'%</b></span>'+
-    '<span><b>'+(s.vram_used/1024).toFixed(1)+'</b>/'+Math.round(s.vram_total/1024)+' GB</span>'+
-    '<span><b>'+fmtTok(s.tokens)+'</b> tok</span>';}catch(_){}finally{statsBusy=false;}}
+    '<span><b>'+(s.vram_used/1024).toFixed(1)+'</b>/'+Math.round(s.vram_total/1024)+' GB</span>';
+  if(s.cpu!=null)h+='<span>CPU <b>'+s.cpu+'%</b></span>';
+  if(s.ram_used!=null)h+='<span>RAM <b>'+Math.round(s.ram_used)+'</b>/'+Math.round(s.ram_total)+'</span>';
+  h+='<span><b>'+fmtTok(s.tokens)+'</b> tok</span>';
+  statsEl.innerHTML=h;}catch(_){}finally{statsBusy=false;}}
 function loadChats(){try{return JSON.parse(localStorage.getItem(CKEY))||[]}catch(_){return[]}}
 function saveChats(){try{localStorage.setItem(CKEY,JSON.stringify(chats.slice(0,50)))}catch(_){}}
 let chats=loadChats(),curId=localStorage.getItem(CURKEY);
