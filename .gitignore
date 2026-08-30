@@ -22,3 +22,24 @@ _claude_old_sessions/
 
 # local model memory - measured + auto-harvested facts stay local, never public
 tools/local_mem/
+
+# --- Local AI / personal stack — NEVER publish (private only) ---
+goal/
+local_mem/
+tools/phone_agent.py
+tools/rag.py
+tools/mem.py
+tools/seed_local_mem.py
+tools/collect_pc.py
+tools/local_organize.py
+tools/ingest_personal.py
+tools/ingest_organized.py
+tools/skill_inject.py
+tools/oneclaude.ps1
+tools/unified_proxy.py
+tools/ollama_fanout.py
+tools/github_roblox.py
+tools/roblox_api_names.json
+tools/test_phone_behaviors.py
+tools/run_phone_agent.bat
+tools/Modelfile.uncensored-*
