@@ -43,6 +43,33 @@ Windows, or the link step fails on a locked file.
 
 ## THE fix list (this is the actual work)
 
+### 1 SEP 2026 — 10→8 DEFECTS (99.4%). EVERYTHING BELOW THIS IS OLDER
+
+Fresh clean `batch target/union1324` with the current binary: **1315/1323 clean (99.4%), 8
+defects** — the 22-Aug "22 defects" block below was already stale (real number was 10).
+Two lifter fixes landed (commit `e531307`), measured with a strict ratchet:
+
+- **DUPTABLE cross-branch write** (fixed lv_0129): DupTable now calls `table_needs_binding`
+  like NewTable, so a cloned `{...}` template crossing a branch materialises instead of
+  parking pending and losing a later cross-branch field write at the merge.
+- **Upvalue-alias name collision** (fixed lv_0452): `LocalTracker` now tracks `alias_regs`
+  (a GETUPVAL read of upvalue `vN`); `classify_write` mints a fresh name for a real write to
+  an alias register instead of donating `vN` and colliding with the real upvalue.
+
+**BOTH the unit suite AND the corpus are mandatory gates — neither alone is enough.** Three
+fixes were REVERTED, each failing exactly one gate: `find_merge_point` zero-successor guard
+(fixed lv_0919 in the corpus, **broke 7 merge unit tests** — two arms that both `return`
+share a terminal block as their real merge); `collect_loop_body` dead-end inclusion (**951/0
+tests but regressed lv_0943 + rc_0274**, net +1); ternary leaf-cap widening (**no-op**). Gate
+every change on `cargo test -p luau-core --release --lib` == 951/0 AND a full `batch` diff
+(defects down, NO previously-clean file regressed). Backup tag `backup/pre-defect-fixes-0901`.
+
+**Remaining 8 are at the ceiling:** 2 unfixable `upval_N` (lv_0579, rc_0010 — no CAPTURE data)
++ 6 in the merge/phi/arm/loop core (lv_0124, lv_0883, lv_0919, rc_0037, rc_0047, rc_0040) that
+the three reverts show resists safe change. Per-defect root-cause traces exist (8-agent workflow).
+
+
+
 ### MEASURE ON `target/union1324` — 22 Aug 2026, EVERYTHING BELOW IS OLDER
 
 **The corpus is 1,324 unique files, not the ~15,000 the directory listing
