@@ -1262,7 +1262,7 @@ pub(super) fn lift_instruction_range(
                 // `hits = hits` a self-assign, which dead-store elimination
                 // deleted, silently dropping the upvalue write entirely.
                 locals.pre_declare(a);
-                locals.record_name(a, &name);
+                locals.record_alias_name(a, &name);
             }
             LuauOpcode::SetUpval => {
                 // Phase C2 pass #1 — SETUPVAL upval backscan.
@@ -1990,13 +1990,39 @@ pub(super) fn lift_instruction_range(
                 } else {
                     Expr::Table { fields: vec![] }
                 };
-                // Honour a pinned destination, as LoadNil / GetUpval / GetGlobal
-                // all do. Parking unconditionally ignores a pin that was set
-                // before the branch, so both arms reach the merge holding
-                // structurally different pending tables, neither is a Name, and
-                // `merge_regs` takes its terminal reset -- discarding the table
-                // and every SETTABLEKS that mutated it in place.
-                if !pinned_write_consumed(ctx, regs, locals, stmts, a, pc, expr.clone()) {
+                // Mirror NewTable: when the cloned template is filled or read on
+                // the far side of a branch, a parked pending table is cloned at
+                // every read, so a cross-branch SETTABLEKS mutates a throwaway
+                // copy and is discarded at the merge (`floor25 extends Amount6`
+                // in lv_0129). Materialise eagerly in that case so the field
+                // write becomes a real `t.Amount = ...` Stat that survives; keep
+                // the pending-literal inline path otherwise so short
+                // `return {a=1, b=2}` tables still inline. See table_needs_binding.
+                if pc <= 1 || table_needs_binding(code, pc, a) {
+                    let new_name = ctx.reg_name(proto, a as u8, pc);
+                    let (kind, name) = locals.classify_write(a, &new_name);
+                    match kind {
+                        WriteKind::FirstDecl | WriteKind::Shadow => {
+                            stmts.push(Stat::Local {
+                                names: vec![name.clone()],
+                                values: vec![expr],
+                            });
+                        }
+                        WriteKind::Reassign => {
+                            stmts.push(Stat::Assign {
+                                targets: vec![Expr::Name(name.clone())],
+                                values: vec![expr],
+                            });
+                        }
+                    }
+                    regs[a] = RegVal::Expr(Expr::Name(name));
+                } else if !pinned_write_consumed(ctx, regs, locals, stmts, a, pc, expr.clone()) {
+                    // Honour a pinned destination, as LoadNil / GetUpval / GetGlobal
+                    // all do. Parking unconditionally ignores a pin that was set
+                    // before the branch, so both arms reach the merge holding
+                    // structurally different pending tables, neither is a Name, and
+                    // `merge_regs` takes its terminal reset -- discarding the table
+                    // and every SETTABLEKS that mutated it in place.
                     regs[a] = RegVal::Expr(expr);
                 }
             }

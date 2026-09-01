@@ -77,6 +77,13 @@ pub(in crate::decompiler) struct LocalTracker {
     /// is only used to decide whether a subsequent write should Shadow or
     /// Reassign.
     current_names: HashMap<usize, String>,
+    /// Registers whose `current_names` entry is a read-only ALIAS of an outer
+    /// binding (an upvalue read via GETUPVAL), NOT this register's own declared
+    /// value. When such a register is later given its own value, `classify_write`
+    /// must NOT preserve the alias name: reusing e.g. `v9` (a captured upvalue's
+    /// own name) for an unrelated later CALL result collides with the real
+    /// upvalue and makes dead-store elimination delete real statements (lv_0452).
+    alias_regs: HashSet<usize>,
 }
 
 impl LocalTracker {
@@ -85,7 +92,7 @@ impl LocalTracker {
         for i in 0..param_count {
             declared.insert(i);
         }
-        Self { declared, param_count, current_names: HashMap::new() }
+        Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new() }
     }
 
     /// Returns true if this register needs a `local` declaration (first write).
@@ -146,6 +153,17 @@ impl LocalTracker {
     /// sync with the emitted bindings.
     pub(super) fn record_name(&mut self, reg: usize, name: &str) {
         self.current_names.insert(reg, name.to_string());
+        self.alias_regs.remove(&reg);
+    }
+
+    /// Record that `reg` now holds a read-only ALIAS of an outer binding (an
+    /// upvalue read), under the outer binding's own `name`. Behaves like
+    /// `record_name` for reads, but marks `reg` so a later write of the
+    /// register's OWN value does not silently inherit the alias name and
+    /// collide with the real binding (lv_0452). Cleared by the next real write.
+    pub(super) fn record_alias_name(&mut self, reg: usize, name: &str) {
+        self.current_names.insert(reg, name.to_string());
+        self.alias_regs.insert(reg);
     }
 
     /// Phase B0.49 — decide how to emit a single-register write.
@@ -189,10 +207,21 @@ impl LocalTracker {
                     self.current_names.insert(reg, new_name.to_string());
                     return (WriteKind::Shadow, new_name.to_string());
                 }
+                // This write gives the register its OWN value, so it is no
+                // longer an alias of the outer upvalue.
+                let was_alias = self.alias_regs.remove(&reg);
                 // Names differ.  Only shadow when BOTH are semantic
                 // (non-`v\d+`).  Otherwise reuse the old name to avoid
                 // counter-bump churn.
                 if is_semantic_local_name(&old) && is_semantic_local_name(new_name) {
+                    self.current_names.insert(reg, new_name.to_string());
+                    (WriteKind::Shadow, new_name.to_string())
+                } else if was_alias {
+                    // `old` was a read-only alias of a captured upvalue (e.g.
+                    // `v9`), not this register's own binding. Reusing it here
+                    // would emit `v9 = <call result>` and collide with the real
+                    // upvalue `v9`, which dead-store elimination then unpicks by
+                    // deleting real writes (lv_0452). Mint the fresh name instead.
                     self.current_names.insert(reg, new_name.to_string());
                     (WriteKind::Shadow, new_name.to_string())
                 } else {
