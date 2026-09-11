@@ -1,0 +1,1645 @@
+pub mod parser;
+pub mod disasm;
+pub mod analysis;
+pub mod decompiler;
+pub mod ast;
+pub mod roundtrip;
+
+use anyhow::Result;
+
+/// Decompiler version string, injected from Cargo.toml
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Attribution emitted at the top of every decompiled file.
+///
+/// Every output path routes through here rather than formatting its own
+/// header, so attribution cannot be lost by adding a new entry point and
+/// forgetting to include it. Recovered source is derived work produced by
+/// this tool, and output that travels without provenance ends up with none.
+pub const ATTRIBUTION: &str =
+    "PumbaDecompiler | PumbaHub | PumbaDev — github.com/PumbaaDev/luau-decompiler";
+
+/// The standard two-line banner: attribution followed by version.
+pub fn banner() -> String {
+    format!("-- {}\n-- Luau Decompiler v{}\n", ATTRIBUTION, VERSION)
+}
+
+/// Install a ground-truth opmap (canonical shuffled-byte → opcode table)
+/// obtained from an external source such as the an executor probe script. Ground
+/// truth is applied with top priority in every subsequent `detect` call.
+/// Pass `None` to clear any previously-installed ground truth.
+pub fn set_ground_truth_opmap(map: Option<[u8; 256]>) {
+    parser::opmap::set_ground_truth(map);
+}
+
+/// Read the ground-truth opmap currently installed, if any.
+pub fn get_ground_truth_opmap() -> Option<[u8; 256]> {
+    parser::opmap::get_ground_truth()
+}
+
+/// Install a ground-truth map for a scope and put back whatever was there when
+/// the guard drops.
+///
+/// The installed map lives in a process-global, which is fine for the intended
+/// use (a caller installs one map and decodes with it) but wrong for a caller
+/// that decodes chunks from several different builds in sequence: without a
+/// restore, the first install would leak into every later decode.
+///
+/// This does NOT make concurrent decodes of different builds safe. Two threads
+/// installing different maps still race, because the global is shared. A server
+/// decoding for multiple builds must serialise, or the map must be threaded
+/// through `detect_with_prior` as a parameter instead of read from a global.
+pub struct GroundTruthGuard(Option<[u8; 256]>);
+
+impl GroundTruthGuard {
+    pub fn install(map: [u8; 256]) -> Self {
+        let previous = parser::opmap::get_ground_truth();
+        parser::opmap::set_ground_truth(Some(map));
+        GroundTruthGuard(previous)
+    }
+}
+
+impl Drop for GroundTruthGuard {
+    fn drop(&mut self) {
+        parser::opmap::set_ground_truth(self.0);
+    }
+}
+
+/// What a decode is allowed to lean on.
+///
+/// The two fields are different KINDS of knowledge, not two sources of the same
+/// kind. `prior` is a pooled tally of guesses from other scripts; `exact` is a
+/// permutation that was measured. When an exact entry applies, the prior is
+/// ignored entirely — averaging a measurement with guesses can only make it
+/// worse.
+#[derive(Default)]
+pub struct DecodePlan<'a> {
+    /// Pooled consensus prior (the `--opmap-cache` path).
+    pub prior: Option<&'a [u8; 256]>,
+    /// A verified database entry for this chunk's build. When present, `prior`
+    /// is not consulted.
+    pub exact: Option<&'a parser::opmap_db::DbEntry>,
+}
+
+/// Parse a JSON blob (shape: `{ "0xNN": "OPCODE_NAME", ... }` or envelope
+/// with `"mappings"` key) into a ground-truth `[u8; 256]` map. Returns
+/// `None` on unparseable JSON. Malformed entries are silently skipped.
+pub fn parse_ground_truth_json(json: &str) -> Option<[u8; 256]> {
+    parser::ground_truth::parse_ground_truth_json(json)
+}
+
+/// Serialize a ground-truth map into pretty JSON (the inverse of
+/// [`parse_ground_truth_json`]).
+pub fn serialize_ground_truth_opmap(map: &[u8; 256]) -> String {
+    parser::ground_truth::serialize_ground_truth(map)
+}
+
+/// Canonical opcode name → canonical byte value. `None` for "UNKNOWN" and
+/// anything unrecognised. Accepts mixed case and surrounding whitespace.
+pub fn opcode_name_to_byte(name: &str) -> Option<u8> {
+    parser::ground_truth::opcode_name_to_byte(name)
+}
+
+/// Known-overridable conflict: when the cache maps a byte to a JumpXEq-family
+/// opcode (78-81) but fresh detection says the same byte is the ForGLoop/Prep
+/// pair (60 or 61), fresh wins. Reason: JumpXEq is detected via permissive AUX
+/// heuristics (aux_low31 <= 1), which matches AD-format instructions without
+/// AUX (like ForGLoopINext). The pair detector in detect_forgprep_inext_pair
+/// uses structural pair evidence (ForGPrepINext → ForGLoopINext with matching
+/// A register and valid target), which is much stronger than AUX pattern
+/// matching. When a small script (no ForGPrepINext loops) seeds the cache
+/// with a false JumpXEqKB assignment, a later code-rich script (Animate.lua
+/// with 69 ForGLoopINext occurrences) must be able to override it.
+///
+pub fn fresh_overrides_cache(cache_canon: u8, fresh_canon: u8) -> bool {
+    use parser::opcodes::LuauOpcode;
+    let fresh_is_forgloop_pair = fresh_canon == LuauOpcode::Deprecated61 as u8
+        || fresh_canon == LuauOpcode::ForGPrepINext as u8;
+    if !fresh_is_forgloop_pair {
+        return false;
+    }
+    // Allow override of JumpXEq family: small scripts can set 0x6F → JumpXEqKB via
+    // permissive AUX heuristic, but Animate.lua's structural pair detection at
+    // 0xC5 → ForGPrepINext + 0x6F → Deprecated61 must take precedence.
+    let cache_is_jumpxeq = cache_canon >= LuauOpcode::JumpXEqKNil as u8
+        && cache_canon <= LuauOpcode::JumpXEqKS as u8;
+    cache_is_jumpxeq
+}
+
+/// Merge a fresh-heuristic opmap with a cached opmap — CACHE WINS on conflict.
+///
+/// The cache represents distilled consensus from many prior scripts (already
+/// filtered through consolidate_cache's 80% agreement check), so it's more
+/// authoritative than any single script's fresh heuristic detection. Fresh
+/// entries are only applied where the cache has a gap AND the standard opcode
+/// isn't already assigned elsewhere in the cache.
+///
+/// Without this cache-first ordering, a single noisy fresh detection
+/// (e.g., wrong byte for MINUS) can shadow the cache's correct mapping,
+/// poisoning per-script output even when 30+ prior scripts agree.
+///
+/// EXCEPTION: specific known-overridable patterns (see fresh_overrides_cache)
+/// let fresh win, because the fresh detector used structural evidence stronger
+/// than the cache's initial permissive heuristic.
+fn merge_cache_first(fresh: &[u8; 256], cached: &[u8; 256]) -> [u8; 256] {
+    // Step 1: Seed from the cache (authoritative consensus).
+    let mut merged = *cached;
+    let mut assigned_std = [false; 256];
+    for &v in merged.iter() {
+        if v != 255 { assigned_std[v as usize] = true; }
+    }
+    // Step 2: Layer fresh heuristic.
+    //   - Fill gaps (cache has 255 at this index, fresh has a value not yet assigned).
+    //   - Apply known-overridable conflicts (fresh_overrides_cache returns true).
+    for (idx, &v) in fresh.iter().enumerate() {
+        if v == 255 { continue; }
+        let cur = merged[idx];
+        if cur == 255 {
+            if !assigned_std[v as usize] {
+                merged[idx] = v;
+                assigned_std[v as usize] = true;
+            }
+        } else if v != cur && fresh_overrides_cache(cur, v) {
+            // Fresh's structural detection overrides cache's permissive heuristic.
+            // Un-assign the displaced canonical so it remains available elsewhere
+            // (either fresh places it at its correct byte, or it stays unmapped —
+            // both preferable to leaving the wrong byte locked in the cache).
+            assigned_std[cur as usize] = false;
+            merged[idx] = v;
+            assigned_std[v as usize] = true;
+        }
+    }
+    merged
+}
+
+/// Phase B0.33: Fresh-first merge. Opposite of `merge_cache_first`.
+///
+/// The script's own structural detection wins on every byte. The cache is
+/// consulted ONLY to fill in bytes the script's solo detection couldn't assign
+/// (and where the canonical opcode isn't already claimed by the fresh map).
+///
+/// Rationale: cross-shuffle cache pollution. Different scripts can come from
+/// different Roblox client shuffles, and the fingerprint-keyed variant cache
+/// isn't always perfect — small scripts with identical short-prefix fingerprints
+/// can end up sharing a variant even when their true shuffles differ. In that
+/// case `merge_cache_first` forces the wrong mapping. `merge_fresh_first` lets
+/// each script's own evidence override cache assumptions.
+///
+/// Risk: small scripts with noisy fresh detection can pick the wrong byte and
+/// the cache can no longer correct them. Mitigation: fresh detectors are
+/// already strict (see detect_jumpback's FORGLOOP-shape rejection).
+// Intentionally retained but currently unwired (see the Phase B0.33 note at the
+// cache-first merge call site): kept as a documented alternative merge strategy
+// for possible future per-shuffle fingerprinting.
+#[allow(dead_code)]
+fn merge_fresh_first(fresh: &[u8; 256], cached: &[u8; 256]) -> [u8; 256] {
+    // Step 1: Seed from fresh (per-script authoritative evidence).
+    let mut merged = *fresh;
+    let mut assigned_std = [false; 256];
+    for &v in merged.iter() {
+        if v != 255 { assigned_std[v as usize] = true; }
+    }
+    // Step 2: Cache fills only the gaps.
+    for (idx, &v) in cached.iter().enumerate() {
+        if v == 255 { continue; }
+        if merged[idx] == 255 && !assigned_std[v as usize] {
+            merged[idx] = v;
+            assigned_std[v as usize] = true;
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{build_consensus_map, merge_cache_first, select_best_variant};
+
+    /// The core bug: fresh says byte 0x0E is MINUS, cache says 0x2B is MINUS.
+    /// Cache must win — fresh's wrong assignment must be dropped entirely.
+    #[test]
+    fn cache_wins_on_conflict_same_std_opcode() {
+        let mut fresh = [255u8; 256];
+        fresh[0x0E] = 51; // MINUS at wrong byte
+        let mut cached = [255u8; 256];
+        cached[0x2B] = 51; // MINUS at correct byte
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x2B], 51, "cache's MINUS byte must be preserved");
+        assert_eq!(merged[0x0E], 255, "fresh's wrong MINUS byte must be dropped");
+    }
+
+    #[test]
+    fn fresh_fills_gaps_not_covered_by_cache() {
+        let mut fresh = [255u8; 256];
+        fresh[0x10] = 7; // GETGLOBAL
+        let mut cached = [255u8; 256];
+        cached[0x20] = 6; // MOVE
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x20], 6, "cache MOVE preserved");
+        assert_eq!(merged[0x10], 7, "fresh fills gap for GETGLOBAL");
+    }
+
+    #[test]
+    fn empty_cache_falls_through_to_fresh() {
+        let mut fresh = [255u8; 256];
+        fresh[0x10] = 7;
+        fresh[0x20] = 6;
+        let cached = [255u8; 256];
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x10], 7);
+        assert_eq!(merged[0x20], 6);
+    }
+
+    #[test]
+    fn fresh_and_cache_agree() {
+        let mut fresh = [255u8; 256];
+        fresh[0x2B] = 51;
+        let mut cached = [255u8; 256];
+        cached[0x2B] = 51;
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x2B], 51);
+        // No other slots should have been filled
+        assert_eq!(merged.iter().filter(|&&v| v != 255).count(), 1);
+    }
+
+    /// Cache seeded with JumpXEqKB (canonical 79) at 0x35 by early small scripts,
+    /// but fresh detection on Animate.lua finds the structural ForGPrepINext →
+    /// ForGLoopINext pair that lands on 0x35 with canonical 61 (Deprecated61).
+    /// Fresh must win because pair detection is structurally stronger than
+    /// JumpXEq's permissive AUX heuristic.
+    #[test]
+    fn fresh_overrides_cache_jumpxeq_to_deprecated61() {
+        let mut fresh = [255u8; 256];
+        fresh[0x35] = 61; // Deprecated61 (ForGLoopINext) — from pair detector
+        fresh[0x65] = 60; // ForGPrepINext — pair detected both
+
+        let mut cached = [255u8; 256];
+        cached[0x35] = 79; // JumpXEqKB — wrong, from earlier small script
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x35], 61, "fresh's Deprecated61 must override cache's JumpXEqKB");
+        assert_eq!(merged[0x65], 60, "fresh's ForGPrepINext must fill gap");
+    }
+
+    /// Symmetric override: ForGPrepINext (canonical 60) vs JumpXEqKNil (78) at same byte.
+    #[test]
+    fn fresh_overrides_cache_jumpxeq_to_forgprep_inext() {
+        let mut fresh = [255u8; 256];
+        fresh[0x40] = 60; // ForGPrepINext — from pair detector
+
+        let mut cached = [255u8; 256];
+        cached[0x40] = 78; // JumpXEqKNil — false positive
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x40], 60, "fresh's ForGPrepINext must override cache's JumpXEqKNil");
+    }
+
+    /// Non-overridable conflict: cache MINUS at 0x2B vs fresh MINUS at 0x0E.
+    /// The original cache-wins behavior must be preserved (fresh_overrides_cache
+    /// returns false for this combo).
+    #[test]
+    fn non_overridable_conflict_cache_wins() {
+        let mut fresh = [255u8; 256];
+        fresh[0x0E] = 51; // MINUS at wrong byte
+        let mut cached = [255u8; 256];
+        cached[0x2B] = 51; // MINUS at correct byte
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x2B], 51, "cache's MINUS byte must be preserved");
+        assert_eq!(merged[0x0E], 255, "fresh's wrong MINUS byte must be dropped");
+    }
+
+    /// B0.74: select_best_variant picks the variant with highest solo-detection
+    /// agreement, not just the biggest.
+    #[test]
+    fn select_best_variant_picks_matching_shuffle() {
+        // Variant A: maps 0x07 → LOADN (4), 0x9F → CALL (21)
+        let mut va = [255u8; 256];
+        va[0x07] = 4; // LOADN
+        va[0x9F] = 21; // CALL
+        va[0x82] = 22; // RETURN
+        // Variant B: maps 0x03 → LOADN (4), 0xA9 → CALL (21) — different shuffle
+        let mut vb = [255u8; 256];
+        vb[0x03] = 4; // LOADN
+        vb[0xA9] = 21; // CALL
+        vb[0x82] = 22; // RETURN
+        vb[0x30] = 16; // extra mapping — bigger variant
+
+        let variants = vec![va, vb];
+
+        // select_best_variant with empty/invalid bytecode should return Some
+        // (falls back to biggest = variant B at index 1)
+        let result = select_best_variant(&[], &variants);
+        assert!(result.is_some());
+
+        // With no variants, returns None
+        assert_eq!(select_best_variant(&[], &[]), None);
+
+        // Single variant always returns 0
+        assert_eq!(select_best_variant(&[], &[va]), Some(0));
+    }
+
+    /// B0.75: consensus map picks highest-voted mapping per byte/opcode pair.
+    #[test]
+    fn consensus_map_picks_majority_voted_mappings() {
+        // 3 variants: all agree RETURN→0x82, but disagree on ADD
+        let mut v1 = [255u8; 256];
+        v1[0x82] = 22; // RETURN
+        v1[0x87] = 33; // ADD
+        v1[0x43] = 34; // SUB
+
+        let mut v2 = [255u8; 256];
+        v2[0x82] = 22; // RETURN
+        v2[0x87] = 33; // ADD — agrees with v1
+        v2[0x43] = 35; // MUL — disagrees with v1 on 0x43
+
+        let mut v3 = [255u8; 256];
+        v3[0x82] = 22; // RETURN
+        v3[0x26] = 33; // ADD — disagrees on which byte is ADD
+        v3[0x43] = 34; // SUB — agrees with v1
+
+        let consensus = build_consensus_map(&[v1, v2, v3]);
+        // RETURN at 0x82: 3/3 votes — assigned
+        assert_eq!(consensus[0x82], 22);
+        // ADD at 0x87: 2/3 votes vs ADD at 0x26: 1/3 — 0x87 wins
+        assert_eq!(consensus[0x87], 33);
+        // SUB at 0x43: 2/3 votes — assigned (MUL at 0x43 only 1/3)
+        assert_eq!(consensus[0x43], 34);
+
+        // Gap filling: v3 has 0x26→ADD (1 vote, below threshold). But v3 is
+        // the biggest variant if we add an extra mapping. Let's test with v1
+        // being biggest: MUL (35) only in v2 at 0x43 (1 vote, below threshold
+        // as SUB got 0x43). But v1 has no MUL. Add it to v1 to test gap fill.
+        let mut v1b = v1;
+        v1b[0xAA] = 35; // MUL — unique to biggest variant, should be gap-filled
+        let consensus2 = build_consensus_map(&[v1b, v2, v3]);
+        assert_eq!(consensus2[0x82], 22); // consensus
+        assert_eq!(consensus2[0x87], 33); // consensus
+        assert_eq!(consensus2[0x43], 34); // consensus
+        assert_eq!(consensus2[0xAA], 35); // gap-filled from biggest (v1b)
+
+        // Empty variants → all 255
+        let empty = build_consensus_map(&[]);
+        assert!(empty.iter().all(|&b| b == 255));
+
+        // Single variant → exact copy
+        let single = build_consensus_map(&[v1]);
+        assert_eq!(single, v1);
+    }
+
+    /// Override only fires on the specific JumpXEq↔ForGLoop pattern. Other
+    /// mis-detections must not trigger overrides (preserves cache authority).
+    #[test]
+    fn override_is_narrow_to_jumpxeq_vs_forgloop_pair() {
+        let mut fresh = [255u8; 256];
+        fresh[0x10] = 7; // GETGLOBAL — fresh wrong
+        let mut cached = [255u8; 256];
+        cached[0x10] = 79; // JumpXEqKB — cached, fresh has GETGLOBAL not Deprecated61
+
+        let merged = merge_cache_first(&fresh, &cached);
+        assert_eq!(merged[0x10], 79, "non-targeted override pattern must not fire");
+    }
+}
+
+/// Select the best matching cached opmap variant for a given bytecode.
+///
+/// When the cache holds multiple variants (from different Roblox client
+/// shuffles accumulated over time), blindly picking the biggest variant
+/// can corrupt output for scripts compiled with a different shuffle.
+///
+/// This function parses the bytecode, runs a quick solo detection, and
+/// picks the cached variant with the highest agreement on co-mapped bytes.
+/// Returns the index of the best variant, or None if variants is empty.
+pub fn select_best_variant(bytecode: &[u8], variants: &[[u8; 256]]) -> Option<usize> {
+    if variants.is_empty() {
+        return None;
+    }
+    // Try to parse and solo-detect. If parsing fails, fall back to biggest.
+    // (If only one variant, we still want to SCORE it so a wrong-shuffle single
+    // variant doesn't poison solo — see Phase B0.136 rationale below.)
+    let chunk = match parser::parse(bytecode) {
+        Ok(c) => c,
+        Err(_) => {
+            return Some(variants.iter().enumerate()
+                .max_by_key(|(_, v)| v.iter().filter(|&&b| b != 255).count())
+                .map(|(i, _)| i)
+                .unwrap_or(0));
+        }
+    };
+    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        return Some(0); // No remapping needed, variant choice irrelevant
+    }
+    let solo = parser::opmap::OpcodeMap::detect(&chunk);
+    let solo_map = &solo.heuristic_map;
+
+    // Score each variant by agreement with solo detection.
+    // Agreement = number of bytes where both solo and variant map to the same
+    // standard opcode (both non-255 and equal). Penalize conflicts.
+    let mut best_idx = 0;
+    let mut best_score: i32 = i32::MIN;
+    for (idx, variant) in variants.iter().enumerate() {
+        let mut agreements: i32 = 0;
+        let mut conflicts: i32 = 0;
+        for i in 0..256 {
+            if solo_map[i] != 255 && variant[i] != 255 {
+                if solo_map[i] == variant[i] {
+                    agreements += 1;
+                } else {
+                    conflicts += 1;
+                }
+            }
+        }
+        // Score: agreements minus weighted conflicts. A conflict means
+        // the variant definitely disagrees with this script's detection.
+        let score = agreements - conflicts * 3;
+        if score > best_score || (score == best_score
+            && variant.iter().filter(|&&b| b != 255).count()
+                > variants[best_idx].iter().filter(|&&b| b != 255).count())
+        {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+    // Phase B0.136: reject all variants when even the best has more weighted
+    // conflicts than agreements with this script's solo detection. This happens
+    // when the cache was seeded by scripts from a *different* Roblox shuffle
+    // (different client version) and the current script's shuffle is not
+    // represented in the cache. Returning None makes decompile_with_opmap fall
+    // back to solo-only detection, which is strictly better than merging a
+    // wrong-shuffle variant via merge_cache_first.
+    //
+    // Repro: VRVehicleCamera (solo=77 < SOLO_CONFIDENCE_THRESHOLD=83) against
+    // the reference's 8-variant cache selected a variant that mapped 0x52→GETUPVAL
+    // while solo correctly mapped 0x52→LOADK. Every LOADK then lifted as
+    // GETUPVAL, producing 72 out-of-range `upval_N` emissions.
+    if best_score <= 0 {
+        return None;
+    }
+    Some(best_idx)
+}
+
+/// B0.75: Build a consensus opmap from multiple cached variants by majority voting.
+///
+/// Instead of picking ONE variant (which has random arithmetic assignments),
+/// this builds a single map where each (shuffled_byte → standard_opcode) pair
+/// is assigned based on how many variants agree on that mapping.
+///
+/// Uses greedy bipartite matching: sort all (vote_count, byte, opcode) triples
+/// by vote count descending, then assign pairs that don't conflict with already-
+/// assigned bytes or opcodes. This naturally resolves competition: structural
+/// opcodes (RETURN, CALL) with 15/15 votes get assigned first, then arithmetic
+/// opcodes fill in with whatever agreement exists (5/15, 3/15, etc.).
+///
+/// Uses a two-phase approach:
+/// 1. Majority voting: assign high-confidence mappings (≥2 votes when 3+ variants)
+/// 2. Gap filling: for opcodes left unmapped, inherit from the most complete variant
+///    (the one with the most mapped opcodes that doesn't conflict with phase 1).
+/// This gives structural stability from consensus while preserving coverage from
+/// individual variant detections for rare/noisy opcodes like arithmetic.
+pub fn build_consensus_map(variants: &[[u8; 256]]) -> [u8; 256] {
+    let mut result = [255u8; 256];
+    if variants.is_empty() {
+        return result;
+    }
+    if variants.len() == 1 {
+        return variants[0];
+    }
+
+    // Step 1: Count votes for each (shuffled_byte → standard_opcode) pair
+    let mut votes = vec![[0u32; 256]; 256];
+    for variant in variants {
+        for (byte, &opcode) in variant.iter().enumerate() {
+            if opcode != 255 {
+                votes[byte][opcode as usize] += 1;
+            }
+        }
+    }
+
+    // Step 2: Build priority list sorted by vote count descending
+    let mut triples: Vec<(u32, u8, u8)> = Vec::new();
+    for byte in 0..256u16 {
+        for opcode in 0..256u16 {
+            let count = votes[byte as usize][opcode as usize];
+            if count > 0 {
+                triples.push((count, byte as u8, opcode as u8));
+            }
+        }
+    }
+    triples.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+    // Step 3: Greedy assignment — pick highest-voted pairs that don't conflict
+    let mut byte_assigned = [false; 256];
+    let mut opcode_assigned = [false; 256];
+    let min_votes: u32 = if variants.len() >= 3 { 2 } else { 1 };
+    for &(count, byte, opcode) in &triples {
+        if count < min_votes {
+            break;
+        }
+        if byte_assigned[byte as usize] || opcode_assigned[opcode as usize] {
+            continue;
+        }
+        result[byte as usize] = opcode;
+        byte_assigned[byte as usize] = true;
+        opcode_assigned[opcode as usize] = true;
+    }
+
+    // Step 4: Gap filling — for opcodes still unmapped, use the remaining
+    // single-vote triples (which were skipped by the min_votes threshold).
+    // This ensures rare opcodes (DIV, DIVK, AND) that only one variant
+    // detected still get mapped, as long as their byte isn't already claimed.
+    // Process in vote-count order (all 1-vote triples) for determinism.
+    for &(count, byte, opcode) in &triples {
+        if count >= min_votes {
+            continue; // already processed in Step 3
+        }
+        if byte_assigned[byte as usize] || opcode_assigned[opcode as usize] {
+            continue;
+        }
+        result[byte as usize] = opcode;
+        byte_assigned[byte as usize] = true;
+        opcode_assigned[opcode as usize] = true;
+    }
+
+    result
+}
+
+/// Phase C1 stability guard: hard ceiling on emitted decompiled source
+/// (in bytes). 20 MB is far above any legitimate hand-written or compiled
+/// Roblox script; hitting this signals a lifter regression and we prefer a
+/// clean structured error over streaming a multi-megabyte blob to the caller.
+pub const PROTO_SOURCE_BAIL_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+
+/// Phase C1: returns `Err(...)` when `source_len` exceeds
+/// [`PROTO_SOURCE_BAIL_BYTES`]. Pulled out of `decompile_with_opmap` so it
+/// can be unit-tested without building a 20 MB bytecode fixture.
+pub fn check_source_size_bail(source_len: usize) -> Result<()> {
+    if source_len > PROTO_SOURCE_BAIL_BYTES {
+        anyhow::bail!(
+            "decompiled source exceeds {}-byte stability ceiling ({} bytes emitted)",
+            PROTO_SOURCE_BAIL_BYTES,
+            source_len
+        );
+    }
+    Ok(())
+}
+
+/// The measured permutation bundled with this crate, parsed once.
+///
+/// WHY THIS IS IN THE LIBRARY. The bundled-database default used to live only
+/// in the CLI (`bundled_db_path()`), which finds the JSON relative to the
+/// working directory or the executable. A library cannot rely on either, so
+/// `luau-wasm` and `luau-server` - which call [`decompile`] - silently took the
+/// detector-only path and produced DIFFERENT, worse output than the binary for
+/// the same bytes. Measured on the 1,324-file union corpus:
+///
+/// ```text
+/// detector-only          891 / 1,323 clean (67.3%), 1,112 defects
+/// measured entry       1,297 / 1,323 clean (98.0%),    33 defects
+/// ```
+///
+/// A 31-point gap that every library consumer paid and nothing recorded. The
+/// file is ~3 KB, so compiling it in costs nothing and removes the filesystem
+/// dependency entirely - which is what makes it usable from WASM at all.
+fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
+    static DB: std::sync::OnceLock<Option<parser::opmap_db::OpmapDb>> =
+        std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        const JSON: &str = include_str!("../../../opmap_db/roblox_v9_live.json");
+        parser::opmap_db::OpmapDb::parse(JSON).ok().map(|(db, _warnings)| db)
+    })
+    .as_ref()
+}
+
+/// High-level API: decompile raw bytecode into Luau source
+///
+/// Consults the bundled measured permutation first. `lookup` returns `Hit`
+/// only after checking the chunk against the entry's fingerprint, so bytecode
+/// from any other build falls through to detection byte-for-byte as before -
+/// this can only replace INFERENCE with MEASUREMENT, never override a chunk
+/// the entry does not fit.
+pub fn decompile(bytecode: &[u8]) -> Result<String> {
+    if let Some(db) = bundled_db() {
+        if let Ok(chunk) = parser::parse(bytecode) {
+            if let parser::opmap_db::DbLookup::Hit { ref entry_id, .. } = db.lookup(&chunk) {
+                if let Some(entry) = db.get(entry_id) {
+                    // A plan failure is not fatal: fall through to detection
+                    // rather than turn a decodable chunk into an error.
+                    if let Ok((source, _)) = decompile_with_plan(
+                        bytecode,
+                        &DecodePlan { prior: None, exact: Some(entry) },
+                    ) {
+                        return Ok(source);
+                    }
+                }
+            }
+        }
+    }
+    decompile_with_opmap(bytecode, None).map(|(source, _)| source)
+}
+
+/// Decompile with optional cached opcode map. Returns (source, detected_opmap).
+/// If `cached_opmap` is provided and the bytecode uses shuffled opcodes, the cached
+/// map is tried first. If it produces fewer unknowns than fresh detection, it's used.
+/// The returned opmap is the HEURISTIC-only map (safe to cache, no speculative
+/// completion). The decompilation itself uses the full merged+completed map.
+pub fn decompile_with_opmap(
+    bytecode: &[u8],
+    cached_opmap: Option<&[u8; 256]>,
+) -> Result<(String, Option<[u8; 256]>)> {
+    decompile_with_plan(
+        bytecode,
+        &DecodePlan {
+            prior: cached_opmap,
+            exact: None,
+        },
+    )
+}
+
+/// Decompile under an explicit [`DecodePlan`].
+///
+/// With `plan.exact == None` this is byte-for-byte the behaviour
+/// [`decompile_with_opmap`] has always had. With an exact entry it takes a
+/// different path entirely: the entry's map is used verbatim, with no detection
+/// and no bijection completion, because completing a measured map would be
+/// filling in facts with guesses.
+pub fn decompile_with_plan(
+    bytecode: &[u8],
+    plan: &DecodePlan<'_>,
+) -> Result<(String, Option<[u8; 256]>)> {
+    // Per-chunk counters. Without this the call-recovery totals accumulate
+    // across a batch run and every file after the first reports the corpus.
+    crate::decompiler::call_recovery::reset();
+    let cached_opmap = if plan.exact.is_some() { None } else { plan.prior };
+    let mut chunk = parser::parse(bytecode)?;
+
+    // A database-backed decode installs its map as ground truth for the
+    // duration, so anything else in this process that consults the global sees
+    // the same answer, and restores the previous value on the way out.
+    let _gt_guard = plan.exact.map(|e| GroundTruthGuard::install(e.map));
+
+    // Canonical (non-Roblox) Luau bytecode needs a handful of opcodes lifted
+    // with their real semantics rather than Roblox's passthrough behaviour.
+    // Captured here because `is_canonical_luau` inspects the chunk before it
+    // is remapped.
+    let is_canonical_luau = !parser::opmap::OpcodeMap::needs_remapping(&chunk)
+        && parser::opmap::OpcodeMap::is_canonical_luau(&chunk);
+
+    // Auto-detect and apply opcode remapping for Roblox-shuffled bytecode
+    // No `needs_remapping` filter here. `OpcodeDb::lookup` has already
+    // walk-verified this entry against this chunk, and a frequency heuristic
+    // must not overrule a verified measured map -- the previous filter discarded
+    // one even when `--opmap-db-entry` named it explicitly. Genuine upstream
+    // Luau is excluded by `is_canonical_luau` above, which is the real question.
+    let opmap_info = if let Some(entry) = plan.exact {
+        // Measured permutation. No detectors run, and nothing is completed:
+        // every byte here was read off the client's own compiler, and the
+        // lookup already verified that this chunk walks cleanly under it, so
+        // there is no gap left for completion to fill.
+        let exact = parser::opmap::OpcodeMap::from_exact_map(entry.map);
+        let coverage = exact.coverage(&chunk);
+        let (remap_unknowns, unknown_byte_freq, unknown_byte_sample) = exact.remap_chunk(&mut chunk);
+        // Returns `None` as the cacheable map on purpose: a chunk decoded from
+        // a measurement has no honest contribution to make to a tally of
+        // guesses, and feeding it in would let one entry outvote real readings.
+        Some((
+            entry.pinned(),
+            entry.map,
+            remap_unknowns,
+            unknown_byte_freq,
+            unknown_byte_sample,
+            coverage,
+        ))
+    } else if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        // Phase B0.31: Self-detect-first. Always try solo detection before applying
+        // any prior. If solo detection produces >= SOLO_CONFIDENCE_THRESHOLD opcodes,
+        // the script has enough structural evidence to detect its own shuffle
+        // reliably — skip the prior entirely to avoid cross-shuffle pollution.
+        //
+        // Background: prior observational data showed Animate.lua (96KB) solo-detects
+        // 87 opcodes with 17 unresolved and emits 104KB of readable decompile, but
+        // when seeded with a 47-small-script cache that detected a *different*
+        // shuffle, its output collapsed to 8KB with 32 unresolved. Small scripts
+        // lack evidence to uniquely pin their shuffle, so their solo detections can
+        // disagree with large-script detections. Cross-seeding corrupts the
+        // large-script pipeline.
+        // Threshold tuning history:
+        //   80: too permissive — idx 35 (10830b) solo=80 had 18 unresolved vs 2 with prior
+        //   85: covered idx 45/46/47 at 86-87 solo, Phase B0.31 baseline (113 unresolved)
+        //   83: Phase B0.33 — after detect_jumpback FORGLOOP-aware fix, idx 33 solo=83
+        //       dropped to 1 unresolved (vs 5 with polluted prior). Lowering to 83 lets
+        //       idx 33 use its own authoritative detection, reaching 75 corpus unresolved.
+        //       idx 35 still at solo=80 → remains below threshold → uses prior (no regression).
+        const SOLO_CONFIDENCE_THRESHOLD: usize = 83;
+        let solo_detected = parser::opmap::OpcodeMap::detect(&chunk);
+
+        // A large script self-detects enough of the shuffle to stand on its own,
+        // and the original rule then IGNORED the prior entirely for such files.
+        // But "self-detects a lot" is not "self-detects correctly": a script can
+        // map 83 bytes and still have its own detectors mis-assign a confusable
+        // one — e.g. detect_arithmetic greedily claiming the true GETGLOBAL byte
+        // for MUL, which is exactly what left 282_Animate emitting `(v0*v172)()`
+        // and failing to compile. Discarding the prior threw away the one piece
+        // of evidence that had that byte right.
+        //
+        // The rule the gate was really reaching for is CROSS-SHUFFLE protection:
+        // the measured Animate collapse came from seeding a large script with a
+        // cache read off a DIFFERENT client permutation. So gate on that directly
+        // — keep solo authoritative only when the prior looks like a different
+        // shuffle (fewer than MIN_ANCHOR_AGREE anchors land on the same byte). A
+        // prior that IS this shuffle is strictly better evidence than one file's
+        // solo guess and must be folded in; `detect_with_prior` locks its entries
+        // and still runs every solo detector on top, so nothing self-detected is
+        // lost. `same_shuffle` is the same anchor predicate `resolve_for` already
+        // uses to admit ballots, so this trusts exactly the priors the consensus
+        // layer trusts.
+        let prior_is_same_shuffle = cached_opmap.is_some_and(|c| {
+            parser::consensus::same_shuffle(&solo_detected.heuristic_map, c)
+        });
+        let solo_is_authoritative = solo_detected.mapped_count >= SOLO_CONFIDENCE_THRESHOLD
+            && !prior_is_same_shuffle;
+
+        let detected_opmap = if solo_is_authoritative {
+            // Large script, and the prior is a different (or unrecognisable)
+            // shuffle — self-detect and ignore the prior, as before.
+            solo_detected
+        } else if let Some(cached) = cached_opmap {
+            // Either a small script, or a large one whose prior is the SAME
+            // shuffle: fold the prior in so its high-confidence entries correct
+            // the confusable bytes the solo detectors got wrong.
+            parser::opmap::OpcodeMap::detect_with_prior(&chunk, cached)
+        } else {
+            solo_detected
+        };
+
+        let fresh_heuristic = detected_opmap.heuristic_map;
+
+        let (decompile_map, mapped, cache_return_map) = if let Some(cached) = cached_opmap {
+            if solo_is_authoritative {
+                // Authoritative solo detection. Use it directly (no cache-first merge),
+                // but return it as cache_return so the server can REPLACE the cached
+                // variant if this script has more/better coverage.
+                let mut map_for_decompile = fresh_heuristic;
+                parser::opmap::OpcodeMap::permutation_complete_map(&mut map_for_decompile, &chunk);
+                let mapped_count = map_for_decompile.iter().filter(|&&v| v != 255).count();
+
+                let decompile_opmap = parser::opmap::OpcodeMap {
+                    shuffled_to_standard: map_for_decompile,
+                    mapped_count,
+                    heuristic_map: fresh_heuristic,
+                    heuristic_count: detected_opmap.heuristic_count,
+                    heuristic_evidence: detected_opmap.heuristic_evidence,
+                    pre_completion_map: fresh_heuristic,
+                };
+                (decompile_opmap, mapped_count, fresh_heuristic)
+            } else {
+                // Non-authoritative: fall back to original cache-first merge path.
+                //
+                // Phase B0.33: experimentally swapped to merge_fresh_first (letting
+                // the script's own detection win on every byte) to test cross-shuffle
+                // pollution hypothesis. Result: corpus unresolved 72 → 359. Small
+                // scripts lack evidence to reliably pin their shuffle, their noisy
+                // fresh detection picks wrong bytes, and without cache to correct
+                // them, individual scripts regressed from 0-5 to 20-50 unresolved.
+                // The cache-first merge is strictly better; fresh-only is the wrong
+                // answer. Kept merge_fresh_first defined (unused) in case future
+                // per-shuffle fingerprinting makes it useful.
+                let mut merged = merge_cache_first(&fresh_heuristic, cached);
+                let cache_map = merged;
+
+                parser::opmap::OpcodeMap::permutation_complete_map(&mut merged, &chunk);
+                let merged_count = merged.iter().filter(|&&v| v != 255).count();
+
+                let decompile_opmap = parser::opmap::OpcodeMap {
+                    shuffled_to_standard: merged,
+                    mapped_count: merged_count,
+                    heuristic_map: fresh_heuristic,
+                    heuristic_count: detected_opmap.heuristic_count,
+                    heuristic_evidence: detected_opmap.heuristic_evidence,
+                    // Cache entries carry cross-script consensus, so the merged
+                    // map — not this file's detections alone — is the evidence
+                    // that existed before completion filled the rest.
+                    pre_completion_map: cache_map,
+                };
+                (decompile_opmap, merged_count, cache_map)
+            }
+        } else {
+            // No cache — use the full detection for decompilation, return heuristic for caching.
+            let mapped = detected_opmap.mapped_count;
+            let cache_map = fresh_heuristic;
+            (detected_opmap, mapped, cache_map)
+        };
+
+        // Measure how much of this decode rests on evidence BEFORE remap_chunk
+        // rewrites the opcode bytes out from under the walk.
+        let coverage = decompile_map.coverage(&chunk);
+        // Return the heuristic-only map for safe caching (no speculative guesses).
+        let (remap_unknowns, unknown_byte_freq, unknown_byte_sample) = decompile_map.remap_chunk(&mut chunk);
+        Some((mapped, cache_return_map, remap_unknowns, unknown_byte_freq, unknown_byte_sample, coverage))
+    } else if parser::opmap::OpcodeMap::is_canonical_luau(&chunk) {
+        // Standard/canonical open-source Luau bytecode (e.g. from `luau-compile`).
+        // It carries no Roblox opcode shuffle, but its canonical opcode numbering
+        // differs from the Roblox layout this decompiler targets, so a plain
+        // identity decode would misread opcodes such as DUPCLOSURE. Translate the
+        // canonical numbering into the internal one and skip shuffle detection.
+        // Not cached: a canonical map must never pollute the Roblox per-shuffle cache.
+        let _ = parser::opmap::OpcodeMap::canonical_luau().remap_chunk(&mut chunk);
+        None
+    } else {
+        None
+    };
+
+    let main_idx = chunk.main_proto as usize;
+    if main_idx >= chunk.protos.len() {
+        anyhow::bail!("invalid main_proto index {} (only {} protos)", main_idx, chunk.protos.len());
+    }
+    let main = &chunk.protos[main_idx];
+    let mut ctx = decompiler::DecompileContext::new(&chunk);
+    ctx.set_canonical_luau(is_canonical_luau);
+    // A database entry may have OBSERVED that this client's compiler really
+    // emits NOT / MINUS / LENGTH for `not x`, `-x` and `#x`. Only then does the
+    // lifter stop passing them through. Inferred decodes never reach this line,
+    // so their behaviour is unchanged.
+    if let Some(entry) = plan.exact {
+        if !is_canonical_luau {
+            ctx.set_unary_semantics(entry.semantics);
+        }
+    }
+    let source = decompiler::decompile_proto(&mut ctx, main, main_idx, 0);
+
+    // Safety: if the decompiled source is absurdly large, truncate it
+    // to prevent memory issues. This typically means expression duplication.
+    const MAX_OUTPUT_CHARS: usize = 50_000_000; // 50MB — effectively unlimited
+    let source = if source.len() > MAX_OUTPUT_CHARS {
+        let mut truncated = source[..MAX_OUTPUT_CHARS].to_string();
+        truncated.push_str(&format!(
+            "\n-- TRUNCATED: output exceeded {} chars ({} total). Possible expression duplication.\n",
+            MAX_OUTPUT_CHARS, source.len()
+        ));
+        truncated
+    } else {
+        source
+    };
+
+    // Phase C1 stability guard: hard 20 MB ceiling on emitted source. Unlike
+    // the larger truncation above (which is effectively a diagnostic), this
+    // surfaces as a structured `Err(...)` so the caller (HTTP handler, CLI)
+    // can reject clearly instead of streaming a multi-megabyte blob back.
+    // Runaway output past this point signals either a lifter regression or
+    // a bytecode file we cannot reasonably process on the current build.
+    check_source_size_bail(source.len())?;
+
+    // Build the opcode map dump for diagnostics (shows shuffled→standard mapping)
+    // Use the accurate unknown count from remap_chunk (which walks bytecode correctly,
+    // properly skipping AUX words) instead of post-remap counting which misattributes
+    // AUX words as unknown instructions.
+    let opmap_dump = if let Some((_, ref detected, _, _, _, _)) = opmap_info {
+        let map = detected;
+        let mut dump = String::from("-- SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
+        let mut mappings: Vec<(u8, u8)> = map.iter().enumerate()
+            .filter(|(_, &v)| v != 255)
+            .map(|(i, &v)| (i as u8, v))
+            .collect();
+        mappings.sort_by_key(|&(_, std)| std);
+        for (shuffled, standard) in &mappings {
+            let name = parser::opcodes::LuauOpcode::from_u8(*standard).name();
+            dump.push_str(&format!("--   0x{:02X} -> {:2} {}\n", shuffled, standard, name));
+        }
+        Some(dump)
+    } else {
+        None
+    };
+
+    let mapped_count = opmap_info.as_ref().map(|(m, _, _, _, _, _)| *m);
+    let unknown_insn_count = opmap_info.as_ref().map(|(_, _, u, _, _, _)| *u).unwrap_or(0);
+    let unknown_byte_freq: Option<[u32; 256]> = opmap_info.as_ref().map(|(_, _, _, f, _, _)| *f);
+    let unknown_byte_sample: Option<[Option<u32>; 256]> = opmap_info.as_ref().map(|(_, _, _, _, s, _)| *s);
+    let opmap_coverage = opmap_info.as_ref().map(|(_, _, _, _, _, c)| *c);
+    let returned_opmap = opmap_info.map(|(_, detected, _, _, _, _)| detected);
+
+    // Add header with remap info
+    if let Some(mapped) = mapped_count {
+        let mut header = format!(
+            "{}-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
+            banner(), mapped, chunk.protos.len(), chunk.main_proto
+        );
+        // CALL RECOVERY. A dropped function body leaves no undefined name and
+        // no bad call, so every other check scores it clean; the bytecode's own
+        // call count is the only thing that contradicts it. Emitted into the
+        // header so `semantic_check` can read it the way it reads the proto
+        // count. Measured: 29 files of 1,143 have at least one short proto.
+        let (short_protos, missing_calls) = crate::decompiler::call_recovery::snapshot();
+        if short_protos > 0 {
+            header.push_str(&format!(
+                "-- call recovery: {} proto(s) emitted {} fewer call(s) than the bytecode contains
+",
+                short_protos, missing_calls
+            ));
+        }
+        // Evidence line. Deliberately unconditional: the failure mode this
+        // guards against is a wholly mis-detected shuffle producing output that
+        // is clean, plausible and wrong with no marker of any kind. The
+        // "opcodes detected" count above cannot serve as that marker — it is
+        // inflated by bijection filling of bytes this chunk never uses, so a
+        // chunk where completion invented 45 mappings scores HIGHER than one
+        // whose detectors covered everything it actually contains.
+        //
+        // This line reports provenance, NOT correctness, and is worded so it
+        // cannot be read as the latter. Measured against ground truth on a
+        // 47-program shuffled corpus, the evidence-backed share correlates with
+        // per-byte accuracy at only r=+0.26: a detector can be confidently,
+        // structurally, repeatably wrong. What the line does tell you is which
+        // part of the map anything downstream may lean on.
+        //
+        // A database-backed decode is the one case where that caveat does not
+        // apply, and it says so instead: the map was measured against the
+        // client's own compiler rather than inferred, so no detector and no
+        // completion guess contributed to it.
+        if let Some(entry) = plan.exact {
+            header.push_str(&format!(
+                "-- opmap source: database entry \"{}\" - {} opcodes measured against the \
+                 client's own compiler ({})\n",
+                entry.id,
+                entry.pinned(),
+                entry.provenance.method,
+            ));
+            header.push_str(
+                "-- opmap evidence: not applicable; no detector or bijection completion \
+                 contributed to this decode\n",
+            );
+            if !entry.semantics.all_passthrough() {
+                header.push_str(&format!(
+                    "-- unary semantics: not={} minus={} length={} (observed, not assumed)\n",
+                    entry.semantics.not.as_str(),
+                    entry.semantics.minus.as_str(),
+                    entry.semantics.length.as_str(),
+                ));
+            }
+        } else if let Some(cov) = opmap_coverage {
+            header.push_str(&format!(
+                "-- opmap evidence: {}/{} opcode bytes used by this chunk were pinned by \
+                 detectors ({}% of instruction words), {} filled by bijection completion, \
+                 {} left unmapped; {} further mappings are for bytes this chunk never uses\n",
+                cov.present_confident,
+                cov.present_bytes,
+                cov.confidence_pct(),
+                cov.present_invented,
+                cov.present_unmapped,
+                cov.ghost_mappings,
+            ));
+            // Observability bound. This is a fact about the input, not a guess
+            // about the output: a chunk that only ever executes N distinct
+            // opcodes constrains at most N of the ~84 entries in the shuffle,
+            // whatever the detectors report. Every other entry is unfalsifiable
+            // from this chunk alone. Worth saying out loud before anyone feeds
+            // such a map into a cross-script consensus cache.
+            const OBSERVABILITY_FLOOR: usize = 60;
+            if cov.present_bytes < OBSERVABILITY_FLOOR {
+                header.push_str(&format!(
+                    "-- NOTE: this chunk exercises only {} of ~84 opcodes, so most of the \
+                     shuffle is unconstrained by it; treat the mapping as provisional\n",
+                    cov.present_bytes,
+                ));
+            }
+        }
+        if unknown_insn_count > 0 {
+            header.push_str(&format!("-- {} unresolved instructions (unmapped opcodes)\n", unknown_insn_count));
+            // Emit per-byte breakdown of unresolved bytes with instruction pattern samples
+            if let Some(ref freq) = unknown_byte_freq {
+                let mut unresolved: Vec<(u8, u32)> = freq.iter().enumerate()
+                    .filter(|(_, &c)| c > 0)
+                    .map(|(b, &c)| (b as u8, c))
+                    .collect();
+                unresolved.sort_by(|a, b| b.1.cmp(&a.1)); // descending by count
+                let parts: Vec<String> = unresolved.iter()
+                    .map(|(b, c)| format!("0x{:02X}({})", b, c))
+                    .collect();
+                header.push_str(&format!("-- Unresolved bytes: {}\n", parts.join(", ")));
+
+                // Diagnostic: for each unresolved byte, show sample A/B/C fields and
+                // next-word value so we can identify what kind of opcode it is.
+                if let Some(ref samples) = unknown_byte_sample {
+                    header.push_str("-- Unresolved patterns (sample A,B,C,next_word):\n");
+                    for (b, _c) in &unresolved {
+                        if let Some(insn) = samples[*b as usize] {
+                            let a = (insn >> 8) & 0xFF;
+                            let rb = (insn >> 16) & 0xFF;
+                            let c = (insn >> 24) & 0xFF;
+                            let d = ((insn >> 16) as i16) as i32; // signed D field
+                            header.push_str(&format!("--   0x{:02X}: A={} B={} C={} D={} raw=0x{:08X}\n", b, a, rb, c, d, insn));
+                        }
+                    }
+                }
+            }
+        }
+        // Phase C10U: SHUFFLE MAP is a ~30-50 line diagnostic dump useful only
+        // when there are unresolved instructions to investigate. Emitting it
+        // on every file adds ~10% pure-noise bytes to a clean corpus. Gate on
+        // unknown_insn_count>0 so the diagnostic only appears when needed.
+        if unknown_insn_count > 0 {
+            if let Some(ref dump) = opmap_dump {
+                header.push_str(dump);
+            }
+        }
+        header.push_str(&source);
+        Ok((header, returned_opmap))
+    } else {
+        let versioned = format!("{}{}", banner(), source);
+        Ok((versioned, None))
+    }
+}
+
+/// Observe this chunk's INDEPENDENT opinion about the opcode shuffle, for
+/// pooling into a cross-script consensus (see [`parser::consensus`]).
+///
+/// Returns `None` for bytecode that carries no Roblox shuffle — canonical Luau
+/// must never vote in a Roblox tally.
+///
+/// Two properties make the returned ballot admissible as evidence, and both are
+/// load-bearing:
+///
+/// * It comes from **prior-free** solo detection. A map produced under a prior
+///   is a copy of that prior, not an independent observation; pooling such maps
+///   lets the first file processed vote once per subsequent file. That
+///   auto-correlation is why a naively shared cache measures *worse* than no
+///   cache at all, and why the damage is worst under the smallest-file-first
+///   ordering production actually uses.
+/// * It carries the **heuristic** map, taken before `permutation_complete`.
+///   Completion invents mappings by bijection from what this one chunk happens
+///   to contain; it is per-chunk guesswork with no evidence behind it. Letting
+///   it into a shared tally would propagate one file's inventions to every
+///   later script — a strictly worse version of the bug being fixed.
+pub fn observe_ballot(bytecode: &[u8]) -> Option<parser::consensus::Ballot> {
+    let chunk = parser::parse(bytecode).ok()?;
+    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        return None;
+    }
+    let solo = parser::opmap::OpcodeMap::detect(&chunk);
+    Some(parser::consensus::Ballot::new(
+        parser::consensus::content_key(bytecode),
+        solo.heuristic_map,
+        solo.present_byte_mask(&chunk),
+    ))
+}
+
+/// Lightweight opcode detection only (no decompilation).
+/// Parses bytecode, runs opcode detection, merges with cached map, returns the
+/// HEURISTIC-only detected opmap (safe to cache, no speculative completion).
+/// Used for pre-scanning all scripts to build a complete cache before decompiling.
+pub fn scan_opmap(
+    bytecode: &[u8],
+    cached_opmap: Option<&[u8; 256]>,
+) -> Result<Option<[u8; 256]>> {
+    let chunk = parser::parse(bytecode)?;
+
+    if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        // Seed per-script detection with the cache (same architecture as decompile_with_opmap).
+        let fresh_opmap = if let Some(cached) = cached_opmap {
+            parser::opmap::OpcodeMap::detect_with_prior(&chunk, cached)
+        } else {
+            parser::opmap::OpcodeMap::detect(&chunk)
+        };
+
+        // Use heuristic map (pre-completion) — only high-confidence detections.
+        // Safety-net merge in case validation dropped a cached entry.
+        let result_map = if let Some(cached) = cached_opmap {
+            merge_cache_first(&fresh_opmap.heuristic_map, cached)
+        } else {
+            fresh_opmap.heuristic_map
+        };
+
+        Ok(Some(result_map))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Quick peek at the bytecode version (first byte). Returns None if empty or error bytecode (version 0).
+pub fn bytecode_version(bytecode: &[u8]) -> Option<u8> {
+    bytecode.first().copied().filter(|&v| v >= 3 && v <= 8)
+}
+
+/// High-level API: disassemble raw bytecode into readable text
+pub fn disassemble(bytecode: &[u8], show_debug: bool) -> Result<String> {
+    let chunk = parser::parse(bytecode)?;
+    Ok(disasm::disassemble(&chunk, show_debug))
+}
+
+/// Disassemble with opmap applied — applies the same shuffle detection/remap
+/// as decompile_with_opmap, then disassembles the remapped chunk. This is the
+/// diagnostic view of what the lifter actually processes.
+pub fn disassemble_with_opmap(
+    bytecode: &[u8],
+    cached_opmap: Option<&[u8; 256]>,
+) -> Result<String> {
+    let mut chunk = parser::parse(bytecode)?;
+
+    let mut header = String::new();
+    if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        let fresh_opmap = if let Some(cached) = cached_opmap {
+            parser::opmap::OpcodeMap::detect_with_prior(&chunk, cached)
+        } else {
+            parser::opmap::OpcodeMap::detect(&chunk)
+        };
+        let fresh_heuristic = fresh_opmap.heuristic_map;
+
+        let decompile_map = if let Some(cached) = cached_opmap {
+            let mut merged = merge_cache_first(&fresh_heuristic, cached);
+            let pre_completion_map = merged;
+            parser::opmap::OpcodeMap::permutation_complete_map(&mut merged, &chunk);
+            let merged_count = merged.iter().filter(|&&v| v != 255).count();
+            parser::opmap::OpcodeMap {
+                shuffled_to_standard: merged,
+                mapped_count: merged_count,
+                heuristic_map: fresh_heuristic,
+                heuristic_count: fresh_opmap.heuristic_count,
+                heuristic_evidence: fresh_opmap.heuristic_evidence,
+                pre_completion_map,
+            }
+        } else {
+            fresh_opmap
+        };
+
+        header.push_str(&format!("; Luau bytecode v{} — remapped ({} opcodes)\n",
+            chunk.version, decompile_map.mapped_count));
+        header.push_str("; SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
+        let mut mappings: Vec<(u8, u8)> = decompile_map.shuffled_to_standard.iter().enumerate()
+            .filter(|(_, &v)| v != 255)
+            .map(|(i, &v)| (i as u8, v))
+            .collect();
+        mappings.sort_by_key(|&(_, std)| std);
+        for (shuffled, standard) in &mappings {
+            let name = parser::opcodes::LuauOpcode::from_u8(*standard).name();
+            header.push_str(&format!(";   0x{:02X} -> {:2} {}\n", shuffled, standard, name));
+        }
+        header.push('\n');
+
+        let (_unknowns, _, _) = decompile_map.remap_chunk(&mut chunk);
+    } else if parser::opmap::OpcodeMap::is_canonical_luau(&chunk) {
+        // Canonical open-source Luau bytecode: no shuffle, but its opcode
+        // numbering must be translated into the internal (Roblox) layout.
+        let (_unknowns, _, _) = parser::opmap::OpcodeMap::canonical_luau().remap_chunk(&mut chunk);
+        header.push_str(&format!(
+            "; Luau bytecode v{} — canonical (no shuffle; canonical opcode numbering translated)\n\n",
+            chunk.version
+        ));
+    } else {
+        header.push_str(&format!("; Luau bytecode v{} — no remapping needed\n\n", chunk.version));
+    }
+
+    let body = disasm::disassemble(&chunk, true);
+    Ok(format!("{}{}", header, body))
+}
+
+/// Disassemble under a decode plan, so the diagnostic view matches what the
+/// DECOMPILE would actually use.
+///
+/// `disassemble_with_opmap` takes only a pooled prior, so when a measured
+/// database entry applies the disassembly still ran the detectors and printed a
+/// map the decompile never used. That makes the tool's own diagnostic view
+/// disagree with its output on exactly the chunks where a measured permutation
+/// exists -- the case where the disassembly is most likely to be trusted. It
+/// cost several investigations real time, one of which concluded a chunk was
+/// mis-decoded from a listing produced by a map the decompiler had not used.
+pub fn disassemble_with_plan(bytecode: &[u8], plan: &DecodePlan<'_>) -> Result<String> {
+    let Some(entry) = plan.exact else {
+        return disassemble_with_opmap(bytecode, plan.prior);
+    };
+    let mut chunk = parser::parse(bytecode)?;
+    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+        return disassemble_with_opmap(bytecode, plan.prior);
+    }
+
+    // Same ground-truth installation the decompile path performs, so anything
+    // consulting the global sees the measured answer.
+    let _gt_guard = GroundTruthGuard::install(entry.map);
+    let exact = parser::opmap::OpcodeMap::from_exact_map(entry.map);
+
+    let mut header = format!(
+        "; Luau bytecode v{} — measured map \"{}\" ({} opcodes, no detectors run)\n",
+        chunk.version,
+        entry.id,
+        exact.mapped_count
+    );
+    header.push_str("; SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
+    let mut mappings: Vec<(u8, u8)> = exact
+        .shuffled_to_standard
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v != 255)
+        .map(|(i, &v)| (i as u8, v))
+        .collect();
+    mappings.sort_by_key(|&(_, std)| std);
+    for (shuffled, standard) in &mappings {
+        let name = parser::opcodes::LuauOpcode::from_u8(*standard).name();
+        header.push_str(&format!(";   0x{:02X} -> {:2} {}\n", shuffled, standard, name));
+    }
+    header.push('\n');
+
+    let (_unknowns, _, _) = exact.remap_chunk(&mut chunk);
+    Ok(format!("{}{}", header, disasm::disassemble(&chunk, true)))
+}
+
+/// High-level API: parse and return structured info about the bytecode
+pub fn info(bytecode: &[u8]) -> Result<BytecodeInfo> {
+    let chunk = parser::parse(bytecode)?;
+    Ok(BytecodeInfo {
+        version: chunk.version,
+        types_version: chunk.types_version,
+        num_protos: chunk.protos.len(),
+        num_strings: chunk.strings.len(),
+        main_proto: chunk.main_proto as usize,
+        protos: chunk
+            .protos
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ProtoInfo {
+                index: i,
+                name: p.debug_name.clone(),
+                num_params: p.num_params,
+                num_upvalues: p.num_upvalues,
+                max_stack: p.max_stack_size,
+                is_vararg: p.is_vararg,
+                num_instructions: p.code.len(),
+                num_constants: p.constants.len(),
+                num_children: p.child_protos.len(),
+                line_defined: p.line_defined,
+                has_debug_info: p.debug_info.is_some(),
+                has_line_info: p.line_info.is_some(),
+            })
+            .collect(),
+    })
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BytecodeInfo {
+    pub version: u8,
+    pub types_version: u8,
+    pub num_protos: usize,
+    pub num_strings: usize,
+    pub main_proto: usize,
+    pub protos: Vec<ProtoInfo>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProtoInfo {
+    pub index: usize,
+    pub name: Option<String>,
+    pub num_params: u8,
+    pub num_upvalues: u8,
+    pub max_stack: u8,
+    pub is_vararg: bool,
+    pub num_instructions: usize,
+    pub num_constants: usize,
+    pub num_children: usize,
+    pub line_defined: u32,
+    pub has_debug_info: bool,
+    pub has_line_info: bool,
+}
+
+#[cfg(test)]
+mod phase_c1_stability_tests {
+    //! Phase C1 stability guards: the 20 MB output-source ceiling and the
+    //! proto-wide statement-budget sentinel added to the lifter.
+
+    use super::{check_source_size_bail, PROTO_SOURCE_BAIL_BYTES};
+    use crate::ast::Stat;
+    use crate::decompiler::lifter::{
+        note_stmts_pushed, reset_stmt_budget, stmt_budget_tripped,
+        MAX_STMTS_PER_PROTO,
+    };
+
+    #[test]
+    fn c1_source_size_bail_returns_ok_at_ceiling() {
+        // Exactly at the ceiling is allowed — we only bail strictly above.
+        assert!(check_source_size_bail(0).is_ok());
+        assert!(check_source_size_bail(1).is_ok());
+        assert!(check_source_size_bail(PROTO_SOURCE_BAIL_BYTES).is_ok());
+    }
+
+    #[test]
+    fn c1_source_size_bail_returns_err_above_ceiling() {
+        let err = check_source_size_bail(PROTO_SOURCE_BAIL_BYTES + 1)
+            .expect_err("should bail when source exceeds 20 MB");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("20 MB") || msg.contains("stability ceiling"),
+            "error should mention stability ceiling, got: {msg}",
+        );
+        assert!(check_source_size_bail(50 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn c1_statement_budget_emits_sentinel_comment_on_overrun() {
+        // After `note_stmts_pushed` is called with a count that blows past
+        // the cap, the block should be truncated and the sentinel comment
+        // appended exactly once.
+        reset_stmt_budget();
+        // Build a block overshooting the cap.
+        let mut block: Vec<Stat> = (0..(MAX_STMTS_PER_PROTO + 32))
+            .map(|i| Stat::Comment(format!("stmt {i}")))
+            .collect();
+        let pushed = block.len();
+        note_stmts_pushed(&mut block, pushed);
+        assert!(stmt_budget_tripped(), "budget should be tripped");
+        let last = block.last().expect("block has a last element");
+        match last {
+            Stat::Comment(c) => assert_eq!(c, "-- statement budget exceeded"),
+            other => panic!("expected sentinel comment, got {other:?}"),
+        }
+        // Block should have been trimmed to MAX_STMTS_PER_PROTO + 1 (cap + sentinel).
+        assert_eq!(block.len(), MAX_STMTS_PER_PROTO + 1);
+    }
+
+    #[test]
+    fn c1_statement_budget_is_silent_below_ceiling() {
+        reset_stmt_budget();
+        let mut block: Vec<Stat> = (0..100)
+            .map(|i| Stat::Comment(format!("stmt {i}")))
+            .collect();
+        note_stmts_pushed(&mut block, 100);
+        assert!(!stmt_budget_tripped(), "budget should not trip at 100");
+        assert_eq!(block.len(), 100);
+        // No sentinel injected.
+        assert!(!matches!(
+            block.last(),
+            Some(Stat::Comment(c)) if c == "-- statement budget exceeded"
+        ));
+    }
+
+    #[test]
+    fn c1_reset_stmt_budget_clears_trip_flag() {
+        reset_stmt_budget();
+        let mut block: Vec<Stat> = (0..(MAX_STMTS_PER_PROTO + 1))
+            .map(|i| Stat::Comment(format!("stmt {i}")))
+            .collect();
+        let len = block.len();
+        note_stmts_pushed(&mut block, len);
+        assert!(stmt_budget_tripped());
+        // A subsequent proto should start fresh.
+        reset_stmt_budget();
+        assert!(!stmt_budget_tripped());
+    }
+}
+
+/// End-to-end tests for the database-backed decode path and the scoping of the
+/// NOT / MINUS / LENGTH passthrough.
+///
+/// The property under test in most of these is a NEGATIVE one: that nothing
+/// about an ordinary decode changed. That is the whole safety argument for this
+/// feature, so it is worth more test surface than the happy path.
+#[cfg(test)]
+mod db_decode_tests {
+    use crate::parser::opmap_db::{DbEntry, Provenance, UnarySem, UnarySemantics};
+    use crate::parser::test_fixtures as fx;
+
+    fn entry(id: &str, perm: fn(u8) -> u8, semantics: UnarySemantics) -> DbEntry {
+        DbEntry {
+            id: id.to_string(),
+            bytecode_version: 6,
+            build_label: None,
+            provenance: Provenance {
+                method: "probe-align".to_string(),
+                producer: Some("test".to_string()),
+                probe_set_version: Some(1),
+                probe_programs: Some(19),
+                notes: None,
+            },
+            semantics,
+            map: fx::exact_map(perm),
+        }
+    }
+
+    /// Every decode in this module takes the ground-truth lock.
+    ///
+    /// `decompile_with_opmap` reads the process-global installed map, and some
+    /// tests here install one, so without serialising them the harness's
+    /// parallelism would let one test's install leak into another's decode.
+    /// Same limitation `GroundTruthGuard` documents for real callers.
+    fn decode(bytes: &[u8], entry: Option<&DbEntry>) -> String {
+        let _lock = fx::ground_truth_lock();
+        crate::decompile_with_plan(
+            bytes,
+            &crate::DecodePlan {
+                prior: None,
+                exact: entry,
+            },
+        )
+        .expect("decode succeeds")
+        .0
+    }
+
+    // ── the inference path must be untouched ──
+
+    /// The single most important test here: with no entry, output is exactly
+    /// what it would have been before any of this existed.
+    #[test]
+    fn no_entry_means_byte_for_byte_the_old_behaviour() {
+        for bytes in [fx::P03_UNARY, fx::M04_MIRROR_FLOW, fx::M02_MIRROR_BRANCH] {
+            let shuffled = fx::permuted_bytes(bytes, fx::perm_a);
+            let via_plan = decode(&shuffled, None);
+            let via_old = {
+                let _lock = fx::ground_truth_lock();
+                crate::decompile_with_opmap(&shuffled, None)
+                    .expect("decode succeeds")
+                    .0
+            };
+            assert_eq!(via_plan, via_old);
+        }
+    }
+
+    #[test]
+    fn an_inferred_decode_never_claims_a_database_source() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let out = decode(&shuffled, None);
+        assert!(!out.contains("opmap source: database entry"));
+        assert!(out.contains("opmap evidence:"));
+    }
+
+    // ── the database path ──
+
+    #[test]
+    fn a_database_backed_decode_says_so_in_the_header() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let out = decode(&shuffled, Some(&e));
+        assert!(
+            out.contains("opmap source: database entry \"build_a\""),
+            "header did not name the entry:\n{}",
+            out.lines().take(8).collect::<Vec<_>>().join("\n")
+        );
+        assert!(out.contains("no detector or bijection completion contributed"));
+    }
+
+    /// An exact map must not be "completed". Completion invents mappings, and
+    /// inventing on top of a measurement is the one thing this path exists to
+    /// avoid.
+    #[test]
+    fn a_database_backed_decode_leaves_unmeasured_bytes_unmapped() {
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let mut e = entry("build_a", fx::perm_a, UnarySemantics::default());
+        let pinned_before = e.pinned();
+        // Drop a byte the chunk never executes: completion would fill it back
+        // in, an exact decode must not.
+        let unused = (0..=255u8)
+            .find(|&b| {
+                e.map[b as usize] != 255
+                    && crate::parser::opcodes::LuauOpcode::from_u8(e.map[b as usize]).name()
+                        == "COVERAGE"
+            })
+            .or_else(|| (0..=255u8).find(|&b| e.map[b as usize] != 255));
+        if let Some(b) = unused {
+            e.map[b as usize] = 255;
+        }
+        let out = decode(&shuffled, Some(&e));
+        let reported: usize = out
+            .lines()
+            .find(|l| l.contains("opcodes measured against"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|w| w.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        assert!(
+            reported < pinned_before,
+            "an exact decode must report the measured count, not a completed one"
+        );
+    }
+
+    // ── the passthrough, scoped ──
+
+    /// `#x` must NOT become a real length operator on an inferred Roblox decode.
+    /// This is the behaviour the passthrough exists for and it must not move.
+    #[test]
+    fn length_stays_a_passthrough_without_a_database_entry() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let out = decode(&shuffled, None);
+        assert!(
+            !out.contains('#'),
+            "inferred decode emitted a length operator:\n{}",
+            out
+        );
+    }
+
+    /// An entry that does NOT claim the semantics must not change the lifting
+    /// either, even though its map is exact. Knowing which byte is LENGTH is a
+    /// different claim from knowing the client emits it for `#x`.
+    #[test]
+    fn an_exact_map_alone_does_not_enable_the_operators() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::default());
+        let out = decode(&shuffled, Some(&e));
+        assert!(!out.contains('#'), "semantics were not claimed:\n{}", out);
+    }
+
+    /// With the observation recorded, the operators come back.
+    #[test]
+    fn observed_semantics_restore_the_real_operators() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let out = decode(&shuffled, Some(&e));
+        assert!(out.contains("return #"), "length operator missing:\n{}", out);
+        assert!(out.contains("return not "), "not operator missing:\n{}", out);
+        assert!(out.contains("return -"), "minus operator missing:\n{}", out);
+        assert!(out.contains("unary semantics:"), "header should record it");
+    }
+
+    /// The three are independent: claiming one must not enable the others.
+    #[test]
+    fn each_unary_slot_is_scoped_on_its_own() {
+        let shuffled = fx::permuted_bytes(fx::P03_UNARY, fx::perm_a);
+        let only_length = UnarySemantics {
+            not: UnarySem::Passthrough,
+            minus: UnarySem::Passthrough,
+            length: UnarySem::Operator,
+        };
+        let e = entry("build_a", fx::perm_a, only_length);
+        let out = decode(&shuffled, Some(&e));
+        assert!(out.contains("return #"), "length should be an operator:\n{}", out);
+        assert!(
+            !out.contains("return not "),
+            "not should still be a passthrough:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("return -"),
+            "minus should still be a passthrough:\n{}",
+            out
+        );
+    }
+
+    // ── context defaults ──
+
+    #[test]
+    fn a_fresh_context_is_all_passthrough() {
+        let chunk = fx::canonical(fx::P03_UNARY);
+        let ctx = crate::decompiler::DecompileContext::new(&chunk);
+        assert!(ctx.unary.all_passthrough());
+        assert!(!ctx.is_canonical_luau);
+    }
+
+    #[test]
+    fn set_canonical_luau_moves_all_three_together() {
+        let chunk = fx::canonical(fx::P03_UNARY);
+        let mut ctx = crate::decompiler::DecompileContext::new(&chunk);
+        ctx.set_canonical_luau(true);
+        assert_eq!(ctx.unary, UnarySemantics::canonical());
+        ctx.set_canonical_luau(false);
+        assert!(
+            ctx.unary.all_passthrough(),
+            "turning canonical off must restore the Roblox default"
+        );
+    }
+
+    // ── the global install is restored ──
+
+    #[test]
+    fn a_database_decode_does_not_leak_its_map_into_the_process() {
+        // Held across the assert, not just the decode: the whole point is that
+        // no other install can be responsible for what we observe afterwards.
+        let _lock = fx::ground_truth_lock();
+        crate::set_ground_truth_opmap(None);
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let e = entry("build_a", fx::perm_a, UnarySemantics::canonical());
+        let _ = crate::decompile_with_plan(
+            &shuffled,
+            &crate::DecodePlan {
+                prior: None,
+                exact: Some(&e),
+            },
+        )
+        .expect("decode succeeds");
+        assert_eq!(
+            crate::get_ground_truth_opmap(),
+            None,
+            "the installed map must be put back on the way out"
+        );
+    }
+
+    #[test]
+    fn the_guard_restores_a_previous_map_not_just_none() {
+        let _lock = fx::ground_truth_lock();
+        let first = fx::exact_map(fx::perm_b);
+        crate::set_ground_truth_opmap(Some(first));
+        {
+            let _g = crate::GroundTruthGuard::install(fx::exact_map(fx::perm_a));
+            assert_eq!(crate::get_ground_truth_opmap(), Some(fx::exact_map(fx::perm_a)));
+        }
+        assert_eq!(crate::get_ground_truth_opmap(), Some(first));
+        crate::set_ground_truth_opmap(None);
+    }
+
+    // ── canonical bytecode is untouched by any of this ──
+
+    #[test]
+    fn canonical_bytecode_still_lifts_its_operators() {
+        let out = decode(fx::P03_UNARY, None);
+        assert!(out.contains("return #"), "canonical `#` regressed:\n{}", out);
+        assert!(out.contains("return not "), "canonical `not` regressed:\n{}", out);
+        assert!(out.contains("return -"), "canonical unary `-` regressed:\n{}", out);
+    }
+}

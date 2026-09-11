@@ -1,0 +1,20 @@
+[package]
+name = "luau-compiler"
+description = "Luau source -> custom-VM protected script compiler (anti-decompile)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "luau-protect"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+full_moon.workspace = true
+
+[dev-dependencies]

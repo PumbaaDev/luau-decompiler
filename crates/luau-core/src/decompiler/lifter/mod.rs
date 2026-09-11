@@ -1,0 +1,11399 @@
+//! The lifter: converts bytecode into AST statements using CFG-based
+//! control flow structuring. This is the core intelligence of the decompiler.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::analysis::cfg::ControlFlowGraph;
+use crate::analysis::structuring::{structure_control_flow, Region};
+use crate::ast::*;
+use crate::decompiler::{analyze_register_usage, constant_to_expr, is_stdlib_shadow_name, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
+use std::cell::RefCell;
+use crate::parser::types::*;
+
+mod naming;
+use naming::{WriteKind, LocalTracker, is_semantic_local_name};
+pub(crate) use naming::RegVal;
+
+mod table_reconstruction;
+use table_reconstruction::{
+    reconstruct_table_constructors,
+    coalesce_setlist_sequential,
+    is_valid_luau_identifier,
+};
+
+mod post_passes;
+use post_passes::{
+    collapse_elseif_chains,
+    collapse_nil_init_conditional,
+    collapse_short_circuit_assignments,
+    inline_pure_literals,
+};
+
+mod opcode_handlers;
+use opcode_handlers::lift_instruction_range;
+
+// Re-exported solely for the `#[cfg(test)]` submodules under `lifter/tests/`,
+// which reach these helpers via `super::super::<name>`. They are not referenced
+// by non-test lifter code, so the re-import is test-gated to keep the regular
+// build warning-free.
+#[cfg(test)]
+use post_passes::inline_single_use_temps;
+#[cfg(test)]
+use table_reconstruction::{is_pure_two_step_value, two_step_field_absorb};
+#[cfg(test)]
+use post_passes::{is_inlinable_literal, stmt_writes_name_recursive};
+
+/// Max recursion depth for nested closures to prevent stack overflow.
+/// Obfuscated/auto-generated Luau (HUD.lua-class GUI files) nests 20+ deep;
+/// the server thread runs with a 256 MB stack so we have headroom.
+const MAX_DECOMPILE_DEPTH: usize = 40;
+
+/// Phase C1 stability guard: proto-wide statement budget. Augments the
+/// existing per-range safety guards. When a single proto tries to emit
+/// more than this many statements we short-circuit the current block with
+/// a comment stub instead of continuing to bloat memory. 50,000 statements
+/// is well above any legitimate hand-written or compiled Luau proto.
+pub(crate) const MAX_STMTS_PER_PROTO: usize = 50_000;
+
+thread_local! {
+    /// Running count of statements emitted for the proto currently being
+    /// lifted. Reset at the top of every `lift_proto_inner` call. Mutated
+    /// through the [`push_stat`] helper (and its in-place twin
+    /// [`note_stmts_pushed`]) so the budget is enforced everywhere the
+    /// lifter appends AST statements.
+    pub(crate) static STMTS_EMITTED: std::cell::Cell<usize> =
+        std::cell::Cell::new(0);
+    /// True once we have already appended the budget-exceeded sentinel to
+    /// the outermost block for this proto. Prevents repeated comments and
+    /// marks the lifter as "tripped" so push helpers silently drop further
+    /// statements.
+    pub(crate) static STMT_BUDGET_TRIPPED: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+/// Reset the proto-wide statement counter. Called at the top of every
+/// `lift_proto_inner` invocation (including recursive closure lifts — nested
+/// closures reuse the main proto's budget intentionally, so if the parent is
+/// tripped children short-circuit too).
+pub(crate) fn reset_stmt_budget() {
+    STMTS_EMITTED.with(|c| c.set(0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(false));
+}
+
+/// Returns true if the proto-wide statement budget has been exhausted.
+/// Callers can consult this to short-circuit region loops early.
+pub(crate) fn stmt_budget_tripped() -> bool {
+    STMT_BUDGET_TRIPPED.with(|c| c.get())
+}
+
+/// Push a `Stat` into `block`, counting against the proto-wide budget.
+/// On the first push that crosses [`MAX_STMTS_PER_PROTO`] the helper
+/// substitutes a `Stat::Comment("-- statement budget exceeded")` sentinel
+/// so downstream passes can see that truncation occurred. All subsequent
+/// calls after tripping are silently dropped, so callers can keep invoking
+/// this helper without extra guards — the block simply stops growing.
+#[allow(dead_code)]
+pub(crate) fn push_stat(block: &mut Vec<Stat>, stat: Stat) {
+    if STMT_BUDGET_TRIPPED.with(|c| c.get()) {
+        // Already tripped — drop further statements to cap memory.
+        return;
+    }
+    let current = STMTS_EMITTED.with(|c| c.get());
+    if current >= MAX_STMTS_PER_PROTO {
+        STMT_BUDGET_TRIPPED.with(|c| c.set(true));
+        block.push(Stat::Comment("-- statement budget exceeded".to_string()));
+        return;
+    }
+    STMTS_EMITTED.with(|c| c.set(current + 1));
+    block.push(stat);
+}
+
+/// Record that `count` statements were appended to a block by a path that
+/// does not route through [`push_stat`] (e.g., post-passes that extend the
+/// vec via `append`). Same trip behaviour as `push_stat`.
+pub(crate) fn note_stmts_pushed(block: &mut Vec<Stat>, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if STMT_BUDGET_TRIPPED.with(|c| c.get()) {
+        return;
+    }
+    let current = STMTS_EMITTED.with(|c| c.get());
+    let new_total = current.saturating_add(count);
+    if new_total > MAX_STMTS_PER_PROTO {
+        STMT_BUDGET_TRIPPED.with(|c| c.set(true));
+        // Truncate block back down to whatever fits, then append sentinel.
+        let overshoot = new_total - MAX_STMTS_PER_PROTO;
+        let keep = block.len().saturating_sub(overshoot);
+        block.truncate(keep);
+        block.push(Stat::Comment("-- statement budget exceeded".to_string()));
+        STMTS_EMITTED.with(|c| c.set(MAX_STMTS_PER_PROTO));
+    } else {
+        STMTS_EMITTED.with(|c| c.set(new_total));
+    }
+}
+
+/// For the main proto (depth==0, no parent), infer upvalue names by scanning
+/// bytecode usage patterns. In Roblox scripts, the main proto's upvalues are
+/// VM-injected globals: typically `script` (the script instance) and sometimes
+/// others. Since there's no parent proto to provide CAPTURE-based inference,
+/// we look at how each upvalue is *used* and assign names accordingly.
+///
+/// Heuristics:
+///   - NAMECALL with `:GetService()` on the upval -> "game"
+///   - GETTABLEKS with `.Parent`, `.Name`, `.ClassName` -> "script"
+///   - GETTABLEKS with `.Client`, `.Shared`, `.Server` (module paths) -> "script"
+///   - NAMECALL with Roblox-instance methods (`:WaitForChild`, `:FindFirstChild`,
+///     `:Connect`, `:Fire`, `:InvokeServer`, etc.) -> "script" / "signal" / "remote"
+///   - `SETGLOBAL R(A), "X"` after `GETUPVAL R(A), U(idx)` -> name upval as "X"
+///     (idiom: `_G.MyVar = upval_0` or bare global assignment)
+///   - `require(upval)` (where `require` is a known import/global) -> "module"
+///   - If none match, leave unnamed (will fall through to `upval_N`)
+fn infer_main_proto_upval_names(proto: &Proto, strings: &[String]) -> Vec<String> {
+    let num_upvals = proto.num_upvalues as usize;
+    if num_upvals == 0 {
+        return Vec::new();
+    }
+
+    // Collect usage evidence for each upvalue index.
+    // We track which field/method names are accessed on each upval,
+    // whether it's used as a call target, and whether it has SETTABLEKS writes.
+    let mut upval_methods: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut upval_fields: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut upval_is_called: HashSet<usize> = HashSet::new();
+    let mut upval_settable_fields: HashMap<usize, Vec<String>> = HashMap::new();
+    // Phase B0.43B additions:
+    //   - upval_setglobal_names[i] = list of global names assigned FROM upval i
+    //     (from `GETUPVAL R(A), U(i); SETGLOBAL R(A), "name"`)
+    //   - upval_is_require_arg[i]  = true if upval i is passed as the sole arg
+    //     to a call of a register that was loaded from `require` (GETIMPORT /
+    //     GETGLOBAL producing the name "require").
+    let mut upval_setglobal_names: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut upval_is_require_arg: HashSet<usize> = HashSet::new();
+
+    // Lightweight register-name tracker used for pattern 1 (track which reg
+    // currently holds which upval) and pattern 6 (track which reg currently
+    // holds the name "require"). `None` = unknown contents.
+    //
+    // For the upval tracker we store Some(upval_idx) if the register was most
+    // recently written by a GETUPVAL; any later overwrite clears it.
+    let reg_count = (proto.max_stack_size as usize).max(256);
+    let mut reg_holds_upval: Vec<Option<usize>> = vec![None; reg_count];
+    // For the `require` tracker we store whether the register currently holds
+    // the callable `require` function (as identified by the *name* "require").
+    let mut reg_is_require: Vec<bool> = vec![false; reg_count];
+
+    let code = &proto.code;
+    let mut pc = 0;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let d = insn_d(insn);
+
+        if op == LuauOpcode::GetUpval {
+            let dest_reg = a;
+            let upval_idx = b;
+            if upval_idx < num_upvals {
+                // Look ahead at the next non-AUX instruction to see how this upval is used
+                let next_pc = pc + 1;
+                if next_pc < code.len() {
+                    let next_insn = code[next_pc];
+                    let next_op = LuauOpcode::from_u8(insn_op(next_insn));
+
+                    match next_op {
+                        LuauOpcode::NameCall => {
+                            // NAMECALL A B AUX: B is the object register
+                            let nc_b = insn_b(next_insn) as usize;
+                            if nc_b == dest_reg {
+                                // The upval is the object of a method call
+                                let aux_pc = next_pc + 1;
+                                if aux_pc < code.len() {
+                                    let aux = code[aux_pc];
+                                    let method = get_method_string_from_aux(proto, strings, aux);
+                                    upval_methods.entry(upval_idx).or_default().push(method);
+                                }
+                            }
+                        }
+                        LuauOpcode::GetTableKS => {
+                            // GETTABLEKS A B AUX: B is the table register
+                            let gt_b = insn_b(next_insn) as usize;
+                            if gt_b == dest_reg {
+                                let aux_pc = next_pc + 1;
+                                if aux_pc < code.len() {
+                                    let aux = code[aux_pc];
+                                    let field = get_table_string_from_aux(proto, strings, aux);
+                                    upval_fields.entry(upval_idx).or_default().push(field);
+                                }
+                            }
+                        }
+                        LuauOpcode::SetTableKS => {
+                            // SETTABLEKS A B AUX: B is the table register
+                            let st_b = insn_b(next_insn) as usize;
+                            if st_b == dest_reg {
+                                let aux_pc = next_pc + 1;
+                                if aux_pc < code.len() {
+                                    let aux = code[aux_pc];
+                                    let field = get_table_string_from_aux(proto, strings, aux);
+                                    upval_settable_fields.entry(upval_idx).or_default().push(field);
+                                }
+                            }
+                        }
+                        LuauOpcode::Call => {
+                            // CALL A B C: A is the function register
+                            let call_a = insn_a(next_insn) as usize;
+                            if call_a == dest_reg {
+                                upval_is_called.insert(upval_idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── Pattern 1: SETGLOBAL <- upval ────────────────────────────────
+        //
+        // Update `reg_holds_upval` so we can recognise
+        //   GETUPVAL R(A), U(i)      -- possibly with other ops in between
+        //   SETGLOBAL R(A), "MyName" -- still holding upval i
+        // and assign "MyName" to upval i.
+        //
+        // The SETGLOBAL handler also uses `reg_is_require` for pattern 6.
+        match op {
+            LuauOpcode::GetUpval => {
+                if a < reg_count && b < num_upvals {
+                    reg_holds_upval[a] = Some(b);
+                    reg_is_require[a] = false;
+                }
+            }
+            LuauOpcode::SetGlobal => {
+                // SETGLOBAL A D [AUX]: writes R(A) into global K[D].
+                // If R(A) was loaded from GETUPVAL with no intervening overwrite,
+                // the upval's "natural" name is the global being assigned to.
+                if a < reg_count {
+                    if let Some(upval_idx) = reg_holds_upval[a] {
+                        let aux = code.get(pc + 1).copied();
+                        if let Some(name) = resolve_global_name(proto, strings, d, aux) {
+                            if upval_idx < num_upvals && is_sane_identifier(&name) {
+                                upval_setglobal_names
+                                    .entry(upval_idx)
+                                    .or_default()
+                                    .push(name);
+                            }
+                        }
+                    }
+                }
+                // SETGLOBAL does NOT write R(A); just note we've seen it (no
+                // register invalidation needed).
+            }
+
+            // ── Pattern 6: require(upval) ────────────────────────────────
+            //
+            // Track registers that currently hold the callable `require`.
+            // Then watch for `CALL R(f), 2, N` where `R(f+1)` was loaded
+            // from GETUPVAL.
+            LuauOpcode::GetImport => {
+                if a < reg_count {
+                    // K[D] is typically Constant::Import; decode id0 to get the
+                    // top-level name.
+                    let aux_val = code.get(pc + 1).copied();
+                    let import_val = aux_val.unwrap_or_else(|| {
+                        let d_unsigned = d as u16 as usize;
+                        match proto.constants.get(d_unsigned) {
+                            Some(Constant::Import(v)) => *v,
+                            _ => 0,
+                        }
+                    });
+                    let mut name: Option<String> = None;
+                    if import_val != 0 {
+                        let ids = decode_import(import_val);
+                        if let Some(&id0) = ids.first() {
+                            if let Some(Constant::String(s)) = proto.constants.get(id0 as usize) {
+                                name = Some(s.clone());
+                            } else if let Some(s) = strings.get(id0 as usize) {
+                                name = Some(s.clone());
+                            }
+                        }
+                    }
+                    reg_is_require[a] = matches!(name.as_deref(), Some("require"));
+                    reg_holds_upval[a] = None;
+                }
+            }
+            LuauOpcode::GetGlobal => {
+                if a < reg_count {
+                    let aux = code.get(pc + 1).copied();
+                    let name = resolve_global_name(proto, strings, d, aux);
+                    reg_is_require[a] = matches!(name.as_deref(), Some("require"));
+                    reg_holds_upval[a] = None;
+                }
+            }
+            LuauOpcode::Call => {
+                // CALL A B C: A=func, B=nargs+1 (0=vararg), C=nresults+1
+                // Detect `require(R(A+1))` when R(A)=require and B==2 (1 arg).
+                let call_a = a;
+                if call_a < reg_count
+                    && reg_is_require[call_a]
+                    && b == 2
+                {
+                    let arg_reg = call_a + 1;
+                    if arg_reg < reg_count {
+                        if let Some(upval_idx) = reg_holds_upval[arg_reg] {
+                            if upval_idx < num_upvals {
+                                upval_is_require_arg.insert(upval_idx);
+                            }
+                        }
+                    }
+                }
+                // Invalidate result register(s): CALL overwrites R(A)..R(A+nresults-1).
+                // We don't need precise tracking here, just a conservative clear
+                // so subsequent patterns don't match stale data.
+                if call_a < reg_count {
+                    reg_holds_upval[call_a] = None;
+                    reg_is_require[call_a] = false;
+                }
+            }
+
+            // Instructions that overwrite R(A) without giving it a meaningful
+            // upval/require identity — clear the tracker.
+            LuauOpcode::Move
+            | LuauOpcode::LoadK | LuauOpcode::LoadN | LuauOpcode::LoadB
+            | LuauOpcode::LoadNil | LuauOpcode::LoadKX
+            | LuauOpcode::NameCall | LuauOpcode::NewTable | LuauOpcode::NewClosure
+            | LuauOpcode::DupClosure | LuauOpcode::DupTable
+            | LuauOpcode::Add | LuauOpcode::Sub | LuauOpcode::Mul | LuauOpcode::Div
+            | LuauOpcode::Mod | LuauOpcode::Pow | LuauOpcode::Concat
+            | LuauOpcode::Length | LuauOpcode::Minus | LuauOpcode::Not
+            | LuauOpcode::GetTableKS | LuauOpcode::GetTableN | LuauOpcode::GetTable
+            | LuauOpcode::Band | LuauOpcode::Bor | LuauOpcode::Bxor
+            | LuauOpcode::Bnot | LuauOpcode::Shl | LuauOpcode::Shr
+            | LuauOpcode::Bandk | LuauOpcode::Bork => {
+                if a < reg_count {
+                    reg_holds_upval[a] = None;
+                    reg_is_require[a] = false;
+                }
+            }
+
+            _ => {}
+        }
+
+        // Advance past AUX if needed
+        if op.has_aux() {
+            pc += 2;
+        } else {
+            pc += 1;
+        }
+    }
+
+    // Now decide names based on collected evidence
+    let mut names = vec![String::new(); num_upvals];
+    for idx in 0..num_upvals {
+        let methods = upval_methods.get(&idx);
+        let fields = upval_fields.get(&idx);
+
+        // Check for "game" pattern: :GetService() is the definitive signal
+        if let Some(m) = methods {
+            if m.iter().any(|name| name == "GetService" || name == "FindService") {
+                names[idx] = "game".to_string();
+                continue;
+            }
+        }
+
+        // Check for "script" pattern: .Parent, .Name, .ClassName, or module
+        // hierarchy fields (.Client, .Shared, .Server)
+        if let Some(f) = fields {
+            let script_fields = ["Parent", "Name", "ClassName", "Client", "Shared", "Server"];
+            if f.iter().any(|name| script_fields.contains(&name.as_str())) {
+                names[idx] = "script".to_string();
+                continue;
+            }
+        }
+
+        // Check for Roblox event / remote method NAMECALLs (pattern 5).
+        // These are strong signals even without field-access context because
+        // these method names are rare outside the Roblox instance API.
+        if let Some(m) = methods {
+            // Remote-like methods: upval is a RemoteEvent / RemoteFunction
+            let remote_methods = [
+                "FireServer", "FireClient", "FireAllClients",
+                "InvokeServer", "InvokeClient",
+            ];
+            if m.iter().any(|name| remote_methods.contains(&name.as_str())) {
+                names[idx] = "remote".to_string();
+                continue;
+            }
+            // Signal-like methods: upval is a RBXScriptSignal / BindableEvent
+            // Note: `Connect`/`Once`/`Wait` also appear on many non-signal
+            // objects, but in practice NAMECALL sites for these names are
+            // overwhelmingly on signals in real Roblox code.
+            let signal_methods = ["Connect", "Once", "Wait", "Fire", "ConnectParallel", "DisconnectAll"];
+            if m.iter().any(|name| signal_methods.contains(&name.as_str())) {
+                names[idx] = "signal".to_string();
+                continue;
+            }
+        }
+
+        // Check for method patterns suggesting a service or instance
+        if let Some(m) = methods {
+            // Phase B0.43B: expanded set includes FindFirstAncestor + friends.
+            let instance_methods = [
+                "WaitForChild", "FindFirstChild", "FindFirstChildOfClass",
+                "FindFirstChildWhichIsA", "FindFirstAncestor",
+                "FindFirstAncestorOfClass", "FindFirstAncestorWhichIsA",
+                "FindFirstDescendant",
+                "GetChildren", "GetDescendants", "GetAttribute", "SetAttribute",
+                "GetAttributes", "GetAttributeChangedSignal",
+                "GetPropertyChangedSignal",
+                "Clone", "Destroy", "IsA", "IsDescendantOf", "IsAncestorOf",
+            ];
+            if m.iter().any(|name| instance_methods.contains(&name.as_str())) {
+                // Generic instance -- could be script or something else.
+                // If it also has field access, lean toward "script".
+                if fields.map(|f| !f.is_empty()).unwrap_or(false) {
+                    names[idx] = "script".to_string();
+                } else {
+                    // Unknown instance with method calls -- name it "instance"
+                    // rather than leaving as upval_N
+                    names[idx] = "instance".to_string();
+                }
+                continue;
+            }
+        }
+
+        // Check for Roblox event/signal patterns via field access.
+        if let Some(f) = fields {
+            if !f.is_empty() {
+                let event_fields = [
+                    "OnServerEvent", "OnClientEvent", "OnServerInvoke",
+                    "OnClientInvoke", "FireServer", "FireClient", "FireAllClients",
+                    "InvokeServer", "InvokeClient",
+                ];
+                let conn_fields = ["Connect", "Wait", "Once", "DisconnectAll"];
+                if f.iter().any(|name| event_fields.contains(&name.as_str())) {
+                    names[idx] = "remote".to_string();
+                    continue;
+                }
+                if f.iter().any(|name| conn_fields.contains(&name.as_str())) {
+                    names[idx] = "signal".to_string();
+                    continue;
+                }
+            }
+        }
+
+        // Phase B0.43B — pattern 1: SETGLOBAL from upval.
+        // The first meaningful global name assigned from this upval wins.
+        // Example: `_G.Config = upval_0` or `MyThing = upval_0`.
+        if let Some(ns) = upval_setglobal_names.get(&idx) {
+            if let Some(first) = ns.first() {
+                names[idx] = first.clone();
+                continue;
+            }
+        }
+
+        // Phase B0.43B — pattern 6: require(upval) means upval is likely a
+        // ModuleScript instance.  Name it "module" unless something stronger
+        // was inferred above.
+        if upval_is_require_arg.contains(&idx) && names[idx].is_empty() {
+            names[idx] = "module".to_string();
+            continue;
+        }
+
+        // Check for upvals that are SETTABLEKS targets (written-to tables).
+        // Common for module tables: upval.foo = bar
+        if let Some(sf) = upval_settable_fields.get(&idx) {
+            if !sf.is_empty() && names[idx].is_empty() {
+                names[idx] = "module".to_string();
+                continue;
+            }
+        }
+
+        // Check for upvals used as call targets (functions captured from parent)
+        if upval_is_called.contains(&idx) && names[idx].is_empty() {
+            names[idx] = "func".to_string();
+            continue;
+        }
+    }
+
+    names
+}
+
+/// Returns true if `s` looks like a plain Luau identifier:
+///   - non-empty, starts with a letter or `_`, only contains
+///     alphanumerics or `_`.
+///
+/// Used by pattern 1 (SETGLOBAL <- upval) to reject AUX-resolved strings
+/// that happen to not be legal identifiers (hashes, paths, etc).
+fn is_sane_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Infer upvalue names from SETUPVAL instructions by tracing what value is
+/// being stored.  When `SETUPVAL upval[B] = R(A)` and R(A) was loaded by a
+/// preceding instruction that gives it a meaningful name (GETIMPORT, GETGLOBAL,
+/// LOADK with a string, or another GETUPVAL with a known name), we can
+/// retroactively name that upvalue.
+///
+/// This runs as a lightweight bytecode scan *before* lifting, so the inferred
+/// names are available when GETUPVAL/SETUPVAL are processed into AST nodes.
+///
+/// Returns a vec of length `num_upvalues` where non-empty entries are the
+/// inferred names.  Empty entries mean no SETUPVAL-based name was found.
+fn infer_upval_names_from_setupval(
+    proto: &Proto,
+    strings: &[String],
+    existing_names: Option<&Vec<String>>,
+) -> Vec<String> {
+    let num_upvals = proto.num_upvalues as usize;
+    if num_upvals == 0 {
+        return Vec::new();
+    }
+
+    let code = &proto.code;
+    let reg_count = (proto.max_stack_size as usize).max(256);
+
+    // Lightweight register tracker: we only care about *names* that were loaded
+    // into registers, not full expressions.  None = unknown / not a simple name.
+    let mut reg_names: Vec<Option<String>> = vec![None; reg_count];
+
+    // For each upvalue index, collect candidate names from SETUPVAL sites.
+    // We keep only the *first* meaningful name per upvalue (the initial store
+    // is the most reliable; later stores may be mutations).
+    let mut upval_names: Vec<String> = vec![String::new(); num_upvals];
+
+    let mut pc = 0;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let d = insn_d(insn);
+
+        match op {
+            // Track instructions that give a register a meaningful name.
+
+            LuauOpcode::GetImport => {
+                // GETIMPORT A D [AUX]: imports a global like `game`, `workspace`
+                // For multi-segment imports like `game.X.Module`, the register
+                // holds the *final* value — the module, not "game". Use the
+                // LAST id for name inference so SETUPVAL / require() arg pick
+                // up the module identity. Single-segment imports still use
+                // that one id.  (C6 follow-up.)
+                let aux_val = code.get(pc + 1).copied();
+                let import_val = aux_val.unwrap_or_else(|| {
+                    let d_unsigned = d as u16 as usize;
+                    match proto.constants.get(d_unsigned) {
+                        Some(Constant::Import(v)) => *v,
+                        _ => 0,
+                    }
+                });
+                if import_val != 0 {
+                    let ids = decode_import(import_val);
+                    if let Some(&id_last) = ids.last() {
+                        let name = if let Some(Constant::String(s)) = proto.constants.get(id_last as usize) {
+                            Some(s.clone())
+                        } else {
+                            strings.get(id_last as usize).cloned()
+                        };
+                        if a < reg_count {
+                            reg_names[a] = name;
+                        }
+                    }
+                }
+            }
+
+            LuauOpcode::GetGlobal => {
+                // GETGLOBAL A D [AUX]: K[D] is the global name, AUX is hash/index
+                let aux_word = code.get(pc + 1).copied();
+                let name = resolve_global_name(proto, strings, d, aux_word);
+                if a < reg_count {
+                    reg_names[a] = name;
+                }
+            }
+
+            LuauOpcode::GetUpval => {
+                // GETUPVAL A B: loads upvalue B into R(A)
+                if a < reg_count {
+                    let upval_idx = b;
+                    let known = existing_names
+                        .and_then(|names| names.get(upval_idx))
+                        .filter(|n| !n.is_empty())
+                        .cloned()
+                        .or_else(|| {
+                            let n = upval_names.get(upval_idx)?;
+                            if n.is_empty() { None } else { Some(n.clone()) }
+                        });
+                    reg_names[a] = known;
+                }
+            }
+
+            LuauOpcode::LoadK => {
+                // LOADK A D: loads constant K[D] into R(A)
+                let d_unsigned = d as u16 as usize;
+                if a < reg_count {
+                    if let Some(Constant::String(s)) = proto.constants.get(d_unsigned) {
+                        reg_names[a] = Some(s.clone());
+                    } else {
+                        reg_names[a] = None;
+                    }
+                }
+            }
+
+            LuauOpcode::Move => {
+                // MOVE A B: R(A) = R(B), propagate name
+                if a < reg_count && b < reg_count {
+                    reg_names[a] = reg_names[b].clone();
+                }
+            }
+
+            LuauOpcode::SetUpval => {
+                // SETUPVAL A B: upval[B] = R(A)
+                let upval_idx = b;
+                if upval_idx < num_upvals && upval_names[upval_idx].is_empty() {
+                    if let Some(name) = reg_names.get(a).cloned().flatten() {
+                        let is_generic_vreg = name.starts_with('v')
+                            && name.len() > 1
+                            && name[1..].chars().all(|c| c.is_ascii_digit());
+                        if !name.is_empty() && !is_generic_vreg {
+                            upval_names[upval_idx] = name;
+                        }
+                    }
+                }
+            }
+
+            // B0.61: GetTableKS loads R(A) = R(B)[AUX_string]. The FIELD name
+            // is a much better hint for R(A) than nothing — e.g. `local Keypress = M.Keypress`
+            // turns into the field being tracked, so a subsequent `upval_N = Keypress`
+            // setupval can inherit the name.
+            LuauOpcode::GetTableKS => {
+                if a < reg_count {
+                    let aux = code.get(pc + 1).copied().unwrap_or(0);
+                    if let Some(field) = resolve_aux_string(proto, strings, aux) {
+                        reg_names[a] = Some(field);
+                    } else {
+                        reg_names[a] = None;
+                    }
+                }
+            }
+
+            // B0.61: NameCall prepares a method call — R(A) = method function,
+            // R(A+1) = object. The method name (from AUX) is the right hint for A.
+            LuauOpcode::NameCall => {
+                if a < reg_count {
+                    let aux = code.get(pc + 1).copied().unwrap_or(0);
+                    if let Some(method) = resolve_aux_string(proto, strings, aux) {
+                        reg_names[a] = Some(method);
+                    } else {
+                        reg_names[a] = None;
+                    }
+                }
+            }
+
+            // B0.131: CALL result naming for upval inference.
+            // Instead of blanket-clearing, try to derive a name from the
+            // call pattern:
+            // - NAMECALL :GetService("X") / :FindFirstChild("X") → "X"
+            // - require(script.X) → "X"
+            // - require(Name) → use Name
+            // Falls back to None when no pattern matches.
+            LuauOpcode::Call => {
+                if a < reg_count {
+                    let mut call_name: Option<String> = None;
+                    // CALL A B C: function is R(A), first arg is R(A+1)
+                    // For NAMECALL-preceded calls, R(A) held the method name
+                    let func_name = reg_names.get(a).cloned().flatten();
+                    if let Some(ref method) = func_name {
+                        let is_naming_method = matches!(method.as_str(),
+                            "GetService" | "FindFirstChild" | "FindFirstChildOfClass"
+                            | "FindFirstChildWhichIsA" | "WaitForChild"
+                            | "FindFirstAncestor" | "FindFirstAncestorOfClass"
+                            | "FindFirstAncestorWhichIsA"
+                        );
+                        if is_naming_method {
+                            // First arg is at R(A+2) for NAMECALL calls (A+1 is self)
+                            let arg_reg = a + 2;
+                            if let Some(Some(arg_name)) = reg_names.get(arg_reg) {
+                                if is_valid_luau_identifier(arg_name)
+                                    && !is_stdlib_shadow_name(arg_name)
+                                {
+                                    call_name = Some(arg_name.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Check for require() pattern: R(A) = require, arg at R(A+1)
+                    if call_name.is_none() {
+                        if let Some(Some(fname)) = reg_names.get(a) {
+                            if fname == "require" {
+                                // First arg at R(A+1), could be Name or Field
+                                let arg_reg = a + 1;
+                                if let Some(Some(arg_name)) = reg_names.get(arg_reg) {
+                                    // Use the argument name as module name
+                                    if is_valid_luau_identifier(arg_name)
+                                        && !is_stdlib_shadow_name(arg_name)
+                                    {
+                                        call_name = Some(arg_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    reg_names[a] = call_name;
+                }
+            }
+
+            // Instructions that overwrite a register without a meaningful name
+            LuauOpcode::NewTable | LuauOpcode::NewClosure | LuauOpcode::DupClosure
+            | LuauOpcode::Add | LuauOpcode::Sub | LuauOpcode::Mul | LuauOpcode::Div
+            | LuauOpcode::Mod | LuauOpcode::Pow | LuauOpcode::Concat
+            | LuauOpcode::Length | LuauOpcode::Minus | LuauOpcode::Not
+            | LuauOpcode::GetTableN | LuauOpcode::GetTable
+            | LuauOpcode::Band | LuauOpcode::Bor | LuauOpcode::Bxor
+            | LuauOpcode::Bnot | LuauOpcode::Shl | LuauOpcode::Shr
+            | LuauOpcode::Bandk | LuauOpcode::Bork
+            | LuauOpcode::RbxExt92 | LuauOpcode::RbxExt93 | LuauOpcode::RbxExt94
+            | LuauOpcode::RbxExt95 | LuauOpcode::RbxExt96 | LuauOpcode::RbxExt97
+            | LuauOpcode::RbxExt98 | LuauOpcode::RbxExt99 | LuauOpcode::RbxExt100
+            | LuauOpcode::RbxExt101 | LuauOpcode::RbxExt102 | LuauOpcode::RbxExt103
+            | LuauOpcode::RbxExt104 | LuauOpcode::RbxExt105 => {
+                if a < reg_count {
+                    reg_names[a] = None;
+                }
+            }
+
+            _ => {}
+        }
+
+        if op.has_aux() {
+            pc += 2;
+        } else {
+            pc += 1;
+        }
+    }
+
+    upval_names
+}
+
+/// Lift a proto's bytecode into AST statements using structured control flow
+/// Rotation 86: which POST-PASS rewrites a correct `if` condition into a bare
+/// generated name?
+///
+/// `extract_branch_condition` was measured returning
+/// `Field { arg2, "StartReqs" }` for `533_NPCs::AddEvent` pc 176, and the
+/// emitted output still says `if v3 then`. So the rewrite happens after
+/// lifting. Gated on `LUAU_PASS_PROBE`; prints one line per pass with whether
+/// the good condition and the bad condition are present.
+fn pass_probe(proto: &Proto, tag: &str, stmts: &[Stat]) {
+    if std::env::var("LUAU_PASS_PROBE").is_err() {
+        return;
+    }
+    // Rotation 92: statements and CALLS after each post-pass.
+    //
+    // `603_Orbiter::Update` pushes an else arm of 11 statements carrying 5
+    // calls (IFPUSH), and emits an else arm of one `return false`. The arm is
+    // built correctly and destroyed afterwards, so the question is which pass
+    // destroys it - answered by counting, not by reading the passes.
+    fn count(ss: &[Stat]) -> usize {
+        ss.len()
+    }
+    // PROTO-QUALIFIED. Without it the pass chain of the NEXT proto reads as a
+    // later pass on this one - which is exactly how the first run of this probe
+    // appeared to show a collapse from 20 statements to 4, and is the third
+    // time in this session that an unqualified trace has pointed at the wrong
+    // function.
+    eprintln!(
+        "PASS	{}@{}	{}	stmts={}	calls={}",
+        proto.debug_name.as_deref().unwrap_or("?"),
+        proto.line_defined,
+        tag,
+        count(stmts),
+        count_calls_stats(stmts)
+    );
+}
+
+pub fn lift_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize) -> Vec<Stat> {
+    // Phase C1: reset the proto-wide statement budget at the top-level entry
+    // so every fresh proto gets the full allowance. Recursive closure lifts
+    // (via `lift_proto_inner` from `NewClosure`) intentionally share this
+    // same counter with the main proto — the budget is a whole-decompilation
+    // cap, not a per-closure cap.
+    reset_stmt_budget();
+    lift_proto_inner(ctx, proto, proto_index, 0)
+}
+
+/// LUAU_BODY_REPORT prints, per proto, how many INSTRUCTIONS it has against how
+/// many STATEMENTS were emitted for it.
+///
+/// This is the sound adjudicator for `truncated_body` findings. Rotation 30
+/// used the FILE's bytecode size, which is far too coarse: 889_Utils_Invisibility
+/// is 1,263 bytes and its `MakeVisible` proto is a single `Return`, so the empty
+/// body the sweep flagged as truncated is CORRECT output for an empty shipped
+/// function. Only the per-proto instruction count can tell a real truncation
+/// from a function that genuinely does nothing.
+/// Count `Call`/`MethodCall` nodes in a lifted body, exactly.
+///
+/// Rotation 56 counted emitted calls with a REGEX over the output text and it
+/// over-counted badly (`698_Use_Toy`: 3 in the bytecode, 9 "emitted"), which
+/// made `duplicate_call` undecidable - over-counting manufactures exactly the
+/// signal that claim looks for.
+///
+/// The match is EXHAUSTIVE on purpose: no `_` arm, so adding an AST variant
+/// breaks the build here rather than silently under-counting, which would
+/// invent `dropped_call` deficits instead.
+///
+/// Closure bodies are NOT descended into: `Expr::Function` is a separate proto
+/// and is reported on its own line, so descending would double-count.
+fn count_calls_stats(stats: &[Stat]) -> usize {
+    stats.iter().map(count_calls_stat).sum()
+}
+
+fn count_calls_stat(s: &Stat) -> usize {
+    match s {
+        Stat::Local { values, .. } => values.iter().map(count_calls_expr).sum(),
+        Stat::Assign { targets, values } => {
+            targets.iter().map(count_calls_expr).sum::<usize>()
+                + values.iter().map(count_calls_expr).sum::<usize>()
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            count_calls_expr(condition)
+                + count_calls_stats(then_body)
+                + elseif_clauses
+                    .iter()
+                    .map(|(c, b)| count_calls_expr(c) + count_calls_stats(b))
+                    .sum::<usize>()
+                + else_body.as_ref().map(|b| count_calls_stats(b)).unwrap_or(0)
+        }
+        Stat::While { condition, body } => count_calls_expr(condition) + count_calls_stats(body),
+        Stat::Repeat { body, condition } => count_calls_stats(body) + count_calls_expr(condition),
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            count_calls_expr(start)
+                + count_calls_expr(stop)
+                + step.as_ref().map(count_calls_expr).unwrap_or(0)
+                + count_calls_stats(body)
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().map(count_calls_expr).sum::<usize>() + count_calls_stats(body)
+        }
+        Stat::Return { values } => values.iter().map(count_calls_expr).sum(),
+        Stat::Break | Stat::Continue | Stat::Comment(_) => 0,
+        Stat::DoBlock { body } => count_calls_stats(body),
+        Stat::ExprStat(e) => count_calls_expr(e),
+        // A closure is its own proto and is reported separately.
+        Stat::LocalFunction { .. } | Stat::MethodFunction { .. } => 0,
+    }
+}
+
+fn count_calls_expr(e: &Expr) -> usize {
+    match e {
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Name(_)
+        | Expr::Vector(_, _, _) => 0,
+        Expr::Field { object, .. } => count_calls_expr(object),
+        Expr::Index { object, key } => count_calls_expr(object) + count_calls_expr(key),
+        Expr::BinOp { left, right, .. } => count_calls_expr(left) + count_calls_expr(right),
+        Expr::UnOp { operand, .. } => count_calls_expr(operand),
+        Expr::Call { func, args } => {
+            1 + count_calls_expr(func) + args.iter().map(count_calls_expr).sum::<usize>()
+        }
+        Expr::MethodCall { object, args, .. } => {
+            1 + count_calls_expr(object) + args.iter().map(count_calls_expr).sum::<usize>()
+        }
+        // Separate proto - see the note above.
+        Expr::Function { .. } => 0,
+        Expr::Table { fields } => fields
+            .iter()
+            .map(|f| match f {
+                TableField::Sequential(v) => count_calls_expr(v),
+                TableField::Named(_, v) => count_calls_expr(v),
+                TableField::Indexed(k, v) => count_calls_expr(k) + count_calls_expr(v),
+            })
+            .sum(),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            count_calls_expr(cond) + count_calls_expr(then_expr) + count_calls_expr(else_expr)
+        }
+    }
+}
+
+pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    // Always recorded, not gated: this feeds a semantic check, not a trace.
+    {
+        // A CALL IN PROVABLY-DEAD CODE IS NOT A DROPPED CALL.
+        //
+        // `rc_0030 Janitor::AddPromise@103` reported 10 of 10 calls missing for
+        // a 57-word body, which looks like a total collapse and is correct
+        // output:
+        //
+        //     0: LOADB     R2 false
+        //     1: JUMPIFNOT R2 -> 56     <- R2 IS false, so this ALWAYS jumps
+        //     2..55: the body, 10 calls
+        //
+        // It is a bundled Janitor with `FoundPromiseLibrary` stubbed to false,
+        // so the compiler kept a branch that can never run. Charging those ten
+        // as dropped calls puts a proto in the defect list that no lifter change
+        // can or should remove.
+        //
+        // Only the constant-guard form is skipped - `LOADB Rn <b>` immediately
+        // followed by a jump on Rn whose polarity matches - because that is
+        // decidable from two adjacent words with no dataflow.
+        let mut dead: Vec<(usize, usize)> = Vec::new();
+        {
+            let code = &proto.code;
+            let mut i = 0usize;
+            while i + 1 < code.len() {
+                let op = LuauOpcode::from_u8((code[i] & 0xFF) as u8);
+                if matches!(op, LuauOpcode::LoadB) {
+                    let reg = insn_a(code[i]) as usize;
+                    let val = insn_b(code[i]) != 0;
+                    let jpc = i + 1;
+                    let jop = LuauOpcode::from_u8((code[jpc] & 0xFF) as u8);
+                    let same_reg = insn_a(code[jpc]) as usize == reg;
+                    let always = match jop {
+                        LuauOpcode::JumpIfNot => same_reg && !val,
+                        LuauOpcode::JumpIf => same_reg && val,
+                        _ => false,
+                    };
+                    if always {
+                        let t = (jpc as i64 + insn_d(code[jpc]) as i64 + 1) as usize;
+                        if t > jpc + 1 && t <= code.len() {
+                            dead.push((jpc + 1, t));
+                        }
+                    }
+                }
+                i += if op.has_aux() { 2 } else { 1 };
+            }
+        }
+        let mut bc = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
+            let insn = proto.code[i];
+            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+            if matches!(op, LuauOpcode::Call)
+                && !dead.iter().any(|&(s, e)| i >= s && i < e)
+            {
+                bc += 1;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        // proto INDEX, not just the line: several closures can share a line,
+        // and without the index a proto lifted more than once is
+        // indistinguishable from several distinct protos - which is exactly
+        // the confusion the header's "N proto(s)" count fell into.
+        let who = format!(
+            "#{} {}@{}",
+            proto_index,
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined
+        );
+        crate::decompiler::call_recovery::record(proto_index, &who, bc, count_calls_stats(&out));
+    }
+    if std::env::var("LUAU_BODY_REPORT").is_ok() {
+        // Also count CALL-family opcodes. A `dropped_call` claim - "a call whose
+        // result is referenced but the call itself is missing" - is decidable by
+        // comparing the calls the BYTECODE contains against the calls the output
+        // emits, which is the same artefact-vs-claim test that collapsed
+        // truncated_body and undefined_register.
+        let mut calls = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
+            let insn = proto.code[i];
+            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+            // COUNT ONLY `Call`.
+            //
+            // `obj:Method()` compiles to NAMECALL followed by CALL - two
+            // instructions for ONE call expression. Counting both inflated the
+            // bytecode side by one per method call and manufactured deficits:
+            // `218_Collectors::getSwingSpeedMultiplier` reported 2 bytecode
+            // calls against 1 emitted while its whole body is
+            // `return value3:Get().Transient.CollectorSpeed or 1` - a single
+            // method call, correctly emitted.
+            //
+            // Every call, plain or method, terminates in exactly one CALL, so
+            // CALL alone is the right unit to compare against AST call nodes.
+            if matches!(op, LuauOpcode::Call) {
+                calls += 1;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        eprintln!(
+            "BODY proto={}@{} insns={} stmts={} calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            proto.code.len(),
+            out.len(),
+            calls
+        );
+        eprintln!(
+            "BODYAST proto={}@{} bc_calls={} ast_calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            calls,
+            count_calls_stats(&out)
+        );
+    }
+    out
+}
+
+fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
+    if depth >= MAX_DECOMPILE_DEPTH {
+        return vec![Stat::Comment("-- max decompile depth reached".to_string())];
+    }
+    // If the proto-wide statement budget has already been exhausted by a
+    // sibling / ancestor proto on this decompilation, short-circuit here so
+    // we don't do more lifting work than we can possibly emit.
+    if stmt_budget_tripped() {
+        return vec![Stat::Comment("-- statement budget exceeded".to_string())];
+    }
+
+    // Infer upvalue names from usage patterns in the bytecode.
+    //
+    // For the main proto (depth==0), there's no parent to provide CAPTURE-based
+    // inference, so this is the only source of upvalue names.
+    //
+    // For child protos (depth>0), CAPTURE-based inference from the parent is
+    // preferred. However, if CAPTURE inference failed or was incomplete (e.g.,
+    // un-remapped CAPTUREs that didn't pass structural validation), we fill in
+    // the gaps with usage-based inference as a fallback.
+    //
+    // IMPORTANT: this block runs *before* analyze_register_usage so that the
+    // pre-pass can hint GETUPVAL destinations with real upvalue names instead
+    // of generic v{reg} fallbacks.
+    if proto.num_upvalues > 0 {
+        let existing = ctx.inferred_upvalue_names.get(&proto_index);
+        let num_upvals = proto.num_upvalues as usize;
+        let has_gaps = match existing {
+            None => true,
+            Some(names) => names.len() < num_upvals || names.iter().any(|n| n.is_empty()),
+        };
+        if has_gaps {
+            let usage_names = infer_main_proto_upval_names(proto, &ctx.chunk.strings);
+            if usage_names.iter().any(|n| !n.is_empty()) {
+                // Merge: keep CAPTURE-inferred names where available, fill gaps with usage names
+                let mut merged = existing.cloned().unwrap_or_else(|| vec![String::new(); num_upvals]);
+                // Pad to full length if needed
+                merged.resize(num_upvals, String::new());
+                for (i, usage) in usage_names.iter().enumerate() {
+                    if i < merged.len() && merged[i].is_empty() && !usage.is_empty() {
+                        merged[i] = usage.clone();
+                    }
+                }
+                ctx.inferred_upvalue_names.insert(proto_index, merged);
+            }
+        }
+    }
+
+
+    // SETUPVAL-based upvalue name inference: scan the bytecode for SETUPVAL
+    // instructions and trace backwards to see what meaningful name R(A) held.
+    // This catches cases where CAPTURE inference failed but the proto's own
+    // code stores a known value (from GETIMPORT/GETGLOBAL/LOADK) into an upvalue.
+    if proto.num_upvalues > 0 {
+        let existing = ctx.inferred_upvalue_names.get(&proto_index);
+        let num_upvals = proto.num_upvalues as usize;
+        let has_gaps = match existing {
+            None => true,
+            Some(names) => names.len() < num_upvals || names.iter().any(|n| n.is_empty()),
+        };
+        if has_gaps {
+            let setupval_names = infer_upval_names_from_setupval(
+                proto,
+                &ctx.chunk.strings,
+                ctx.inferred_upvalue_names.get(&proto_index),
+            );
+            if setupval_names.iter().any(|n| !n.is_empty()) {
+                let mut merged = ctx.inferred_upvalue_names
+                    .get(&proto_index)
+                    .cloned()
+                    .unwrap_or_else(|| vec![String::new(); num_upvals]);
+                merged.resize(num_upvals, String::new());
+                for (i, name) in setupval_names.iter().enumerate() {
+                    if i < merged.len() && merged[i].is_empty() && !name.is_empty() {
+                        merged[i] = name.clone();
+                    }
+                }
+                ctx.inferred_upvalue_names.insert(proto_index, merged);
+            }
+        }
+    }
+
+    // Run pre-pass to analyze register usage and generate naming hints.
+    // This must happen AFTER upvalue inference (so GETUPVAL hints get real
+    // upvalue names) and BEFORE any reg_name calls for this proto.
+    let upval_names_clone = ctx.inferred_upvalue_names.get(&proto_index).cloned();
+    let hints = analyze_register_usage(
+        proto,
+        &ctx.chunk.strings,
+        upval_names_clone.as_deref(),
+        Some(&ctx.chunk.protos),
+    );
+    ctx.init_proto_naming(
+        proto_index,
+        hints,
+        upval_names_clone.as_deref().unwrap_or(&[]),
+    );
+    let prev_proto = ctx.current_proto_index;
+    ctx.current_proto_index = Some(proto_index);
+    // Let each function claim its own recorded name before any temporary
+    // sharing its register can take it. Must run with `current_proto_index`
+    // already switched, and before any other naming happens in this proto.
+    let closure_sites = crate::decompiler::closure_debug_names(proto, &ctx.chunk.protos);
+    ctx.preallocate_closure_names(&closure_sites);
+    // B0.134b: push this proto onto the decompilation stack so child
+    // NEWCLOSURE instructions can detect (and prevent) recursion into
+    // any ancestor proto. Previously proto_stack was only maintained
+    // in the NEWCLOSURE handler, leaving the main proto untracked.
+    ctx.proto_stack.push(proto_index);
+
+    let cfg = ControlFlowGraph::build(proto);
+    let regions = structure_control_flow(&cfg, proto);
+    // Use a generous register count — max_stack_size can be too small for some operands
+    let reg_count = (proto.max_stack_size as usize).max(256);
+    let mut regs = vec![RegVal::Unknown; reg_count];
+    // Register indices are per-proto, so provenance from the previous proto
+    // must not leak in. After this, a register with no recorded origin was
+    // never written in THIS proto at all -- a distinct cause worth counting
+    // separately from the ones that clear a register deliberately.
+    crate::decompiler::mint_trace::clear_unknown_origins();
+    let mut locals = LocalTracker::new(proto.num_params as usize);
+
+    // Initialize parameters
+    for i in 0..proto.num_params {
+        let name = ctx.reg_name(proto, i, 0);
+        regs[i as usize] = RegVal::Expr(Expr::Name(name.clone()));
+        // Phase B0.49: record param name.  Parameter registers never
+        // re-declare (classify_write always returns Reassign for reg <
+        // param_count), but keeping current_names populated guards any
+        // future code path that might read the current name by proxy.
+        locals.record_name(i as usize, &name);
+    }
+
+    let mut stmts = Vec::new();
+    for region in &regions {
+        if stmt_budget_tripped() {
+            break;
+        }
+        let before_len = stmts.len();
+        lift_region(ctx, proto, proto_index, &cfg, region, &mut regs, &mut locals, depth, &mut stmts);
+        // Account for statements appended by push-sites that do not route
+        // through `push_stat` (the lifter has ~56 direct `.push(Stat::…)`
+        // call sites). `note_stmts_pushed` trims back + stamps the comment
+        // if this particular region tipped us over the edge.
+        let delta = stmts.len().saturating_sub(before_len);
+        note_stmts_pushed(&mut stmts, delta);
+    }
+
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_region_loop calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    // Restore parent proto context for nested decompilation
+    ctx.proto_stack.pop(); // B0.134b: match the push at entry
+    ctx.current_proto_index = prev_proto;
+
+    // Re-stamp the DCE identity: nested closures are lifted DURING the region
+    // loop above and each overwrites it, so by here it names the last nested
+    // proto rather than this one. Rotation 69 found this by getting no trace
+    // output at all for the proto being investigated.
+    set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
+    // Post-processing: eliminate dead stores and collapse control flow
+    simplify_stmts(&mut stmts);
+    pass_probe(proto, "simplify_stmts", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_simplify_stmts calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    eliminate_dead_stores(&mut stmts);
+    pass_probe(proto, "eliminate_dead_stores", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_stores calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    if std::env::var("LUAU_NO_DCE").is_err() {
+        eliminate_dead_code(&mut stmts);
+    }
+    pass_probe(proto, "eliminate_dead_code", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_code calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    // C10b: drop `local v_N = { K = "K" }` artifact patterns when unused.
+    // C10j: also drop `local v_N = <pure_rhs>` for bare literals/Name/Field
+    // chains when never read/written downstream.
+    // Second dead-code sweep because these drops can leave empty-if shells.
+    eliminate_dead_key_eq_value_locals(&mut stmts);
+    pass_probe(proto, "eliminate_dead_key_eq_value_locals", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_eliminate_dead_key_eq_value_locals calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    if std::env::var("LUAU_NO_DCE").is_err() {
+        eliminate_dead_code(&mut stmts);
+    }
+    pass_probe(proto, "eliminate_dead_code", &stmts);
+    // Phase B0.46A: post-AST repeat-until detection. Catches `repeat ... until`
+    // loops that the bytecode-level structuring pass emitted as
+    // `while true do <body>; if cond then break end end`. Must run BEFORE
+    // `convert_single_pass_loops` so the trailing `if cond then break end`
+    // is still present (single-pass collapse would rewrite it into an if/else).
+    convert_while_true_break_to_repeat(&mut stmts);
+    pass_probe(proto, "convert_while_true_break_to_repeat", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_convert_while_true_break_to_repeat calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    convert_single_pass_loops(&mut stmts);
+    pass_probe(proto, "convert_single_pass_loops", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_convert_single_pass_loops calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    collapse_elseif_chains(&mut stmts);
+    pass_probe(proto, "collapse_elseif_chains", &stmts);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_collapse_elseif_chains calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+
+    // Phase B0.95: collapse `if cond then X = true else X = false end`
+    // into `X = cond`. MUST run BEFORE collapse_short_circuit_assignments
+    // to prevent the short-circuit pass from converting boolean-assignment
+    // patterns into `X = cond and true or false` (which doesn't simplify).
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} before_post_passes calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+    post_passes::collapse_if_assign_bool(&mut stmts);
+    pass_probe(proto, "collapse_if_assign_bool", &stmts);
+
+    collapse_short_circuit_assignments(&mut stmts);
+    pass_probe(proto, "collapse_short_circuit_assignments", &stmts);
+
+    // Phase B0.89: merge `local x = nil; x = expr` into `local x = expr`.
+    // Must run BEFORE B0.87/88 so that `local x = nil; x = expr; if ...`
+    // patterns are simplified first (the nil→expr merge may expose a new
+    // ternary pattern for B0.87/88).
+    post_passes::merge_dead_init_with_assignment(&mut stmts);
+    pass_probe(proto, "merge_dead_init_with_assignment", &stmts);
+
+    // Phase B0.87/88: collapse `local x = <init>; if cond then x = a [else x = b] end`
+    // into `local x = if cond then a else b` (or `... else <init>` without else).
+    // Must run AFTER collapse_short_circuit_assignments (which handles the
+    // self-referencing `if x then x = a end` shape separately) and BEFORE
+    // inline_single_use_temps (which benefits from the reduced read-count).
+    collapse_nil_init_conditional(&mut stmts);
+    pass_probe(proto, "collapse_nil_init_conditional", &stmts);
+
+    rename_upvals(&mut stmts);
+
+    // Phase C2 pass #2: recursive upvalue name propagation (bounded fixpoint).
+    //
+    // rename_upvals just resolved this proto's upvalue names from AST usage.
+    // Children captured by this proto may still have `upval_N` placeholders
+    // because their parent's upvalue was named AFTER the child was visited.
+    // Grandchildren are an even deeper case: P1 → P2 → P3 where P3's upval_N
+    // depends on P2's upval_M depending on P1's resolved name.
+    //
+    // We walk `upval_parent_links` for ALL protos (not just direct children of
+    // the current one) and propagate named parents to unnamed children. Each
+    // iteration may resolve a new link, feeding the next iteration. We bound
+    // the loop at 5 iterations to guarantee termination even if the parent
+    // link graph contains a cycle (which would be malformed but must not hang).
+    //
+    // After any update we re-run `rename_upvals` on the current proto's AST
+    // so that newly-resolved names flow into the emitted output.
+    for _ in 0..PROPAGATE_UPVAL_MAX_ITERATIONS {
+        let changed = propagate_upval_names_once(
+            &ctx.chunk.protos,
+            &mut ctx.inferred_upvalue_names,
+            &ctx.upval_parent_links,
+        );
+        if !changed { break; }
+        // Re-walk this proto's AST — new parent→child names may have been
+        // propagated that affect `upval_N` references emitted during the
+        // lifting phase. `rename_upvals` uses AST-usage heuristics and
+        // descends into nested closure bodies (via apply_renames_to_stmts),
+        // so any newly-resolved context propagates throughout the tree.
+        rename_upvals(&mut stmts);
+    }
+
+    // Clean up decompiler artifacts
+    cleanup_stmts(&mut stmts);
+    pass_probe(proto, "cleanup_stmts", &stmts);
+
+    // Collapse method chains: `local v0 = obj:M1()` + `v0 = v0:M2(args)` → `local v0 = obj:M1():M2(args)`
+    // Also collapses different-name chains: `call = X()` + `call2 = call:M()` → `call2 = X():M()`
+    collapse_method_chains(&mut stmts);
+    pass_probe(proto, "collapse_method_chains", &stmts);
+
+    // Phase B0.47: Reconstruct module-style table constructors from the
+    // `local M = {}; M.foo = ...; M.bar = ...` pattern.  Must run BEFORE
+    // `inline_single_use_temps` because removing the intermediate field
+    // assignments changes the read-count of `M`, which `inline_single_use_temps`
+    // uses to decide whether to inline the table value.
+    reconstruct_table_constructors(&mut stmts);
+    pass_probe(proto, "reconstruct_table_constructors", &stmts);
+
+    // Phase C2: SETLIST / sequential-integer-index coalesce.  Converts
+    // `local t = {[1] = a, [2] = b, [3] = c}` (produced by
+    // `reconstruct_table_constructors` when the keys are integers and
+    // therefore not valid identifiers) into `local t = {a, b, c}`.  Runs
+    // AFTER `reconstruct_table_constructors` so it operates on the already-
+    // folded Table constructor.  Purely cosmetic: no name-read-count side
+    // effects, so order relative to `inline_single_use_temps` is free.
+    coalesce_setlist_sequential(&mut stmts);
+
+    // Phase C10O: unwrap `local R = {K = inner}; require(R)` → `require(inner)`.
+    // Must run BEFORE inline_single_use_temps — that pass has a B0.114 guard
+    // that refuses to inline tables into require() args, so the wrapper local
+    // would otherwise persist. C10O handles the pre-materialized case
+    // directly; C8 (CALL-time) already covers the inline form.
+    post_passes::unwrap_require_wrapper_locals(&mut stmts);
+
+    // Phase C10P: rename `local serviceN = game:GetService("X")` locals to X.
+    // Upstream LITERAL_NAMING_METHODS logic (mod.rs) is supposed to propagate
+    // the string arg into the register hint, but ~1112 corpus locals still
+    // surface as generic `serviceN`. This post-pass catches the survivors.
+    post_passes::rename_service_locals(&mut stmts);
+
+    // Inline single-use call/method temps into their use sites:
+    // `call7 = chain:Build()` + `call8 = Y:Add(call7)` → `call8 = Y:Add(chain:Build())`
+    let arity_pinned = ctx.arity_pinned_temps.clone();
+    post_passes::inline_single_use_temps_pinned(&mut stmts, &arity_pinned);
+    if std::env::var("LUAU_PASS_TRACE").is_ok() {
+        eprintln!("PASS proto={}@{} after_post_passes calls={}",
+            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+            count_calls_stats(&stmts));
+    }
+
+    // Phase B0.51B: inline pure literal locals at ALL read sites
+    // (regardless of read count) up to the next reassignment.  Targets
+    // the Roblox pattern where a register is reused with multiple
+    // LOADK loads, e.g. `local v3 = "Players"; game:GetService(v3); ...`
+    // becomes `game:GetService("Players")` etc.
+    inline_pure_literals(&mut stmts);
+
+    // Phase C2: fold multi-return call unpack pattern
+    //   `local v1,v2,v3 = f()` + `x.a=v1; x.b=v2; x.c=v3`
+    //   →  `x.a, x.b, x.c = f()`
+    // Runs AFTER inline_single_use_temps so the simple one-to-one single-use
+    // case is already collapsed; any surviving scattered-unpack cluster is
+    // the N-ary pattern this fold targets.
+    post_passes::fold_multireturn_unpack(&mut stmts);
+
+    // Run chain collapse again — inlining may create new consecutive chain opportunities
+    collapse_method_chains(&mut stmts);
+
+    // Phase B0.60: reconstruct Luau method-function syntax from the
+    // two-step `local F = function(...) end; Base.X = F` pattern that
+    // the lifter produces for every Roblox module field-closure write.
+    // Converts to `Stat::MethodFunction` with `is_method=true` when the
+    // first param is used as an object receiver in the body — emit.rs
+    // then renders as `function Base:X(...) end` (proper Luau method
+    // syntax). Runs AFTER inline_single_use_temps so any folded temps
+    // are cleaned up first.
+    post_passes::reconstruct_method_assignments(&mut stmts);
+
+    // Phase C10S: drop `setmetatable.X = ...` / `function pcall.Y() end`
+    // and similar stdlib-function-lvalue artifacts. These only appear
+    // when a register that should hold a local-binding name got
+    // corrupted upstream into `Name("setmetatable")` (or any other
+    // stdlib function). Real source never writes to stdlib functions,
+    // so the resulting statement is pure decompiler noise. Runs AFTER
+    // reconstruct_method_assignments so both the raw `Stat::Assign`
+    // artifact AND any `Stat::MethodFunction` form get swept.
+    post_passes::drop_stdlib_function_lvalue_artifacts(&mut stmts);
+
+    // B0.119: Convert `local fn = function(...) ... end` to the idiomatic
+    // `local function fn(...) ... end` form. Runs AFTER method-function
+    // reconstruction (which may absorb some of these into Base:Method style)
+    // and AFTER inline_single_use_temps (which may inline closures).
+    convert_local_function_sugar(&mut stmts);
+
+    // Phase C2 pass #5: convert `T.m = function(self, ...)` to idiomatic
+    // `function T:m(...)` when the body uses `self.x` or `self:y()` at
+    // least twice. Runs AFTER reconstruct_method_assignments (which
+    // handles the two-step local-then-assign pattern) so this pass picks
+    // up the remaining direct-assign shapes. Must run AFTER all temp-
+    // inlining and naming so the self-count is accurate.
+    post_passes::convert_dot_to_method_function(&mut stmts);
+
+    // Fold constant expressions (3 + 4 → 7, "a" .. "b" → "ab", etc.)
+    fold_constants_in_stmts(&mut stmts);
+
+    // C10h: after fold, `if "utf8" == "utf8" then X end` becomes
+    // `if true then X end`. Splice into parent. Always-false becomes
+    // `if false then X else Y end` → Y.
+    collapse_constant_ifs(&mut stmts);
+
+    // Phase B0.93c: collapse `if cond then return true else return false end`
+    // into `return cond`. Must run AFTER fold_constants (which may simplify
+    // conditions) and AFTER collapse_nil_init_conditional (which may convert
+    // if/assign patterns that look similar but aren't return-based).
+    post_passes::collapse_if_return_bool(&mut stmts);
+
+    // Phase B0.97: collapse `if cond then return a else return b end`
+    // into `return if cond then a else b`. Also handles the fallthrough
+    // pattern `if cond then return a end; return b`. Must run AFTER
+    // collapse_if_return_bool so bool-specific `return cond` fires first.
+    post_passes::collapse_if_return_ternary(&mut stmts);
+
+    crate::decompiler::walk_cover::report(
+        proto.debug_name.as_deref().unwrap_or("?"),
+        proto.line_defined,
+        &proto.code,
+    );
+    stmts
+}
+
+/// Lift the body of one if/else branch.
+///
+/// Historically each branch was lifted one CFG basic block at a time. That
+/// silently dropped every conditional jump nested inside the branch: the only
+/// code that turns a conditional jump into a nested `Stat::If` lives in
+/// `lift_instruction_range` and is gated on `target > pc && target <= end`, but
+/// `ControlFlowGraph::build` makes a block ending in a conditional branch end at
+/// `branch_pc + 1`. With a single block as the range, a forward jump target is
+/// always past `end`, so the guard can never hold — and the trailing fallback
+/// only emits anything when `in_loop` is true, which it is not here. The nested
+/// branch vanished without a trace (an `elseif` arm disappearing entirely, after
+/// which the dead-code and ternary passes correctly folded the wrong input).
+///
+/// Lifting the whole branch as ONE contiguous PC span lets that existing
+/// machinery fire. The contiguity check is load-bearing rather than defensive:
+/// when a merge block sits between two branch blocks, a naive span would swallow
+/// or duplicate it, so non-contiguous branches keep the per-block behaviour.
+#[allow(clippy::too_many_arguments)]
+/// Find every value join wholly contained in `[start, end)`, in program order.
+///
+/// Returns `(entry, arms, join, join_start)` tuples. Only joins that both begin
+/// and reconverge inside the span are reported, so splicing them into the span's
+/// lift can never claim an instruction outside it.
+fn collect_value_joins_in_span(
+    cfg: &ControlFlowGraph,
+    proto: &Proto,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, Vec<usize>, usize, usize)> {
+    // No loop-header set is needed here, and computing one would run a full
+    // dominator analysis for every branch arm and loop body in the proto. It is
+    // also unnecessary: a loop can only be re-entered through a back edge, and
+    // every back edge is rejected outright — either structurally (a successor at
+    // or before the entry) or because its latch carries `JUMPBACK` / `FOR*LOOP`,
+    // none of which are in the purity allowlist.
+    let headers = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut pc = start;
+    while pc < end {
+        let block = match cfg.blocks.get(&pc) {
+            Some(b) => b,
+            None => break,
+        };
+        if let Some(vj) = crate::analysis::value_region::find_value_join(cfg, &proto.code, pc, &headers)
+        {
+            let join_start = cfg.blocks.get(&vj.join).map(|b| b.start).unwrap_or(end + 1);
+            if join_start <= end {
+                out.push((vj.entry, vj.arms, vj.join, join_start));
+                pc = join_start;
+                continue;
+            }
+        }
+        pc = block.end;
+    }
+    out
+}
+
+/// Rotation 84: which lift path actually handles a given pc?
+///
+/// Two fixes were built on an INFERENCE about the path that lifts
+/// `533_NPCs::AddEvent`'s 14-block arm, and both left the file untouched.
+/// This reports the path instead of inferring it. Gated on `LUAU_LIFTPATH`.
+fn liftpath(proto: &Proto, who: &str, lo: usize, hi: usize) {
+    if std::env::var("LUAU_LIFTPATH").is_ok() {
+        eprintln!(
+            "LIFTPATH	{}	{}	{}..{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            who,
+            lo,
+            hi
+        );
+    }
+}
+
+fn lift_branch_region(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    sorted_blocks: &[usize],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    let ranges: Vec<(usize, usize)> = sorted_blocks
+        .iter()
+        .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+        .collect();
+    liftpath(
+        proto,
+        "branch_region",
+        ranges.iter().map(|r| r.0).min().unwrap_or(0),
+        ranges.iter().map(|r| r.1).max().unwrap_or(0),
+    );
+    if std::env::var("LUAU_ARM_TRACE").is_ok() {
+        // Two fix attempts (rotations 71, 72) assumed this function receives the
+        // 23-block else arm of OnInputBegin@184 and both missed it entirely.
+        // Print what it is ACTUALLY called with before assuming a third time.
+        eprintln!(
+            "ARM proto={}@{} blocks={} ranges={} first={:?}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            sorted_blocks.len(),
+            ranges.len(),
+            sorted_blocks.iter().take(6).collect::<Vec<_>>()
+        );
+    }
+
+    // Split the arm into maximal CONTIGUOUS runs of adjacent block ranges. A
+    // gap between two arm blocks is exactly where another region's blocks live
+    // (a merge block, an already-claimed inner region, ...), so a lift must
+    // never span one: structuring `min(start)..max(end)` of a disjoint arm is
+    // what double-lifted foreign blocks and broke 23 compile-gate files in the
+    // previous attempt at the dropped-loop fix.
+    // STRUCTURE THE WHOLE ARM SPAN when the arm contains a return before its
+    // last block.
+    //
+    // A branch arm is otherwise lifted as a flat linear span, and the only
+    // structurer it can reach (`structure_numeric_for_body`) emits
+    // `Linear`/`ValueJoin` and cannot express control flow. So an arm holding
+    // its own loops and branches is FLATTENED: `277_DragManager::OnInputBegin`
+    // keeps 4 of 36 statements, and - measured across the corpus - 27 files
+    // lose a loop entirely, the body rendered once and unconditionally.
+    //
+    // The header above records that structuring `min(start)..max(end)` of a
+    // DISJOINT arm double-lifted foreign blocks and broke 23 compile-gate
+    // files. That verdict predates this corpus. Measured here:
+    //
+    //     clean 1,100 -> 1,104   defects 48 -> 39
+    //     files losing clean status                     : 0
+    //     validation failures, FULL corpus              : 0 of 1142
+    //                                     (baseline also 0 of 1142)
+    //     changed files GAINING a loop construct        : 27
+    //     changed files LOSING one                      : 0
+    //
+    // Four files gain a chunk-top declaration, which is the CONSEQUENCE of
+    // recovering a loop - a variable assigned inside a loop body needs outer
+    // scope - not a regression.
+    //
+    // Two narrower variants were built and measured WORSE and are recorded in
+    // the journal: a subset structurer (-45 clean / +92 defects) and one
+    // restricted to terminating branches (-40 / +93).
+    if std::env::var("LUAU_BRANCH_ARMS").is_ok() && sorted_blocks.len() > 1 {
+        let regions = crate::analysis::structuring::structure_block_subset(
+            cfg, proto, sorted_blocks,
+        );
+        let n = sorted_blocks.len();
+        let smaller = regions.iter().all(|r| match r {
+            Region::IfThenElse { then_region, else_region, .. } => {
+                then_region.len() < n && else_region.len() < n
+            }
+            _ => true,
+        });
+        if smaller && regions.iter().any(|r| matches!(r, Region::IfThenElse { .. })) {
+            lift_structured_regions(
+                ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
+            );
+            return;
+        }
+    }
+    if ranges.len() > 1 {
+        let last = ranges.len() - 1;
+        let early_ret = ranges[..last].iter().any(|&(s, e)| {
+            let mut i = s;
+            let mut found = false;
+            while i < e && i < proto.code.len() {
+                let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                if matches!(op, LuauOpcode::Return) {
+                    found = true;
+                }
+                i += if op.has_aux() { 2 } else { 1 };
+            }
+            found
+        });
+        // WIDER TRIGGER, gated (rotation 82). `Return` is only one way an arm
+        // ends without falling through: `error(...)` never returns either, and
+        // an arm ending that way swallows the join the same way. The evidence
+        // is `533_NPCs::AddEvent` - 37 blocks collapsed to 4 regions, and the
+        // block at pc 174 (`GETTABLEKS R3 R1."StartReqs"`, the write the
+        // emitted `if v3 then` is missing) placed INSIDE the `error` arm and
+        // BEFORE pc 139, i.e. out of bytecode order.
+        //
+        // `error` cannot be recognised by opcode, so the proxy is the property
+        // that actually defeats the flat lifter: a non-last arm range holding
+        // its own conditional branch.
+        //
+        // MEASURED and NEGATIVE (rotation 82), left gated rather than deleted
+        // because the measurement is the point:
+        //
+        //     clean 1,104 -> 1,103   defects 39 -> 40
+        //     fixed  : 286_LeaderboardsGui (calls_not_emitted)
+        //     broke  : 7_Shop (branch_local_discarded),
+        //              919_pprint (calls_not_emitted)
+        //     533_NPCs, the file the trigger was BUILT from: unchanged.
+        //
+        // That last line is the finding. The trigger never fires there, because
+        // the swallowing does not happen in this function at all - it happens in
+        // `structure_control_flow`, which hands `lift_branch_region` an arm that
+        // ALREADY contains the join. See the journal, rotation 82: for
+        // `AddEvent` the trace reads `cond_block=112 then=14 merge=Some(210)`,
+        // and 210 is the target of the arm's terminating `JUMP` at pc 147, not
+        // the immediate postdominator at pc 139 where both paths converge.
+        // No re-triggering here can reach that.
+        let cond_arm = std::env::var("LUAU_ARM_COND").is_ok()
+            && ranges[..last].iter().any(|&(s, e)| {
+                let mut i = s;
+                let mut found = false;
+                while i < e && i < proto.code.len() {
+                    let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                    if matches!(
+                        op,
+                        LuauOpcode::JumpIf
+                            | LuauOpcode::JumpIfNot
+                            | LuauOpcode::JumpIfEq
+                            | LuauOpcode::JumpIfNotEq
+                            | LuauOpcode::JumpIfNotLE
+                            | LuauOpcode::JumpIfNotLT
+                    ) {
+                        found = true;
+                    }
+                    i += if op.has_aux() { 2 } else { 1 };
+                }
+                found
+            });
+        if early_ret || cond_arm {
+            let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+            let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, lo, hi, regs, locals, out, in_loop,
+            );
+            return;
+        }
+    }
+    let runs = split_contiguous_runs(&ranges);
+
+    if std::env::var("LUAU_RUN_TRACE").is_ok() {
+        let mut rs = ranges.clone();
+        rs.sort();
+        let spans: Vec<(usize, usize)> =
+            runs.iter().map(|&(lo, hi)| (ranges[lo].0, ranges[hi].1)).collect();
+        eprintln!("RUNS proto@{} blocks={:?} runs={:?}", proto.line_defined, rs, spans);
+    }
+    for &(lo, hi) in &runs {
+        let start = ranges[lo].0;
+        let end = ranges[hi].1;
+
+        // A branch arm is normally lifted as a raw linear span, and the linear
+        // dispatcher's match arm for FORNPREP/FORGPREP/FOR*LOOP is EMPTY
+        // ("handled at the region level" — which for arm-interior loops never
+        // happens: `structure_control_flow` marked these blocks `handled` when
+        // it matched the enclosing if/else, so `try_match_for_loop` never saw
+        // them). The loop was emitted as nothing: iterator call flattened to a
+        // bare 3-value local, body unguarded, loop variables permanently nil.
+        //
+        // When a run provably contains a complete prep→loop pair, structure it
+        // with the same scan that for-loop bodies already use (that path
+        // recurses and its loops DO survive), and lift the resulting regions.
+        // Runs without a complete for-pair keep the exact pre-existing
+        // behavior below.
+        // Same treatment for a nested BRANCH, gated. The loop case above was
+        // wired up in the B-loops fix; the branch case is the identical hole
+        // one construct over, and it is the only path that can reach a
+        // CONTIGUOUS arm (`ranges.len() > 1` is false, so both arm triggers
+        // above are dead for it). See `range_contains_nested_cond`.
+        //
+        // MEASURED, POSITIVE ON THE SCORE, AND NOT ADOPTED (rotation 83):
+        //
+        //     clean 1,104 -> 1,105   defects 39 -> 38
+        //     fixed 286_LeaderboardsGui; NO new findings anywhere
+        //     23 files changed; loops gained in 13, lost in 0; calls lost in 1
+        //
+        // Sampled recoveries are genuine - `93_Beequips` and `383_Honey` each
+        // turn a flattened `if` back into the `while` it was, `974_MonsterLevel`
+        // regains a loop with a `break`. But `1125_Supreme_Star_Amulet_Generator`
+        // LOSES `if 490000000000 <= value2.Honey then` outright and runs the
+        // body that spends 490 billion honey unconditionally. Narrowing the
+        // predicate to strictly-nested targets (`< end`, kept - it is the
+        // correct reading either way) did not restore it.
+        //
+        // The B-loops fix was adopted on "gained 27, lost 0". This one loses a
+        // guard in one file, so by that same standard it does not ship. A
+        // defect the checker cannot see is worth more than a defect it can.
+        if std::env::var("LUAU_ARM_IF").is_ok()
+            && crate::analysis::structuring::range_contains_nested_cond(&proto.code, start, end)
+        {
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, start, end, regs, locals, out, in_loop,
+            );
+            continue;
+        }
+        if crate::analysis::structuring::range_contains_nested_for(&proto.code, start, end) {
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, start, end, regs, locals, out, in_loop,
+            );
+            continue;
+        }
+
+        if runs.len() == 1 {
+            // A loop body or branch arm is lifted as one raw span, so a value join
+            // inside it never reaches the region structurer. Splice the ones that
+            // are there back in; when there are none this is exactly the single
+            // `lift_instruction_range` call it replaces.
+            let joins = collect_value_joins_in_span(cfg, proto, start, end);
+            if joins.is_empty() {
+                lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+            } else {
+                let mut cursor = start;
+                for (entry, arms, join, join_start) in joins {
+                    let entry_start = cfg.blocks.get(&entry).map(|b| b.start).unwrap_or(cursor);
+                    if entry_start < cursor {
+                        continue;
+                    }
+                    if cursor < entry_start {
+                        lift_instruction_range(ctx, proto, proto_index, depth, cursor, entry_start, regs, locals, out, in_loop);
+                    }
+                    lift_value_join(ctx, proto, proto_index, cfg, entry, &arms, join, regs, locals, depth, out, in_loop);
+                    cursor = join_start;
+                }
+                if cursor < end {
+                    lift_instruction_range(ctx, proto, proto_index, depth, cursor, end, regs, locals, out, in_loop);
+                }
+            }
+        } else {
+            // LIFT THE RUN AS ONE RANGE, not block by block.
+            //
+            // `lift_instruction_range` is the ONLY code that turns a nested
+            // conditional jump into a `Stat::If`, and it is gated on
+            // `target > pc && target <= end`. Handing it one block at a time
+            // makes `end` the block's own end, so every nested jump that
+            // crosses a block boundary is past `end` and vanishes without a
+            // trace - the arm is emitted as straight-line code and its inner
+            // branches are gone.
+            //
+            // A RUN is contiguous by construction: `split_contiguous_runs`
+            // returns maximal runs of PC-adjacent ranges, and its own contract
+            // is that the span `ranges[lo].0 .. ranges[hi].1` "contains no
+            // instruction outside the listed blocks". So widening the call from
+            // per-block to per-run claims nothing the arm does not own; it only
+            // stops truncating the window the nested-jump handler is allowed to
+            // see. The single-run case above already does exactly this.
+            lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
+        }
+    }
+}
+
+/// Split sorted block ranges into maximal runs of PC-adjacent ranges.
+///
+/// Returns inclusive index pairs `(lo, hi)` into `ranges`; each run's PC span
+/// is `ranges[lo].0 .. ranges[hi].1` and contains no instruction outside the
+/// listed blocks. Runs partition the input: every index appears in exactly one
+/// run, in order.
+fn split_contiguous_runs(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < ranges.len() {
+        let mut j = i;
+        while j + 1 < ranges.len() && ranges[j].1 == ranges[j + 1].0 {
+            j += 1;
+        }
+        runs.push((i, j));
+        i = j + 1;
+    }
+    runs
+}
+
+/// Lift one contiguous PC span `[start, end)` of a branch arm (or while-body
+/// block list) that is known to contain at least one complete for-loop
+/// prep→loop pair, by structuring it with `structure_numeric_for_body` and
+/// lifting the resulting regions in PC order.
+///
+/// Every region the scan produces lies inside `[start, end)` by construction
+/// (the scan walks only that range), so nothing outside the run — hence
+/// nothing owned by another region — can be lifted here. The debug assertion
+/// pins that invariant: its violation is the double-lift failure mode that
+/// sank the previous attempt at this fix.
+#[allow(clippy::too_many_arguments)]
+fn lift_structured_run(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    start: usize,
+    end: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    liftpath(proto, "structured_run", start, end);
+    // Loop headers protect `find_value_join` from claiming a nested loop's
+    // header as a value-join entry. Same set `structure_control_flow` builds;
+    // only computed when a run actually needs structuring, so the dominator
+    // walk is not paid on the common (for-free) arm.
+    let loop_headers: std::collections::BTreeSet<usize> =
+        cfg.find_loops().iter().map(|l| l.header).collect();
+    let regions = crate::analysis::structuring::structure_numeric_for_body(
+        &proto.code, start, end, cfg, &loop_headers,
+    );
+    // Rotation 87: what does the run structurer actually emit? Proto-qualified,
+    // because rotation 86 spent four rotations on the wrong near-duplicate
+    // proto for want of exactly this field.
+    // Rotation 112: RECURSE into loop bodies. The top-level print showed
+    // `GenericFor 55..162` covering `59_LocalCubs`'s skipped range and stopped
+    // there, so whether that body is structured at all was invisible.
+    fn runreg_nested(proto: &Proto, run: (usize, usize), regs_: &[Region], depth: usize) {
+        for r in regs_ {
+            let (kind, lo, hi, nested): (&str, usize, usize, Option<&Vec<Region>>) = match r {
+                Region::Linear { start, end } => ("Linear", *start, *end, None),
+                Region::IfThenElse { cond_pc, merge_pc, .. } => {
+                    ("IfThenElse", *cond_pc, merge_pc.unwrap_or(0), None)
+                }
+                Region::ValueJoin { entry, join, .. } => ("ValueJoin", *entry, *join, None),
+                Region::NumericFor { body_start, body_end, body, .. } => {
+                    ("NumericFor", *body_start, *body_end, Some(body))
+                }
+                Region::GenericFor { body_start, body_end, body, .. } => {
+                    ("GenericFor", *body_start, *body_end, Some(body))
+                }
+                Region::WhileDo { header, .. } => ("WhileDo", *header, 0, None),
+                Region::WhileTrue { header, .. } => ("WhileTrue", *header, 0, None),
+                Region::RepeatUntil { header, cond_pc, .. } => {
+                    ("RepeatUntil", *header, *cond_pc, None)
+                }
+                Region::InlineLoopInLoop { body_start, latch_pc, .. } => {
+                    ("InlineLoopInLoop", *body_start, *latch_pc, None)
+                }
+                Region::InlineIfThenInLoop { cond_pc, body, .. } => {
+                    ("InlineIfThenInLoop", *cond_pc, 0, Some(body))
+                }
+            };
+            eprintln!(
+                "RUNREG	{}@{}	run={}..{}	{}{}	{}..{}	nested={}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                run.0,
+                run.1,
+                "  ".repeat(depth),
+                kind,
+                lo,
+                hi,
+                nested.map(|v| v.len()).unwrap_or(0)
+            );
+            if let Some(v) = nested {
+                if depth < 4 {
+                    runreg_nested(proto, run, v, depth + 1);
+                }
+            }
+        }
+    }
+    if std::env::var("LUAU_RUNREG_TRACE").is_ok() {
+        runreg_nested(proto, (start, end), &regions, 0);
+    }
+    if false {
+        for r in &regions {
+            let (kind, lo, hi) = match r {
+                Region::Linear { start, end } => ("Linear", *start, *end),
+                Region::IfThenElse { cond_pc, merge_pc, .. } => {
+                    ("IfThenElse", *cond_pc, merge_pc.unwrap_or(0))
+                }
+                Region::ValueJoin { entry, join, .. } => ("ValueJoin", *entry, *join),
+                Region::NumericFor { body_start, body_end, .. } => {
+                    ("NumericFor", *body_start, *body_end)
+                }
+                Region::GenericFor { body_start, body_end, .. } => {
+                    ("GenericFor", *body_start, *body_end)
+                }
+                Region::WhileDo { header, .. } => ("WhileDo", *header, 0),
+                Region::WhileTrue { header, .. } => ("WhileTrue", *header, 0),
+                Region::RepeatUntil { header, cond_pc, .. } => {
+                    ("RepeatUntil", *header, *cond_pc)
+                }
+                Region::InlineLoopInLoop { .. } => ("InlineLoopInLoop", 0, 0),
+                Region::InlineIfThenInLoop { .. } => ("InlineIfThenInLoop", 0, 0),
+            };
+            eprintln!(
+                "RUNREG	{}	run={}..{}	{}	{}..{}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                start,
+                end,
+                kind,
+                lo,
+                hi
+            );
+        }
+    }
+    debug_assert!(
+        regions.iter().all(|r| region_pc_extent_within(r, start, end)),
+        "structured arm run [{start}, {end}) produced a region outside its span"
+    );
+    lift_structured_regions(
+        ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
+    );
+}
+
+/// Lift a `structure_numeric_for_body` region list in caller context.
+///
+/// Mirrors the nested-body iteration in `Region::GenericFor` /
+/// `Region::InlineIfThenInLoop`, with one load-bearing difference: those sites
+/// sit inside a real loop and hardcode `in_loop: true` for Linear children,
+/// while this helper also runs inside non-loop branch arms — where a hardcoded
+/// `true` would translate arm-exit jumps into `break`/`continue` statements
+/// outside any loop, a guaranteed compile failure. The caller's `in_loop` is
+/// threaded through Linear, ValueJoin, and InlineIfThenInLoop children
+/// instead. Self-contained loop regions (NumericFor / GenericFor /
+/// InlineLoopInLoop) establish their own loop context and go through
+/// `lift_region` unchanged.
+#[allow(clippy::too_many_arguments)]
+fn lift_structured_regions(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    regions: &[Region],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    // The run's own bound, taken from the regions rather than a parameter.
+    let run_end = regions
+        .iter()
+        .filter_map(|r| match r {
+            Region::Linear { end, .. } => Some(*end),
+            Region::ValueJoin { join, .. } => Some(*join),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // How far an extended Linear lift already reached. Regions inside it were
+    // lifted as part of that span; a region STRADDLING it keeps its tail.
+    let mut consumed_to = 0usize;
+    for sub in regions {
+        match sub {
+            Region::Linear { start, end } => {
+                if *end <= consumed_to {
+                    continue;
+                }
+                let from = (*start).max(consumed_to);
+                let ext = linear_escape_else_target(&proto.code, from, *end, run_end);
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth, from, ext.unwrap_or(*end), regs, locals, out,
+                    in_loop,
+                );
+                if let Some(m) = ext {
+                    consumed_to = m;
+                }
+            }
+            Region::ValueJoin { entry, arms, join } => {
+                if *join <= consumed_to {
+                    continue;
+                }
+                lift_value_join(
+                    ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, out,
+                    in_loop,
+                );
+            }
+            Region::InlineIfThenInLoop { cond_pc, body } => {
+                let condition = extract_branch_condition(ctx, proto, *cond_pc, regs);
+                let mut then_stmts = Vec::new();
+                lift_structured_regions(
+                    ctx, proto, proto_index, cfg, depth, body, regs, locals, &mut then_stmts,
+                    in_loop,
+                );
+                if matches!(&condition, Expr::Bool(true)) {
+                    out.extend(then_stmts);
+                } else {
+                    out.push(Stat::If {
+                        condition,
+                        then_body: then_stmts,
+                        elseif_clauses: vec![],
+                        else_body: None,
+                    });
+                }
+            }
+            _ => {
+                lift_region(
+                    ctx, proto, proto_index, cfg, sub, regs, locals, depth + 1, out,
+                );
+            }
+        }
+    }
+}
+
+/// Is every PC this region names inside `[start, end)`?
+///
+/// Backs the `debug_assert!` in `lift_structured_run`: structuring a
+/// contiguous arm run must not claim instructions owned by another region —
+/// the double-lift that broke the previous attempt at recovering
+/// arm-interior for-loops.
+fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
+    let within = |pc: usize| pc >= start && pc < end;
+    match region {
+        Region::Linear { start: s, end: e } => *s >= start && *e <= end,
+        Region::ValueJoin { entry, arms, join } => {
+            // `join` is a boundary, not a member: it may sit AT the run end.
+            within(*entry) && arms.iter().all(|&a| within(a)) && *join <= end
+        }
+        Region::NumericFor { prep_pc, loop_pc, body, .. }
+        | Region::GenericFor { prep_pc, loop_pc, body, .. } => {
+            within(*prep_pc)
+                && within(*loop_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::InlineLoopInLoop { header_start, latch_pc, body, .. } => {
+            within(*header_start)
+                && within(*latch_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::InlineIfThenInLoop { cond_pc, body } => {
+            within(*cond_pc)
+                && body.iter().all(|r| region_pc_extent_within(r, start, end))
+        }
+        Region::IfThenElse { .. }
+        | Region::WhileTrue { .. }
+        | Region::WhileDo { .. }
+        | Region::RepeatUntil { .. } => false,
+    }
+}
+
+/// Hard cap on how many root-to-join paths a value join may have. Each path
+/// contributes one operand to the reconstructed expression.
+const MAX_VALUE_JOIN_PATHS: usize = 16;
+
+/// One root-to-join path through a value join: the condition under which it is
+/// taken, and the register file it produces.
+struct ValuePath {
+    condition: Expr,
+    regs: Vec<RegVal>,
+}
+
+/// Split a basic block into the pc range of its body and the pc of its
+/// terminating branch, if it has one.
+///
+/// `find_branch_pc` assumes the block ends in a branch and always excludes its
+/// last word. That is wrong for a block reached by falling through and left the
+/// same way — its final instruction is ordinary value code, and excluding it
+/// silently drops the value the block exists to compute.
+fn block_body_and_terminator(proto: &Proto, start: usize, end: usize) -> (usize, Option<usize>) {
+    if end <= start || end > proto.code.len() {
+        return (end.min(proto.code.len()), None);
+    }
+    // Walk forward, instruction-aligned. Scanning backwards cannot tell an
+    // instruction from an AUX word: an AUX is arbitrary data that may decode as
+    // any opcode, including one that itself carries an AUX.
+    let mut last = start;
+    let mut w = start;
+    while w < end {
+        last = w;
+        w += if LuauOpcode::from_u8(insn_op(proto.code[w])).has_aux() {
+            2
+        } else {
+            1
+        };
+    }
+    let op = LuauOpcode::from_u8(insn_op(proto.code[last]));
+    let is_branch = matches!(
+        op,
+        LuauOpcode::Jump
+            | LuauOpcode::JumpBack
+            | LuauOpcode::JumpX
+            | LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    );
+    if is_branch {
+        (last, Some(last))
+    } else {
+        (end, None)
+    }
+}
+
+/// Conjoin two path conditions, dropping the vacuous `true`.
+fn and_conditions(acc: &Expr, next: Expr) -> Expr {
+    if matches!(acc, Expr::Bool(true)) {
+        return next;
+    }
+    Expr::BinOp {
+        left: Box::new(acc.clone()),
+        op: BinOp::And,
+        right: Box::new(next),
+    }
+}
+
+/// Combine one guarded value with the expression covering every later path.
+///
+/// Returns `None` when no *sound* pure-expression form exists, in which case
+/// the caller lowers the whole join to an explicit if/elseif/else chain.
+///
+/// The three rules mirror what the Luau compiler actually emitted:
+///  * `cond` IS the value — that is `cond or rest`, i.e. an `or` chain;
+///  * `cond` is `X and Y` and the value is `Y` — Lua's `and` yields its right
+///    operand, so `cond or rest` reproduces it exactly (an identity, not an
+///    approximation);
+///  * otherwise a ternary, which `emit.rs` renders as `cond and v or rest` and
+///    is therefore only faithful when `v` cannot be `false` or `nil`.
+fn combine_guarded_value(cond: &Expr, value: &Expr, rest: Expr) -> Option<Expr> {
+    if exprs_structurally_equal(cond, value) {
+        return Some(Expr::BinOp {
+            left: Box::new(value.clone()),
+            op: BinOp::Or,
+            right: Box::new(rest),
+        });
+    }
+    if let Expr::BinOp { op: BinOp::And, right, .. } = cond {
+        if exprs_structurally_equal(right, value) {
+            return Some(Expr::BinOp {
+                left: Box::new(cond.clone()),
+                op: BinOp::Or,
+                right: Box::new(rest),
+            });
+        }
+    }
+    if crate::decompiler::emit::is_provably_truthy(value) {
+        return Some(Expr::Ternary {
+            cond: Box::new(cond.clone()),
+            then_expr: Box::new(value.clone()),
+            else_expr: Box::new(rest),
+        });
+    }
+    None
+}
+
+/// Fold the per-path values of one register into a single expression.
+///
+/// Paths carrying the same value are grouped first, and the largest group
+/// becomes the default arm. That is deliberately independent of the order the
+/// paths were enumerated in: `t and t.n or -1` has three paths but only two
+/// distinct values (`-1` twice, `t.n` once), and the `-1` paths are not
+/// adjacent in any traversal order. Grouping collapses them regardless, leaving
+/// the single guarded value that the source actually wrote.
+fn fold_register_paths(paths: &[ValuePath], values: &[Expr]) -> Option<Expr> {
+    debug_assert_eq!(paths.len(), values.len());
+    if values.is_empty() {
+        return None;
+    }
+    // Group path indices by structurally equal value, preserving first-seen
+    // order so the reconstructed expression follows program order.
+    let mut groups: Vec<(Expr, Vec<usize>)> = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        match groups.iter_mut().find(|(g, _)| exprs_structurally_equal(g, v)) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((v.clone(), vec![i])),
+        }
+    }
+    if groups.len() == 1 {
+        return Some(groups[0].0.clone());
+    }
+    // Default arm: the value the most paths agree on. Ties go to the group
+    // seen last, which is the fall-back the compiler laid out last.
+    let default_idx = (0..groups.len())
+        .max_by_key(|&i| (groups[i].1.len(), i))
+        .expect("groups is non-empty");
+    let default_value = groups[default_idx].0.clone();
+
+    let mut acc = default_value;
+    for gi in (0..groups.len()).rev() {
+        if gi == default_idx {
+            continue;
+        }
+        let (value, idxs) = &groups[gi];
+        // A guard spanning many paths would produce an unreadable disjunction;
+        // fall back to the explicit statement form instead.
+        if idxs.len() > 2 {
+            return None;
+        }
+        let mut cond = paths[idxs[0]].condition.clone();
+        for &i in &idxs[1..] {
+            cond = Expr::BinOp {
+                left: Box::new(cond),
+                op: BinOp::Or,
+                right: Box::new(paths[i].condition.clone()),
+            };
+        }
+        acc = combine_guarded_value(&cond, value, acc)?;
+    }
+    Some(acc)
+}
+
+/// Enumerate every root-to-join path of a value join, lifting each with its own
+/// register file. Returns `None` if any path emits a statement (the region is
+/// then not a pure value selection after all) or if the caps are exceeded.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_value_paths(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    entry: usize,
+    members: &std::collections::BTreeSet<usize>,
+    join: usize,
+    base_regs: &[RegVal],
+    locals: &LocalTracker,
+    in_loop: bool,
+    hoist: &mut Vec<Stat>,
+) -> Option<Vec<ValuePath>> {
+    let mut out: Vec<ValuePath> = Vec::new();
+    // Depth-first, fall-through edge first, so paths come back in program
+    // order and the last one is the natural default arm.
+    let mut stack: Vec<(usize, Expr, Vec<RegVal>)> =
+        vec![(entry, Expr::Bool(true), base_regs.to_vec())];
+
+    while let Some((block_id, cond, mut regs)) = stack.pop() {
+        if block_id == join {
+            if out.len() >= MAX_VALUE_JOIN_PATHS {
+                return None;
+            }
+            out.push(ValuePath { condition: cond, regs });
+            continue;
+        }
+        if !members.contains(&block_id) {
+            return None;
+        }
+        let block = cfg.blocks.get(&block_id)?;
+        let (body_end, terminator) = block_body_and_terminator(proto, block.start, block.end);
+        // The entry block's pre-branch code has already been lifted into the
+        // real statement list; only its branch belongs to the path walk.
+        let body_start = if block_id == entry { body_end } else { block.start };
+
+        if body_start < body_end {
+            let mut scratch = Vec::new();
+            let mut trial_locals = locals.clone();
+            lift_instruction_range(
+                ctx, proto, proto_index, depth + 1, body_start, body_end,
+                &mut regs, &mut trial_locals, &mut scratch, in_loop,
+            );
+            // A SIDE EFFECT AND A MATERIALISED TEMP ARE NOT THE SAME THING.
+            //
+            // This rejected on ANY statement. Measured 19 Aug 2026 on
+            // 71_PlaceInfo (57 lines): ONE statement in ONE arm block killed a
+            // whole three-arm value join -
+            //     local PrivateServerOwnerId = game.PrivateServerOwnerId
+            // - and the register the three arms all wrote (R7) lost its value,
+            // so the post-join read minted an unassigned `v7` and the output
+            // compared against nil.
+            //
+            // A side effect genuinely cannot be duplicated or reordered. A temp
+            // binding a SIDE-EFFECT-FREE expression is only a naming choice: it
+            // can be evaluated ahead of the branch without changing behaviour,
+            // which is what hoisting it does. `has_side_effects` is already the
+            // arbiter of exactly this question for the ternary phi below.
+            //
+            // Anything else still rejects, so a real side effect is still
+            // refused - this narrows the guard, it does not remove it.
+            if !scratch.is_empty() {
+                let all_pure_temps = scratch.iter().all(|st| match st {
+                    Stat::Local { names, values } => {
+                        names.len() == 1
+                            && values.len() == 1
+                            && !has_side_effects(&values[0])
+                    }
+                    _ => false,
+                });
+                if !all_pure_temps {
+                    return None;
+                }
+                hoist.extend(scratch.drain(..));
+            }
+        }
+
+        match block.successors.len() {
+            1 => stack.push((block.successors[0], cond, regs)),
+            2 => {
+                let branch_pc = terminator?;
+                let fall_cond = extract_branch_condition(ctx, proto, branch_pc, &regs);
+                // Pushed in reverse so the fall-through edge is popped first.
+                stack.push((
+                    block.successors[1],
+                    and_conditions(&cond, negate_condition(&fall_cond)),
+                    regs.clone(),
+                ));
+                stack.push((
+                    block.successors[0],
+                    and_conditions(&cond, fall_cond),
+                    regs,
+                ));
+            }
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Which registers does `[start, end)` read before writing them?
+///
+/// Used to decide what has to be bound to a name BEFORE a value join is lifted.
+/// A register still holding a pending table constructor would otherwise be
+/// materialised *inside* an arm, which both emits a statement (defeating the
+/// pure-value reconstruction) and duplicates the constructor once per path.
+fn regs_read_in_range(code: &[u32], start: usize, end: usize) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b, c) = (
+            insn_a(insn) as usize,
+            insn_b(insn) as usize,
+            insn_c(insn) as usize,
+        );
+        match op {
+            LuauOpcode::Move
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN => {
+                out.insert(b);
+            }
+            LuauOpcode::GetTable => {
+                out.insert(b);
+                out.insert(c);
+            }
+            LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS => {
+                out.insert(a);
+            }
+            _ => {}
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    out
+}
+
+/// Lift a `Region::ValueJoin`.
+///
+/// Reconstructs, for every register the arms disagree on, the value it carries
+/// at the join. When each disagreement folds into a sound expression the region
+/// collapses to plain values (`t and t.n or -1`); otherwise it lowers to an
+/// explicit `if/elseif/else` assignment chain, which is correct for any runtime
+/// value at the cost of being wordier.
+#[allow(clippy::too_many_arguments)]
+fn lift_value_join(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    entry: usize,
+    arms: &[usize],
+    join: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    depth: usize,
+    stmts: &mut Vec<Stat>,
+    in_loop: bool,
+) {
+    let entry_block = match cfg.blocks.get(&entry) {
+        Some(b) => b,
+        None => return,
+    };
+    let (entry_body_end, entry_terminator) =
+        block_body_and_terminator(proto, entry_block.start, entry_block.end);
+    let branch_pc = match entry_terminator {
+        Some(t) => t,
+        None => return,
+    };
+    let join_start = cfg.blocks.get(&join).map(|b| b.start).unwrap_or(branch_pc);
+
+    // The entry block's pre-branch code runs unconditionally.
+    lift_instruction_range(
+        ctx, proto, proto_index, depth, entry_block.start, entry_body_end, regs, locals, stmts,
+        in_loop,
+    );
+
+    // Bind any value the arms READ that is still an unnamed compound (a pending
+    // table constructor, a call result, …). Done before the walk so no arm has
+    // to materialise it, which would emit a statement mid-region.
+    let free_reads = regs_read_in_range(&proto.code, branch_pc, join_start);
+    for r in free_reads {
+        if r < regs.len() {
+            ensure_lvalue_base_materialized(ctx, proto, regs, locals, stmts, r, branch_pc);
+        }
+    }
+
+    let members: std::collections::BTreeSet<usize> =
+        arms.iter().copied().chain(std::iter::once(entry)).collect();
+    let base_regs = regs.clone();
+    // Pure temps materialised inside an arm are hoisted here and emitted ahead
+    // of the region; see the guard in enumerate_value_paths for why that is
+    // sound. Dropped on the fallback path, where the linear lift re-emits them.
+    let mut hoisted_temps: Vec<Stat> = Vec::new();
+    let paths = enumerate_value_paths(
+        ctx, proto, proto_index, cfg, depth, entry, &members, join, &base_regs, locals, in_loop,
+        &mut hoisted_temps,
+    );
+    let paths = match paths {
+        Some(p) if p.len() >= 2 => {
+            for st in hoisted_temps.drain(..) {
+                stmts.push(st);
+            }
+            p
+        }
+        // Not a pure value selection after all. Fall back to the linear lift of
+        // the whole span, which is exactly what a `Region::Linear` would do.
+        _ => {
+            // Seed the registers that escape this diamond BEFORE the fallback
+            // lift, exactly as the `Region::IfThenElse` caller does.
+            //
+            // Without this the fallback lifts `branch_pc..join_start`, so the
+            // nested inline-if handler forwards an after-window of
+            // `join_start..join_start` -- zero width -- and
+            // `premateralize_branch_escapes_spans` returns at its
+            // `after_end <= after_start` guard before evaluating a single gate.
+            // The handler then hard-restores the pre-branch snapshot, which
+            // annihilates BOTH arm writes silently, and the post-join read
+            // mints a name nothing ever assigns.
+            //
+            // The real after-window is the join onward, not the empty span
+            // between the branch and the join.
+            if arms.len() == 2 {
+                let range_of = |id: &usize| cfg.blocks.get(id).map(|b| (b.start, b.end));
+                let then_ranges: Vec<(usize, usize)> = range_of(&arms[0]).into_iter().collect();
+                let else_ranges: Vec<(usize, usize)> = range_of(&arms[1]).into_iter().collect();
+                if !then_ranges.is_empty() && !else_ranges.is_empty() {
+                    let arm_ranges: Vec<(usize, usize)> = then_ranges
+                        .iter()
+                        .chain(else_ranges.iter())
+                        .copied()
+                        .collect();
+                    premateralize_branch_escapes_spans(
+                        ctx,
+                        proto,
+                        regs,
+                        locals,
+                        stmts,
+                        &arm_ranges,
+                        Some((&then_ranges, &else_ranges)),
+                        join_start,
+                        proto.code.len(),
+                        branch_pc,
+                    );
+                }
+            }
+            lift_instruction_range(
+                ctx, proto, proto_index, depth, branch_pc, join_start, regs, locals, stmts, in_loop,
+            );
+            return;
+        }
+    };
+
+    // Registers every path agrees on keep their value — strictly better than
+    // the two-way merge, which can only agree or forget.
+    let width = paths.iter().map(|p| p.regs.len()).min().unwrap_or(0);
+    let mut divergent: Vec<usize> = Vec::new();
+    for i in 0..width {
+        let first = &paths[0].regs[i];
+        let same = paths[1..].iter().all(|p| match (first, &p.regs[i]) {
+            (RegVal::Expr(a), RegVal::Expr(b)) => exprs_structurally_equal(a, b),
+            (RegVal::LoopVar(a), RegVal::LoopVar(b)) => a == b,
+            (RegVal::Unknown, RegVal::Unknown) => true,
+            _ => false,
+        });
+        if same {
+            regs[i] = first.clone();
+            continue;
+        }
+        // `Unknown` means "no information", not "some value". Reconstructing a
+        // phi from it would invent a reference to an undeclared name, so fall
+        // back to the conservative merge result for that register.
+        if paths.iter().any(|p| matches!(p.regs[i], RegVal::Unknown)) {
+            regs[i] = RegVal::Unknown;
+            crate::decompiler::mint_trace::note_unknown("UNK_JOIN_ANY_PATH", i);
+            continue;
+        }
+        divergent.push(i);
+    }
+
+    // Try the pure-expression reconstruction for every divergent register. It
+    // is all-or-nothing: a partial fold would leave some registers described by
+    // an expression and others by a statement chain guarded by the same
+    // conditions, evaluating them twice.
+    let mut folded: Vec<(usize, Expr)> = Vec::new();
+    let mut all_folded = true;
+    for &i in &divergent {
+        let values: Vec<Expr> = paths.iter().map(|p| reg_expr(&p.regs, i)).collect();
+        match fold_register_paths(&paths, &values) {
+            Some(e) => folded.push((i, simplify_expr(&e))),
+            None => {
+                all_folded = false;
+                break;
+            }
+        }
+    }
+
+    if all_folded {
+        for (i, value) in folded {
+            store_complex(ctx, proto, regs, locals, stmts, i, join_start, value);
+        }
+        return;
+    }
+
+    // Fallback lowering: `local r; if c1 then r = v1 elseif c2 then ... else
+    // r = vn end`. Always sound, whatever the values turn out to be.
+    let mut names: Vec<String> = Vec::new();
+    for &i in &divergent {
+        let name = ctx.reg_name(proto, i as u8, join_start);
+        let (kind, name) = locals.classify_write(i, &name);
+        names.push(name.clone());
+        regs[i] = RegVal::Expr(Expr::Name(name.clone()));
+        // A register that is ALREADY bound - a parameter, or a local declared
+        // before the branch - must not be re-declared here. `classify_write`
+        // answers exactly that with `Reassign` ("the register IS the
+        // parameter, never re-declared"), and the arms below assign the name
+        // either way, so the declaration is pure damage: `local arg2` over
+        // parameter `arg2` rebinds it to nil and EVERY later read of that
+        // parameter in the function evaluates to nil.
+        //
+        // Measured on the 1,143-file corpus: this destroyed 238_EggTypes
+        // (`arg1`, 145 reads) and 879_BigNum (`self`, 134 reads). The sibling
+        // site at the split-arm seed already guards with
+        // `is_undeclared_non_param`; this one discarded the classification.
+        if kind != WriteKind::Reassign {
+            stmts.push(Stat::Local {
+                names: vec![name],
+                values: vec![],
+            });
+        }
+    }
+    let assigns = |p: &ValuePath| -> Vec<Stat> {
+        divergent
+            .iter()
+            .zip(names.iter())
+            .map(|(&i, n)| Stat::Assign {
+                targets: vec![Expr::Name(n.clone())],
+                values: vec![reg_expr(&p.regs, i)],
+            })
+            .collect()
+    };
+    let last = paths.len() - 1;
+    let elseifs: Vec<(Expr, Vec<Stat>)> = paths[1..last]
+        .iter()
+        .map(|p| (simplify_expr(&p.condition), assigns(p)))
+        .collect();
+    stmts.push(Stat::If {
+        condition: simplify_expr(&paths[0].condition),
+        then_body: assigns(&paths[0]),
+        elseif_clauses: elseifs,
+        else_body: Some(assigns(&paths[last])),
+    });
+}
+
+/// Lift a single region into statements
+fn lift_region(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    region: &Region,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    depth: usize,
+    stmts: &mut Vec<Stat>,
+) {
+    match region {
+        Region::Linear { start, end } => {
+            lift_instruction_range(ctx, proto, proto_index, depth, *start, *end, regs, locals, stmts, false);
+        }
+
+        Region::ValueJoin { entry, arms, join } => {
+            lift_value_join(
+                ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, stmts, false,
+            );
+        }
+
+        Region::IfThenElse {
+            cond_pc,
+            then_region,
+            else_region,
+            merge_pc,
+        } => {
+            // Lift the condition block up to (not including) the branch
+            let block = &cfg.blocks[cond_pc];
+            let branch_pc = block_branch_pc(block);
+            lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, stmts, false);
+
+            // Extract the condition expression from the branch instruction
+            let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
+
+            // Name any parked literal the arms overwrite and later code reads,
+            // BEFORE snapshotting. Without this the arm writes stay parked in
+            // the register file, `merge_regs` collapses the disagreeing parks
+            // to `Unknown` at the join, `is_empty_if` then deletes the (still
+            // statement-free) arms, and every post-merge read of the register
+            // becomes a permanently-nil hoisted `vN`. The measured shape
+            // (95_TaskTypes GetStat): `LOADNIL R2`, a three-way ORK diamond
+            // writing R2, `SUB R2 ...` after the merge — the whole diamond
+            // vanished and the read arrived as `v2`. Pinning routes each arm
+            // write through `store_complex`'s pinned path, so the arms emit
+            // `v2 = ...` reassignments against ONE pre-declared identity and
+            // the diamond survives as an if/else.
+            //
+            // Only when a merge exists: arms that return/diverge have no join
+            // to feed, and the write scan walks the arm's ACTUAL block ranges
+            // (never `min..max` of a disjoint arm — the double-lift lesson).
+            if let Some(mpc) = merge_pc {
+                let then_ranges: Vec<(usize, usize)> = then_region
+                    .iter()
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
+                let else_ranges: Vec<(usize, usize)> = else_region
+                    .iter()
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
+                let arm_ranges: Vec<(usize, usize)> = then_ranges
+                    .iter()
+                    .chain(else_ranges.iter())
+                    .copied()
+                    .collect();
+                let after_start = cfg.blocks.get(mpc).map(|b| b.start).unwrap_or(*mpc);
+                premateralize_branch_escapes_spans(
+                    ctx,
+                    proto,
+                    regs,
+                    locals,
+                    stmts,
+                    &arm_ranges,
+                    Some((&then_ranges, &else_ranges)),
+                    after_start,
+                    proto.code.len(),
+                    branch_pc,
+                );
+            }
+
+            // MATERIALISE PENDING TABLES BEFORE THE ARMS RUN.
+            //
+            // A table literal sits in its register unemitted so later field
+            // writes can be folded into the constructor. That is right for
+            // straight-line code and fatal across a branch: an arm that adds a
+            // field leaves `Expr::Table` with a DIFFERENT field set on its
+            // side, `merge_regs` finds the two sides unequal and neither a
+            // `Name`, and resets the register to `Unknown` - destroying the
+            // table. Every later use then renders as an undeclared `v{reg}`.
+            //
+            // Measured on `654_Collect_Pollen`, whose source is
+            //
+            //     local filter = {}
+            //     if self.Zone  then filter.Zone  = self.Zone  end
+            //     if self.Color then filter.Color = self.Color end
+            //
+            // `DupTable` really does write the register (pc=25), and it is the
+            // merge that loses it - so the repair belongs here, before the
+            // arms, and NOT at the write site: rotation 34 tried seeding an
+            // empty table at the SETTABLEKS and merely fabricated tables where
+            // the register had held a game Instance.
+            //
+            // Emitting the binding first makes both arms mutate ONE named
+            // local, which is what the source did.
+            let pending_tables: Vec<usize> = (0..regs.len())
+                .filter(|&i| matches!(&regs[i], RegVal::Expr(Expr::Table { .. })))
+                .filter(|&i| locals.is_non_param(i))
+                .collect();
+            for i in pending_tables {
+                let RegVal::Expr(value) = regs[i].clone() else { continue };
+                let fresh = ctx.reg_name(proto, i as u8, branch_pc);
+                let (kind, name) = locals.classify_write(i, &fresh);
+                match kind {
+                    WriteKind::FirstDecl | WriteKind::Shadow => {
+                        stmts.push(Stat::Local {
+                            names: vec![name.clone()],
+                            values: vec![value],
+                        });
+                    }
+                    WriteKind::Reassign => {
+                        stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(name.clone())],
+                            values: vec![value],
+                        });
+                    }
+                }
+                regs[i] = RegVal::Expr(Expr::Name(name));
+            }
+
+            // Snapshot register state before branches so then/else don't
+            // corrupt each other's view of the registers.
+            let regs_before = regs.clone();
+
+            // Lift then-body (sorted by start PC for correct instruction order)
+            let mut then_sorted = then_region.clone();
+            then_sorted.sort_unstable();
+            let mut then_stmts = Vec::new();
+            lift_branch_region(ctx, proto, proto_index, cfg, depth, &then_sorted, regs, locals, &mut then_stmts, false);
+            let regs_after_then = regs.clone();
+
+            // Restore pre-branch state for the else-branch. Clone so we can
+            // still reference `regs_before` afterward in the B0.57 hoist.
+            *regs = regs_before.clone();
+
+            // Lift else-body (sorted by start PC for correct instruction order)
+            let mut else_sorted = else_region.clone();
+            else_sorted.sort_unstable();
+            if std::env::var("LUAU_ORDER_TRACE").is_ok() && !else_sorted.is_empty() {
+                // Does the block holding the function's trailing RETURN sort
+                // LAST? `else_sorted` is an ascending sort of block ids, which
+                // are start pcs, so it should - unless a block with a lower id
+                // contains a return that is not the function's exit.
+                let marks: Vec<String> = else_sorted
+                    .iter()
+                    .map(|bid| {
+                        let has_ret = cfg
+                            .blocks
+                            .get(bid)
+                            .map(|b| {
+                                let mut i = b.start;
+                                let mut found = false;
+                                while i < b.end && i < proto.code.len() {
+                                    let op = LuauOpcode::from_u8((proto.code[i] & 0xFF) as u8);
+                                    if matches!(op, LuauOpcode::Return) {
+                                        found = true;
+                                    }
+                                    i += if op.has_aux() { 2 } else { 1 };
+                                }
+                                found
+                            })
+                            .unwrap_or(false);
+                        format!("{}{}", bid, if has_ret { "*RET" } else { "" })
+                    })
+                    .collect();
+                eprintln!(
+                    "ORDER proto={}@{} else_sorted=[{}]",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    marks.join(" ")
+                );
+            }
+            // `mut` because the phi reconstruction below may append an
+            // assignment into each arm.
+            let mut else_body = if !else_sorted.is_empty() {
+                let mut else_stmts = Vec::new();
+                lift_branch_region(ctx, proto, proto_index, cfg, depth, &else_sorted, regs, locals, &mut else_stmts, false);
+                Some(else_stmts)
+            } else {
+                None
+            };
+
+            if std::env::var("LUAU_IF_TRACE").is_ok() {
+                // Lifted-and-empty vs lifted-and-discarded. The else arm IS
+                // passed to `lift_branch_region`, so if 23 blocks come back as
+                // zero statements the loss is inside that call, not in whether
+                // it was made.
+                eprintln!(
+                    "IFLIFT proto={}@{} else_blocks={} else_stmts={:?} else_calls={:?} then_stmts={} then_calls={} then_blocks={}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    else_sorted.len(),
+                    else_body.as_ref().map(|b| b.len()),
+                    else_body.as_ref().map(|b| count_calls_stats(b)),
+                    then_stmts.len(),
+                    count_calls_stats(&then_stmts),
+                    then_sorted.len()
+                );
+            }
+            // Save else-path register state before merge for B0.116.
+            let regs_after_else = regs.clone();
+
+            // Merge register state: keep values both branches agree on,
+            // reset to Unknown where they diverge. This is conservative
+            // but correct — after an if/else, only values that are the
+            // same on both paths are guaranteed to hold.
+            set_merge_site(*cond_pc, *merge_pc);
+            merge_regs(regs, &regs_after_then, &regs_before);
+
+            // B0.116: Import-guard MethodCall propagation.
+            // Roblox bytecode uses GETIMPORT + guard + NAMECALL + CALL for
+            // service imports. The NAMECALL lives in one branch (then or
+            // else, depending on guard type — JUMPIFNOT vs DEPRECATED_61)
+            // while CALL sits at the merge point. merge_regs (B0.56 Name
+            // rule) discards the MethodCall and keeps the Name from the
+            // other path's GETIMPORT, producing `game(game, ...)` instead
+            // of `game:GetService(...)`. Fix: when the merge block starts
+            // with CALL and EITHER branch wrote a MethodCall to the func
+            // register, propagate it through the merge so CALL sees it.
+            if let Some(mpc) = merge_pc {
+                if let Some(&insn) = proto.code.get(*mpc) {
+                    let mop = LuauOpcode::from_u8(insn_op(insn));
+                    if mop == LuauOpcode::Call {
+                        let ca = insn_a(insn) as usize;
+                        let cur_not_method = ca < regs.len()
+                            && !matches!(&regs[ca], RegVal::Expr(Expr::MethodCall { .. }));
+                        if cur_not_method {
+                            // Check then-path first, then else-path
+                            let source = if ca < regs_after_then.len()
+                                && matches!(&regs_after_then[ca], RegVal::Expr(Expr::MethodCall { .. }))
+                            {
+                                Some(&regs_after_then)
+                            } else if ca < regs_after_else.len()
+                                && matches!(&regs_after_else[ca], RegVal::Expr(Expr::MethodCall { .. }))
+                            {
+                                Some(&regs_after_else)
+                            } else {
+                                None
+                            };
+                            if let Some(src) = source {
+                                regs[ca] = src[ca].clone();
+                                if ca + 1 < regs.len() && ca + 1 < src.len() {
+                                    regs[ca + 1] = src[ca + 1].clone();
+                                }
+
+                                // B0.118 (future): service name recovery for
+                                // GetService arguments needs batch import guard
+                                // analysis — the LOADK for the service name is
+                                // inside a PREVIOUS IfThenElse's branch, and its
+                                // value gets lost through cascading merge_regs.
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Materialize a phi for registers that the two arms disagree on.
+            //
+            // `merge_regs` is a two-outcome lattice meet: identical values
+            // survive, everything else collapses to `Unknown`. That is correct
+            // for statement-shaped branches, but it destroys the *value* of a
+            // pure-value diamond — `local x; if c then x = a else x = b end`
+            // compiles to two register parks and no statements at all, so after
+            // the merge the register is Unknown, `reg_expr` renders it as an
+            // undeclared global, and `is_empty_if` then deletes the (now
+            // statement-free) `if` along with its condition. The value is lost
+            // twice over.
+            //
+            // Where the disagreement is the ONLY thing the branch did, the
+            // register's value at the join is exactly `cond ? then : else`, so
+            // reconstruct it. This is deliberately confined to arms that emit
+            // no statements: with no statements there is no side effect and no
+            // evaluation-order question, and the `if` itself is redundant.
+            let mut hoisted_phis: Vec<Stat> = Vec::new();
+            if let Some(mpc) = merge_pc {
+                let arms_are_pure_value = then_stmts.is_empty()
+                    && else_body.as_ref().map_or(false, |b: &Vec<Stat>| b.is_empty());
+                // The condition is about to appear inside the reconstructed
+                // expression. If evaluating it has side effects, doing so would
+                // duplicate them (the empty `if` survives `is_empty_if` in that
+                // case and would evaluate the condition a second time).
+                if arms_are_pure_value && !has_side_effects(&condition) {
+                    let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                    for i in 0..n {
+                        // Only registers merge_regs actually gave up on.
+                        if !matches!(regs[i], RegVal::Unknown) {
+                            continue;
+                        }
+                        let (t, e) = match (&regs_after_then[i], &regs_after_else[i]) {
+                            (RegVal::Expr(t), RegVal::Expr(e)) => (t.clone(), e.clone()),
+                            _ => continue,
+                        };
+                        if exprs_structurally_equal(&t, &e) {
+                            continue;
+                        }
+                        // Cap expression growth: a phi of two large trees would
+                        // duplicate them at every use site.
+                        if !expr_is_leaf(&t) || !expr_is_leaf(&e) {
+                            continue;
+                        }
+                        let phi = Expr::Ternary {
+                            cond: Box::new(condition.clone()),
+                            then_expr: Box::new(t.clone()),
+                            else_expr: Box::new(e),
+                        };
+                        // `emit.rs` renders every Ternary in expression position
+                        // as `cond and a or b`, which only matches ternary
+                        // semantics when the then-arm is truthy. When it is not,
+                        // force a `Stat::Local`, where B0.108 expands it into a
+                        // real if/else that is sound for any runtime value.
+                        if crate::decompiler::emit::is_provably_truthy(&t) {
+                            store_complex(ctx, proto, regs, locals, &mut hoisted_phis, i, *mpc, phi);
+                        } else {
+                            emit_local_or_assign(
+                                ctx, proto, regs, locals, &mut hoisted_phis, i, *mpc, phi,
+                            );
+                        }
+                    }
+                }
+
+                // Statement form, for the diamonds the ternary path above turns
+                // away: arms that emit statements, or values too large for
+                // `expr_is_leaf`.
+                //
+                // The leaf cap bounds expression growth because a ternary
+                // inlines BOTH trees at every use site. Declaring the name and
+                // assigning inside each arm does not duplicate anything -- each
+                // expression stays in the arm that computed it, evaluated once,
+                // and the condition is not re-evaluated either. So neither gate
+                // the ternary needs applies here.
+                //
+                // Without this the register is left Unknown by `merge_regs`'
+                // terminal reset and the post-join read mints a name nothing
+                // assigns. Measured on CorePackages: of 225 defect names whose
+                // register was last cleared there, 202 have BOTH arms holding an
+                // Expr -- 193 of them blocked purely by `expr_is_leaf`.
+                //
+                // BOTH arms must hold a value. When one side is Unknown this
+                // must NOT fire: assigning on a single path is exactly the
+                // declaration-only hoist that was measured and rejected
+                // (1699/303 -> 1674/335). Declaring more names does not make
+                // more of them assigned on every path.
+                // Runs for ANY register the ternary pass left Unknown -- it sets
+                // `regs[i]` for the ones it handled, so the Unknown test below
+                // is what separates the two paths. Gating this on
+                // `!arms_are_pure_value` would skip the largest group by far:
+                // 193 of the 202 candidates are pure-value arms rejected purely
+                // by `expr_is_leaf`.
+                {
+                    let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                    for i in 0..n {
+                        if !matches!(regs[i], RegVal::Unknown) {
+                            continue;
+                        }
+                        let (t, e) = match (&regs_after_then[i], &regs_after_else[i]) {
+                            (RegVal::Expr(t), RegVal::Expr(e)) => (t.clone(), e.clone()),
+                            _ => continue,
+                        };
+                        if exprs_structurally_equal(&t, &e) {
+                            continue;
+                        }
+                        // Every path must assign, or this becomes the rejected
+                        // declaration-only hoist. With an else arm both arms
+                        // assign. WITHOUT one, the false path leaves the
+                        // register at its PRE-BRANCH value, so seeding the
+                        // declaration with that value covers it -- and only then
+                        // is it sound.
+                        let seed = match else_body {
+                            Some(_) => None,
+                            None => match regs_before.get(i) {
+                                Some(RegVal::Expr(p)) => Some(p.clone()),
+                                Some(RegVal::LoopVar(nm)) => Some(Expr::Name(nm.clone())),
+                                // Pre-branch value unknown and no else arm:
+                                // nothing assigns on the false path. Skip.
+                                _ => continue,
+                            },
+                        };
+                        let raw = ctx.reg_name(proto, i as u8, *mpc);
+                        let (kind, name) = locals.classify_write(i, &raw);
+                        // FirstDecl only. Admitting `Reassign` looks obviously
+                        // safe -- the binding already exists and already holds
+                        // the pre-branch value, so no declaration is needed --
+                        // and it is NOT. TESTED AND REJECTED: it reintroduces
+                        // the scope defect in docs/MERGE_REGS_SCOPE_RISK.md,
+                        // where the name a later read resolves is bound only
+                        // inside an arm. All three purpose-built probes fire:
+                        // `merge_redefinition_stays_unseeded` ("a merge-redefined
+                        // register must not grow a seeded declaration") and both
+                        // `probe_shadow_diff_names_*_after_merge_structure`
+                        // ("top-level use with no top-level declaration").
+                        //
+                        // The seductive part is the score: CoreGui went 220 ->
+                        // 122 defects and BSS 378 -> 260. That is the semantic
+                        // checker being satisfied while the output gets WORSE --
+                        // a top-level name with a branch-local binding compiles
+                        // clean and reads nil at runtime, which is precisely
+                        // what those probes exist to catch.
+                        //
+                        // AND THE SOUND SUBSET IS EMPTY. The correct admission
+                        // test is the one `merge_regs` already uses: allow a
+                        // Reassign only when the binding it targets is the
+                        // PRE-BRANCH one, whose declaration precedes the `if`
+                        // and is therefore live at the join. Implemented and
+                        // measured: all three probes pass, the full suite is
+                        // 928/928 -- and the corpora do not move at all, CoreGui
+                        // 220 and BSS 378, unchanged to the defect.
+                        //
+                        // So every case that appeared to help was one where the
+                        // binding was NOT live. The 45% drop was entirely the
+                        // scope defect. There is nothing here to recover
+                        // soundly; do not try a third time.
+                        if kind != WriteKind::FirstDecl {
+                            continue;
+                        }
+                        hoisted_phis.push(Stat::Local {
+                            names: vec![name.clone()],
+                            values: seed.map(|s| vec![s]).unwrap_or_default(),
+                        });
+                        then_stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(name.clone())],
+                            values: vec![t],
+                        });
+                        if let Some(else_stmts) = else_body.as_mut() {
+                            else_stmts.push(Stat::Assign {
+                                targets: vec![Expr::Name(name.clone())],
+                                values: vec![e],
+                            });
+                        }
+                        regs[i] = RegVal::Expr(Expr::Name(name));
+                    }
+                }
+            }
+
+            // B0.57: hoist `Stat::Local` declarations out of branch bodies
+            // when the register escapes (i.e. post-merge `regs` still holds
+            // an `Expr::Name(n)` matching the declared local). Without this,
+            // BaseCamera-style modules emit `local M = {}` INSIDE an if
+            // block and then use `M.field = X` outside, which Luau parses
+            // as a bare global write because the local's scope ended at
+            // the block's `end`. Pair fix for the B0.56 merge_regs
+            // Name-preservation: B0.56 keeps the Name across the merge,
+            // B0.57 makes sure the declaration survives alongside it.
+            let mut hoisted_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut hoisted: Vec<Stat> = Vec::new();
+            hoist_escaping_locals(&mut then_stmts, regs, &regs_before, &mut hoisted, &mut hoisted_names);
+            let else_body = if let Some(mut es) = else_body {
+                hoist_escaping_locals(&mut es, regs, &regs_before, &mut hoisted, &mut hoisted_names);
+                Some(es)
+            } else {
+                None
+            };
+            stmts.extend(hoisted);
+            // After the B0.57 hoists: a reconstructed phi may reference a local
+            // that the hoist just lifted out of a branch.
+            stmts.extend(hoisted_phis);
+
+            // If condition is always true (unknown branch opcode), inline the body directly
+            if matches!(&condition, Expr::Bool(true)) {
+                stmts.extend(then_stmts);
+                if let Some(else_stmts) = else_body {
+                    stmts.extend(else_stmts);
+                }
+            } else {
+                if std::env::var("LUAU_IF_TRACE").is_ok() {
+                    eprintln!(
+                        "IFPUSH proto={}@{} then_stmts={} else_stmts={:?} else_calls={:?}",
+                        proto.debug_name.as_deref().unwrap_or("?"),
+                        proto.line_defined,
+                        then_stmts.len(),
+                        else_body.as_ref().map(|b| b.len()),
+                        else_body.as_ref().map(|b| count_calls_stats(b))
+                    );
+                }
+                stmts.push(Stat::If {
+                    condition,
+                    then_body: then_stmts,
+                    elseif_clauses: vec![],
+                    else_body,
+                });
+            }
+        }
+
+        Region::WhileDo { header, body_blocks } => {
+            let block = &cfg.blocks[header];
+            let branch_pc = block_branch_pc(block);
+
+            // Lift the header block's pre-branch instructions (e.g., GETTABLEKS,
+            // NAMECALL+CALL, etc.) so registers are populated before we extract
+            // the condition. Without this, the condition expression may reference
+            // stale or Unknown registers.
+            // Emit these BEFORE the loop -- they run once on initial entry.
+            if block.start < branch_pc {
+                lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, stmts, false);
+            }
+
+            // Force-materialize loop-carried registers BEFORE extracting the
+            // condition. Ordering is load-bearing: `extract_branch_condition`
+            // reads the registers directly, so if an accumulator is still a
+            // parked literal we get a constant condition like `while 1 <= 5`
+            // (an infinite loop) instead of `while j <= 5`.
+            //
+            // The header's own pre-branch range is part of the write set: in
+            // the rotated repeat-until shape the induction update lives in the
+            // header block, not in `body_blocks`.
+            {
+                let mut writes = collect_body_writes(&proto.code, block.start, branch_pc);
+                let mut loop_end = block.end;
+                for &block_id in body_blocks {
+                    if block_id == *header { continue; }
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                // Registers whose first touch inside the loop is a pure
+                // definition are re-initialised every iteration, so they carry
+                // nothing in and must not be bound (see `reg_dead_on_entry`).
+                let skip: Vec<usize> = writes
+                    .iter()
+                    .copied()
+                    .filter(|&r| reg_dead_on_entry(&proto.code, block.start, loop_end, r))
+                    .collect();
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &writes, &skip, block.start, Some((block.start, loop_end)),
+                );
+            }
+
+            let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
+
+            let snap = locals.snapshot();
+            let mut sorted_body = body_blocks.clone();
+            sorted_body.sort_unstable();
+            let mut body_stmts = Vec::new();
+            // Lift the body as ONE contiguous span (see `lift_branch_region`).
+            // Block-at-a-time lifting drops any conditional nested inside the
+            // loop body: the nested-if machinery in `lift_instruction_range`
+            // requires the jump target to fall inside the lifted range, which a
+            // single basic block can never satisfy. The `if/else` inside
+            // `while n > 1 do if n % 2 == 0 then ... else ... end end`
+            // degraded into a pair of `break`s.
+            let body_only: Vec<usize> = sorted_body.iter().copied()
+                .filter(|id| id != header)
+                .collect();
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = body_blocks
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
+            lift_branch_region(ctx, proto, proto_index, cfg, depth, &body_only, regs, locals, &mut body_stmts, true);
+            // Remove trailing JUMPBACK if present
+            remove_trailing_jump(&mut body_stmts);
+            ctx.current_loop_end = prev_loop_end;
+
+            // Re-lift the header's pre-branch instructions at the end of the
+            // loop body. In the original bytecode, JUMPBACK returns control to
+            // the header, which re-executes these instructions every iteration
+            // to re-evaluate the condition. We place them at the bottom of the
+            // body so the condition is re-computed each time around.
+            if block.start < branch_pc {
+                lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, &mut body_stmts, true);
+            }
+
+            // Hoist locals first declared inside the loop body
+            hoist_loop_locals(locals, &snap, stmts, &mut body_stmts);
+
+            stmts.push(Stat::While {
+                condition,
+                body: body_stmts,
+            });
+        }
+
+        Region::WhileTrue { header: _, body_blocks } => {
+            // Force-materialize loop-carried registers before the body lift —
+            // same defect as `Region::WhileDo` above, minus the condition
+            // consequence (this loop's condition is a literal `true`).
+            {
+                let mut writes: Vec<usize> = Vec::new();
+                let mut loop_start = usize::MAX;
+                let mut loop_end = 0usize;
+                for &block_id in body_blocks {
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        loop_start = loop_start.min(b.start);
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                if loop_start != usize::MAX {
+                    premateralize_loop_carried(
+                        ctx, proto, regs, locals, stmts,
+                        &writes, &[], loop_start, Some((loop_start, loop_end)),
+                    );
+                }
+            }
+
+            let snap = locals.snapshot();
+            let mut sorted_body = body_blocks.clone();
+            sorted_body.sort_unstable();
+            let mut body_stmts = Vec::new();
+            // A forward jump to the loop's LATCH block skips the rest of the
+            // iteration and re-tests — that is `continue`, not `break`. The
+            // latch is the last block of the loop, so it has the highest start
+            // pc. Without this, `repeat ... if c then continue end ... until d`
+            // (which structures as a while-true) emitted `break` and exited the
+            // loop on the first skipped iteration.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = sorted_body
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
+            // A for-loop nested in the body spans several of these blocks, and
+            // block-at-a-time lifting drops it: the linear dispatcher's
+            // FORNPREP/FOR*LOOP arm is empty ("handled at the region level",
+            // which never happens for blocks this loop already claimed), so the
+            // loop flattened into its own body statements and its jumps to the
+            // FORNLOOP latch were minted as bare `continue` mid-block — for
+            // 511_TriangleMaker that `continue` was not last in its block, and
+            // the emitted chunk failed the Luau parser outright. Structure any
+            // contiguous run that provably contains a complete prep→loop pair
+            // (same scan as if/else arms since f7cc859); runs without one keep
+            // the per-block lift byte-for-byte.
+            let ranges: Vec<(usize, usize)> = sorted_body
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                .collect();
+            // The loop's own latch (highest start pc — same assumption as the
+            // `continue` minting above) must stay OUT of any structured span:
+            // its JUMPBACK targets the span's first pc, which the scan reads as
+            // an inner loop of the span, double-lifting the tail and swallowing
+            // the loop exit. The latch is lifted per-block after the span, just
+            // as it always was.
+            let last_idx = ranges.len().saturating_sub(1);
+            for &(lo, hi) in &split_contiguous_runs(&ranges) {
+                let run_has_latch = hi == last_idx && ranges.len() > 1;
+                let run_start = ranges[lo].0;
+                let span_end = if run_has_latch { ranges[hi].0 } else { ranges[hi].1 };
+                if run_start < span_end
+                    && crate::analysis::structuring::range_contains_nested_for(&proto.code, run_start, span_end)
+                {
+                    lift_structured_run(
+                        ctx, proto, proto_index, cfg, depth, run_start, span_end, regs, locals,
+                        &mut body_stmts, true,
+                    );
+                    if run_has_latch {
+                        let (s, e) = ranges[hi];
+                        lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                    }
+                } else {
+                    for &(s, e) in &ranges[lo..=hi] {
+                        lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                    }
+                }
+            }
+            ctx.current_loop_end = prev_loop_end;
+            remove_trailing_jump(&mut body_stmts);
+
+            // Hoist locals first declared inside the loop body
+            hoist_loop_locals(locals, &snap, stmts, &mut body_stmts);
+
+            stmts.push(Stat::While {
+                condition: Expr::Bool(true),
+                body: body_stmts,
+            });
+        }
+
+        Region::RepeatUntil { header: _, body_blocks, cond_pc } => {
+            // Force-materialize loop-carried registers before the body lift,
+            // for the same reason as `Region::WhileDo` above: an accumulator
+            // left parked as a literal makes the body fold into itself and
+            // emit nothing, and leaves the `until` condition reading the
+            // one-iteration literal.
+            {
+                let mut writes: Vec<usize> = Vec::new();
+                let mut loop_start = usize::MAX;
+                let mut loop_end = 0usize;
+                for &block_id in body_blocks {
+                    if let Some(b) = cfg.blocks.get(&block_id) {
+                        if block_id != *cond_pc {
+                            writes.extend(collect_body_writes(&proto.code, b.start, b.end));
+                        }
+                        loop_start = loop_start.min(b.start);
+                        loop_end = loop_end.max(b.end);
+                    }
+                }
+                if let Some(cb) = cfg.blocks.get(cond_pc) {
+                    let cbranch = block_branch_pc(cb);
+                    writes.extend(collect_body_writes(&proto.code, cb.start, cbranch));
+                    loop_start = loop_start.min(cb.start);
+                    loop_end = loop_end.max(cb.end);
+                }
+                writes.sort_unstable();
+                writes.dedup();
+                if loop_start != usize::MAX {
+                    premateralize_loop_carried(
+                        ctx, proto, regs, locals, stmts,
+                        &writes, &[], loop_start, Some((loop_start, loop_end)),
+                    );
+                }
+            }
+
+            let snap = locals.snapshot();
+            let mut sorted_body = body_blocks.clone();
+            sorted_body.sort_unstable();
+            let mut body_stmts = Vec::new();
+            // A `continue` inside `repeat ... until c` targets the UNTIL TEST,
+            // which is not part of the body span — without this the jump reads
+            // as "leaves the range" and is emitted as `break`.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = body_blocks
+                .iter()
+                .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
+                .max();
+            for &block_id in &sorted_body {
+                if block_id == *cond_pc { continue; } // condition is separate
+                if let Some(b) = cfg.blocks.get(&block_id) {
+                    lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
+                }
+            }
+            ctx.current_loop_end = prev_loop_end;
+
+            // Lift the condition block's pre-branch instructions so that
+            // registers used in the condition are populated. For example,
+            // the cond block may contain GETTABLEKS or CALL instructions
+            // that produce the value compared by the branch instruction.
+            let cond_block = &cfg.blocks[cond_pc];
+            let cond_branch_pc = block_branch_pc(cond_block);
+            if cond_block.start < cond_branch_pc {
+                lift_instruction_range(ctx, proto, proto_index, depth, cond_block.start, cond_branch_pc, regs, locals, &mut body_stmts, true);
+            }
+
+            let condition = extract_branch_condition(ctx, proto, cond_branch_pc, regs);
+
+            // Hoist locals first declared inside the loop body
+            hoist_loop_locals(locals, &snap, stmts, &mut body_stmts);
+
+            stmts.push(Stat::Repeat {
+                body: body_stmts,
+                condition,
+            });
+        }
+
+        Region::NumericFor { prep_pc, loop_pc: _, body_start, body_end, body: nested_body } => {
+            let code = &proto.code;
+            let a = insn_a(code[*prep_pc]) as usize;
+
+            // Phase B0.3 fix: Luau v6 FORNPREP register layout is:
+            //   R(A+0) = limit
+            //   R(A+1) = step
+            //   R(A+2) = initial index (also the loop variable `i` during the body)
+            //
+            // Verified empirically against ModuleScript.luac:
+            //   - Proto 9 numeric_for_simple  (for i = 1, n do sum = sum + i)
+            //   - Proto 11 nested_for outer   (for i = 1, n do ...)
+            //   - Proto 11 nested_for inner   (for j = 1, n do sum = sum + i*j)
+            // In all three, the body uses R(A+2) as the loop variable, while
+            // R(A+0) holds the (runtime) limit and R(A+1) holds the step.
+            //
+            // Note: this is the MODERN Luau layout and differs from the
+            // Lua 5.1 / classic layout (start=A, stop=A+1, step=A+2, var=A+3).
+            // The project's earlier docs/code used the 5.1 layout, which broke
+            // numeric-for reconstruction (e.g. emitted `for i = arg1, 1 do end`
+            // instead of `for i = 1, n do ... end`).
+            //
+            // Try to absorb the for-loop setup (limit/step/start assignments)
+            // from the preceding statements. Absorb in reverse order because
+            // the start expression (highest register) is usually the most
+            // recently emitted statement on top of the stmts stack.
+            let start_expr = absorb_numeric_for_setup(stmts, regs, a + 2);
+            let step_expr  = absorb_numeric_for_setup(stmts, regs, a + 1);
+            let stop_expr  = absorb_numeric_for_setup(stmts, regs, a);
+            let var_name   = ctx.reg_name(proto, ((a + 2) & 0xFF) as u8, *prep_pc);
+
+            // Phase B0.3 fix: pre-materialize any register that (a) currently
+            // holds a live inlinable value and (b) is written somewhere in the
+            // loop body. Without this, a pattern like `local sum = 0; for i =
+            // 1, n do sum = sum + i end` never materializes `sum` as a local —
+            // LOADN R1, 0 inlines `Number(0)` into regs[1], and the body's
+            // `ADD R1, R1, R4` then reads `Number(0) + Name(i)`, folds it into
+            // `regs[1]` silently, and emits an empty body. Force-materializing
+            // R1 before the loop turns it into `local v1 = 0`, after which the
+            // ADD reads `Name(v1) + Name(i)` and (via self-mutation detection
+            // in `store_complex`) emits the expected `v1 = v1 + i`.
+            //
+            // We guard against re-materializing the loop-control registers
+            // themselves (R(A), R(A+1), R(A+2)) because those are either
+            // already absorbed (start/limit/step) or about to be rebound to
+            // the loop variable name below.
+            {
+                let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &body_writes, &[a, a + 1, a + 2], *prep_pc,
+                    Some((*body_start, *body_end)),
+                );
+            }
+
+            // Phase B0.3 fix: bind the loop variable register to its symbolic
+            // name (`i`, `j`, etc.) so body instructions that read R(A+2) see
+            // the loop variable rather than the stale initial-value literal.
+            // Without this, `MUL R8, R4, R7` inside a nested loop would read
+            // the initial `1`s stored by LOADN during setup and emit
+            // `local v8 = 1 * 1`.
+            if (a + 2) < regs.len() {
+                regs[a + 2] = RegVal::Expr(Expr::Name(var_name.clone()));
+                locals.pre_declare(a + 2);
+                // Phase B0.49: record the loop-var name so body writes to
+                // this register treat the loop variable as the existing
+                // binding and don't accidentally shadow it.
+                locals.record_name(a + 2, &var_name);
+            }
+
+            let mut body_stmts = Vec::new();
+            // Phase B0.4: iterate the structured nested body if the
+            // structurer produced one. This is what makes inner for-loops
+            // render as real `Stat::NumericFor` sub-nodes instead of raw
+            // opcodes inside a linear body range.
+            //
+            // The nested body is a Vec<Region> where each entry is either a
+            // Region::Linear (straight-line body code) or a nested
+            // Region::NumericFor. When the vector is empty we fall back to
+            // the pre-B0.4 linear lift — covers degenerate bodies.
+            //
+            // CRITICAL: Linear sub-regions MUST be lifted with `in_loop:
+            // true` so that forward-jumps-beyond-body-end emit `break`
+            // statements (the for-loop break semantics). Calling
+            // `lift_region` on a `Region::Linear` uses `in_loop: false` and
+            // silently drops those breaks. For Linear children of a
+            // Region::NumericFor we therefore bypass `lift_region` and call
+            // `lift_instruction_range` directly with in_loop=true — which
+            // exactly mirrors the pre-B0.4 body-lift semantics. For nested
+            // Region::NumericFor children we delegate to `lift_region`,
+            // which re-enters this same arm and establishes its own body
+            // scope (including its own in_loop semantics).
+            if nested_body.is_empty() {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *body_start, *body_end,
+                    regs, locals, &mut body_stmts, true,
+                );
+            } else {
+                for sub_region in nested_body {
+                    match sub_region {
+                        Region::Linear { start, end } => {
+                            lift_instruction_range(
+                                ctx, proto, proto_index, depth,
+                                *start, *end,
+                                regs, locals, &mut body_stmts, true,
+                            );
+                        }
+                        _ => {
+                            lift_region(
+                                ctx, proto, proto_index, cfg, sub_region,
+                                regs, locals, depth + 1, &mut body_stmts,
+                            );
+                        }
+                    }
+                }
+            }
+            // Remove the FORNLOOP at the end
+            remove_trailing_jump(&mut body_stmts);
+
+            // Omit step if it's 1
+            let step = match &step_expr {
+                Expr::Number(n) if *n == 1.0 => None,
+                _ => Some(step_expr),
+            };
+
+            // C10c: same stdlib-shadow leak guard as materialized assignments.
+            // `for i = "os", v1, v2 do` is always a decompiler artifact — the
+            // start value came from an unresolved LOADK of a stdlib name.
+            let start_expr = sanitize_leaked_global_string(start_expr);
+            let stop_expr  = sanitize_leaked_global_string(stop_expr);
+            let step = step.map(sanitize_leaked_global_string);
+
+            // C10L: FORNPREP bound that resolves to a stdlib Name (e.g. `os`,
+            // `math`, `game`) is always a corruption artifact — you cannot
+            // iterate from a library table. Replace the corrupt bound with 0
+            // so the output parses. (C10W: previously emitted a diagnostic
+            // comment here; dropped because the 0-replacement is evidence
+            // enough and the comment was noise in ~30 hot files.)
+            let start_corrupt = is_stdlib_name_corruption(&start_expr);
+            let stop_corrupt  = is_stdlib_name_corruption(&stop_expr);
+            let step_corrupt  = step.as_ref().map_or(false, is_stdlib_name_corruption);
+            let start_expr = if start_corrupt { Expr::Number(0.0) } else { start_expr };
+            let stop_expr  = if stop_corrupt  { Expr::Number(0.0) } else { stop_expr };
+            let step = if step_corrupt { Some(Expr::Number(1.0)) } else { step };
+
+            stmts.push(Stat::NumericFor {
+                var: var_name,
+                start: start_expr,
+                stop: stop_expr,
+                step,
+                body: body_stmts,
+            });
+        }
+
+        Region::GenericFor { prep_pc, loop_pc, body_start, body_end, body: nested_body } => {
+            let code = &proto.code;
+            let a = insn_a(code[*prep_pc]) as usize;
+
+            // The iterator state is at registers a, a+1, a+2
+            // Loop variables start at a+3 (or a+2 depending on encoding)
+            //
+            // Try to absorb the iterator setup from the preceding statement.
+            // The typical pattern is:
+            //   local v5, v6, v7 = pairs(t)   -- CALL result for iterator
+            //   FORGPREP r5 D
+            // We want to emit `for k, v in pairs(t)` rather than `for k, v in v5`.
+            //
+            // Phase B0.7: `absorb_iterator_setup` now returns a `Vec<Expr>`.
+            // When the absorption succeeds, the vec contains exactly one call
+            // expression (the common shape). When it fails, the vec contains
+            // between 1 and 3 expressions drawn directly from
+            // `regs[a..=a+2]` — this recovers `for k, v in next, t do` style
+            // iterators where the compiler never emits a CALL because the
+            // three-value iterator triple is already in the right registers.
+            let iter_exprs = absorb_iterator_setup(stmts, regs, a);
+            // First iterator is the generator expression used by name-inference
+            // below; the whole vec is what we emit into `Stat::GenericFor`.
+            let primary_iter = iter_exprs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| reg_expr(regs, a));
+
+            // Determine if the loop-back instruction is FORGLOOPINEXT (Deprecated61),
+            // which has no AUX word and always iterates exactly 2 variables (integer
+            // index + value) for ipairs-style loops.
+            let loop_back_is_inext = *loop_pc < code.len()
+                && LuauOpcode::from_u8(insn_op(code[*loop_pc])) == LuauOpcode::Deprecated61;
+
+            // Try to get variable names from debug info
+            let mut var_names = Vec::new();
+            if *loop_pc < code.len() {
+                let nresults = if loop_back_is_inext {
+                    // FORGLOOPINEXT: no AUX, always 2 vars (integer key + value)
+                    2u32
+                } else {
+                    // FORGLOOP: AUX encodes the loop variable count in low bits;
+                    // bit 31 is the "inext" flag (ipairs-style). Mask off bit 31 first.
+                    // Cap at 5 to guard against corrupted AUX, require at least 1.
+                    let loop_aux = if *loop_pc + 1 < code.len() { code[*loop_pc + 1] } else { 0 };
+                    (loop_aux & 0x7FFFFFFF).clamp(1, 5)
+                };
+                for i in 0..nresults {
+                    var_names.push(ctx.reg_name(proto, ((a + 3 + i as usize) & 0xFF) as u8, *body_start));
+                }
+            }
+            if var_names.is_empty() {
+                // Infer conventional names from the iterator expression.
+                // pairs(t) → k, v   ipairs(t) / next → i, v   unknown → k, v
+                let (first, second) = if loop_back_is_inext {
+                    // FORGLOOPINEXT is always ipairs-style: integer index + value
+                    ("i", "v")
+                } else {
+                    match &primary_iter {
+                        Expr::Call { func, .. } | Expr::MethodCall { method: _, object: func, .. } => {
+                            match func.as_ref() {
+                                Expr::Name(n) if n == "ipairs" => ("i", "v"),
+                                Expr::Name(n) if n == "pairs" || n == "next" => ("k", "v"),
+                                _ => ("k", "v"),
+                            }
+                        }
+                        Expr::Name(n) if n == "ipairs" => ("i", "v"),
+                        Expr::Name(n) if n == "pairs" || n == "next" => ("k", "v"),
+                        _ => ("k", "v"),
+                    }
+                };
+                // Use plain names when they are not yet taken; fall back to gen_var.
+                let first_name = if ctx.is_name_used(first) {
+                    ctx.gen_var(first)
+                } else {
+                    ctx.reserve_name(first)
+                };
+                var_names.push(first_name);
+                let second_name = if ctx.is_name_used(second) {
+                    ctx.gen_var(second)
+                } else {
+                    ctx.reserve_name(second)
+                };
+                var_names.push(second_name);
+                // If FORGLOOP AUX specifies more than 2 variables, add extra vars.
+                // FORGLOOPINEXT always has exactly 2, so skip this for inext loops.
+                if !loop_back_is_inext && *loop_pc < code.len() && *loop_pc + 1 < code.len() {
+                    let loop_aux = code[*loop_pc + 1];
+                    // Mask off bit 31 (inext flag) before reading variable count
+                    let nresults = (loop_aux & 0x7FFFFFFF).clamp(1, 5) as usize;
+                    for extra in 2..nresults {
+                        let n = ctx.gen_var(&format!("v{}", extra));
+                        crate::decompiler::mint_trace::note("FORGLOOP_EXTRA_VAR", &n);
+                        var_names.push(n);
+                    }
+                }
+            }
+
+            // Phase B0.10: seed loop variable registers so body read-ops see
+            // the correct names.  Without this, `reg_expr(regs, a+3)` returns
+            // `v{a+3}` (the Unknown fallback) while `Stat::GenericFor.vars`
+            // already contains the correct names — creating a disconnect between
+            // the for-loop header and its body.  This mirrors the NumericFor
+            // treatment of its loop variable at line ~862:
+            //   `regs[a + 2] = RegVal::Expr(Expr::Name(var_name.clone()))`.
+            //
+            // When debug info is present, `var_names[i]` already holds the
+            // original source name (e.g. "player") because `ctx.reg_name`
+            // consulted `proto.debug_info.locals` when building var_names above.
+            // Seeding `regs` here propagates those original names into the body
+            // without any additional infrastructure.
+            //
+            // IMPORTANT: We use `RegVal::LoopVar(name)` instead of
+            // `RegVal::Expr(Expr::Name(name))`.  Both produce `Expr::Name(name)`
+            // when read by `reg_expr`.  The difference is that the CALL vararg
+            // boundary scanner (B=0 path) uses `_ => break` for non-`Expr`
+            // variants, so `LoopVar` registers are NOT absorbed as trailing call
+            // arguments — fixing the regression where B0.10 caused inner vararg
+            // CALLs to pick up loop variable registers as extra args.
+            // Force-materialize loop-carried registers before the body lift —
+            // same defect as `Region::WhileDo` above. This must run AFTER
+            // `var_names` is built (so the loop-variable count is known) and
+            // BEFORE the LoopVar seeding below, so a stale literal in a
+            // loop-variable slot is not turned into a bogus `local k = <stale>`
+            // that the seeding then shadows.
+            {
+                let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
+                let mut skip = vec![a, a + 1, a + 2];
+                for i in 0..var_names.len() {
+                    skip.push(a + 3 + i);
+                }
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &body_writes, &skip, *prep_pc, Some((*body_start, *body_end)),
+                );
+            }
+
+            {
+                let mut reg = a + 3;
+                for name in &var_names {
+                    if reg < regs.len() {
+                        regs[reg] = RegVal::LoopVar(name.clone());
+                        locals.pre_declare(reg);
+                        // Phase B0.49: keep current_names in sync with loop
+                        // variable bindings so body writes correctly classify.
+                        locals.record_name(reg, name);
+                    }
+                    reg += 1;
+                }
+            }
+
+            // Phase B0.6: iterate the structured nested body if the
+            // structurer produced one. Mirrors the Phase B0.4 NumericFor
+            // mechanism for the generic-for case. Each sub-region is either
+            // a Region::Linear (straight-line body code) or a nested
+            // Region::NumericFor / Region::GenericFor / Region::InlineIfThenInLoop.
+            // When the vector is empty we fall back to the pre-B0.6 linear lift.
+            //
+            // CRITICAL: Linear children must be lifted with `in_loop: true` so
+            // forward-jumps-beyond-body-end translate into `break` statements.
+            // `lift_region` passes `false` for Linear regions, so we call
+            // `lift_instruction_range` directly for Linear children here.
+            let mut body_stmts = Vec::new();
+            // A generic-for never set this, so every forward jump that left a
+            // lifted range inside one fell to `Break` - including jumps to the
+            // FORGLOOP itself, which are CONTINUES. `lv_0756 PassiveTile` shows
+            // it as `if not New3 then break end`, abandoning the whole loop
+            // where the bytecode skips a single item.
+            //
+            // The value is the EXCLUSIVE end of the loop construct - one past
+            // the back edge - so that a jump TO the back edge reads as continue
+            // under the existing `target < le` test, and only a jump past the
+            // whole construct reads as break.
+            let prev_loop_end = ctx.current_loop_end;
+            {
+                let lop = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
+                ctx.current_loop_end =
+                    Some(*loop_pc + if lop.has_aux() { 2 } else { 1 });
+            }
+            if nested_body.is_empty() {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *body_start, *body_end,
+                    regs, locals, &mut body_stmts, true,
+                );
+            } else {
+                for sub_region in nested_body {
+                    match sub_region {
+                        Region::Linear { start, end } => {
+                            // A Linear span holding a branch that escapes it is
+                            // a structuring miss, not straight-line code. Lift
+                            // to the end of the loop body so the branch is in
+                            // range and `detect_else_skip` can resolve the arms
+                            // it was cutting through. That consumes the rest of
+                            // the body, so stop iterating rather than lift any
+                            // of it twice.
+                            let esc = linear_branch_escapes(code, *start, *end, *body_end);
+                            lift_instruction_range(
+                                ctx, proto, proto_index, depth,
+                                *start, if esc { *body_end } else { *end },
+                                regs, locals, &mut body_stmts, true,
+                            );
+                            if esc {
+                                break;
+                            }
+                        }
+                        _ => {
+                            lift_region(
+                                ctx, proto, proto_index, cfg, sub_region,
+                                regs, locals, depth + 1, &mut body_stmts,
+                            );
+                        }
+                    }
+                }
+            }
+            ctx.current_loop_end = prev_loop_end;
+            remove_trailing_jump(&mut body_stmts);
+
+            // Phase C4: lifter corruption guard — reject GenericFor whose
+            // iterator is provably non-iterable.  Two checks:
+            //  (1) the absorbed/built iterator expression (post-filter) is
+            //      a known non-callable path like `math.huge` / `math.pi`;
+            //  (2) the pre-absorption register at `a` holds a literal
+            //      Number/Bool/Nil.  absorb_iterator_setup replaces such
+            //      literals with `Name("v{a}")` for downstream safety, but
+            //      the presence of the literal in the iterator slot is
+            //      itself evidence of bad opmap detection, so surface it
+            //      as a Comment.
+            //
+            // When either fires, emit a `Stat::Comment` instead of the
+            // `Stat::GenericFor`.  This keeps the rest of the file
+            // parseable by full_moon while making the corruption visible.
+            let primary = iter_exprs.first();
+            let mut non_iter_reason: Option<String> = match primary {
+                Some(Expr::Number(n)) => Some(format!("non-iterable number literal {}", n)),
+                Some(Expr::Bool(b)) => Some(format!("non-iterable bool literal {}", b)),
+                Some(Expr::Nil) => Some("non-iterable nil literal".to_string()),
+                Some(Expr::Field { object, field }) => {
+                    if let Expr::Name(obj_name) = object.as_ref() {
+                        if obj_name == "math" && matches!(
+                            field.as_str(),
+                            "huge" | "pi" | "maxinteger" | "mininteger"
+                        ) {
+                            Some(format!("non-iterable non-callable {}.{}", obj_name, field))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            // Pre-absorption register inspection — catches literals the
+            // absorb-fallback filter would have papered over.
+            if non_iter_reason.is_none() {
+                if let Some(RegVal::Expr(e)) = regs.get(a) {
+                    non_iter_reason = match e {
+                        Expr::Number(n) => Some(format!("non-iterable number literal {}", n)),
+                        Expr::Bool(b) => Some(format!("non-iterable bool literal {}", b)),
+                        Expr::Nil => Some("non-iterable nil literal".to_string()),
+                        _ => None,
+                    };
+                }
+            }
+            if let Some(reason) = non_iter_reason {
+                let raw = if *prep_pc < code.len() {
+                    code[*prep_pc]
+                } else {
+                    0
+                };
+                stmts.push(Stat::Comment(format!(
+                    "-- lifter error: GenericFor iterator is {}  raw_opcode=0x{:08x}",
+                    reason, raw
+                )));
+            } else {
+                stmts.push(Stat::GenericFor {
+                    vars: var_names,
+                    iterators: iter_exprs,
+                    body: body_stmts,
+                });
+            }
+        }
+
+        // Phase B0.5, Shape B: an `if <cond> then <for-loop> end` inside a
+        // numeric-for body. Emitted by `structure_numeric_for_body` when a
+        // forward conditional jump's target range contains a nested for-loop.
+        //
+        // Without this arm, the nested for-loop would be extracted correctly
+        // (Shape A / B0.4 path), but the Linear segment preceding the inner
+        // FORNPREP/FORGPREP would contain the JumpIf* whose D target lands
+        // past the Linear segment's end (because the structurer already
+        // split the range at the inner prep). `lift_instruction_range` would
+        // then fire its "forward jump beyond range" fallback at that PC and
+        // emit a spurious `if cond then break end` that doesn't exist in the
+        // source. This arm bypasses that by:
+        //   1) extracting the branch condition from `cond_pc` directly,
+        //   2) iterating `body` in structured form (Linear → in-loop lift,
+        //      non-Linear → recursive `lift_region`),
+        //   3) emitting a single `Stat::If` with the nested body.
+        //
+        // `in_loop: true` is preserved on the Linear children so any real
+        // `break`s inside the then-body still translate into Stat::Break.
+        //
+        // If `extract_branch_condition` cannot decode the condition it
+        // returns `Expr::Bool(true)` (the always-true fallback) — in that
+        // case we inline the body directly without an `if` wrapper, matching
+        // the IfThenElse handler's behavior.
+        Region::InlineIfThenInLoop { cond_pc, body } => {
+            let condition = extract_branch_condition(ctx, proto, *cond_pc, regs);
+
+            let mut then_stmts = Vec::new();
+            for sub_region in body {
+                match sub_region {
+                    Region::Linear { start, end } => {
+                        lift_instruction_range(
+                            ctx, proto, proto_index, depth,
+                            *start, *end,
+                            regs, locals, &mut then_stmts, true,
+                        );
+                    }
+                    _ => {
+                        lift_region(
+                            ctx, proto, proto_index, cfg, sub_region,
+                            regs, locals, depth + 1, &mut then_stmts,
+                        );
+                    }
+                }
+            }
+
+            if matches!(&condition, Expr::Bool(true)) {
+                stmts.extend(then_stmts);
+            } else {
+                stmts.push(Stat::If {
+                    condition,
+                    then_body: then_stmts,
+                    elseif_clauses: vec![],
+                    else_body: None,
+                });
+            }
+        }
+
+        Region::InlineLoopInLoop {
+            header_start,
+            cond_pc,
+            body_start,
+            latch_pc,
+            body,
+        } => {
+            // Mirrors `Region::WhileDo`; the ordering below is load-bearing.
+            //
+            // (a) The header's pre-branch instructions run once on entry.
+            let cond_start = cond_pc.unwrap_or(*body_start);
+            if *header_start < cond_start {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *header_start, cond_start,
+                    regs, locals, stmts, false,
+                );
+            }
+
+            // (b) Materialize this loop's own carried registers BEFORE the
+            //     condition is read. Without it the inner accumulator is still a
+            //     parked literal, so the guard renders as `0 < 2` and the body's
+            //     updates fold away into the register file.
+            {
+                let mut writes =
+                    collect_body_writes(&proto.code, *header_start, *latch_pc);
+                writes.sort_unstable();
+                writes.dedup();
+                let skip: Vec<usize> = writes
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        reg_dead_on_entry(&proto.code, *header_start, *latch_pc, r)
+                    })
+                    .collect();
+                premateralize_loop_carried(
+                    ctx, proto, regs, locals, stmts,
+                    &writes, &skip, *header_start,
+                    Some((*header_start, *latch_pc + 1)),
+                );
+            }
+
+            let condition = match cond_pc {
+                Some(cp) => extract_branch_condition(ctx, proto, *cp, regs),
+                None => Expr::Bool(true),
+            };
+
+            let snap = locals.snapshot();
+            let mut body_stmts = Vec::new();
+            // (c) `break`/`continue` inside the body must resolve against THIS
+            //     loop, not the enclosing for.
+            let prev_loop_end = ctx.current_loop_end;
+            ctx.current_loop_end = Some(*latch_pc);
+            for sub_region in body {
+                match sub_region {
+                    Region::Linear { start, end } => {
+                        lift_instruction_range(
+                            ctx, proto, proto_index, depth,
+                            *start, *end,
+                            regs, locals, &mut body_stmts, true,
+                        );
+                    }
+                    _ => {
+                        lift_region(
+                            ctx, proto, proto_index, cfg, sub_region,
+                            regs, locals, depth + 1, &mut body_stmts,
+                        );
+                    }
+                }
+            }
+            remove_trailing_jump(&mut body_stmts);
+            ctx.current_loop_end = prev_loop_end;
+
+            // (d) Re-lift the header at the bottom so the condition is
+            //     recomputed every iteration.
+            if *header_start < cond_start {
+                lift_instruction_range(
+                    ctx, proto, proto_index, depth,
+                    *header_start, cond_start,
+                    regs, locals, &mut body_stmts, true,
+                );
+            }
+
+            hoist_loop_locals(locals, &snap, stmts, &mut body_stmts);
+
+            stmts.push(Stat::While {
+                condition,
+                body: body_stmts,
+            });
+        }
+    }
+}
+
+/// B0.57 — hoist `Stat::Local { names: [n], values: [init] }` statements out
+/// of a branch body when register `n` survives the post-branch merge (its
+/// `Expr::Name(n)` appears in `regs_after_merge`). Replaces the Local inside
+/// the branch with a plain `Stat::Assign` so the inside-body semantics stay.
+/// Conservative: only hoists when the RHS init value references only
+/// expressions that were already available pre-branch (so the hoist doesn't
+/// move code past its dependencies).
+///
+/// `hoisted_names` accumulates across calls (for the else-branch pass) so we
+/// don't emit duplicate `local` declarations for the same name.
+fn hoist_escaping_locals(
+    body: &mut Vec<Stat>,
+    regs_after_merge: &[RegVal],
+    regs_before: &[RegVal],
+    hoisted_out: &mut Vec<Stat>,
+    hoisted_names: &mut std::collections::HashSet<String>,
+) {
+    // Collect the set of names that post-merge still resolve to themselves
+    // (i.e. the register escapes the branch).
+    let mut escaping: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for slot in regs_after_merge.iter() {
+        if let RegVal::Expr(Expr::Name(n)) = slot {
+            escaping.insert(n.clone());
+        }
+    }
+    if escaping.is_empty() {
+        return;
+    }
+
+    // Pre-branch names: what was already bound before the if. Used to
+    // decide whether an init RHS is "safe" to hoist (references only
+    // pre-existing values).
+    let mut pre_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for slot in regs_before.iter() {
+        if let RegVal::Expr(Expr::Name(n)) = slot {
+            pre_names.insert(n.clone());
+        } else if let RegVal::LoopVar(n) = slot {
+            pre_names.insert(n.clone());
+        }
+    }
+
+    for stmt in body.iter_mut() {
+        let (name_opt, init_opt) = match stmt {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                (Some(names[0].clone()), Some(values[0].clone()))
+            }
+            _ => (None, None),
+        };
+        let Some(name) = name_opt else { continue; };
+        let Some(init) = init_opt else { continue; };
+        if !escaping.contains(&name) {
+            continue;
+        }
+        if hoisted_names.contains(&name) {
+            // Already hoisted by the other branch — convert to Assign here
+            // so we don't shadow-redeclare.
+            *stmt = Stat::Assign {
+                targets: vec![Expr::Name(name.clone())],
+                values: vec![init],
+            };
+            continue;
+        }
+        if !is_safe_hoist_init(&init, &pre_names) {
+            // TESTED AND REJECTED. The safe path below hoists `local x = init`
+            // AND re-assigns inside the arm, evaluating `init` twice -- fine for
+            // a literal or pre-branch name, which is what `is_safe_hoist_init`
+            // restricts it to, and impossible for a call or closure init.
+            //
+            // Hoisting the DECLARATION alone (`local x`, leaving `x = init` in
+            // the arm) evaluates once, needs no safety test, and would make the
+            // binding lexically live at the join -- exactly what `merge_regs`
+            // looks for before resetting a register to Unknown. Sound in
+            // principle; measured on CoreGui it went 1699/303 -> 1674/335, so
+            // it costs 25 clean files. Declaring more names does not make more
+            // of them assigned on every path.
+            //
+            // RE-MEASURED on full1143 (rotation 52) because that number came
+            // from CoreGui, and this session had already found two CoreGui
+            // verdicts worth re-testing here. It agrees:
+            //
+            //     1,126 clean / 19 defects  ->  1,120 clean / 25 defects
+            //
+            // and for exactly the reason stated above - the extra `local x`
+            // turns an `undefined_register` into a `declared_never_assigned`,
+            // which is a different label on the same missing value. BOTH
+            // corpora now reject this. Left gated behind LUAU_DECL_HOIST so the
+            // next reader can reproduce it in one run instead of rebuilding it.
+            if std::env::var("LUAU_DECL_HOIST").is_ok() {
+                hoisted_out.push(Stat::Local {
+                    names: vec![name.clone()],
+                    values: vec![],
+                });
+                hoisted_names.insert(name.clone());
+                *stmt = Stat::Assign {
+                    targets: vec![Expr::Name(name)],
+                    values: vec![init],
+                };
+            }
+            continue;
+        }
+        hoisted_out.push(Stat::Local {
+            names: vec![name.clone()],
+            values: vec![init.clone()],
+        });
+        hoisted_names.insert(name.clone());
+        *stmt = Stat::Assign {
+            targets: vec![Expr::Name(name)],
+            values: vec![init],
+        };
+    }
+}
+
+/// B0.57 helper — is `init` safe to hoist out of a branch? Safe means the
+/// expression uses only literals or identifiers that existed pre-branch.
+/// Branch-local temps or compound expressions with register-reads are NOT
+/// safe (hoisting would reference something not yet computed).
+fn is_safe_hoist_init(init: &Expr, pre_names: &std::collections::HashSet<String>) -> bool {
+    match init {
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Varargs => true,
+        Expr::Name(n) => pre_names.contains(n),
+        // A table literal is safe when every element is itself safe. The empty
+        // constructor covers the common `local M = {}` module-table seed that
+        // is the whole point of the hoist; a populated one such as
+        // `local t = { n = 0 }` is equally safe as long as nothing inside it
+        // reads a branch-local temp. Leaving those unhoistable declares the
+        // local inside the branch while the merged register still names it, so
+        // every later reference parses as a bare global read.
+        Expr::Table { fields } => fields.iter().all(|f| match f {
+            TableField::Sequential(v) => is_safe_hoist_init(v, pre_names),
+            TableField::Named(_, v) => is_safe_hoist_init(v, pre_names),
+            TableField::Indexed(k, v) => {
+                is_safe_hoist_init(k, pre_names) && is_safe_hoist_init(v, pre_names)
+            }
+        }),
+        _ => false,
+    }
+}
+
+/// Merge register state after an if/else branch: keep values both branches
+/// agree on, reset to Unknown where they diverge. `regs` holds the else-path
+/// state, `other` holds the then-path state.
+///
+/// Phase B0.56: if ONE side is `Expr::Name(n)` and the other side is Unknown
+/// or a compound expression, preserve the Name. Rationale: the Name almost
+/// always refers to a local that was declared on one of the two paths (e.g.
+/// `local v16 = {}` emitted inside an `if` branch); resetting to Unknown
+/// makes the lifter forget the declaration and emit `v16.field = X` as a
+/// bare global write downstream. In real Roblox modules this is the root
+/// cause of missing `local v16 = {}` declarations in BaseCamera-style
+/// scripts. Preserving the Name allows subsequent SetTableKS handlers to
+/// continue treating the register as a known local.
+/// Phase B0.80/B0.85: compare two expressions for structural equality.
+/// Used by `merge_regs` to preserve identical register values across
+/// branch merges. Handles all expression types recursively so that
+/// registers holding call results, arithmetic, unary ops, etc. that
+/// were NOT modified in either branch are correctly preserved.
+///
+/// This is purely a structural AST comparison — it does NOT imply that
+/// two structurally equal call expressions return the same value. The
+/// correctness guarantee comes from the fact that merge_regs compares
+/// CLONES of the same pre-branch register state: if neither branch
+/// modified the register, both clones hold the exact same expression.
+fn exprs_structurally_equal(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Nil, Expr::Nil) => true,
+        (Expr::Bool(x), Expr::Bool(y)) => x == y,
+        (Expr::Number(x), Expr::Number(y)) => x.to_bits() == y.to_bits(),
+        (Expr::String(x), Expr::String(y)) => x == y,
+        (Expr::Varargs, Expr::Varargs) => true,
+        (Expr::Name(x), Expr::Name(y)) => x == y,
+        (Expr::Field { object: o1, field: f1 }, Expr::Field { object: o2, field: f2 }) => {
+            f1 == f2 && exprs_structurally_equal(o1, o2)
+        }
+        // Phase B0.85: extend to compound expressions. These are safe
+        // because merge_regs compares cloned pre-branch state — if
+        // neither branch modified the register, both sides are
+        // structurally identical clones of the same expression.
+        (Expr::Index { object: o1, key: k1 }, Expr::Index { object: o2, key: k2 }) => {
+            exprs_structurally_equal(o1, o2) && exprs_structurally_equal(k1, k2)
+        }
+        (Expr::BinOp { op: op1, left: l1, right: r1 },
+         Expr::BinOp { op: op2, left: l2, right: r2 }) => {
+            op1 == op2 && exprs_structurally_equal(l1, l2) && exprs_structurally_equal(r1, r2)
+        }
+        (Expr::UnOp { op: op1, operand: o1 },
+         Expr::UnOp { op: op2, operand: o2 }) => {
+            op1 == op2 && exprs_structurally_equal(o1, o2)
+        }
+        (Expr::Call { func: f1, args: a1 }, Expr::Call { func: f2, args: a2 }) => {
+            a1.len() == a2.len()
+                && exprs_structurally_equal(f1, f2)
+                && a1.iter().zip(a2.iter()).all(|(x, y)| exprs_structurally_equal(x, y))
+        }
+        (Expr::MethodCall { object: o1, method: m1, args: a1 },
+         Expr::MethodCall { object: o2, method: m2, args: a2 }) => {
+            m1 == m2
+                && a1.len() == a2.len()
+                && exprs_structurally_equal(o1, o2)
+                && a1.iter().zip(a2.iter()).all(|(x, y)| exprs_structurally_equal(x, y))
+        }
+        (Expr::Table { fields: f1 }, Expr::Table { fields: f2 }) => {
+            f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|(a, b)| table_fields_equal(a, b))
+        }
+        // Function expressions: skip — full body comparison is expensive
+        // and function literals are rarely in registers across branches.
+        // Vector: compare all three components by bits.
+        (Expr::Vector(x1, y1, z1), Expr::Vector(x2, y2, z2)) => {
+            x1.to_bits() == x2.to_bits()
+                && y1.to_bits() == y2.to_bits()
+                && z1.to_bits() == z2.to_bits()
+        }
+        _ => false,
+    }
+}
+
+/// Helper for table field structural comparison.
+fn table_fields_equal(a: &crate::ast::TableField, b: &crate::ast::TableField) -> bool {
+    use crate::ast::TableField;
+    match (a, b) {
+        (TableField::Sequential(e1), TableField::Sequential(e2)) => {
+            exprs_structurally_equal(e1, e2)
+        }
+        (TableField::Named(k1, v1), TableField::Named(k2, v2)) => {
+            k1 == k2 && exprs_structurally_equal(v1, v2)
+        }
+        (TableField::Indexed(k1, v1), TableField::Indexed(k2, v2)) => {
+            exprs_structurally_equal(k1, k2) && exprs_structurally_equal(v1, v2)
+        }
+        _ => false,
+    }
+}
+
+fn merge_regs(regs: &mut Vec<RegVal>, other: &[RegVal], regs_before: &[RegVal]) {
+    for (i, slot) in regs.iter_mut().enumerate() {
+        if i >= other.len() {
+            // Stay with current slot — caller's side may have a valid Name
+            // that we shouldn't drop just because the other side is short.
+            continue;
+        }
+        // Phase B0.80: compare register values using structural equality
+        // for expressions.  Before this fix, only Name/LoopVar/Unknown
+        // matched — identical constant values (Number, String, Bool, Nil,
+        // Field chains) from untouched registers were reset to Unknown
+        // after any if/else merge, losing the value for all subsequent reads.
+        // Rotation 120: what does the join ACTUALLY see?
+        //
+        // Every rotation since 114 has reasoned about this and none has printed
+        // it - and r119 built a rule on the reasoning that did not fire for the
+        // register it was written for. `LUAU_MERGE_WATCH=<reg>` prints the three
+        // inputs for one register, proto-qualified.
+        if let Ok(w) = std::env::var("LUAU_MERGE_WATCH") {
+            if w.parse::<usize>() == Ok(i) {
+                let d = |v: Option<&RegVal>| match v {
+                    None => "MISSING".to_string(),
+                    Some(RegVal::Unknown) => "Unknown".to_string(),
+                    Some(RegVal::LoopVar(n)) => format!("LoopVar({})", n),
+                    Some(RegVal::Expr(e)) => {
+                        let t = format!("{:?}", e);
+                        format!("Expr({})", &t[..t.len().min(46)])
+                    }
+                    Some(_) => "other".to_string(),
+                };
+                let (mc, mm) = merge_site();
+                eprintln!(
+                    "MERGE	{}	cond_pc={}	merge_pc={}	reg={}	before={}	self={}	other={}",
+                    current_dce_proto(),
+                    mc as i64,
+                    if mm == usize::MAX { -1 } else { mm as i64 },
+                    i,
+                    d(regs_before.get(i)),
+                    d(Some(&*slot)),
+                    d(other.get(i))
+                );
+            }
+        }
+        let same = match (&slot, &other[i]) {
+            (RegVal::Expr(a), RegVal::Expr(b)) => exprs_structurally_equal(a, b),
+            (RegVal::LoopVar(a), RegVal::LoopVar(b)) => a == b,
+            (RegVal::Unknown, RegVal::Unknown) => true,
+            _ => false,
+        };
+        if same {
+            continue;
+        }
+        // B0.56: preserve a Name on either side rather than resetting to
+        // Unknown. A declared local is valid on whichever path declared it,
+        // and keeping the Name lets downstream opcode handlers continue
+        // emitting valid `name.field = X` statements.
+        let self_name = matches!(&slot, RegVal::Expr(Expr::Name(_)));
+        let other_name = matches!(&other[i], RegVal::Expr(Expr::Name(_)));
+        if self_name && !other_name {
+            // Keep self's Name.
+            continue;
+        }
+        if other_name && !self_name {
+            *slot = other[i].clone();
+            continue;
+        }
+        // Both sides hold a simple Name and they merely DIFFER. B0.56 handled
+        // the asymmetric cases directly above but not this one, so it fell
+        // through to the reset below, producing hoisted-and-never-assigned
+        // `local vN` (75 names across 60 files at the time of c77dcd1).
+        //
+        // It arises when a write inside a branch shadows an already-declared
+        // register (naming.rs classify_write returns Shadow once BOTH the old
+        // and new names are semantic). The two paths then reach the merge
+        // holding different names for one register.
+        //
+        // c77dcd1 kept the fall-through (self/else) name unconditionally.
+        // That was measurably better on the gates but structurally unsound:
+        // a Shadow write emits its `Stat::Local` INSIDE the branch block, and
+        // B0.57's hoist only rescues inits that `is_safe_hoist_init` accepts
+        // (literals, pre-branch names, safe tables). A closure or call init
+        // stays branch-local, so a post-merge read of the kept name referenced
+        // a declaration that is lexically out of scope — it compiles clean
+        // (bare global read), `free_var_decls` is scope-blind to it, and at
+        // runtime it resolves to nil. CONFIRMED by construction in
+        // `merge_regs_scope_probe_tests` (see docs/MERGE_REGS_SCOPE_RISK.md).
+        //
+        // The sound subset: keep a differing name ONLY when it matches the
+        // PRE-BRANCH binding of this register. That binding's `local` was
+        // emitted before the `if` statement, so it is still lexically live
+        // after the merge. A name minted inside a branch on BOTH sides has no
+        // in-scope declaration at the join — reset to Unknown so the read
+        // falls back to a VISIBLE `v{idx}` instead of a plausible wrong name.
+        if self_name && other_name {
+            let pre_name: Option<&str> = regs_before.get(i).and_then(|v| match v {
+                RegVal::Expr(Expr::Name(n)) => Some(n.as_str()),
+                RegVal::LoopVar(n) => Some(n.as_str()),
+                _ => None,
+            });
+            let self_n = match &slot {
+                RegVal::Expr(Expr::Name(n)) => n.clone(),
+                _ => unreachable!("self_name checked above"),
+            };
+            let other_n = match &other[i] {
+                RegVal::Expr(Expr::Name(n)) => n.as_str(),
+                _ => unreachable!("other_name checked above"),
+            };
+            match pre_name {
+                Some(p) if self_n == p => {
+                    // Self side still holds the pre-branch binding — keep it.
+                    continue;
+                }
+                Some(p) if other_n == p => {
+                    // Other side holds the pre-branch binding — adopt it.
+                    *slot = other[i].clone();
+                    continue;
+                }
+                _ => {
+                    // Both names were minted inside the arms; neither
+                    // declaration survives the join lexically.
+                    *slot = RegVal::Unknown;
+                    crate::decompiler::mint_trace::note_unknown("UNK_MERGE_ARM_NAMES", i);
+                    continue;
+                }
+            }
+        }
+        // Genuinely neither side is a simple Name — both compound, or one is
+        // Unknown with no Name counterpart. Now the reset really is safe.
+        *slot = RegVal::Unknown;
+        crate::decompiler::mint_trace::note_unknown("UNK_MERGE_COMPOUND", i);
+    }
+}
+
+/// Extract a condition expression from a branch instruction at the given PC.
+///
+/// Returns the FALL-THROUGH condition, i.e., the condition under which the jump
+/// is NOT taken and execution continues to the next instruction. This is because
+/// callers (IfThenElse, WhileDo, RepeatUntil) treat the fall-through path as
+/// the "then" body / loop body / exit condition respectively.
+fn extract_branch_condition(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    pc: usize,
+    regs: &[RegVal],
+) -> Expr {
+    let code = &proto.code;
+    if pc >= code.len() {
+        return Expr::Bool(true);
+    }
+
+    let insn = code[pc];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let a = insn_a(insn) as usize;
+    let aux = if op.has_aux() && pc + 1 < code.len() { Some(code[pc + 1]) } else { None };
+
+    // Rotation 86: report the register the condition is actually read from and
+    // what it holds AT THAT MOMENT. Four rotations located this fault four
+    // different wrong places by reasoning about the output; this reports it.
+    if std::env::var("LUAU_COND_TRACE").is_ok() {
+        let v = regs.get(a).map(|r| format!("{:?}", r)).unwrap_or_else(|| "OUT_OF_RANGE".into());
+        eprintln!(
+            "COND	{}	pc={}	{:?}	reg={}	regs_len={}	{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            pc,
+            op,
+            a,
+            regs.len(),
+            &v[..v.len().min(90)]
+        );
+    }
+
+    match op {
+        LuauOpcode::JumpIf => {
+            // JumpIf jumps when A is truthy; fall-through when A is falsy
+            Expr::UnOp { op: UnOp::Not, operand: Box::new(reg_expr(regs, a)) }
+        }
+        LuauOpcode::JumpIfNot => {
+            // JumpIfNot jumps when A is falsy; fall-through when A is truthy
+            reg_expr(regs, a)
+        }
+        LuauOpcode::JumpIfEq => {
+            // JumpIfEq jumps when A == AUX; fall-through when A ~= AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::NotEq, right: Box::new(right) }
+        }
+        LuauOpcode::JumpIfNotEq => {
+            // JumpIfNotEq jumps when A ~= AUX; fall-through when A == AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::Eq, right: Box::new(right) }
+        }
+        LuauOpcode::JumpIfLT => {
+            // JumpIfLT jumps when A < AUX; fall-through when A >= AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::GE, right: Box::new(right) }
+        }
+        LuauOpcode::JumpIfLE => {
+            // JumpIfLE jumps when A <= AUX; fall-through when A > AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::GT, right: Box::new(right) }
+        }
+        LuauOpcode::JumpIfNotLT => {
+            // JumpIfNotLT jumps when A >= AUX; fall-through when A < AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::LT, right: Box::new(right) }
+        }
+        LuauOpcode::JumpIfNotLE => {
+            // JumpIfNotLE jumps when A > AUX; fall-through when A <= AUX
+            let right = reg_expr(regs, (aux.unwrap_or(0) & 0xFF) as usize);
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: BinOp::LE, right: Box::new(right) }
+        }
+        LuauOpcode::JumpXEqKNil => {
+            let negated = aux.unwrap_or(0) & 0x80000000 != 0;
+            // Negate: jump-taken has cmp, fall-through has the opposite
+            let cmp = if negated { BinOp::Eq } else { BinOp::NotEq };
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: cmp, right: Box::new(Expr::Nil) }
+        }
+        LuauOpcode::JumpXEqKB => {
+            let aux_val = aux.unwrap_or(0);
+            let negated = aux_val & 0x80000000 != 0;
+            let val = (aux_val & 1) != 0;
+            // Negate: jump-taken has cmp, fall-through has the opposite
+            let cmp = if negated { BinOp::Eq } else { BinOp::NotEq };
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: cmp, right: Box::new(Expr::Bool(val)) }
+        }
+        LuauOpcode::JumpXEqKN | LuauOpcode::JumpXEqKS => {
+            let aux_val = aux.unwrap_or(0);
+            let negated = aux_val & 0x80000000 != 0;
+            let kidx = aux_val & 0x00FFFFFF;
+            let right = get_const_expr(proto, &ctx.chunk.strings, kidx);
+            // Negate: jump-taken has cmp, fall-through has the opposite
+            let cmp = if negated { BinOp::Eq } else { BinOp::NotEq };
+            Expr::BinOp { left: Box::new(reg_expr(regs, a)), op: cmp, right: Box::new(right) }
+        }
+        // For-loop preps with conditional (skip loop)
+        LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+        | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+            Expr::Bool(true) // Condition is implicit in the for-loop
+        }
+        _ => Expr::Bool(true),
+    }
+}
+
+/// The PC of the branch instruction ending a block, as computed once by the
+/// CFG's forward, instruction-aligned walk.
+///
+/// This replaces a local `find_branch_pc` that stepped BACKWARD from `end` and
+/// asked whether the word at `end - 2` carried an AUX. That question is not
+/// decidable in reverse: the word may itself be an AUX payload whose value
+/// happens to decode as an aux-carrying opcode. A block ending
+/// `GETTABLEKS <aux=31> JUMPIFNOT` was read as ending in opcode 31
+/// (`JumpIfNotLE`), and the real JUMPIFNOT word was then consumed as that
+/// phantom instruction's operand, so `extract_branch_condition` synthesized a
+/// comparison out of two registers that were never operands of anything. The
+/// visible result was output like `if arg1 <= v26 then` in place of a plain
+/// truthy test, with both names invented.
+///
+/// `cfg.rs` had already diagnosed this and switched to a forward walk for its
+/// own successor edges, then discarded the value. The bug survived because the
+/// fix landed in one of the two places that needed it.
+fn block_branch_pc(block: &crate::analysis::cfg::BasicBlock) -> usize {
+    match block.branch_pc {
+        Some(pc) => pc,
+        None => {
+            // Never expected for a block that ends in a branch. Logged rather
+            // than silent: a quiet fallback reinstates the old wrong answer for
+            // some subset of sites and makes the measurement uninterpretable.
+            log::warn!(
+                "BRANCH_PC FALLBACK: block [{}, {}) carries no branch_pc; using end-1",
+                block.start,
+                block.end
+            );
+            block.end.saturating_sub(1)
+        }
+    }
+}
+
+/// Does a conditional branch inside `[start, end)` jump PAST `end` but stay
+/// inside `limit`?
+///
+/// A `Linear` region is meant to be straight-line code. Where structuring
+/// cannot match a construct it falls back to Linear spans, and those spans can
+/// end up CONTAINING a branch, which `lift_instruction_range` then sees as
+/// out-of-range and degrades to `break`. `lv_0756 PassiveTile` proto 7 is a
+/// four-arm string dispatch that structures as
+///
+///     Linear { 5, 13 }      <- JUMPXEQKS at 7 targets 66
+///     InlineIfThenInLoop { cond_pc: 13, .. }
+///     Linear { 15, 74 }     <- JUMPXEQKS at 68 targets 84
+///     ...
+///
+/// so every "try the next case" jump escapes its own Linear span and only the
+/// first arm of the dispatch survives.
+fn linear_branch_escapes(code: &[u32], start: usize, end: usize, limit: usize) -> bool {
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        // The JumpXEqK* family ONLY - a constant-equality test, which is what
+        // a dispatch chain is built from. Including the general JumpIf* family
+        // measured worse than the calls it recovered: it produced an
+        // `undefined_local` in `lv_0005` ("would error at runtime") plus
+        // dropped values in `lv_0358` and `rc_0060`, because extending past the
+        // structured sub-regions discards the register state they establish.
+        let is_cond = matches!(
+            op,
+            LuauOpcode::JumpXEqKNil
+                | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN
+                | LuauOpcode::JumpXEqKS
+        );
+        if is_cond {
+            let t = (pc as i64 + insn_d(code[pc]) as i64 + 1) as usize;
+            if t > end && t <= limit && t > 0 {
+                // Require the arm to END IN AN UNCONDITIONAL JUMP over the next
+                // case - the else-skip shape `detect_else_skip` matches. That
+                // is what makes the chain resolve recursively, and without it
+                // this fires on an ordinary guard and destroys it: in
+                // `rc_0054 TutorialController` it collapsed a three-way
+                // if/elseif/else that honoured an `arg1` override into an
+                // unconditional default, losing the override entirely while
+                // every corpus total still improved.
+                // Find the instruction that ENDS at `t` by walking boundaries.
+                // `t - 1` is not safe to decode: it can land on the AUX word of
+                // a two-word instruction, and an AUX word read as an opcode is
+                // arbitrary. It happened to be a real JUMP in `lv_0756`.
+                let mut q = start;
+                let mut prev = None;
+                while q < t && q < code.len() {
+                    let qop = LuauOpcode::from_u8(insn_op(code[q]));
+                    let qsz = if qop.has_aux() { 2 } else { 1 };
+                    if q + qsz == t {
+                        prev = Some((q, qop));
+                        break;
+                    }
+                    q += qsz;
+                }
+                let jt = match prev {
+                    Some((q, LuauOpcode::Jump)) => {
+                        Some((q as i64 + insn_d(code[q]) as i64 + 1) as usize)
+                    }
+                    Some((q, LuauOpcode::JumpX)) => {
+                        Some((q as i64 + insn_e(code[q]) as i64 + 1) as usize)
+                    }
+                    _ => None,
+                };
+                if jt.map_or(false, |j| j > t && j <= limit) {
+                    return true;
+                }
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// If the LAST instruction of `[start, end)` is a conditional branch escaping
+/// the span, and the instruction ending at its target is an unconditional JUMP
+/// forward, return that JUMP's target - the merge point of the if/else this
+/// span was cut through the middle of.
+///
+/// `rc_0084 ComputePath` structures its arm run 4..112 as
+///
+///     Linear 13..25      <- JUMPIFNOT at 24 targets 60
+///     ValueJoin 25..50
+///     Linear 50..112     <- contains JUMP at 59 -> 108, over arm B
+///
+/// The branch at 24 escapes its Linear span, and outside a loop an escaping
+/// branch is DISCARDED, so no if/else is built. `Linear 50..112` then follows
+/// the unconditional JUMP at 59 straight to 108, skipping 60..107 - arm B, and
+/// its three calls, emitted nowhere. Returning 108 here lets the span be lifted
+/// as 13..108 so the branch is in range and `detect_else_skip` recovers both
+/// arms.
+fn linear_escape_else_target(
+    code: &[u32],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> Option<usize> {
+    let mut pc = start;
+    let mut last: Option<(usize, LuauOpcode, usize)> = None;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let sz = if op.has_aux() { 2 } else { 1 };
+        last = Some((pc, op, pc + sz));
+        pc += sz;
+    }
+    let (bpc, bop, bend) = last?;
+    // The branch must BE the span's tail; a branch in the middle is ordinary
+    // code, not a construct the span was cut through.
+    if bend != end {
+        return None;
+    }
+    if !matches!(
+        bop,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+    ) {
+        return None;
+    }
+    let t = (bpc as i64 + insn_d(code[bpc]) as i64 + 1) as usize;
+    if t <= end || t > limit {
+        return None;
+    }
+    // Walk boundaries to the instruction ENDING at t - `t - 1` may be an AUX
+    // word, and an AUX word decoded as an opcode is arbitrary.
+    let mut q = end;
+    let mut prev = None;
+    while q < t && q < code.len() {
+        let qop = LuauOpcode::from_u8(insn_op(code[q]));
+        let qsz = if qop.has_aux() { 2 } else { 1 };
+        if q + qsz == t {
+            prev = Some((q, qop));
+            break;
+        }
+        q += qsz;
+    }
+    let (jpc, jop) = prev?;
+    let m = match jop {
+        LuauOpcode::Jump => (jpc as i64 + insn_d(code[jpc]) as i64 + 1) as usize,
+        LuauOpcode::JumpX => (jpc as i64 + insn_e(code[jpc]) as i64 + 1) as usize,
+        _ => return None,
+    };
+    if m > t && m <= limit {
+        Some(m)
+    } else {
+        None
+    }
+}
+
+fn remove_trailing_jump(stmts: &mut Vec<Stat>) {
+    // Remove trailing comments first (these are often opcode annotations)
+    while matches!(stmts.last(), Some(Stat::Comment(_))) {
+        stmts.pop();
+    }
+    // Remove exactly ONE trailing break or continue — the synthetic one from
+    // JUMPBACK/FORNLOOP handling. Don't strip more, as additional break/continue
+    // statements before it may be legitimate user code.
+    if matches!(stmts.last(), Some(Stat::Break) | Some(Stat::Continue)) {
+        stmts.pop();
+    }
+}
+
+/// Phase B0.51 — materialize an implicit `local vN = {}` seed for a register
+/// that is about to be used as a SET*/GET* table target but was never written.
+///
+/// Root cause this fixes:  when the Roblox compiler emits a module-style
+/// `local M = {}; M.foo = ...; return M` pattern but the NEWTABLE opcode is
+/// missed by our opmap detector (or permuted onto a byte we don't yet
+/// recognise), the lifter sees a sequence of SETTABLEKS targeting an
+/// undeclared register.  `reg_expr`/`table_expr` synthesize a `v0` name as
+/// a fallback, producing orphaned `v0.foo = value` lines with no preceding
+/// `local v0 = {}` declaration.  Downstream, `reconstruct_table_constructors`
+/// (B0.47) can't fire because there is no empty-table seed statement to
+/// absorb the field assigns into.
+///
+/// This helper runs BEFORE the SET/GET handler uses `table_expr(regs, reg)`.
+/// If and only if:
+///   * `regs[reg]` is `RegVal::Unknown` (never written in THIS control path),
+///     AND
+///   * `reg` has never been declared as a local (never classified), AND
+///   * `reg` is not a parameter slot
+/// then we emit `local vN = {}` via `classify_write` (which also marks the
+/// register declared) and seed `regs[reg] = Name(vN)` so the subsequent SET*
+/// handler treats the table as "already materialized" and emits the classic
+/// `vN.foo = value` assignment shape.  B0.47/B0.48 then collapse these into
+/// a proper constructor at end-of-pipeline.
+///
+/// The guard is intentionally narrow: when the register has any other state
+/// (pending Table literal, Name, loop var, etc.) we leave the existing flow
+/// untouched so B0.49's shadow-local detection, the B0.3 self-mutation path,
+/// and all other accumulated invariants remain unchanged.
+pub(super) fn ensure_table_reg_declared(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    reg: usize,
+    pc: usize,
+) {
+    if reg >= regs.len() {
+        return;
+    }
+    // Seeding predicate: we materialize a `local vN = {}` when the register
+    // contains either
+    //   (a) `Unknown` — never written in this proto's control-flow path, OR
+    //   (b) a non-table primitive (Bool / Number / String / Nil) that would
+    //       be safely ignored by `table_expr` (it falls back to
+    //       `Name(v{reg})`) but leaves the register state stale for
+    //       subsequent reads.
+    // Any NAME / TABLE / FUNCTION / CALL / FIELD / INDEX / BINOP / UNOP /
+    // METHODCALL / VECTOR / VARARGS or `LoopVar` reg value means the
+    // register is already meaningful and must NOT be clobbered.
+    let needs_seed = match &regs[reg] {
+        RegVal::Unknown => true,
+        RegVal::Expr(Expr::Bool(_))
+        | RegVal::Expr(Expr::Number(_))
+        | RegVal::Expr(Expr::String(_))
+        | RegVal::Expr(Expr::Nil) => true,
+        _ => false,
+    };
+    if !needs_seed {
+        return;
+    }
+    if !locals.is_undeclared_non_param(reg) {
+        return;
+    }
+    if (reg as usize) >= (proto.max_stack_size as usize).max(256) {
+        return;
+    }
+
+    let seed_name = ctx.reg_name(proto, reg as u8, pc);
+    let (kind, name) = locals.classify_write(reg, &seed_name);
+    let empty = Expr::Table { fields: vec![] };
+    match kind {
+        WriteKind::FirstDecl | WriteKind::Shadow => {
+            stmts.push(Stat::Local {
+                names: vec![name.clone()],
+                values: vec![empty],
+            });
+        }
+        WriteKind::Reassign => {
+            // Defensive: classify_write shouldn't return Reassign here since
+            // the is_undeclared_non_param guard above proves the reg was
+            // never declared.  Handle it anyway for completeness.
+            stmts.push(Stat::Assign {
+                targets: vec![Expr::Name(name.clone())],
+                values: vec![empty],
+            });
+        }
+    }
+    regs[reg] = RegVal::Expr(Expr::Name(name));
+}
+
+/// B0.117: Materialize a register's complex expression as a local when it would
+/// produce an invalid lvalue root for a table-write (SETTABLEKS / SETTABLE).
+/// Expressions like MethodCall, Call, Table, Function, Vector are valid *values*
+/// but not valid *lvalue bases* in Luau — `obj:Method().field = x` is a syntax
+/// error. This function checks whether `regs[reg]` would be invalid as a table
+/// base for assignment, and if so, emits `local vN = <expr>` and replaces
+/// `regs[reg]` with `Name(vN)`.
+pub(super) fn ensure_lvalue_base_materialized(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    reg: usize,
+    pc: usize,
+) {
+    if reg >= regs.len() {
+        return;
+    }
+    let expr = reg_expr(regs, reg);
+    // If the expression is already a valid lvalue root (Name, or Field/Index
+    // chain rooted in a Name), no materialization needed.
+    if is_lvalue_root(&expr) {
+        return;
+    }
+    // If the expression is Unknown or a primitive that table_expr would replace
+    // with a fallback Name anyway, skip — ensure_table_reg_declared handles those.
+    if matches!(&regs[reg], RegVal::Unknown) || is_impossible_as_table(&expr) {
+        return;
+    }
+    // The expression is complex (MethodCall, Call, Table, Function, Vector,
+    // BinOp, etc.) — materialize it as a local.
+    emit_local_or_assign(ctx, proto, regs, locals, stmts, reg, pc, expr);
+}
+
+/// Emit a local declaration if this is the first write to a register,
+/// otherwise emit a plain assignment. Always emits a statement so the
+/// value gets a name and isn't re-inlined at every use site.
+///
+/// Phase B0.49: uses `classify_write` so that a reassignment to a
+/// register with a NEW semantic name shadows the old local with a fresh
+/// `local` declaration — preventing emission of a global write to an
+/// undeclared name (e.g., `reverse_k_arith = function()...end`).
+pub(super) fn emit_local_or_assign(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    reg: usize,
+    pc: usize,
+    value: Expr,
+) {
+    let new_name = ctx.reg_name(proto, reg as u8, pc);
+    let (kind, name) = locals.classify_write(reg, &new_name);
+    regs[reg] = RegVal::Expr(Expr::Name(name.clone()));
+
+    match kind {
+        WriteKind::FirstDecl | WriteKind::Shadow => {
+            stmts.push(Stat::Local {
+                names: vec![name],
+                values: vec![value],
+            });
+        }
+        WriteKind::Reassign => {
+            stmts.push(Stat::Assign {
+                targets: vec![Expr::Name(name)],
+                values: vec![value],
+            });
+        }
+    }
+}
+
+/// Store a computed expression in a register. For simple values (names, literals)
+/// and side-effect-free expressions (field chains, index lookups, unary/binary ops
+/// with simple operands, empty tables, vectors), just stores in the register for
+/// later inlining. For expressions with side effects or unbounded size (calls,
+/// method calls, functions, deeply nested ops), emits a local declaration to
+/// prevent the expression from being duplicated at every use site.
+pub(super) fn store_complex(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    reg: usize,
+    pc: usize,
+    value: Expr,
+) {
+    // Phase B0.3 fix: self-mutation detection.
+    //
+    // Pattern: `R1 = R1 + R4` inside a loop body, where R1 is a carried local
+    // (e.g. `sum = sum + i`). With lazy inlining, the value `BinOp(Name(v1),
+    // Add, Name(i))` looks like a leaf-leaf BinOp → `expr_is_inlinable` → true
+    // → store in `regs[1]` without emitting a statement. Result: the body is
+    // silently empty and the emitted loop is `for i = 1, n do end` with no
+    // update to `sum`.
+    //
+    // Detect this by checking whether `value` transitively references the
+    // destination register's current Name. If so, we MUST emit a statement
+    // because inlining would lose the write semantics. This is both narrow
+    // (only fires when the destination is already a named local AND the new
+    // value reads from it) and safe (fold-only patterns like `R2 = R0 + 1`
+    // are unaffected because `value` doesn't reference `R2`).
+    let is_self_mutation = match regs.get(reg) {
+        Some(RegVal::Expr(Expr::Name(n))) | Some(RegVal::LoopVar(n)) => {
+            expr_references_name(&value, n)
+        }
+        _ => false,
+    };
+
+    // A loop-carried register that `premateralize_loop_carried` turned into a
+    // real local must have EVERY write emitted, not just self-mutating ones.
+    // `while not flag do ... flag = c >= 3 ... end` reads nothing from `flag`,
+    // so `is_self_mutation` is false and the update was parked in the register
+    // file. With no write left in the AST, `inline_pure_literals` then
+    // constant-propagated the initial value into the loop condition and deleted
+    // the declaration, folding the whole thing to `while true do`.
+    //
+    // Gated on the PIN rather than on a bare in-loop flag, so it fires only for
+    // the registers premateralization deliberately bound, and only across that
+    // loop's PC span.
+    let is_pinned_loop_carried = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+        && ctx.is_pinned_reg(reg as u8, pc);
+
+    if !is_self_mutation && !is_pinned_loop_carried && expr_is_inlinable(&value) {
+        regs[reg] = RegVal::Expr(value);
+    } else {
+        // B0.127b: sanitize stdlib-name strings when emitting as a statement.
+        // This does NOT apply in the inlining branch above because call
+        // arguments like `print("game")` must preserve the string literal.
+        // Only materialized assignments (`local v4 = "os"`) need conversion.
+        let value = sanitize_leaked_global_string(value);
+        // Complex expressions with side effects or unbounded size, or
+        // self-mutation patterns that must be materialized: emit a statement.
+        //
+        // Phase B0.3: if the register already holds a `Name(n)` (e.g. because
+        // it was pre-materialized before a loop), reuse that name instead of
+        // asking `ctx.reg_name` for a new one. `ctx.reg_name` is PC-scoped and
+        // can return a DIFFERENT name at different PCs (e.g. `v1` before the
+        // loop, `v12` inside the loop), which would break the `sum = sum + i`
+        // pattern by renaming the LHS between iterations.
+        //
+        // Phase B0.49: when there IS no existing Name to reuse (fresh write
+        // to this register), run the new name through `classify_write` so
+        // shadowing fires when a semantic-rename arrives (e.g., a subsequent
+        // arithmetic or CALL write changing the register's meaning).  When
+        // we CAN reuse the existing name, we skip the classifier: arithmetic
+        // self-mutation (`count = count + 1`) must NOT re-declare `count`.
+        //
+        // Phase B0.65: before blindly reusing the carried name, peek at the
+        // FRESH `Named` hint for this register at the current PC.  Pattern:
+        // GETGLOBAL R0 installs `Named("script")` and seeds R0 with
+        // `Expr::Name("script")`; the subsequent GETTABLEKS R0, R0 writes
+        // `Field(Name("script"), "Parent")` to the same register — old code
+        // reused "script" and emitted `local script = script.Parent` even
+        // though GETTABLEKS just installed a newer `Named("Parent")` hint at
+        // its own PC.  Blind-test corpus had 559 such "local X = X.Y" bugs.
+        //
+        // When the hint at `pc` yields a DIFFERENT semantic name than the
+        // carried one, route through `classify_write` so the newer name
+        // wins via Shadow or FirstDecl.  When the hint matches the carried
+        // name (the benign `count = count + 1` case — B0.43C's arithmetic
+        // name-propagation keeps `Named("count")` current), skip the
+        // classifier and reuse the existing name so arithmetic loops never
+        // re-declare `count`.
+        //
+        // Skip the fresh-hint peek when:
+        //   * the carried source is `RegVal::LoopVar` (loop-var names are
+        //     stable by construction — never shadow them),
+        //   * the carried name is a generic `v\d+` fallback (mirrors
+        //     `classify_write`'s shadow gate — avoids churn from
+        //     counter-bumped generic names).
+        //
+        // We DO peek on both declared and undeclared registers: the
+        // GETGLOBAL/GETTABLEKS pattern sets `regs[reg] = Expr::Name("script")`
+        // WITHOUT calling `needs_local` (the global name isn't materialized
+        // as a local), so the subsequent store_complex at GETTABLEKS sees
+        // an undeclared register with a semantic carried name.  That is
+        // exactly where the "local script = script.Parent" bug fires, and
+        // we need the peek to catch it.
+        let existing_name = match &regs[reg] {
+            RegVal::Expr(Expr::Name(n)) | RegVal::LoopVar(n) => Some(n.clone()),
+            _ => None,
+        };
+        let carried_is_loopvar = matches!(&regs[reg], RegVal::LoopVar(_));
+        // B0.130b: "self" is a NAMECALL artifact — never preserve it as a
+        // reassignment target for non-self values.  Without this,
+        // LoadKX/DupClosure closures stored via store_complex emit
+        // `self = function()...end` (59 remaining instances after B0.130).
+        // Force through the no-carried-name classifier path with a generic
+        // replacement name.
+        let existing_name = if matches!(existing_name.as_deref(), Some("self"))
+            && matches!(&value, Expr::Function { .. })
+        {
+            None
+        } else {
+            existing_name
+        };
+        if let Some(name) = existing_name {
+            // Consult the fresh hint when the carried source is a plain
+            // `Expr::Name` (not LoopVar).
+            //
+            // B0.72: also peek when the carried name is GENERIC (`v0`, `v12`).
+            // Previously, the peek was gated on `is_semantic_local_name(&name)`,
+            // which blocked generic-to-semantic transitions. This caused
+            // self-field-access chains (`v0 = v0.Title; v0 = v0.Timer`) to
+            // stay as `v0` instead of `local Title = v0.Title; local Timer =
+            // Title.Timer`. The inner check `is_semantic_local_name(&fresh)`
+            // still prevents generic-to-generic churn.
+            //
+            // `ctx.reg_name` is idempotent at the same (reg, pc); calling
+            // it here caches the synthesized name for downstream lookups
+            // at the same PC.
+            //
+            // Round 4: a PINNED register never peeks. The pin's contract is
+            // one stable identity across its span (a loop body, a branch
+            // arm, a capture span); a semantic hint inside the span is a
+            // hint about the VALUE passing through the slot, not about the
+            // binding — honoring it shadow-demotes the arm write into a
+            // fresh local and the join annihilates it. That is the
+            // "pre-branch NAME-seeded registers still shadow-demote inside
+            // arms" residual 26f939b documented, and the reason the round-4
+            // unknown-seed pass could not hold without this gate
+            // (16_StickerPlacer: the arm CALL's "GetLocalPlayerCanvasSet"
+            // hint out-ranked the seeded identity).
+            // SELF-MUTATION IS NOT A REBIND.
+            //
+            // `Lvl3 = Lvl3 + 2` recomputes a register FROM ITSELF. The peek
+            // below asks `ctx.reg_name` for a fresh hint, gets `Lvl4` because
+            // the uniquifier bumped its counter, sees a different semantic name
+            // and treats it as a new binding - so the arm emits
+            // `local Lvl4 = Lvl3 + 2` and the value never reaches the `Lvl3`
+            // used after the branch. 213_Tornado loses a `+ 2` this way and
+            // 734_StatModifiers_BaseConversionRate returns an un-appended
+            // string.
+            //
+            // `store_complex` already detects this shape for the loop case
+            // (Phase B0.3, see the header) and the `else` branch below keeps
+            // the carried name for exactly this reason. The peek simply ran
+            // first. Suppressing the peek when the value reads the carried name
+            // routes self-mutation into that existing path.
+            // ONLY an arithmetic or concat extension counts.
+            //
+            // `X = X.field` reads the SAME name and is not an accumulate - it
+            // NARROWS one value into a different one, and the old value is
+            // usually still needed. Accepting it rewrote
+            // `local VREnabled6 = VRService.VREnabled` into
+            // `VRService = VRService.VREnabled`, destroying the service
+            // reference that the rest of 25_RootCamera goes on to use, and the
+            // same for `Players = Players.LocalPlayer`.
+            //
+            // A `BinOp` whose operand is the carried name is the shape that IS
+            // an accumulate: `Lvl3 + 2`, `Op .. " Bees)"`, `count * 2`. This is
+            // deliberately the same predicate `check_branch_local_discarded`
+            // uses to recognise the family - the checker and the fix agree on
+            // what the defect is.
+            let mut self_mutation =
+                matches!(&value, Expr::BinOp { .. }) && expr_uses_name_as_operand(&value, &name);
+
+            // ACCUMULATE THROUGH AN ALIAS.
+            //
+            // Luau's CONCAT needs its operands in consecutive registers, so
+            // `desc = desc .. x .. " "` first MOVEs the accumulator into the
+            // start of a scratch range. The arm then reads as
+            //
+            //     Pool = Name2                        -- the MOVE
+            //     local Name3 = (Pool .. self.Pool) .. " "
+            //
+            // and the extension references the SCRATCH name, not the carried
+            // one, so the guard above cannot see that this is still an
+            // accumulate onto `Name2`. 819_StatReqs_Completed_Quests loses the
+            // pool name from its description this way, and the same shape
+            // appears in 165_QuestListener and 263_BeeTypeStatsBox.
+            //
+            // Only ONE level, and only when the MOVE is the statement
+            // immediately before: a longer chain is not evidence of anything,
+            // and matching loosely here is how rotations 25 and 27 broke files.
+            if !self_mutation && matches!(&value, Expr::BinOp { .. }) {
+                if let Some(Stat::Assign { targets, values }) = stmts.last() {
+                    if let (Some(Expr::Name(alias)), Some(Expr::Name(src))) =
+                        (targets.first(), values.first())
+                    {
+                        if src == &name && expr_uses_name_as_operand(&value, alias) {
+                            self_mutation = true;
+                        }
+                    }
+                }
+            }
+            let do_peek =
+                !carried_is_loopvar && !ctx.is_pinned_reg(reg as u8, pc) && !self_mutation;
+            let rebind_name: Option<String> = if do_peek {
+                let fresh = ctx.reg_name(proto, reg as u8, pc);
+                if fresh != name && is_semantic_local_name(&fresh) {
+                    Some(fresh)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(new_name) = rebind_name {
+                // Fresh semantic hint differs from carried name → treat as
+                // a semantic rebind.  `classify_write` returns Shadow or
+                // Reassign depending on `current_names` state; either way
+                // the emitted code uses the new name.
+                let (kind, final_name) = locals.classify_write(reg, &new_name);
+                match kind {
+                    WriteKind::FirstDecl | WriteKind::Shadow => {
+                        stmts.push(Stat::Local {
+                            names: vec![final_name.clone()],
+                            values: vec![value],
+                        });
+                    }
+                    WriteKind::Reassign => {
+                        stmts.push(Stat::Assign {
+                            targets: vec![Expr::Name(final_name.clone())],
+                            values: vec![value],
+                        });
+                    }
+                }
+                regs[reg] = RegVal::Expr(Expr::Name(final_name));
+            } else if locals.needs_local(reg) {
+                // Pre-declare path (reg wasn't yet declared but has a carried
+                // name — happens for loop-var pre-declare).  Emit Local.
+                locals.record_name(reg, &name);
+                stmts.push(Stat::Local {
+                    names: vec![name.clone()],
+                    values: vec![value],
+                });
+                regs[reg] = RegVal::Expr(Expr::Name(name));
+            } else {
+                // Already declared, hint matches (or peek was skipped).
+                // Keep current name to avoid clobbering the self-mutation
+                // pattern (see Phase B0.3 comment above).  Do not overwrite
+                // current_names here — the existing binding stands.
+                stmts.push(Stat::Assign {
+                    targets: vec![Expr::Name(name.clone())],
+                    values: vec![value],
+                });
+                regs[reg] = RegVal::Expr(Expr::Name(name));
+            }
+        } else {
+            // No carried name — freshly compute and go through classifier.
+            let mut new_name = ctx.reg_name(proto, reg as u8, pc);
+            // B0.130b: "self" escape — same logic as NewClosure handler.
+            if new_name == "self" && matches!(&value, Expr::Function { .. }) {
+                new_name = format!("fn{}", reg);
+            }
+            let (kind, name) = locals.classify_write(reg, &new_name);
+            match kind {
+                WriteKind::FirstDecl | WriteKind::Shadow => {
+                    stmts.push(Stat::Local {
+                        names: vec![name.clone()],
+                        values: vec![value],
+                    });
+                }
+                WriteKind::Reassign => {
+                    stmts.push(Stat::Assign {
+                        targets: vec![Expr::Name(name.clone())],
+                        values: vec![value],
+                    });
+                }
+            }
+            regs[reg] = RegVal::Expr(Expr::Name(name));
+        }
+    }
+}
+
+/// Does `expr` transitively reference the local variable `name`?
+///
+/// Used by `store_complex` to detect self-mutation (`R1 = R1 + X`) inside
+/// loops. Recursively walks every sub-expression so that deeply-nested reads
+/// still count (e.g. `R1 = (a + R1) * 2`).
+/// Does `expr` use `name` as a DIRECT operand of its arithmetic/concat spine?
+///
+/// `expr_references_name` answers "does this mention the name anywhere", which
+/// is too generous for deciding an accumulate. `self.Name .. " is in a trade"`
+/// mentions `self`, but it READS A FIELD of the object and builds a string; the
+/// object is still live. Rewriting that as `self = self.Name .. "..."`
+/// destroyed the receiver in 356_TradeRequestGui and 388_ItemPackages_Sticker.
+///
+/// A real accumulate has the name itself as an operand - `Lvl3 + 2`,
+/// `Op .. " ("` - so this walks ONLY the BinOp/UnOp spine and refuses to
+/// descend into a field, index, or call.
+pub(super) fn expr_uses_name_as_operand(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n == name,
+        Expr::UnOp { operand, .. } => expr_uses_name_as_operand(operand, name),
+        Expr::BinOp { left, right, .. } => {
+            expr_uses_name_as_operand(left, name) || expr_uses_name_as_operand(right, name)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn expr_references_name(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n == name,
+        Expr::Field { object, .. } => expr_references_name(object, name),
+        Expr::Index { object, key } => {
+            expr_references_name(object, name) || expr_references_name(key, name)
+        }
+        Expr::UnOp { operand, .. } => expr_references_name(operand, name),
+        Expr::BinOp { left, right, .. } => {
+            expr_references_name(left, name) || expr_references_name(right, name)
+        }
+        Expr::Call { func, args } => {
+            expr_references_name(func, name)
+                || args.iter().any(|a| expr_references_name(a, name))
+        }
+        Expr::MethodCall { object, args, .. } => {
+            expr_references_name(object, name)
+                || args.iter().any(|a| expr_references_name(a, name))
+        }
+        Expr::Table { fields } => fields.iter().any(|f| match f {
+            TableField::Sequential(e) => expr_references_name(e, name),
+            TableField::Named(_, e) => expr_references_name(e, name),
+            TableField::Indexed(k, e) => {
+                expr_references_name(k, name) || expr_references_name(e, name)
+            }
+        }),
+        // Vectors carry f32 literals, not nested expressions, so they can
+        // never reference a named register.
+        Expr::Vector(_, _, _) => false,
+        // Phase B0.52P10: ternary references a name iff any sub-expression does.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_references_name(cond, name)
+                || expr_references_name(then_expr, name)
+                || expr_references_name(else_expr, name)
+        }
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Function { .. } => false,
+    }
+}
+/// After lifting a loop body, hoist any `local` declarations that were first
+/// introduced inside the loop.  Bytecode registers are function-scoped, so
+/// variables assigned inside a loop must be visible after the loop exits.
+/// We emit bare `local vN` declarations *before* the loop and rewrite the
+/// corresponding `Stat::Local` nodes inside the body to plain `Stat::Assign`.
+fn hoist_loop_locals(
+    locals: &LocalTracker,
+    snap: &HashSet<usize>,
+    stmts: &mut Vec<Stat>,
+    body: &mut Vec<Stat>,
+) {
+    let new_regs = locals.new_since(snap);
+    if new_regs.is_empty() {
+        return;
+    }
+
+    // ONLY THE NAMES THAT ARE ACTUALLY NEW IN THIS LOOP.
+    //
+    // This collected every `Stat::Local` name in the body. `new_regs` was
+    // computed, tested for emptiness, and then never used again - so a name
+    // already live BEFORE the loop was hoisted too, and the bare `local` we
+    // emit below re-declared it, shadowing the existing binding with nil:
+    //
+    //     local result4 = task.wait(...)        -- assigned
+    //     local random49, random50, result4     -- hoist re-declares it
+    //     while result4 do                      -- reads nil, never runs
+    //
+    // That is 250_GlitchEffect, where the periodic effect could never fire
+    // once. The same shape shadows `self` and `arg2` inside a method in
+    // 879_BigNum, so `self.len` indexes nil. On the 18 Aug 1,143-file corpus
+    // `declared_never_assigned` was 100 of the 102 remaining defects.
+    //
+    // The doc comment above already described the correct rule; this makes the
+    // code do it. A register in `new_regs` was first declared inside the loop,
+    // so hoisting its name is sound. A name bound to any other register was
+    // live on the way in and must be assigned, never re-declared.
+    let new_names: HashSet<String> = new_regs
+        .iter()
+        .filter_map(|&r| locals.current_name(r).map(|s| s.to_string()))
+        .collect();
+
+    let mut hoisted_names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // A name already live on the way in still has to become an ASSIGNMENT.
+    //
+    // Not hoisting it is only half the job. The body re-binds the same
+    // register each time round, and if that stays a `local` it shadows the
+    // outer binding inside the loop, so the condition never sees the new
+    // value:
+    //
+    //     local result4 = task.wait(...)
+    //     while result4 do
+    //         glitchEffect(arg1)
+    //         local result4 = task.wait(...)   -- shadows; outer never updates
+    //     end
+    //
+    // Registers are function-scoped, so a body write to a register that was
+    // live before the loop IS the same variable - rewriting it to an assign is
+    // what the bytecode actually said.
+    let mut rebind_names: Vec<String> = Vec::new();
+    for stat in body.iter() {
+        if let Stat::Local { names, .. } = stat {
+            for name in names {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if new_names.contains(name) {
+                    hoisted_names.push(name.clone());
+                } else {
+                    rebind_names.push(name.clone());
+                }
+            }
+        }
+    }
+
+    if hoisted_names.is_empty() && rebind_names.is_empty() {
+        return;
+    }
+
+    // Only the genuinely new names get a declaration; the rest were already
+    // declared outside and re-declaring them is the shadowing bug above.
+    if !hoisted_names.is_empty() {
+        stmts.push(Stat::Local {
+            names: hoisted_names.clone(),
+            values: vec![],
+        });
+    }
+
+    // Rewrite matching Local nodes in the body to plain Assign - both the
+    // hoisted ones and the ones that were live all along.
+    let mut rewrite_set: HashSet<String> = hoisted_names.into_iter().collect();
+    rewrite_set.extend(rebind_names);
+    rewrite_locals_to_assigns(body, &rewrite_set);
+}
+
+/// Rewrite `Stat::Local { names, values }` into `Stat::Assign` when any name
+/// is in `rewrite_set`.  Only rewrites top-level statements.
+fn rewrite_locals_to_assigns(body: &mut Vec<Stat>, rewrite_set: &HashSet<String>) {
+    for stat in body.iter_mut() {
+        let should_rewrite = if let Stat::Local { names, .. } = stat {
+            names.iter().any(|n| rewrite_set.contains(n))
+        } else {
+            false
+        };
+        if should_rewrite {
+            if let Stat::Local { names, values } =
+                std::mem::replace(stat, Stat::Comment(String::new()))
+            {
+                let targets: Vec<Expr> = names.into_iter().map(Expr::Name).collect();
+                *stat = Stat::Assign { targets, values };
+            }
+        }
+    }
+}
+
+
+/// Determine whether an expression is safe and cheap to inline into every use
+/// site rather than being emitted as a local variable.
+///
+/// An expression is inlinable if it is:
+/// 1. Side-effect-free (no function calls)
+/// 2. Small enough that duplicating it doesn't bloat the output
+///
+/// This avoids generating unnecessary locals like:
+///   local v5 = game.Players   ->  game.Players.LocalPlayer  (inlined)
+///   local v3 = not v2          ->  not v2  (inlined)
+///   local v4 = a + b           ->  a + b   (inlined)
+fn expr_is_inlinable(expr: &Expr) -> bool {
+    match expr {
+        // Tier 0: literals and names -- always inlinable
+        Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
+        | Expr::Varargs | Expr::String(_) | Expr::Vector(..) => true,
+
+        // Tier 1: field chains -- side-effect-free property access.
+        // game.Players.LocalPlayer reads better inlined than as a temp local.
+        // Only inline if the base object is itself inlinable.
+        Expr::Field { object, .. } => expr_is_inlinable(object),
+
+        // Tier 2: index lookups with simple keys -- tbl[1], tbl["key"], tbl[name].
+        // Only inline if both object and key are inlinable.
+        Expr::Index { object, key } => expr_is_inlinable(object) && expr_is_inlinable(key),
+
+        // Tier 3: unary ops -- `not x`, `-x`, `#x` are tiny and side-effect-free.
+        // Only inline if the operand is inlinable.
+        Expr::UnOp { operand, .. } => expr_is_inlinable(operand),
+
+        // Tier 4: binary ops -- `a + b`, `x == 5`, `a .. b`.
+        // Only inline when BOTH operands are leaf-level (names/literals/field chains)
+        // to prevent exponential expression growth from nested inlining.
+        Expr::BinOp { left, right, .. } => expr_is_leaf(left) && expr_is_leaf(right),
+
+        // Tier 5: tables -- keep pending so SETTABLEKS/SETLIST can fill them
+        // in-place. DUPTABLE creates tables with nil-initialized fields (template
+        // keys) that are meant to be overwritten — those must stay pending too.
+        Expr::Table { fields } => {
+            fields.is_empty()
+                || fields.iter().all(|f| matches!(f, TableField::Named(_, Expr::Nil)))
+        },
+
+        // Tier 6: ternary -- `if c then a else b` is side-effect-free when
+        // all sub-expressions are leaf-level (prevents nested ternary blowup).
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_is_leaf(cond) && expr_is_leaf(then_expr) && expr_is_leaf(else_expr)
+        }
+
+        // Everything else (Call, MethodCall, Function, non-empty Table) has side
+        // effects or is too large -- must be emitted as a local.
+        _ => false,
+    }
+}
+
+/// Check if an expression is a "leaf" -- small enough to appear as a BinOp
+/// operand without risk of blowup. This is intentionally more restrictive
+/// than `expr_is_inlinable` to prevent nested BinOps from being inlined
+/// recursively (which would cause exponential duplication).
+fn expr_is_leaf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
+        | Expr::Varargs | Expr::String(_) | Expr::Vector(..) => true,
+        Expr::Field { object, .. } => expr_is_leaf(object),
+        Expr::UnOp { operand, .. } => expr_is_leaf(operand),
+        _ => false,
+    }
+}
+
+/// Check if an expression references a given variable name anywhere.
+fn expr_uses_name(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n == name,
+        Expr::Field { object, .. } => expr_uses_name(object, name),
+        Expr::Index { object, key } => expr_uses_name(object, name) || expr_uses_name(key, name),
+        Expr::BinOp { left, right, .. } => expr_uses_name(left, name) || expr_uses_name(right, name),
+        Expr::UnOp { operand, .. } => expr_uses_name(operand, name),
+        Expr::Call { func, args } => {
+            expr_uses_name(func, name) || args.iter().any(|a| expr_uses_name(a, name))
+        }
+        Expr::MethodCall { object, args, .. } => {
+            expr_uses_name(object, name) || args.iter().any(|a| expr_uses_name(a, name))
+        }
+        Expr::Table { fields } => fields.iter().any(|f| match f {
+            TableField::Sequential(e) => expr_uses_name(e, name),
+            TableField::Named(_, e) => expr_uses_name(e, name),
+            TableField::Indexed(k, v) => expr_uses_name(k, name) || expr_uses_name(v, name),
+        }),
+        Expr::Function { .. } => false, // closures capture by upvalue, not name
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_uses_name(cond, name) || expr_uses_name(then_expr, name) || expr_uses_name(else_expr, name)
+        }
+        _ => false,
+    }
+}
+
+/// Eliminate dead stores: remove assignments that are immediately overwritten
+/// by a later assignment to the same register (same variable name).
+// ---------------------------------------------------------------------------
+// Expression simplification pass
+// ---------------------------------------------------------------------------
+
+/// Returns true for constant literals (Nil, Bool, Number, String).
+/// Used by boolean-comparison simplifications to avoid folding
+/// `"str" == true` into `"str"` (which changes the value).
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_))
+}
+
+/// Recursively simplify a single expression.
+/// Returns a fully simplified clone — does not mutate in place.
+fn simplify_expr(expr: &Expr) -> Expr {
+    match expr {
+        // ── UnOp simplifications ────────────────────────────────────────────
+        Expr::UnOp { op, operand } => {
+            let inner = simplify_expr(operand);
+            match op {
+                // not not x  →  x
+                UnOp::Not => {
+                    if let Expr::UnOp { op: UnOp::Not, operand: inner2 } = &inner {
+                        return simplify_expr(inner2);
+                    }
+                    // Phase B0.92+B0.97b: constant-fold `not` on known values.
+                    // In Lua/Luau, only nil and false are falsy; everything else
+                    // (including 0, "", empty tables) is truthy.
+                    match &inner {
+                        Expr::Nil | Expr::Bool(false) => return Expr::Bool(true),
+                        Expr::Bool(true) => return Expr::Bool(false),
+                        Expr::Number(_) | Expr::String(_) | Expr::Table { .. } => {
+                            return Expr::Bool(false);
+                        }
+                        _ => {}
+                    }
+                    // not (a == b)  →  a ~= b
+                    // not (a ~= b)  →  a == b
+                    // not (a < b)   →  a >= b
+                    // not (a <= b)  →  a > b
+                    // not (a > b)   →  a <= b
+                    // not (a >= b)  →  a < b
+                    if let Expr::BinOp { left, op: bop, right } = &inner {
+                        let flipped = match bop {
+                            BinOp::Eq    => Some(BinOp::NotEq),
+                            BinOp::NotEq => Some(BinOp::Eq),
+                            BinOp::LT    => Some(BinOp::GE),
+                            BinOp::LE    => Some(BinOp::GT),
+                            BinOp::GT    => Some(BinOp::LE),
+                            BinOp::GE    => Some(BinOp::LT),
+                            _ => None,
+                        };
+                        if let Some(new_op) = flipped {
+                            return Expr::BinOp {
+                                left: left.clone(),
+                                op: new_op,
+                                right: right.clone(),
+                            };
+                        }
+                    }
+                    Expr::UnOp { op: UnOp::Not, operand: Box::new(inner) }
+                }
+                // -(-x)  →  x
+                UnOp::Negate => {
+                    if let Expr::UnOp { op: UnOp::Negate, operand: inner2 } = &inner {
+                        return simplify_expr(inner2);
+                    }
+                    Expr::UnOp { op: UnOp::Negate, operand: Box::new(inner) }
+                }
+                // #{} → 0
+                UnOp::Length => {
+                    if let Expr::Table { fields } = &inner {
+                        if fields.is_empty() {
+                            return Expr::Number(0.0);
+                        }
+                    }
+                    // #nil, #true, #false, #number are runtime errors — replace
+                    // with a placeholder since these are decompiler artifacts
+                    match &inner {
+                        Expr::Nil | Expr::Bool(_) | Expr::Number(_) => {
+                            return Expr::Number(0.0);
+                        }
+                        // #"string" can be folded to a constant
+                        Expr::String(s) => {
+                            return Expr::Number(s.len() as f64);
+                        }
+                        _ => {}
+                    }
+                    Expr::UnOp { op: UnOp::Length, operand: Box::new(inner) }
+                }
+                // ~x — no simplification rules for bitwise NOT
+                UnOp::BNot => Expr::UnOp { op: UnOp::BNot, operand: Box::new(inner) },
+            }
+        }
+
+        // ── BinOp simplifications ────────────────────────────────────────────
+        Expr::BinOp { left, op, right } => {
+            let l = simplify_expr(left);
+            let r = simplify_expr(right);
+
+            // -- Constant folding: Number op Number --------------------------
+            if let (Expr::Number(a), Expr::Number(b)) = (&l, &r) {
+                let folded = match op {
+                    BinOp::Add  => Some(a + b),
+                    BinOp::Sub  => Some(a - b),
+                    BinOp::Mul  => Some(a * b),
+                    BinOp::Div  if *b != 0.0 => Some(a / b),
+                    BinOp::IDiv if *b != 0.0 => Some((a / b).floor()),
+                    BinOp::Mod  if *b != 0.0 => Some(a % b),
+                    BinOp::Pow  => Some(a.powf(*b)),
+                    _ => None,
+                };
+                if let Some(val) = folded {
+                    if val.is_finite() {
+                        return Expr::Number(val);
+                    }
+                }
+            }
+
+            // -- Constant folding: String .. String --------------------------
+            if matches!(op, BinOp::Concat) {
+                if let (Expr::String(a), Expr::String(b)) = (&l, &r) {
+                    return Expr::String(format!("{}{}", a, b));
+                }
+            }
+
+            match op {
+                // x + 0  →  x
+                BinOp::Add => {
+                    if matches!(r, Expr::Number(n) if n == 0.0) { return l; }
+                    if matches!(l, Expr::Number(n) if n == 0.0) { return r; }
+                }
+                // x - 0  →  x
+                // x - (-y)  →  x + y  (subtraction of negation)
+                BinOp::Sub => {
+                    if matches!(r, Expr::Number(n) if n == 0.0) { return l; }
+                    if let Expr::UnOp { op: UnOp::Negate, operand } = r {
+                        return Expr::BinOp { left: Box::new(l), op: BinOp::Add, right: operand };
+                    }
+                }
+                // x * 1  →  x,  x * 0  →  0,  x * -1  →  -x
+                BinOp::Mul => {
+                    if matches!(r, Expr::Number(n) if n == 1.0) { return l; }
+                    if matches!(l, Expr::Number(n) if n == 1.0) { return r; }
+                    if matches!(r, Expr::Number(n) if n == 0.0) { return Expr::Number(0.0); }
+                    if matches!(l, Expr::Number(n) if n == 0.0) { return Expr::Number(0.0); }
+                    if matches!(r, Expr::Number(n) if n == -1.0) {
+                        return Expr::UnOp { op: UnOp::Negate, operand: Box::new(l) };
+                    }
+                    if matches!(l, Expr::Number(n) if n == -1.0) {
+                        return Expr::UnOp { op: UnOp::Negate, operand: Box::new(r) };
+                    }
+                }
+                // x / 1  →  x
+                BinOp::Div => {
+                    if matches!(r, Expr::Number(n) if n == 1.0) { return l; }
+                }
+                // x // 1  ->  x
+                BinOp::IDiv => {
+                    if matches!(r, Expr::Number(n) if n == 1.0) { return l; }
+                }
+                // x ^ 1  →  x,  x ^ 0  →  1
+                BinOp::Pow => {
+                    if matches!(r, Expr::Number(n) if n == 1.0) { return l; }
+                    if matches!(r, Expr::Number(n) if n == 0.0) { return Expr::Number(1.0); }
+                }
+                // x .. ""  →  x  — ONLY when the surviving operand is already
+                // string-typed. `"" .. 42` is the string "42", not the number
+                // 42, and dropping the concat turned `#("" .. n)` into `#42`,
+                // which the `#<Number> → 0` artifact guard below then folded to
+                // a silent, wrong `0`.
+                BinOp::Concat => {
+                    let is_stringy = |e: &Expr| {
+                        matches!(e, Expr::String(_))
+                            || matches!(e, Expr::BinOp { op: BinOp::Concat, .. })
+                    };
+                    if matches!(&r, Expr::String(s) if s.is_empty()) && is_stringy(&l) {
+                        return l;
+                    }
+                    if matches!(&l, Expr::String(s) if s.is_empty()) && is_stringy(&r) {
+                        return r;
+                    }
+                }
+                // true and x   ->  x,   false and x  ->  false
+                // nil and x    ->  nil   (nil is falsy, short-circuits)
+                // x and x      ->  x     (idempotent)
+                BinOp::And => {
+                    if matches!(l, Expr::Bool(true))  { return r; }
+                    if matches!(l, Expr::Bool(false)) { return Expr::Bool(false); }
+                    if matches!(l, Expr::Nil)         { return Expr::Nil; }
+                    // Phase B0.97b: x and x → x (idempotent)
+                    if exprs_structurally_equal(&l, &r) { return l; }
+                }
+                // false or x   ->  x,   true or x  ->  true
+                // nil or x     ->  x    (nil is falsy, falls through to RHS)
+                // x or nil     ->  x    (nil is falsy, or-nil is always identity)
+                // x or x       ->  x    (idempotent)
+                BinOp::Or => {
+                    if matches!(l, Expr::Bool(false)) { return r; }
+                    if matches!(l, Expr::Bool(true))  { return Expr::Bool(true); }
+                    if matches!(l, Expr::Nil)         { return r; }
+                    if matches!(r, Expr::Nil)         { return l; }
+                    // Phase B0.97b: x or x → x (idempotent)
+                    if exprs_structurally_equal(&l, &r) { return l; }
+                }
+                // nil == x     ->  x == nil  (convention: nil always on right)
+                // x == true    ->  x         (only for non-literal x)
+                // x == false   ->  not x     (only for non-literal x)
+                BinOp::Eq => {
+                    if matches!(l, Expr::Nil) {
+                        return Expr::BinOp { left: Box::new(r), op: BinOp::Eq, right: Box::new(Expr::Nil) };
+                    }
+                    if matches!(r, Expr::Bool(true)) && !is_literal(&l) {
+                        return l;
+                    }
+                    if matches!(r, Expr::Bool(false)) && !is_literal(&l) {
+                        return Expr::UnOp { op: UnOp::Not, operand: Box::new(l) };
+                    }
+                }
+                // nil ~= x     ->  x ~= nil
+                // x ~= true    ->  not x    (only for non-literal x)
+                // x ~= false   ->  x        (only for non-literal x)
+                BinOp::NotEq => {
+                    if matches!(l, Expr::Nil) {
+                        return Expr::BinOp { left: Box::new(r), op: BinOp::NotEq, right: Box::new(Expr::Nil) };
+                    }
+                    if matches!(r, Expr::Bool(true)) && !is_literal(&l) {
+                        return Expr::UnOp { op: UnOp::Not, operand: Box::new(l) };
+                    }
+                    if matches!(r, Expr::Bool(false)) && !is_literal(&l) {
+                        return l;
+                    }
+                }
+                _ => {}
+            }
+            Expr::BinOp { left: Box::new(l), op: *op, right: Box::new(r) }
+        }
+
+        // ── Recurse into sub-expressions that contain Expr children ─────────
+        Expr::Field { object, field } => Expr::Field {
+            object: Box::new(simplify_expr(object)),
+            field: field.clone(),
+        },
+        Expr::Index { object, key } => Expr::Index {
+            object: Box::new(simplify_expr(object)),
+            key: Box::new(simplify_expr(key)),
+        },
+        Expr::Call { func, args } => Expr::Call {
+            func: Box::new(simplify_expr(func)),
+            args: args.iter().map(simplify_expr).collect(),
+        },
+        Expr::MethodCall { object, method, args } => Expr::MethodCall {
+            object: Box::new(simplify_expr(object)),
+            method: method.clone(),
+            args: args.iter().map(simplify_expr).collect(),
+        },
+        Expr::Table { fields } => Expr::Table {
+            fields: fields.iter().filter_map(|f| match f {
+                TableField::Sequential(e)    => Some(TableField::Sequential(simplify_expr(e))),
+                TableField::Named(k, e)      => {
+                    let simplified = simplify_expr(e);
+                    // Strip named fields with nil values — {x = nil} ≡ {} in Lua
+                    if matches!(simplified, Expr::Nil) {
+                        None
+                    } else {
+                        Some(TableField::Named(k.clone(), simplified))
+                    }
+                }
+                TableField::Indexed(k, v)    => Some(TableField::Indexed(simplify_expr(k), simplify_expr(v))),
+            }).collect(),
+        },
+        Expr::Function { params, is_vararg, body } => {
+            let mut b = body.clone();
+            simplify_stmts(&mut b);
+            Expr::Function { params: params.clone(), is_vararg: *is_vararg, body: b }
+        }
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            let c = simplify_expr(cond);
+            let t = simplify_expr(then_expr);
+            let e = simplify_expr(else_expr);
+            // Constant-condition fold
+            match &c {
+                Expr::Bool(true) => return t,
+                Expr::Bool(false) | Expr::Nil => return e,
+                _ => {}
+            }
+            // Identical branches: `if c then X else X` → `X`
+            if exprs_structurally_equal(&t, &e) {
+                return t;
+            }
+            // Phase B0.94: `if not cond then a else b` → `if cond then b else a`
+            // Removes unnecessary negation by swapping branches.
+            if let Expr::UnOp { op: UnOp::Not, operand } = c {
+                return Expr::Ternary {
+                    cond: operand,
+                    then_expr: Box::new(e),
+                    else_expr: Box::new(t),
+                };
+            }
+            Expr::Ternary {
+                cond: Box::new(c),
+                then_expr: Box::new(t),
+                else_expr: Box::new(e),
+            }
+        }
+        // Leaves — return as-is
+        other => other.clone(),
+    }
+}
+
+/// B0.119: Convert `local fn = function(...) end` to `local function fn(...)`.
+/// Recurses into nested blocks. The `local function` form is idiomatic Luau
+/// and puts the name in scope during the body (enabling recursion).
+fn convert_local_function_sugar(stmts: &mut Vec<Stat>) {
+    for stmt in stmts.iter_mut() {
+        // Recurse into nested blocks first
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                convert_local_function_sugar(then_body);
+                for (_, body) in elseif_clauses {
+                    convert_local_function_sugar(body);
+                }
+                if let Some(eb) = else_body { convert_local_function_sugar(eb); }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. }
+            | Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. }
+            | Stat::DoBlock { body } => convert_local_function_sugar(body),
+            Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+                if let Expr::Function { body, .. } = func {
+                    convert_local_function_sugar(body);
+                }
+            }
+            _ => {}
+        }
+
+        // Convert: `local NAME = function(...) ... end`
+        // → `local function NAME(...) ... end`
+        if let Stat::Local { names, values } = stmt {
+            if names.len() == 1 && values.len() == 1 {
+                if matches!(&values[0], Expr::Function { .. }) {
+                    let name = names[0].clone();
+                    let func = values[0].clone();
+                    *stmt = Stat::LocalFunction { name, func };
+                }
+            }
+        }
+    }
+}
+
+/// Recursively simplify all expressions inside a statement list, and fold
+/// constant-condition control flow (`if true`, `if false`, empty while).
+fn simplify_stmts(stmts: &mut Vec<Stat>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // First, simplify expressions within the current statement in place.
+        match &mut stmts[i] {
+            Stat::Local { values, .. } => {
+                for v in values.iter_mut() { *v = simplify_expr(v); }
+            }
+            Stat::Assign { targets, values } => {
+                for t in targets.iter_mut() { *t = simplify_expr(t); }
+                for v in values.iter_mut()  { *v = simplify_expr(v); }
+            }
+            Stat::Return { values } => {
+                for v in values.iter_mut() { *v = simplify_expr(v); }
+            }
+            Stat::ExprStat(e) => { *e = simplify_expr(e); }
+            Stat::While { condition, body } => {
+                *condition = simplify_expr(condition);
+                simplify_stmts(body);
+            }
+            Stat::Repeat { body, condition } => {
+                simplify_stmts(body);
+                *condition = simplify_expr(condition);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                *start = simplify_expr(start);
+                *stop  = simplify_expr(stop);
+                if let Some(s) = step { *s = simplify_expr(s); }
+                simplify_stmts(body);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                for it in iterators.iter_mut() { *it = simplify_expr(it); }
+                simplify_stmts(body);
+            }
+            Stat::DoBlock { body } => { simplify_stmts(body); }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                *condition = simplify_expr(condition);
+                simplify_stmts(then_body);
+                for (cond, body) in elseif_clauses.iter_mut() {
+                    *cond = simplify_expr(cond);
+                    simplify_stmts(body);
+                }
+                if let Some(ref mut eb) = else_body { simplify_stmts(eb); }
+                // Phase B0.94: `if not cond then A else B end` → `if cond then B else A end`
+                // Only when no elseif clauses and else_body exists.
+                if elseif_clauses.is_empty() && else_body.is_some() {
+                    if let Expr::UnOp { op: UnOp::Not, operand } = condition {
+                        *condition = *operand.clone();
+                        std::mem::swap(then_body, else_body.as_mut().unwrap());
+                    }
+                }
+            }
+            // Phase B0.92: recurse into LocalFunction/MethodFunction bodies.
+            Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+                *func = simplify_expr(func);
+            }
+            _ => {}
+        }
+
+        // Now fold constant-condition If statements.
+        let replacement: Option<Vec<Stat>> = match &stmts[i] {
+            // while false do ... end  →  nothing
+            Stat::While { condition: Expr::Bool(false), .. } => Some(vec![]),
+            // if true then body [elseif/else] end  →  body
+            // (drop the elseif/else branches — `true` short-circuits)
+            Stat::If { condition: Expr::Bool(true), then_body, .. } => {
+                Some(then_body.clone())
+            }
+            // if false then _ [elseif/else] end  →  else_body (or nothing)
+            Stat::If { condition: Expr::Bool(false), else_body, .. } => {
+                Some(else_body.clone().unwrap_or_default())
+            }
+            _ => None,
+        };
+
+        if let Some(mut replacement_stmts) = replacement {
+            // Recursively simplify the inlined body before inserting.
+            simplify_stmts(&mut replacement_stmts);
+            stmts.splice(i..=i, replacement_stmts);
+            // Don't advance i — the spliced statements need to be checked too.
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// Also recursively processes nested statements in control flow.
+fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        let should_remove = {
+            // Look for assignments that have another assignment to the same target shortly after
+            if let Stat::Assign { targets, .. } = &stmts[i] {
+                if targets.len() == 1 {
+                    if let Expr::Name(var_name) = &targets[0] {
+                        // Scan forward for the next write to this variable
+                        let mut found_overwrite = false;
+                        for j in (i + 1)..stmts.len() {
+                            match &stmts[j] {
+                                // Found an assignment to the same variable - this is a dead store.
+                                // The guard must require a Name target matching var_name: a
+                                // broader guard (e.g. just `t2.len() == 1`) would also capture
+                                // `t[k] = x`, `t.f = x` and `y = f(x)`, whose reads of var_name
+                                // would then never reach the stmt_reads_name arm below.
+                                Stat::Assign { targets: t2, values: v2 }
+                                    if t2.len() == 1
+                                        && matches!(&t2[0], Expr::Name(n2) if n2 == var_name) =>
+                                {
+                                    // Only a dead store if the overwriting RHS
+                                    // does NOT read the variable being assigned.
+                                    // e.g. `x = 5; x = x + 3` — first store is NOT dead.
+                                    let rhs_uses_var =
+                                        v2.iter().any(|v| expr_uses_name(v, var_name));
+                                    if !rhs_uses_var {
+                                        found_overwrite = true;
+                                    }
+                                    break;
+                                }
+                                    // Phase B0.92: use stmt_reads_name to precisely check
+                                // whether intervening statements reference the variable.
+                                // Stops on any read (including through control flow).
+                                other => {
+                                    if stmt_reads_name(other, var_name) {
+                                        break;
+                                    }
+                                    // Statement doesn't read the variable — safe to continue.
+                                }
+                            }
+                        }
+                        found_overwrite
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_remove {
+            stmts.remove(i);
+            // Don't increment i, check the same position again (it now has the next statement)
+        } else {
+            // Recursively process nested statements
+            match &mut stmts[i] {
+                Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                    eliminate_dead_stores(then_body);
+                    for (_, body) in elseif_clauses.iter_mut() {
+                        eliminate_dead_stores(body);
+                    }
+                    if let Some(ref mut eb) = else_body {
+                        eliminate_dead_stores(eb);
+                    }
+                }
+                Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                    eliminate_dead_stores(body);
+                }
+                Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                    eliminate_dead_stores(body);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C10b: dead `local v_N = { K = "K" }` artifact elimination
+// ---------------------------------------------------------------------------
+
+fn is_generic_vn(name: &str) -> bool {
+    // Phase C10V: extend to other decompiler-generated generic prefixes.
+    // Each prefix is produced by name_from_call_result / RegisterHint fallbacks
+    // (mod.rs:436+). Matching them lets the pure-RHS drop in
+    // eliminate_dead_key_eq_value_locals sweep dead `local result\d+ = {}` etc.
+    // Constrained to exact prefix + all-digit suffix so user names like `result`
+    // or `tbl_a` survive unchanged. Corpus counts pre-C10V:
+    //   local result\d+ = {}: 651, local fn\d+ = {}: 771, local tbl\d+ = {}: 997.
+    const PREFIXES: &[&str] = &["v", "result", "fn", "tbl", "arg"];
+    for p in PREFIXES {
+        if let Some(rest) = name.strip_prefix(p) {
+            if !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_key_eq_value_table(expr: &Expr) -> bool {
+    if let Expr::Table { fields } = expr {
+        if fields.is_empty() { return false; }
+        fields.iter().all(|f| match f {
+            TableField::Named(k, Expr::String(v)) => k == v,
+            _ => false,
+        })
+    } else {
+        false
+    }
+}
+
+/// C10R: `Expr::Function` with zero params, no vararg, empty body.
+/// Emitted by C10f as a placeholder when a child proto failed to lift
+/// (opcode_handlers.rs:1518). Dead if the enclosing `local` name is
+/// never referenced downstream.
+fn is_empty_function_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Function { params, is_vararg: false, body }
+            if params.is_empty() && body.is_empty()
+    )
+}
+
+fn expr_uses_name_deep(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n == name,
+        Expr::Field { object, .. } => expr_uses_name_deep(object, name),
+        Expr::Index { object, key } => expr_uses_name_deep(object, name) || expr_uses_name_deep(key, name),
+        Expr::BinOp { left, right, .. } => expr_uses_name_deep(left, name) || expr_uses_name_deep(right, name),
+        Expr::UnOp { operand, .. } => expr_uses_name_deep(operand, name),
+        Expr::Call { func, args } =>
+            expr_uses_name_deep(func, name) || args.iter().any(|a| expr_uses_name_deep(a, name)),
+        Expr::MethodCall { object, args, .. } =>
+            expr_uses_name_deep(object, name) || args.iter().any(|a| expr_uses_name_deep(a, name)),
+        Expr::Table { fields } => fields.iter().any(|f| match f {
+            TableField::Sequential(e) => expr_uses_name_deep(e, name),
+            TableField::Named(_, e) => expr_uses_name_deep(e, name),
+            TableField::Indexed(k, v) => expr_uses_name_deep(k, name) || expr_uses_name_deep(v, name),
+        }),
+        Expr::Function { body, .. } => body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        Expr::Ternary { cond, then_expr, else_expr } =>
+            expr_uses_name_deep(cond, name) || expr_uses_name_deep(then_expr, name) || expr_uses_name_deep(else_expr, name),
+        _ => false,
+    }
+}
+
+fn stmt_reads_name_deep(stmt: &Stat, name: &str) -> bool {
+    match stmt {
+        Stat::Local { values, .. } => values.iter().any(|v| expr_uses_name_deep(v, name)),
+        Stat::Assign { targets, values } => {
+            values.iter().any(|v| expr_uses_name_deep(v, name))
+            || targets.iter().any(|t| match t {
+                Expr::Name(_) => false,
+                other => expr_uses_name_deep(other, name),
+            })
+        }
+        Stat::ExprStat(e) => expr_uses_name_deep(e, name),
+        Stat::Return { values } => values.iter().any(|v| expr_uses_name_deep(v, name)),
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            expr_uses_name_deep(condition, name)
+            || then_body.iter().any(|s| stmt_reads_name_deep(s, name))
+            || elseif_clauses.iter().any(|(c, b)|
+                expr_uses_name_deep(c, name) || b.iter().any(|s| stmt_reads_name_deep(s, name)))
+            || else_body.as_ref().map_or(false, |eb| eb.iter().any(|s| stmt_reads_name_deep(s, name)))
+        }
+        Stat::While { condition, body } =>
+            expr_uses_name_deep(condition, name) || body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        Stat::Repeat { body, condition } =>
+            body.iter().any(|s| stmt_reads_name_deep(s, name)) || expr_uses_name_deep(condition, name),
+        Stat::NumericFor { start, stop, step, body, .. } =>
+            expr_uses_name_deep(start, name) || expr_uses_name_deep(stop, name)
+            || step.as_ref().map_or(false, |s| expr_uses_name_deep(s, name))
+            || body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        Stat::GenericFor { iterators, body, .. } =>
+            iterators.iter().any(|it| expr_uses_name_deep(it, name))
+            || body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        Stat::DoBlock { body } => body.iter().any(|s| stmt_reads_name_deep(s, name)),
+        // A closure body reads outer locals as UPVALUES. `convert_local_
+        // function_sugar` rewrites `local f = function() ... end` into these
+        // variants, and without an arm here the sugar hides every upvalue read
+        // from the deep scan — so a local captured only by a closure looks
+        // dead and gets dropped, leaving the closure referencing a nil global.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            expr_uses_name_deep(func, name)
+        }
+        _ => false,
+    }
+}
+
+/// Drop `local v_N = { K = "K", ... }` statements whose RHS is a table of
+/// Named(k, String(v)) fields with every k == v, and whose name is never
+/// read afterwards in the current scope (including inside nested closures).
+///
+/// This is a decompiler artifact pattern — real source never writes tables
+/// whose field keys literally equal their string values. ~1,650 instances
+/// observed across 63 files in the the reference corpus.
+fn eliminate_dead_key_eq_value_locals(stmts: &mut Vec<Stat>) {
+    // Recurse first so inner scopes are cleaned before we check siblings.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                eliminate_dead_key_eq_value_locals(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    eliminate_dead_key_eq_value_locals(body);
+                }
+                if let Some(ref mut eb) = else_body {
+                    eliminate_dead_key_eq_value_locals(eb);
+                }
+            }
+            Stat::While { body, .. }
+            | Stat::Repeat { body, .. }
+            | Stat::DoBlock { body }
+            | Stat::NumericFor { body, .. }
+            | Stat::GenericFor { body, .. } => {
+                eliminate_dead_key_eq_value_locals(body);
+            }
+            Stat::Local { values, .. } | Stat::Assign { values, .. } => {
+                for v in values.iter_mut() {
+                    if let Expr::Function { body, .. } = v {
+                        eliminate_dead_key_eq_value_locals(body);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0;
+    while i < stmts.len() {
+        let drop = if let Stat::Local { names, values } = &stmts[i] {
+            let no_downstream_read = !stmts[i+1..]
+                .iter()
+                .any(|s| stmt_reads_name_deep(s, &names[0]));
+            let no_downstream_write = !stmts[i+1..]
+                .iter()
+                .any(|s| stmt_writes_name(s, &names[0]));
+            // C10Q: drop `local X = { K = "K", ... }` regardless of the
+            // local name as long as it is never read OR reassigned in the
+            // remainder of this scope. Every field must be Named(k, "k")
+            // — this is a distinctive decompiler artifact shape (most
+            // common: `local X = { Get = "Get" }` inside deeply-nested
+            // closure stubs, ~1611 occurrences in HUD alone). Also covers
+            // the original C10b v_N case. The write-check guards against
+            // dropping a local whose later reassignment would otherwise
+            // silently become a global write.
+            let qualifies_key_eq_value = names.len() == 1
+                && values.len() == 1
+                && is_key_eq_value_table(&values[0])
+                && no_downstream_write;
+            // C10b original: pure-literal / field-chain RHS at v_N names
+            // only (arbitrary names too risky — `local MAX = 100` in user
+            // code would incorrectly vanish).
+            let qualifies_pure_rhs = names.len() == 1
+                && values.len() == 1
+                && is_generic_vn(&names[0])
+                && is_generic_vn_drop_candidate(&values[0])
+                && no_downstream_write;
+            // C10N: drop dead method-reference shadows regardless of local
+            // name. Artifact shape: `local GetService = game.GetService`
+            // where the local is never read afterwards. Emitted when
+            // GETTABLEKS method-prep doesn't fuse with the subsequent
+            // NAMECALL/CALL. Root object must be a known Roblox/stdlib
+            // global so we don't accidentally drop a user's cached
+            // reference to a hand-rolled object method.
+            let qualifies_method_ref = names.len() == 1
+                && values.len() == 1
+                && is_dead_method_reference_rhs(&values[0])
+                && no_downstream_write;
+            // C10R: drop dead empty function stubs — `local X = function() end`
+            // with zero params and empty body. These are C10f placeholders for
+            // child protos that failed to lift; when the name is never read
+            // or reassigned afterwards they carry zero diagnostic value
+            // (the file-header aggregate unresolved count already reports
+            // them). 5169 corpus occurrences (4152 in HUD alone).
+            let qualifies_empty_fn = names.len() == 1
+                && values.len() == 1
+                && is_empty_function_literal(&values[0])
+                && no_downstream_write;
+            (qualifies_key_eq_value
+                || qualifies_pure_rhs
+                || qualifies_method_ref
+                || qualifies_empty_fn)
+                && no_downstream_read
+        } else {
+            false
+        };
+        if drop {
+            stmts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// C10N: detect RHS of shape `<root>.<method>` or chains rooted at a known
+/// Roblox/stdlib global. Used to drop dead method-reference locals.
+fn is_dead_method_reference_rhs(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field { object, .. } => is_known_global_root(object),
+        _ => false,
+    }
+}
+
+fn is_known_global_root(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => matches!(
+            n.as_str(),
+            "game" | "script" | "workspace" | "shared" | "plugin"
+                | "UserSettings" | "UserInputService" | "DebuggerManager"
+        ) || is_stdlib_shadow_name(n),
+        Expr::Field { object, .. } => is_known_global_root(object),
+        Expr::MethodCall { object, .. } => is_known_global_root(object),
+        Expr::Call { func, .. } => is_known_global_root(func),
+        _ => false,
+    }
+}
+
+/// C10j: Pure RHS classes we consider safe to drop when the LHS generic `v_N`
+/// is never read and never re-assigned downstream. We purposely limit this to
+/// shapes that decompilers produce as register artifacts: empty tables, nil,
+/// bool/number/string literals, and bare Name/Field/Index expressions that
+/// don't touch globals whose evaluation could throw.
+fn is_generic_vn_drop_candidate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) => true,
+        Expr::Table { fields } if fields.is_empty() => true,
+        // `self.X`, `self.X.Y`, `v3.Row` — pure-looking field chains. Evaluating
+        // a field access never runs user code in Luau (no metatables on tables
+        // without __index), but could error if object is nil. Accept the risk
+        // for decompiler artifacts.
+        Expr::Field { object, .. } => is_generic_vn_drop_candidate(object),
+        Expr::Name(_) => true,
+        _ => false,
+    }
+}
+
+fn stmt_writes_name(stmt: &Stat, name: &str) -> bool {
+    match stmt {
+        Stat::Assign { targets, .. } => targets.iter().any(|t| matches!(t, Expr::Name(n) if n == name)),
+        Stat::Local { names, .. } => names.iter().any(|n| n == name),
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            then_body.iter().any(|s| stmt_writes_name(s, name))
+                || elseif_clauses.iter().any(|(_, b)| b.iter().any(|s| stmt_writes_name(s, name)))
+                || else_body.as_ref().map_or(false, |eb| eb.iter().any(|s| stmt_writes_name(s, name)))
+        }
+        Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+            body.iter().any(|s| stmt_writes_name(s, name))
+        }
+        Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+            body.iter().any(|s| stmt_writes_name(s, name))
+        }
+        // A closure body can WRITE an outer local through an upvalue
+        // (`local n = 0; local function f() n = n + 1 end`). Counting that as
+        // a write keeps the outer declaration alive.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            expr_writes_name_in_closure(func, name)
+        }
+        _ => false,
+    }
+}
+
+/// Does any closure body inside `expr` assign to `name`?
+///
+/// Used to keep a local alive when the only writes to it happen through an
+/// upvalue inside a nested function.
+fn expr_writes_name_in_closure(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Function { body, .. } => body.iter().any(|s| stmt_writes_name(s, name)),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dead code elimination pass
+// ---------------------------------------------------------------------------
+
+/// Returns true if a statement unconditionally terminates the current block
+/// (return, break, or continue).
+fn is_terminator(stmt: &Stat) -> bool {
+    matches!(stmt, Stat::Return { .. } | Stat::Break | Stat::Continue)
+}
+
+/// Returns true if a statement has side effects that must be preserved even
+/// when the result is unused. Function calls may mutate state; assignments
+/// to non-local targets (fields, indexing) may be observable.
+/// C10g: artifact method calls on non-object globals. Calling `:METHOD()` on
+/// things like `setmetatable`, `pairs`, `type` is always decompiler garbage
+/// (these are standalone functions, not objects with methods). Treating them
+/// as side-effect-free lets the dead-code pass drop empty-if wrappers around
+/// them, eliminating hundreds of noise lines like
+/// `if setmetatable:_connections() ~= "_connections" then end`.
+pub(super) fn is_artifact_method_call(expr: &Expr) -> bool {
+    if let Expr::MethodCall { object, .. } = expr {
+        if let Expr::Name(n) = object.as_ref() {
+            return matches!(
+                n.as_str(),
+                "setmetatable"
+                    | "getmetatable"
+                    | "pairs"
+                    | "ipairs"
+                    | "next"
+                    | "tostring"
+                    | "tonumber"
+                    | "type"
+                    | "typeof"
+                    | "rawequal"
+                    | "rawget"
+                    | "rawset"
+                    | "rawlen"
+                    | "select"
+                    | "unpack"
+                    | "assert"
+                    | "error"
+                    | "pcall"
+                    | "xpcall"
+                    | "loadstring"
+                    | "require"
+                    | "print"
+                    | "warn"
+            );
+        }
+    }
+    false
+}
+
+fn has_side_effects(expr: &Expr) -> bool {
+    match expr {
+        // C10g: calls on known non-object globals are artifacts, treat as no-op.
+        _ if is_artifact_method_call(expr) => false,
+        Expr::Call { .. } | Expr::MethodCall { .. } => true,
+        Expr::Field { object, .. } => has_side_effects(object),
+        Expr::Index { object, key } => has_side_effects(object) || has_side_effects(key),
+        Expr::BinOp { left, right, .. } => has_side_effects(left) || has_side_effects(right),
+        Expr::UnOp { operand, .. } => has_side_effects(operand),
+        Expr::Table { fields } => fields.iter().any(|f| match f {
+            TableField::Sequential(e) => has_side_effects(e),
+            TableField::Named(_, e) => has_side_effects(e),
+            TableField::Indexed(k, v) => has_side_effects(k) || has_side_effects(v),
+        }),
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            has_side_effects(cond) || has_side_effects(then_expr) || has_side_effects(else_expr)
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if an if-statement is entirely empty (all branches have no
+/// statements) and the condition has no side effects.
+fn is_empty_if(stmt: &Stat) -> bool {
+    if let Stat::If { condition, then_body, elseif_clauses, else_body } = stmt {
+        then_body.is_empty()
+            && elseif_clauses.iter().all(|(_, body)| body.is_empty())
+            && else_body.as_ref().map_or(true, |b| b.is_empty())
+            && !has_side_effects(condition)
+    } else {
+        false
+    }
+}
+
+/// C10i: extract the side-effect calls from an expression in evaluation order.
+/// Used to turn `if not obj:method() then end` into just `obj:method()`.
+/// Only extracts direct Call / MethodCall nodes (and recurses through
+/// short-circuit-safe wrappers). For OR (lazy) we only take the LEFT side,
+/// since RIGHT may not execute. For AND both run if LEFT is truthy — we take
+/// both and accept a slight semantic drift in rare artifact conditions.
+fn extract_side_effect_stmts(expr: &Expr) -> Vec<Stat> {
+    let mut out = Vec::new();
+    extract_into(expr, &mut out);
+    out
+}
+
+fn extract_into(expr: &Expr, out: &mut Vec<Stat>) {
+    match expr {
+        Expr::Call { .. } | Expr::MethodCall { .. } => {
+            out.push(Stat::ExprStat(expr.clone()));
+        }
+        Expr::UnOp { operand, .. } => extract_into(operand, out),
+        Expr::Field { object, .. } => extract_into(object, out),
+        Expr::Index { object, key } => {
+            extract_into(object, out);
+            extract_into(key, out);
+        }
+        Expr::BinOp { op, left, right } => {
+            extract_into(left, out);
+            // `or` is lazy — skip right when left has a definite call (we just
+            // extracted it). For `and`, right runs when left is truthy; we
+            // conservatively extract both. For relational/arith ops both run.
+            if !matches!(op, BinOp::Or) || out.is_empty() {
+                extract_into(right, out);
+            }
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => extract_into(e, out),
+                    TableField::Named(_, e) => extract_into(e, out),
+                    TableField::Indexed(k, v) => {
+                        extract_into(k, out);
+                        extract_into(v, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Eliminate unreachable code and empty blocks.
+///
+/// This pass performs three cleanups on a statement list:
+///
+/// 1. **Unreachable code after terminators**: After a `return`, `break`, or
+///    `continue`, all subsequent statements at the same nesting level are
+///    unreachable and can be removed.
+///
+/// 2. **Empty if-blocks**: `if v9 then end` (no then-body, no else) is a
+///    no-op when the condition has no side effects. Remove it entirely.
+///    If only some branches are empty, prune those branches.
+///
+/// 3. **Empty do-blocks**: `do end` with no body is removed.
+///
+/// The pass recurses into all nested bodies (if/while/repeat/for/do/function).
+thread_local! {
+    static DCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Proto identity for the DCE trace. `eliminate_dead_code` takes only a
+    /// statement vector, and rotation 68 could not attribute its output to a
+    /// proto - the same failure that made rotation 47 read a pc window from the
+    /// wrong function. Set once per proto lift.
+    static DCE_PROTO: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub(super) fn set_dce_proto(name: &str, line: u32) {
+    DCE_PROTO.with(|p| *p.borrow_mut() = format!("{}@{}", name, line));
+}
+
+/// The proto currently being lifted, for traces that have no `&Proto` to hand.
+///
+/// `reg_expr` mints `v{idx}` from a register index but never sees the proto, and
+/// `free_var_decls` folds every same-named orphan chunk-wide - so a hoisted
+/// `v13` names register 13 in SOME proto and the output cannot say which.
+/// Rotation 116 lost a probe to that gap (and mis-concluded the register was
+/// unidentifiable; it is the index, it is the PROTO that is missing).
+/// A monotonic id for each `lift_instruction_range` invocation.
+///
+/// Rotation 127: one pc range is lifted TWICE with different register states,
+/// and every trace in this session is pc-qualified but not pass-qualified - so
+/// `PREMAT pc=17` and `WATCH before_pc=18` looked like one timeline running
+/// backwards when they came from different passes. Three rotations read them
+/// that way. Same lesson as proto-qualification (r47, r86, r95, r110, r116),
+/// one level down.
+thread_local! {
+    /// The branch whose arms are currently being merged: `(cond_pc, merge_pc)`.
+    ///
+    /// `merge_regs` takes only register slices, so `LUAU_MERGE_WATCH` could
+    /// print the VALUES it collapses but not WHICH branch collapsed them.
+    /// Rotation 134 paired a `MERGE` line with an `IF` line by proto and
+    /// register alone and got the wrong site; rotation 135 measured that error
+    /// (the fix built on it was byte-neutral). This carries the identity the
+    /// print was missing.
+    static MERGE_SITE: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((usize::MAX, usize::MAX))
+    };
+}
+
+pub(crate) fn set_merge_site(cond_pc: usize, merge_pc: Option<usize>) {
+    MERGE_SITE.with(|m| m.set((cond_pc, merge_pc.unwrap_or(usize::MAX))));
+}
+
+fn merge_site() -> (usize, usize) {
+    MERGE_SITE.with(|m| m.get())
+}
+
+pub(crate) fn next_pass_id() -> usize {
+    PASS_ID.with(|p| {
+        let v = p.get() + 1;
+        p.set(v);
+        v
+    })
+}
+
+pub(crate) fn current_pass_id() -> usize {
+    PASS_ID.with(|p| p.get())
+}
+
+thread_local! {
+    static PASS_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn current_dce_proto() -> String {
+    DCE_PROTO.with(|p| p.borrow().clone())
+}
+
+fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
+    // Outermost-only phase trace: the pass recurses, so nested invocations
+    // would drown the signal.
+    let dce_top = DCE_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        let _ = v;
+        true
+    }) && std::env::var("LUAU_DCE_TRACE").is_ok();
+    let dce_say = |phase: &str, st: &Vec<Stat>| {
+        if dce_top {
+            eprintln!(
+                "DCE proto={} depth={} {} stmts={} calls={}",
+                DCE_PROTO.with(|p| p.borrow().clone()),
+                DCE_DEPTH.with(|d| d.get()),
+                phase,
+                st.len(),
+                count_calls_stats(st)
+            );
+        }
+    };
+    dce_say("enter", stmts);
+    // --- Phase 1: Recurse into nested bodies first (bottom-up) ---
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                eliminate_dead_code(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    eliminate_dead_code(body);
+                }
+                if let Some(ref mut eb) = else_body {
+                    eliminate_dead_code(eb);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                eliminate_dead_code(body);
+            }
+            Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                eliminate_dead_code(body);
+            }
+            _ => {}
+        }
+    }
+
+    dce_say("after_phase1_recurse", stmts);
+    // --- Phase 2: Truncate after terminators ---
+    // Find the first unconditional terminator at the top level.
+    let mut truncate_after = None;
+    for (i, stmt) in stmts.iter().enumerate() {
+        if is_terminator(stmt) {
+            truncate_after = Some(i);
+            break;
+        }
+        // An if/elseif/else where ALL branches terminate also terminates.
+        if let Stat::If { then_body, elseif_clauses, else_body, .. } = stmt {
+            if else_body.is_some() {
+                let then_exits = exits_on_all_paths(then_body);
+                let all_elseif_exit = elseif_clauses.iter().all(|(_, b)| exits_on_all_paths(b));
+                let else_exits = else_body.as_ref().map_or(false, |b| exits_on_all_paths(b));
+                if then_exits && all_elseif_exit && else_exits {
+                    truncate_after = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(idx) = truncate_after {
+        if std::env::var("LUAU_DCE_TRACE").is_ok() && stmts.len() > idx + 1 {
+            let kind = match &stmts[idx] {
+                Stat::Return { values } => format!("Return({} values)", values.len()),
+                Stat::Break => "Break".to_string(),
+                Stat::Continue => "Continue".to_string(),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            };
+            eprintln!(
+                "DCETRUNC proto={} at_index={} terminator={} dropping={} stmts",
+                DCE_PROTO.with(|p| p.borrow().clone()),
+                idx,
+                kind,
+                stmts.len() - idx - 1
+            );
+        }
+        stmts.truncate(idx + 1);
+    }
+
+    dce_say("after_phase2_truncate", stmts);
+    // --- Phase 3: Remove empty if-blocks and empty do-blocks ---
+    let mut i = 0;
+    while i < stmts.len() {
+        // C10i: `if X:method() then end` — keep the call, drop the if-wrap.
+        // Only applies when all branches are empty (so the if is pure wrapping).
+        if let Stat::If { condition, then_body, elseif_clauses, else_body } = &stmts[i] {
+            let all_empty = then_body.is_empty()
+                && elseif_clauses.iter().all(|(_, b)| b.is_empty())
+                && else_body.as_ref().map_or(true, |b| b.is_empty());
+            if all_empty && has_side_effects(condition) {
+                let side = extract_side_effect_stmts(condition);
+                if !side.is_empty() {
+                    stmts.splice(i..=i, side);
+                    continue;
+                }
+            }
+        }
+        let should_remove = match &stmts[i] {
+            // Empty do-block: `do end`
+            Stat::DoBlock { body } if body.is_empty() => true,
+            // Entirely empty if: `if cond then end` (no side effects in cond)
+            stmt if is_empty_if(stmt) => true,
+            _ => false,
+        };
+        if should_remove {
+            stmts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+
+    dce_say("after_phase3_remove", stmts);
+    // --- Phase 4: Prune empty branches from if-statements ---
+    // If the then-body is empty but there's an else or elseif, we can negate
+    // the condition and swap. If an else-body is empty, drop it.
+    for stmt in stmts.iter_mut() {
+        if let Stat::If { condition, then_body, elseif_clauses, else_body } = stmt {
+            // If then-body is empty and there are no elseif clauses, but there
+            // IS an else body, negate the condition and swap.
+            if then_body.is_empty() && elseif_clauses.is_empty() && !has_side_effects(condition) {
+                if let Some(eb) = else_body.take() {
+                    if !eb.is_empty() {
+                        *condition = negate_condition(condition);
+                        *then_body = eb;
+                    }
+                }
+            }
+            // Drop empty else body: `if x then ... else end` -> `if x then ... end`
+            if let Some(ref eb) = else_body {
+                if eb.is_empty() {
+                    *else_body = None;
+                }
+            }
+        }
+    }
+    dce_say("after_phase4_prune", stmts);
+    DCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// Negate a boolean condition, trying to produce clean output.
+/// `not (a == b)` -> `a ~= b`, `not (not x)` -> `x`, etc.
+fn negate_condition(cond: &Expr) -> Expr {
+    match cond {
+        // not x  ->  x
+        Expr::UnOp { op: UnOp::Not, operand } => (**operand).clone(),
+        // a == b  ->  a ~= b, etc.
+        Expr::BinOp { left, op, right } => {
+            let flipped = match op {
+                BinOp::Eq    => Some(BinOp::NotEq),
+                BinOp::NotEq => Some(BinOp::Eq),
+                BinOp::LT    => Some(BinOp::GE),
+                BinOp::LE    => Some(BinOp::GT),
+                BinOp::GT    => Some(BinOp::LE),
+                BinOp::GE    => Some(BinOp::LT),
+                _ => None,
+            };
+            if let Some(new_op) = flipped {
+                Expr::BinOp { left: left.clone(), op: new_op, right: right.clone() }
+            } else {
+                Expr::UnOp { op: UnOp::Not, operand: Box::new(cond.clone()) }
+            }
+        }
+        // true -> false, false -> true
+        Expr::Bool(b) => Expr::Bool(!b),
+        // General case: wrap in `not`
+        _ => Expr::UnOp { op: UnOp::Not, operand: Box::new(cond.clone()) },
+    }
+}
+
+/// Phase B0.46A: post-AST conversion of `while true do <body>; if cond then break end end`
+/// into `repeat <body> until cond`.
+///
+/// The bytecode-level structuring pass already emits `Region::RepeatUntil`
+/// when it can detect a 2-successor back-edge source. But many real
+/// `repeat ... until` loops still leak through as `while true do ... break end`
+/// because the structurer's CFG-level pattern match misses some shapes
+/// (e.g. when the back-edge predecessor block has been split, or when the
+/// CFG was lifted before the structural pattern was firmly recognised).
+///
+/// This is a syntactic safety net that runs after the lifter has produced
+/// statements but before `convert_single_pass_loops` rewrites `if cond then
+/// break end` chains into nested if/else. We require an EXACT shape so
+/// false positives are impossible:
+///
+///   while true do
+///       <body...>          // one or more statements (anything)
+///       if <cond> then     // condition is unconstrained
+///           break          // EXACTLY one statement: a bare break
+///       end                // no elseif, no else
+///   end
+///
+///   →  repeat
+///         <body...>
+///       until <cond>
+///
+/// The condition is preserved verbatim — `if not cond then break` becomes
+/// `until not cond`, since `repeat ... until X` exits when X is true,
+/// which matches the `if X then break` semantics exactly.
+///
+/// Negative shapes that must NOT convert:
+///   - Bare `break` at the end (no wrapping if). The body has no condition.
+///   - The if-then has an else-clause or elseif-clauses.
+///   - The if-then's body is anything other than exactly one bare `break`.
+///   - Statements after the if-then (the if isn't the LAST stmt of the body).
+///   - Empty body (no stmts before the if-cond-break) — converting yields
+///     `repeat until cond` which is structurally legal but more confusing
+///     than the original `while true do if X then break end end`.
+fn convert_while_true_break_to_repeat(stmts: &mut Vec<Stat>) {
+    // Recurse into every nested block first so inner loops convert before
+    // their parents are inspected.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::While { body, .. }
+            | Stat::Repeat { body, .. }
+            | Stat::DoBlock { body }
+            | Stat::NumericFor { body, .. }
+            | Stat::GenericFor { body, .. } => {
+                convert_while_true_break_to_repeat(body);
+            }
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                convert_while_true_break_to_repeat(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    convert_while_true_break_to_repeat(body);
+                }
+                if let Some(eb) = else_body {
+                    convert_while_true_break_to_repeat(eb);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Walk this level and rewrite matching `while true do ... end` nodes.
+    for i in 0..stmts.len() {
+        let convert = matches!(&stmts[i], Stat::While { condition: Expr::Bool(true), body }
+            if matches_repeat_until_shape(body));
+        if convert {
+            // Replace in place. Take the existing While so we own its body.
+            let owned = std::mem::replace(&mut stmts[i], Stat::Break);
+            if let Stat::While { body, .. } = owned {
+                let mut body = body;
+                // The trailing `if cond then break end` was validated by
+                // matches_repeat_until_shape above. Pop it off and pull cond.
+                let last = body.pop().expect("matches_repeat_until_shape requires non-empty body");
+                let cond = match last {
+                    Stat::If { condition, .. } => condition,
+                    _ => unreachable!("matches_repeat_until_shape ensures last is If"),
+                };
+                stmts[i] = Stat::Repeat { body, condition: cond };
+            } else {
+                // Should never happen — `convert` implied While. Restore the
+                // sentinel so the slot has something coherent.
+                stmts[i] = owned;
+            }
+        }
+    }
+}
+
+/// Returns true if `body` ends with `if <cond> then break end` (no elseif,
+/// no else, then-body is exactly `[Stat::Break]`) AND there is at least one
+/// statement before the trailing if-cond-break (so the converted Repeat has
+/// a non-empty body — see `convert_while_true_break_to_repeat` rationale).
+fn matches_repeat_until_shape(body: &[Stat]) -> bool {
+    if body.len() < 2 {
+        return false;
+    }
+    match body.last() {
+        Some(Stat::If { then_body, elseif_clauses, else_body, .. }) => {
+            then_body.len() == 1
+                && matches!(&then_body[0], Stat::Break)
+                && elseif_clauses.is_empty()
+                && else_body.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Detect `while true do ... end` blocks that execute at most once (every
+/// path through the body exits via `break` or `return`) and convert them
+/// into proper `if/else` chains or `do ... end` blocks.
+///
+/// The most common pattern produced by the structurer:
+///   while true do
+///       if cond1 then break end
+///       ... body1 ...
+///       if cond2 then break end
+///       ... body2 ...
+///       break
+///   end
+///
+/// This is equivalent to:
+///   if not cond1 then
+///       ... body1 ...
+///       if not cond2 then
+///           ... body2 ...
+///       end
+///   end
+///
+/// We also handle:
+///   while true do <body with no back-jumps> end  →  do <body> end
+fn convert_single_pass_loops(stmts: &mut Vec<Stat>) {
+    // First recurse into sub-blocks so inner loops are converted first
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::While { body, .. } | Stat::Repeat { body, .. }
+            | Stat::DoBlock { body }
+            | Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                convert_single_pass_loops(body);
+            }
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                convert_single_pass_loops(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    convert_single_pass_loops(body);
+                }
+                if let Some(ref mut eb) = else_body {
+                    convert_single_pass_loops(eb);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0;
+    while i < stmts.len() {
+        let should_convert = match &stmts[i] {
+            Stat::While { condition: Expr::Bool(true), body } => {
+                is_single_pass_body(body)
+            }
+            _ => false,
+        };
+
+        if should_convert {
+            if let Stat::While { body, .. } = stmts.remove(i) {
+                let converted = convert_break_chain_to_if_else(body);
+                // Splice the converted statements in place
+                let count = converted.len();
+                for (j, s) in converted.into_iter().enumerate() {
+                    stmts.insert(i + j, s);
+                }
+                // Don't advance i past all inserted stmts — they might need
+                // further processing, but since we recursed first they should
+                // be clean. Skip past them.
+                i += count;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Check if a loop body always exits (every execution path ends with
+/// `break`, `return`, or `continue` — i.e., no path falls through the
+/// bottom without an exit statement). This means the "loop" executes at
+/// most once.
+fn is_single_pass_body(body: &[Stat]) -> bool {
+    if body.is_empty() {
+        return true; // empty body trivially exits (while true do end → nothing)
+    }
+    // Check if the body has any `continue` — if so, it really loops
+    if body_contains_continue(body) {
+        return false;
+    }
+    // Check if every path through the body exits
+    exits_on_all_paths(body)
+}
+
+/// Returns true if every execution path through `stmts` terminates with
+/// a `break` or `return` (at the current nesting level).
+fn exits_on_all_paths(stmts: &[Stat]) -> bool {
+    if stmts.is_empty() {
+        return false;
+    }
+    // Check if there's a top-level break or return anywhere
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stat::Break | Stat::Return { .. } => return true,
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                // If we have if/elseif/else where ALL branches exit, the whole thing exits
+                let then_exits = exits_on_all_paths(then_body);
+                let elseifs_exit = elseif_clauses.iter().all(|(_, b)| exits_on_all_paths(b));
+                let else_exits = else_body.as_ref().map_or(false, |eb| exits_on_all_paths(eb));
+
+                if then_exits && elseifs_exit && else_exits {
+                    return true;
+                }
+
+                // If this if has a `break` in its then-body and NO else, check if
+                // remaining stmts after this if also exit. This handles:
+                //   if C then break end
+                //   ... more code ...
+                //   break
+                if then_exits && else_body.is_none() && elseif_clauses.is_empty() {
+                    // The "else" path falls through to stmts[idx+1..]
+                    if exits_on_all_paths(&stmts[idx + 1..]) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if the body contains a `continue` statement at the current nesting
+/// level (not inside a nested loop). `continue` means the loop actually iterates.
+fn body_contains_continue(stmts: &[Stat]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stat::Continue => return true,
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                if body_contains_continue(then_body) { return true; }
+                for (_, b) in elseif_clauses {
+                    if body_contains_continue(b) { return true; }
+                }
+                if let Some(eb) = else_body {
+                    if body_contains_continue(eb) { return true; }
+                }
+            }
+            // Don't recurse into nested loops — `continue` there refers to the inner loop
+            Stat::While { .. } | Stat::Repeat { .. }
+            | Stat::NumericFor { .. } | Stat::GenericFor { .. } => {}
+            Stat::DoBlock { body } => {
+                if body_contains_continue(body) { return true; }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Structural equality for `Expr` values.
+///
+/// `Expr` does not derive `PartialEq` (and shouldn't — floats and deep
+/// trees make a blanket Eq semantically tricky), but we need a shallow
+/// comparison to detect self-referential assignments like
+/// `pairs.GetService = pairs` produced by misidentified SETTABLEKS
+/// instructions.
+fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Nil, Expr::Nil) => true,
+        (Expr::Bool(x), Expr::Bool(y)) => x == y,
+        (Expr::Number(x), Expr::Number(y)) => x.to_bits() == y.to_bits(),
+        (Expr::String(x), Expr::String(y)) => x == y,
+        (Expr::Varargs, Expr::Varargs) => true,
+        (Expr::Name(x), Expr::Name(y)) => x == y,
+        (Expr::Field { object: o1, field: f1 }, Expr::Field { object: o2, field: f2 }) => {
+            f1 == f2 && expr_structurally_eq(o1, o2)
+        }
+        (Expr::Index { object: o1, key: k1 }, Expr::Index { object: o2, key: k2 }) => {
+            expr_structurally_eq(o1, o2) && expr_structurally_eq(k1, k2)
+        }
+        _ => false,
+    }
+}
+
+/// Detect self-referential field assignment: `tbl.field = tbl`.
+///
+/// This pattern is produced when a NAMECALL instruction is misidentified
+/// as SETTABLEKS.  NAMECALL does `R(A+1) = R(B); R(A) = R(B):method`,
+/// but SETTABLEKS does `R(B)[K(AUX)] = R(A)`.  When both A and B resolve
+/// to the same register value the emitted code becomes the self-referential
+/// nonsense `pairs.GetService = pairs` or `v34.connect = v34`.
+///
+/// Returns true when the assignment target is `tbl.field` or `tbl[key]`
+/// and the value expression is structurally equal to the base table
+/// expression, indicating a spurious self-assignment that should be
+/// suppressed.
+/// Metamethod keys are EXEMPT: `Vec.__index = Vec` is the canonical
+/// OOP-class idiom, not an artifact.  A misidentified NAMECALL always names a
+/// callable method, never a `__`-prefixed metamethod, so this exemption cannot
+/// re-admit the `pairs.GetService = pairs` shape the guard exists to kill.
+/// Dropping the `__index` line silently broke every method dispatch through
+/// a metatable.
+pub(super) fn is_self_referential_field_assign(target: &Expr, value: &Expr) -> bool {
+    if let Expr::Field { field, .. } = target {
+        if field.starts_with("__") {
+            return false;
+        }
+    }
+    match target {
+        Expr::Field { object, .. } => expr_structurally_eq(object, value),
+        Expr::Index { object, .. } => expr_structurally_eq(object, value),
+        _ => false,
+    }
+}
+
+/// C10e: detect `x.FindFirstChild = y` and similar patterns where the field
+/// is a well-known Roblox Instance method name. These are always decompiler
+/// artifacts (normal Luau code never mutates inherited method references)
+/// and drop cleanly without altering program semantics.
+pub(super) fn is_roblox_method_lvalue_artifact(target: &Expr) -> bool {
+    let field_name = match target {
+        Expr::Field { field, .. } => field.as_str(),
+        _ => return false,
+    };
+    matches!(
+        field_name,
+        // Instance core API
+        "FindFirstChild"
+            | "FindFirstChildOfClass"
+            | "FindFirstChildWhichIsA"
+            | "FindFirstAncestor"
+            | "FindFirstAncestorOfClass"
+            | "FindFirstAncestorWhichIsA"
+            | "FindFirstDescendant"
+            | "WaitForChild"
+            | "GetChildren"
+            | "GetDescendants"
+            | "GetFullName"
+            | "GetAttribute"
+            | "SetAttribute"
+            | "GetAttributes"
+            | "GetAttributeChangedSignal"
+            | "IsA"
+            | "IsAncestorOf"
+            | "IsDescendantOf"
+            | "Clone"
+            | "Destroy"
+            | "ClearAllChildren"
+            // DataModel / service access
+            | "GetService"
+            // Signal / RemoteEvent / BindableEvent
+            | "Connect"
+            | "ConnectParallel"
+            | "Once"
+            | "Wait"
+            | "Fire"
+            | "FireServer"
+            | "FireClient"
+            | "FireAllClients"
+            | "Invoke"
+            | "InvokeServer"
+            | "InvokeClient"
+    ) || is_stdlib_constructor_lvalue_artifact(target)
+}
+
+/// C10k: drop LHS of the form `<RobloxType>.<constructor>.<field>` — e.g.
+/// `UDim2.new.X = v13`, `Instance.new.Parent = x`. These are always
+/// decompiler artifacts (can't meaningfully assign to a field of a
+/// constructor function) and have been observed in ~200 instances.
+///
+/// We only match when the DOUBLY-nested object chain looks like
+/// `Name("Type").<ConstructorMethod>` and the outer field is anything.
+fn is_stdlib_constructor_lvalue_artifact(target: &Expr) -> bool {
+    let inner = match target {
+        Expr::Field { object, .. } => object.as_ref(),
+        _ => return false,
+    };
+    let (type_name, method_name) = match inner {
+        Expr::Field { object, field } => match object.as_ref() {
+            Expr::Name(n) => (n.as_str(), field.as_str()),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let type_ok = matches!(
+        type_name,
+        "UDim" | "UDim2" | "Vector2" | "Vector3" | "Vector2int16" | "Vector3int16"
+            | "CFrame" | "Color3" | "BrickColor" | "ColorSequence" | "ColorSequenceKeypoint"
+            | "NumberSequence" | "NumberSequenceKeypoint" | "NumberRange"
+            | "Rect" | "Ray" | "Region3" | "Region3int16"
+            | "Axes" | "Faces" | "TweenInfo" | "Random"
+            | "Instance" | "Enum" | "DateTime" | "PathWaypoint"
+            | "PhysicalProperties" | "OverlapParams" | "RaycastParams"
+            | "FloatCurveKey" | "Path2DControlPoint"
+    );
+    if !type_ok { return false; }
+    matches!(
+        method_name,
+        "new" | "fromScale" | "fromOffset" | "fromRGB" | "fromHSV" | "fromHex"
+            | "fromName" | "fromWedgeAngles" | "fromOrientation" | "fromEulerAnglesXYZ"
+            | "fromEulerAnglesYXZ" | "fromAxisAngle" | "fromMatrix" | "fromUnit"
+            | "lookAt" | "Angles" | "now" | "fromUnixTimestamp" | "fromUnixTimestampMillis"
+            | "fromIsoDate" | "fromUniversalTime" | "fromLocalTime"
+            | "random" | "palette"
+    )
+}
+
+/// Convert a break-chain body into proper if/else statements.
+///
+/// Input (body of a `while true do`):
+///   stmt1; stmt2; if C1 then break end; stmt3; if C2 then break end; stmt4; break
+///
+/// Output:
+///   stmt1; stmt2; if not C1 then stmt3; if not C2 then stmt4 end end
+fn convert_break_chain_to_if_else(body: Vec<Stat>) -> Vec<Stat> {
+    let mut result = Vec::new();
+    let mut remaining = body;
+
+    loop {
+        if remaining.is_empty() {
+            break;
+        }
+
+        // Find the first guard-break: `if <cond> then break end` (no else, no elseif)
+        let guard_pos = remaining.iter().position(|s| match s {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                then_body.len() == 1
+                    && matches!(&then_body[0], Stat::Break)
+                    && elseif_clauses.is_empty()
+                    && else_body.is_none()
+            }
+            _ => false,
+        });
+
+        // Also check for a bare `break` at the end
+        let bare_break = remaining.last().map_or(false, |s| matches!(s, Stat::Break));
+
+        match guard_pos {
+            Some(pos) => {
+                // Emit everything before the guard
+                for s in remaining.drain(..pos) {
+                    if !matches!(&s, Stat::Break) {
+                        result.push(s);
+                    }
+                }
+                // Extract the guard condition
+                let guard = remaining.remove(0);
+                if let Stat::If { condition, .. } = guard {
+                    // Everything after the guard becomes the "else" path
+                    // (the body that runs when condition is false)
+                    let rest = std::mem::take(&mut remaining);
+
+                    // Strip trailing bare break from rest
+                    let inner_body = strip_trailing_breaks(rest);
+
+                    if inner_body.is_empty() {
+                        // Nothing after the guard — just skip
+                        break;
+                    }
+
+                    // Recursively convert the inner body
+                    let converted_inner = convert_break_chain_to_if_else(inner_body);
+
+                    if converted_inner.is_empty() {
+                        break;
+                    }
+
+                    let inverted = negate_condition(&condition);
+                    result.push(Stat::If {
+                        condition: inverted,
+                        then_body: converted_inner,
+                        elseif_clauses: vec![],
+                        else_body: None,
+                    });
+                }
+                break;
+            }
+            None => {
+                // No guard-break found. Check if it's just a plain body with a trailing break.
+                if bare_break && remaining.len() > 1 {
+                    // Emit everything except the trailing break
+                    remaining.pop(); // remove the break
+                    result.append(&mut remaining);
+                } else if bare_break {
+                    // Just a `break` — skip it
+                    remaining.pop();
+                    result.append(&mut remaining);
+                } else {
+                    // No break pattern — emit as-is (shouldn't normally happen
+                    // since is_single_pass_body verified all paths exit)
+                    result.append(&mut remaining);
+                }
+                break;
+            }
+        }
+    }
+
+    result
+}
+
+/// Remove trailing `break` statements from a statement list.
+fn strip_trailing_breaks(mut stmts: Vec<Stat>) -> Vec<Stat> {
+    while stmts.last().map_or(false, |s| matches!(s, Stat::Break)) {
+        stmts.pop();
+    }
+    stmts
+}
+
+// ── Helpers ──
+
+/// Try to absorb a single for-loop setup assignment from the preceding
+/// statement for a numeric for-loop.  When LOADN/LOADK/MOVE instructions
+/// precede FORNPREP, they appear as `local v5 = 1` etc.  We fold these into
+/// the `for i = START, STOP, STEP` header.
+///
+/// If the last statement is a `local NAME = VALUE` or `NAME = VALUE` where
+/// NAME matches the register, remove the statement and return VALUE directly.
+/// Otherwise, fall back to the current register contents.
+/// Walk a `[start, end)` instruction range and return the set of destination
+/// registers (field A) of every instruction whose opcode writes to R(A).
+///
+/// Used by `Region::NumericFor` to pre-materialize registers that carry live
+/// inlinable values across the loop body — without this, LOADN-inlined
+/// literals get silently re-folded into self-referential BinOps that never
+/// emit a body statement. See the Phase B0.3 comment at the NumericFor call
+/// site for the full rationale.
+///
+/// This is intentionally a lightweight best-effort scan: it doesn't descend
+/// into nested regions or interpret AUX words, so the returned set is a
+/// SUPERset of the true write set (safe to over-materialize, unsafe to
+/// under-materialize). Aux-bearing opcodes advance PC by 2 to avoid
+/// mis-reading the AUX word as a new instruction's opcode.
+/// Is `reg` dead on entry to the instruction range `[start, end)`?
+///
+/// True when the first instruction in the range that touches `reg` is a pure
+/// definition — a load or constructor that writes R(A) and reads no register.
+/// Such a register is a scratch temp the loop re-initialises every iteration
+/// (`while k < 2` compiles the bound `2` into a register inside the header
+/// block), not a value carried in from before the loop.
+///
+/// Premateralizing one is actively harmful: it invents `local bound = 2`, pins
+/// that name over the whole loop, and a body write to the same slot — Luau
+/// reuses it for the per-iteration local — then lands on the pinned name as a
+/// reassignment. The loop's bound and the body's local collapse into one
+/// variable.
+///
+/// Deliberately conservative: any opcode outside the pure-definition list
+/// counts as a READ of `reg` whenever `reg` appears in one of its operand
+/// slots, so the answer defaults to "live on entry" and premateralization keeps
+/// its historical behaviour.
+fn reg_dead_on_entry(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let ia = insn_a(insn) as usize;
+        let ib = insn_b(insn) as usize;
+        let ic = insn_c(insn) as usize;
+        let pure_def = matches!(
+            op,
+            LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::LoadKX
+                | LuauOpcode::GetImport
+                | LuauOpcode::GetGlobal
+                | LuauOpcode::GetUpval
+                | LuauOpcode::NewTable
+                | LuauOpcode::DupTable
+                | LuauOpcode::NewClosure
+                | LuauOpcode::DupClosure
+                | LuauOpcode::GetVarargs
+        );
+        if pure_def {
+            if ia == reg {
+                return true;
+            }
+        } else if op == LuauOpcode::Move {
+            if ib == reg {
+                return false;
+            }
+            if ia == reg {
+                return true;
+            }
+        } else if ia == reg || ib == reg || ic == reg {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Does any instruction in `[start, end)` mention `reg` in a register operand?
+///
+/// Deliberately an over-approximation (a `c` field that is really a jump offset
+/// still counts), because the only caller uses it to decide whether to give a
+/// register a name — a false positive costs one extra `local`, a false negative
+/// loses a value.
+fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg
+            || insn_b(insn) as usize == reg
+            || insn_c(insn) as usize == reg
+        {
+            return true;
+        }
+        // CALL and RETURN read a WINDOW of registers that no operand field
+        // names: `CALL A B C` takes its arguments from A+1..A+B-1 and `RETURN A
+        // B` its values from A..A+B-1, where B is a COUNT, not a register. The
+        // A/B/C scan above therefore cannot see them, and this function's own
+        // contract says a false negative loses a value.
+        //
+        // That is not hypothetical. `merge_first_touch_is_read` models these
+        // windows and this function does not, so the two disagree about the
+        // same instruction while this, the cruder one, runs first as a
+        // pre-filter above every seed gate. A register whose only post-join
+        // consumer is a call argument was reported unused and its value
+        // dropped.
+        //
+        // B == 0 means "to the top of the stack" -- the count is decided at
+        // runtime -- so every register above the base is potentially read.
+        // Over-approximating there is the safe direction per the contract.
+        match op {
+            LuauOpcode::Call | LuauOpcode::Return => {
+                let base = insn_a(insn) as usize;
+                let count = insn_b(insn) as usize;
+                let first = if op == LuauOpcode::Call { base + 1 } else { base };
+                if count == 0 {
+                    if reg >= first {
+                        return true;
+                    }
+                } else if reg >= first && reg < base + count {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Give a name to registers that an inline branch writes and later code reads.
+///
+/// The inline if-then path in `lift_instruction_range` lifts the guarded range
+/// with the live register file and then hard-restores the pre-branch snapshot,
+/// so a value produced inside the branch is annihilated at the join. When the
+/// register held a parked literal beforehand, the join silently reads that stale
+/// literal: `flag = c >= 3 and c % 3 == 0` lifted as `flag = false`, and the
+/// enclosing `while not flag` never terminated.
+///
+/// Materializing the register from its PRE-branch value first turns the shape
+/// into the correct
+///
+/// ```luau
+/// local t = false
+/// if c >= 3 then t = c % 3 == 0 end
+/// flag = t
+/// ```
+///
+/// Pinning over the branch range routes the in-body write through
+/// `store_complex`'s pinned-register path so it is emitted rather than folded.
+///
+/// Narrow by construction: only registers that (a) the branch writes and (c)
+/// later code reads, AND (b) currently hold a parked pure expression — a
+/// literal or a larger side-effect-free expr such as `self.Amount` or
+/// `self.Amount .. " Pair"`. Registers already bound to a declared local are
+/// left alone (see `premateralize_branch_escapes_spans` for why pinning them
+/// regressed clean files).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn premateralize_branch_escapes(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    branch_start: usize,
+    branch_end: usize,
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    if branch_end <= branch_start {
+        return;
+    }
+    premateralize_branch_escapes_spans(
+        ctx,
+        proto,
+        regs,
+        locals,
+        stmts,
+        &[(branch_start, branch_end)],
+        None,
+        after_start,
+        after_end,
+        pc,
+    );
+}
+
+/// Split-arm variant for the INLINE if/else diamonds (`detect_else_skip`
+/// shapes in `lift_instruction_range`). Passes the then/else spans separately
+/// so the round-4 unknown-seed case can require a write in BOTH arms — the
+/// gate that makes a bare seeded declaration bit-exact against the bytecode.
+///
+/// The parked-pure scan is unchanged: its write-scan domain is the union of
+/// the two spans, and the only gap between them is the else-skip JUMP, which
+/// writes nothing — so this is span-for-span the behavior the single-range
+/// wrapper had for these callers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn premateralize_branch_escapes_split(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    then_range: (usize, usize),
+    else_range: Option<(usize, usize)>,
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    match else_range {
+        Some(er) => {
+            let then_ranges = [then_range];
+            let else_ranges = [er];
+            let arm_ranges = [then_range, er];
+            premateralize_branch_escapes_spans(
+                ctx,
+                proto,
+                regs,
+                locals,
+                stmts,
+                &arm_ranges,
+                Some((&then_ranges, &else_ranges)),
+                after_start,
+                after_end,
+                pc,
+            );
+        }
+        None => {
+            premateralize_branch_escapes(
+                ctx,
+                proto,
+                regs,
+                locals,
+                stmts,
+                then_range.0,
+                then_range.1,
+                after_start,
+                after_end,
+                pc,
+            );
+        }
+    }
+}
+
+/// Multi-span core of `premateralize_branch_escapes`, for the region-level
+/// if/else lift whose arms are NON-CONTIGUOUS CFG block lists. Collapsing a
+/// disjoint arm to `min(start)..max(end)` is exactly the mistake that
+/// double-lifted foreign blocks in the first arm-loop fix (see
+/// `lift_branch_region`), so the write scan and the pin both walk the arm's
+/// actual block ranges and touch nothing in the gaps.
+///
+/// Per register the logic is unchanged from the single-span version: a
+/// register that (a) some arm writes, (b) currently holds a parked PURE
+/// expression (a literal, or a larger side-effect-free expr — the widening
+/// over 26f939b's literal-only gate), and (c) later code reads, is
+/// materialized from its pre-branch value BEFORE the caller snapshots the
+/// register file, and pinned across every arm range so `store_complex` emits
+/// the arm writes as reassignments to that one name instead of parking them
+/// (region merges collapse disagreeing parks to `Unknown`; the inline paths
+/// hard-restore the snapshot — either way an unpinned arm write is
+/// annihilated at the join and every later read of the register becomes a
+/// permanently-nil hoisted `vN`, or a silent read of the stale pre-branch
+/// value).
+///
+/// A register already bound to a DECLARED local is deliberately excluded. It
+/// needs no declaration, so pinning would only route its arm writes through
+/// the reassignment path — but a declared local's register is routinely reused
+/// as a compare/scratch operand, and pinning one name across the arms orphaned
+/// a later reader on the corpus (476_BadgeMenu, clean bytecode). The
+/// name-seeded arm-rebind is a genuine residual; pin-only threading is not its
+/// cure.
+#[allow(clippy::too_many_arguments)]
+fn premateralize_branch_escapes_spans(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    arm_ranges: &[(usize, usize)],
+    split_arms: Option<(&[(usize, usize)], &[(usize, usize)])>,
+    after_start: usize,
+    after_end: usize,
+    pc: usize,
+) {
+    if after_end <= after_start {
+        return;
+    }
+    let mut writes: Vec<usize> = Vec::new();
+    for &(s, e) in arm_ranges {
+        if e > s {
+            writes.extend(collect_body_writes(&proto.code, s, e));
+        }
+    }
+    writes.sort_unstable();
+    writes.dedup();
+    for reg in writes {
+        if reg >= regs.len() {
+            continue;
+        }
+        // Rotation 104: WHICH GATE rejects each candidate register?
+        //
+        // Every rotation on this mechanism tuned a predicate while ASSUMING the
+        // gate was reached. Rotations 95 and 97 both turned out to be tuning
+        // gates that never fired, and r103 showed a strictly more permissive
+        // rule moving nothing - which only makes sense if these registers never
+        // arrive here at all. This reports the answer instead of assuming it.
+        let gate_trace = std::env::var("LUAU_GATE_TRACE").is_ok();
+        if gate_trace {
+            eprintln!(
+                "GATE	{}@{}	reg={}	val={:?}	after={}..{}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                reg,
+                regs.get(reg).map(|v| match v {
+                    RegVal::Unknown => "Unknown",
+                    RegVal::Expr(Expr::Name(_)) => "Expr(Name)",
+                    RegVal::Expr(_) => "Expr(other)",
+                    _ => "other",
+                }),
+                after_start,
+                after_end
+            );
+        }
+        if !reg_used_in_range(&proto.code, after_start, after_end, reg) {
+            if gate_trace {
+                eprintln!("GATE	  reject reg={} : not used after merge", reg);
+            }
+            continue;
+        }
+        // Round 4 — the UNKNOWN-seed case, the residual this file's parked-pure
+        // gate left open (16_StickerPlacer proto 15, 162_Badges proto 10, both
+        // traced to raw operand fields): a register with NO pre-branch binding
+        // at all, written by BOTH arms of a real two-arm diamond, and read at
+        // the merge. The parked-pure gate below can never fire for it (there
+        // is nothing to materialize), so the fallthrough arm's write parked
+        // and was annihilated by `merge_regs`, the other arm's write
+        // shadow-demoted into an arm-local, and the merge read minted an
+        // unbound `vN` — `declared_never_assigned`, the largest class of the
+        // round-4 census (35 of 69 bc defects).
+        //
+        // Seed a BARE `local <name>` before the branch and pin both arm spans
+        // so every arm write is emitted against that one identity.
+        //
+        // Soundness gates, each necessary:
+        //   * `RegVal::Unknown` + `is_undeclared_non_param` — never touch a
+        //     declared local or parameter slot (the 476_BadgeMenu lesson:
+        //     threading one name over a reused slot orphans later readers);
+        //   * BOTH split arms must write the register — then the merge read
+        //     provably never observes the unknown pre-branch value, so the
+        //     bare declaration is bit-exact against the bytecode. A one-arm
+        //     write would make the seed assert `nil` for a path whose true
+        //     value we lost — that shape stays unfixed and FLAGGED;
+        //   * the merge must READ the register before any redefinition
+        //     (`reg_dead_on_entry` false) — otherwise the arm writes are dead
+        //     and the seed is pure noise;
+        //   * the minted name must be NON-generic — `pinned_write_consumed`
+        //     refuses `vN` bindings because chunk-wide `vN` folding conflates
+        //     unrelated variables (the 551_Shop compile failure).
+        if let Some((then_ranges, else_ranges)) = split_arms {
+            let unknown_seed = matches!(regs.get(reg), Some(RegVal::Unknown))
+                && locals.is_undeclared_non_param(reg)
+                && !then_ranges.is_empty()
+                && !else_ranges.is_empty()
+                && ranges_write_reg(&proto.code, then_ranges, reg)
+                && ranges_write_reg(&proto.code, else_ranges, reg)
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+            if unknown_seed {
+                let mut name = ctx.reg_name(proto, reg as u8, pc);
+                if opcode_handlers::is_generic_placeholder(&name) {
+                    name = format!("sel{}", reg);
+                }
+                let (kind, final_name) = locals.classify_write(reg, &name);
+                // `is_undeclared_non_param` guarantees FirstDecl; anything
+                // else means tracker state moved under us — bail rather than
+                // thread a name we do not own.
+                if kind == WriteKind::FirstDecl {
+                    stmts.push(Stat::Local { names: vec![final_name.clone()], values: Vec::new() });
+                    regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
+                    for &(s, e) in arm_ranges {
+                        if e > s {
+                            ctx.pin_reg_name(reg as u8, &final_name, s, e);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // ROUND 5 - the NAME-BOUND twin of the unknown seed above.
+            //
+            // The exclusion further down rejects EVERY register already bound
+            // to a declared local, because the cure attempted there was to PIN
+            // THE EXISTING NAME across the arms - which threads one identity
+            // over a repurposed scratch slot and orphaned later readers
+            // (476_BadgeMenu, 111_Mechsquitos, both measured). That hazard is
+            // real, but it is a property of REUSING the bound name, not of the
+            // branch shape.
+            //
+            // Re-read the unknown-seed soundness argument above: it never
+            // mentions the pre-branch value. If BOTH arms write the register
+            // and the merge READS it before redefining it, the merge read
+            // provably cannot observe whatever the register held on entry -
+            // true whether that entry value was Unknown or a bound name. So
+            // seed a FRESH name, never the bound one, and the repurposing
+            // hazard cannot arise: nothing that referred to the old name is
+            // rebound, and the old binding simply goes out of use.
+            //
+            // Measured shape (rc_0037 GateController::makeSign, and the same in
+            // DigEffects, CashPassBadge, GloveModels, topbarplus Container):
+            //
+            //     local color
+            //     if self:GetAttribute("Vault") then
+            //         color = Color3.fromRGB(255, 214, 90)
+            //     else
+            //         color = Color3.fromRGB(130, 245, 140)
+            //     end
+            //     label.TextColor3 = color
+            //
+            // which decompiled as two arm-local declarations and an unbound
+            // `v9` at the merge. `carried_identity` cannot rescue this: it
+            // requires the register be written EXACTLY ONCE across the arms,
+            // and `Color3.fromRGB(...)` writes it TWICE per arm - GETIMPORT
+            // parks the callee in the result register, then CALL overwrites it
+            // with the result. Any arm that produces its value by CALLING
+            // something trips the one-write rule, which is why the ordinary
+            // `x = f(...)` two-arm selection was never reachable by it. The
+            // gate trace reads `arm_writes=4` for a plain two-arm diamond.
+            let bound_seed = matches!(
+                regs.get(reg),
+                Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
+            )
+                && locals.is_non_param(reg)
+                && !then_ranges.is_empty()
+                && !else_ranges.is_empty()
+                && ranges_write_reg(&proto.code, then_ranges, reg)
+                && ranges_write_reg(&proto.code, else_ranges, reg)
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+            if bound_seed {
+                let mut name = ctx.reg_name(proto, reg as u8, pc);
+                // A generic `vN` cannot be used: chunk-wide `vN` folding
+                // conflates unrelated variables (the 551_Shop compile
+                // failure). A name already live in this proto cannot be used
+                // either - shadowing a name some other register still reads
+                // would silently retarget that reader.
+                if opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
+                    name = format!("sel{}", reg);
+                }
+                let (kind, final_name) = locals.classify_write(reg, &name);
+                // Shadow is the ONLY outcome that introduces a fresh identity.
+                // Reassign would write the OLD name - precisely the repurposing
+                // this case exists to avoid - so leave those to the gates below
+                // rather than forcing a rebind we cannot justify.
+                if matches!(kind, WriteKind::Shadow | WriteKind::FirstDecl) {
+                    if std::env::var("LUAU_SEED_TRACE").is_ok() {
+                        let sc = arm_ranges.iter().filter(|(a,b)| b>a).any(|&(a,b)| {
+                            let mut w=a; while w<b && w<proto.code.len() {
+                                let wi=proto.code[w];
+                                let wop=LuauOpcode::from_u8(insn_op(wi));
+                                if matches!(wop, LuauOpcode::JumpIf|LuauOpcode::JumpIfNot)
+                                    && insn_a(wi) as usize==reg { return true; }
+                                w += if wop.has_aux() {2} else {1};
+                            } false });
+                        eprintln!("SEED {}@{} reg={} pc={} name={} sc={} arms={:?}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            proto.line_defined, reg, pc, final_name, sc, arm_ranges);
+                    }
+                    stmts.push(Stat::Local {
+                        names: vec![final_name.clone()],
+                        values: Vec::new(),
+                    });
+                    regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
+                    for &(s, e) in arm_ranges {
+                        if e <= s {
+                            continue;
+                        }
+                        // DO NOT PIN ACROSS A NESTED SHORT-CIRCUIT ON THIS
+                        // REGISTER. `x = f(a) or f(b)` inside an arm writes the
+                        // register twice with a JUMPIF between; pinning one name
+                        // over that makes both operands assign it and the chain
+                        // collapses, dropping all but the last. Measured on
+                        // `rc_0100 Popper::queryPoint@258`: seeded at pc 90 on
+                        // R15 with a JUMPIF R15 at pc 99 inside arm (91,108),
+                        // and `workspace:Raycast(arg4, ..)` vanished while the
+                        // checker scored the file CLEAN.
+                        //
+                        // Seeding is still right - both arms do write the
+                        // register - so the seed stays and only the PIN is
+                        // withheld for that arm. Suppressing the whole seed
+                        // instead cost `lv_0922` its tool-ancestor guard.
+                        let mut w = s;
+                        let mut sc = false;
+                        while w < e && w < proto.code.len() {
+                            let wi = proto.code[w];
+                            let wop = LuauOpcode::from_u8(insn_op(wi));
+                            if matches!(wop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+                                && insn_a(wi) as usize == reg
+                            {
+                                sc = true;
+                                break;
+                            }
+                            w += if wop.has_aux() { 2 } else { 1 };
+                        }
+                        if !sc {
+                            ctx.pin_reg_name(reg as u8, &final_name, s, e);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        // Widen the seed gate from LITERAL-only (the residual 26f939b left) to
+        // ANY parked pure expression. `self.Amount` (a Field) and
+        // `self.Amount .. " Pair"` (a BinOp) are parked exactly like a literal
+        // and were lost at the join exactly like one — census exhibits
+        // 110_Collect_Tokens and 148_Match_Pairs, both bytecode-traced. Purity
+        // is the park contract (`store_complex` parks only inlinable exprs), so
+        // evaluating the seed early cannot duplicate or reorder a side effect.
+        //
+        // A register ALREADY bound to a declared local (`RegVal::Name` matching
+        // the tracker) is deliberately NOT handled here: pinning that name
+        // across the arms threads it over reused compare/scratch operands and
+        // orphaned a later reader on the corpus (measured: it minted a fresh
+        // unbound `vN` in 476_BadgeMenu — CLEAN bytecode — and 111_Mechsquitos,
+        // for +4 clean but −2 previously-clean files per corpus). That
+        // name-seeded rebind is a real residual, but pin-only threading is the
+        // wrong cure; left for a pass that can distinguish a carried identity
+        // from a repurposed register.
+        // CARRIED IDENTITY.
+        //
+        // The exclusion below rejects every register already bound to a declared
+        // local, because pin-only threading repurposed scratch slots and cost 2
+        // previously-clean files. Its comment names the missing piece - "a pass
+        // that can distinguish a carried identity from a repurposed register" -
+        // and the bytecode supplies it. `646_Capture_Chicks::Description`:
+        //
+        //     31: CONCAT    R5 R6..R9    R5 = "Capture " .. n .. " " .. name
+        //     34: JUMPIFNOT R6 -> 40
+        //     35: MOVE      R6 R5        the arm READS R5 ...
+        //     39: CONCAT    R5 R6..R8    ... then REASSIGNS it, ONCE
+        //     40: MOVE      R7 R5        post-merge read
+        //
+        // An arm that reads the register before writing it is EXTENDING what it
+        // held, and doing so exactly once. A repurposed slot has nothing to read
+        // and is overwritten repeatedly. Both halves are load-bearing - measured
+        // (rotation 102):
+        //
+        //     reads-B/C-on-every-opcode   1,126/16 but corrupts 284 and 88
+        //     + real-register operands    1,126/16 but still corrupts 88
+        //     + written EXACTLY ONCE      1,125/17, 81 files changed,
+        //                                 calls/loops/ifs lost: 0 anywhere
+        //
+        // The middle row scored higher and shipped a dropped call, so the
+        // one-write rule is not a refinement of the score - it is what makes the
+        // change honest.
+        let carried_identity = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+            && arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg))
+            // EXTENDED ONCE, not reused. A carried identity is written a single
+            // time in the arm (`R5 = R5 .. " from the " .. zone`); a scratch
+            // slot is overwritten again and again. `88_BeeStats` is the latter -
+            // threading its name produced `x = tbl`, `x = x._ApplyBeequipMul`,
+            // `x = arg3`, `x = x("ConversionAtHive")`, `x = x and x * x`, losing
+            // a whole call.
+            && arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .map(|&(s, e)| count_reg_writes(&proto.code, s, e, reg))
+                .sum::<usize>()
+                == 1;
+        if std::env::var("LUAU_PIN_TRACE").is_ok() && carried_identity {
+            eprintln!(
+                "PIN	{}@{}	reg={}	pinned over {:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                reg,
+                arm_ranges
+            );
+        }
+
+        let parked_pure = matches!(
+            regs.get(reg),
+            Some(RegVal::Expr(e)) if expr_is_inlinable(e)
+                && !matches!(e, Expr::Name(_))
+        );
+        // Rotation 107: the outcome of EVERY clause, per candidate register.
+        // r104 printed gate ENTRY and I read it as admission; r105 inferred the
+        // rest from call sites and was wrong. This prints what each test
+        // actually returns so neither mistake is available.
+        if gate_trace {
+            let is_name = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))));
+            let reads_first = arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg));
+            let writes: usize = arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .map(|&(s, e)| count_reg_writes(&proto.code, s, e, reg))
+                .sum();
+            eprintln!(
+                "GATE	  reg={} name_bound={} reads_before_write={} arm_writes={} parked_pure={} carried={} -> {}",
+                reg,
+                is_name,
+                reads_first,
+                writes,
+                parked_pure,
+                carried_identity,
+                if parked_pure || carried_identity { "ADMIT" } else { "REJECT" }
+            );
+        }
+        if !parked_pure && !carried_identity {
+            continue;
+        }
+        if carried_identity && !parked_pure {
+            if let Some(RegVal::Expr(Expr::Name(n))) = regs.get(reg) {
+                let name = n.clone();
+                for &(s, e) in arm_ranges {
+                    if e > s {
+                        ctx.pin_reg_name(reg as u8, &name, s, e);
+                    }
+                }
+            }
+            continue;
+        }
+        let value = reg_expr(regs, reg);
+        emit_local_or_assign(ctx, proto, regs, locals, stmts, reg, pc, value);
+        if let RegVal::Expr(Expr::Name(n)) = &regs[reg] {
+            let name = n.clone();
+            for &(s, e) in arm_ranges {
+                if e > s {
+                    ctx.pin_reg_name(reg as u8, &name, s, e);
+                }
+            }
+        }
+    }
+}
+
+/// Does ANY span in `ranges` contain an instruction writing `reg`?
+/// Same opcode write-set as `collect_body_writes` — kept in terms of it so the
+/// two can never disagree about what counts as a write.
+/// Does `[start, end)` READ `reg` before any write to it?
+///
+/// The discriminant between a carried identity (the arm extends the value the
+/// register already holds) and a repurposed slot (the arm overwrites it with
+/// something unrelated). A repurpose has nothing to read.
+///
+/// `LUAU_CARRY_TRACE` prints the instruction it counts as the read, because
+/// rotation 101 could not tell why this returned true for `284_GuiTile`'s
+/// scratch slot and three of that session's four predicate attempts failed for
+/// want of exactly this print.
+fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    if end <= start || end > code.len() {
+        return false;
+    }
+    let trace = std::env::var("LUAU_CARRY_TRACE").is_ok();
+    let mut pc = start;
+    while pc < end {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let step = if op.has_aux() { 2 } else { 1 };
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        // ONLY where B/C ARE REGISTERS.
+        //
+        // Rotation 102, from `LUAU_CARRY_TRACE`: the previous form read B and C
+        // as registers on EVERY opcode and so matched integers, not reads -
+        //
+        //     CARRY READ reg=0 pc=1 op=NewTable  a=0 b=0 c=0
+        //     CARRY READ reg=1 pc=6 op=FastCall1 a=40 b=1 c=3
+        //
+        // NEWTABLE's B is an array-size hint and FASTCALL1's A is a builtin id.
+        // That is why the predicate admitted repurposed scratch slots and cost
+        // `284_GuiTile` and `88_BeeStats` (rotation 101).
+        //
+        // `reg_used_in_range` has the same flaw deliberately: it over-
+        // approximates "is this used", where a false positive is the SAFE
+        // direction. Here it is the dangerous one, so this allowlists the
+        // opcodes whose B/C genuinely name registers. Anything unlisted counts
+        // as NO read, which merely declines to pin - the status quo.
+        let reads = match op {
+            LuauOpcode::Concat => reg >= b && reg <= c,
+            LuauOpcode::Move
+            | LuauOpcode::GetTable
+            | LuauOpcode::SetTable
+            | LuauOpcode::GetTableN
+            | LuauOpcode::SetTableN
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::SetTableKS
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::And
+            | LuauOpcode::Or
+            | LuauOpcode::AndK
+            | LuauOpcode::OrK
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::NameCall
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::SetGlobal
+            | LuauOpcode::SetUpval => b == reg || c == reg,
+            // A/B/C name nothing readable, or B/C are counts, hints and ids.
+            _ => false,
+        };
+        if reads {
+            if trace {
+                eprintln!(
+                    "CARRY	READ	reg={}	pc={}	op={:?}	a={} b={} c={}	range={}..{}",
+                    reg, pc, op, a, b, c, start, end
+                );
+            }
+            return true;
+        }
+        if a == reg && !matches!(op, LuauOpcode::SetTableKS | LuauOpcode::SetGlobal) {
+            if trace {
+                eprintln!(
+                    "CARRY	WRITE-FIRST	reg={}	pc={}	op={:?}	range={}..{}",
+                    reg, pc, op, start, end
+                );
+            }
+            return false;
+        }
+        pc += step;
+    }
+    false
+}
+
+/// How many times does `[start, end)` write `reg`?
+fn count_reg_writes(code: &[u32], start: usize, end: usize, reg: usize) -> usize {
+    if end <= start || end > code.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut pc = start;
+    while pc < end {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg
+            && !matches!(
+                op,
+                LuauOpcode::SetTableKS
+                    | LuauOpcode::SetTable
+                    | LuauOpcode::SetTableN
+                    | LuauOpcode::SetGlobal
+                    | LuauOpcode::SetUpval
+                    | LuauOpcode::SetList
+            )
+        {
+            n += 1;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    n
+}
+
+fn ranges_write_reg(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool {
+    ranges
+        .iter()
+        .filter(|(s, e)| e > s)
+        .any(|&(s, e)| collect_body_writes(code, s, e).contains(&reg))
+}
+
+/// Is the FIRST post-merge touch of `reg` a genuine READ?
+///
+/// `reg_dead_on_entry` cannot answer this: its pure-definition list omits
+/// every table read, arith op and call, so a `GETTABLEKS R6 = ...`
+/// REDEFINITION of a scratch register counts as "live" there. Seeding on that
+/// answer declared `local Parent` / `local fromRGB` / `local Score` for
+/// call-setup scratch that nothing ever assigns (137_TradableGrid,
+/// 191_BuffTile, 317_GroupQuestListenerOld — the three regressions the first
+/// cut of round 4 introduced, all reverted by this classifier).
+///
+/// Per-opcode operand roles, walked instruction-aligned. Anything not
+/// explicitly classified stops the scan with `false` — an unrecognised
+/// opcode suppresses the seed, never invents one, so the failure mode is
+/// "defect stays flagged", not "bare declaration nothing assigns".
+fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    use LuauOpcode as Op;
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = Op::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        let aux = if op.has_aux() { code.get(i + 1).copied().unwrap_or(0) } else { 0 };
+
+        let mut reads: Vec<usize> = Vec::new();
+        let mut writes: Vec<usize> = Vec::new();
+        let mut classified = true;
+        match op {
+            // Pure definitions — write A, read nothing.
+            Op::LoadNil | Op::LoadB | Op::LoadN | Op::LoadK | Op::LoadKX
+            | Op::GetGlobal | Op::GetImport | Op::GetUpval | Op::NewTable
+            | Op::DupTable | Op::NewClosure | Op::DupClosure | Op::GetVarargs => {
+                writes.push(a);
+            }
+            Op::Move => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::Not | Op::Minus | Op::Length => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::IDiv
+            | Op::And | Op::Or | Op::Band | Op::Bor | Op::Bxor | Op::Shl | Op::Shr => {
+                reads.push(b);
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::AddK | Op::SubK | Op::MulK | Op::DivK | Op::ModK | Op::PowK
+            | Op::IDivK | Op::AndK | Op::OrK | Op::Bandk | Op::Bork | Op::Bnot => {
+                reads.push(b);
+                writes.push(a);
+            }
+            // SUBRK/DIVRK: A = K(B) op R(C).
+            Op::SubRK | Op::DivRK => {
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::Concat => {
+                for r in b..=c.max(b) {
+                    reads.push(r);
+                }
+                writes.push(a);
+            }
+            Op::GetTable => {
+                reads.push(b);
+                reads.push(c);
+                writes.push(a);
+            }
+            Op::GetTableKS | Op::GetTableN => {
+                reads.push(b);
+                writes.push(a);
+            }
+            Op::SetTable => {
+                reads.push(a);
+                reads.push(b);
+                reads.push(c);
+            }
+            Op::SetTableKS | Op::SetTableN => {
+                reads.push(a);
+                reads.push(b);
+            }
+            Op::SetGlobal | Op::SetUpval => {
+                reads.push(a);
+            }
+            Op::SetList => {
+                // Table A, values B.. — everything involved is a read of state
+                // built earlier; A is mutated in place, not redefined.
+                reads.push(a);
+                reads.push(b);
+            }
+            Op::NameCall => {
+                reads.push(b);
+                writes.push(a);
+                writes.push(a + 1);
+            }
+            Op::Call => {
+                // Reads function + args FIRST, then writes results.
+                if b == 0 {
+                    if reg >= a {
+                        return true;
+                    }
+                } else {
+                    for r in a..a + b {
+                        reads.push(r);
+                    }
+                }
+                if c == 0 {
+                    // Writes A..top — unknowable; stop conservatively unless
+                    // the read set already claimed it.
+                    if reads.contains(&reg) {
+                        return true;
+                    }
+                    return false;
+                }
+                for r in a..(a + c).saturating_sub(1) {
+                    writes.push(r);
+                }
+            }
+            Op::Return => {
+                if b == 0 {
+                    if reg >= a {
+                        return true;
+                    }
+                } else {
+                    for r in a..(a + b).saturating_sub(1) {
+                        reads.push(r);
+                    }
+                }
+            }
+            Op::JumpIf | Op::JumpIfNot => {
+                reads.push(a);
+            }
+            Op::JumpIfEq | Op::JumpIfNotEq | Op::JumpIfLE | Op::JumpIfNotLE
+            | Op::JumpIfLT | Op::JumpIfNotLT => {
+                reads.push(a);
+                reads.push((aux & 0xFF) as usize);
+            }
+            Op::JumpXEqKNil | Op::JumpXEqKB | Op::JumpXEqKN | Op::JumpXEqKS => {
+                reads.push(a);
+            }
+            Op::ForNPrep | Op::ForNLoop => {
+                reads.push(a);
+                reads.push(a + 1);
+                reads.push(a + 2);
+                writes.push(a + 3);
+            }
+            Op::ForGPrep | Op::ForGPrepNext | Op::ForGPrepINext | Op::ForGLoop => {
+                reads.push(a);
+                reads.push(a + 1);
+                reads.push(a + 2);
+                // Loop vars A+3.. are writes; the exact arity lives in AUX —
+                // treat any higher touch as a write.
+                if reg > a + 2 {
+                    writes.push(reg);
+                }
+            }
+            Op::Capture => {
+                // Types VAL(0)/REF(1) read parent register B.
+                if a <= 1 {
+                    reads.push(b);
+                }
+            }
+            // Control flow that touches no registers.
+            Op::Nop | Op::Break | Op::Jump | Op::JumpBack | Op::JumpX
+            | Op::CloseUpvals | Op::Coverage | Op::PrepVarargs => {}
+            // FASTCALL variants are speculative mirrors of the CALL that
+            // follows; the CALL decides. They touch nothing here.
+            Op::FastCall | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K
+            | Op::FastCall3 => {}
+            _ => {
+                classified = false;
+            }
+        }
+
+        if !classified {
+            // Unknown opcode — cannot trust roles. Suppress the seed.
+            if a == reg || b == reg || c == reg {
+                return false;
+            }
+        } else {
+            if reads.contains(&reg) {
+                return true;
+            }
+            if writes.contains(&reg) {
+                return false;
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec<usize> {
+    use std::collections::BTreeSet;
+    let mut out: BTreeSet<usize> = BTreeSet::new();
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        // Most AD/ABC opcodes write R(A). The exceptions we care about below
+        // are explicitly listed. For unknown/control-flow opcodes we skip the
+        // register (safe: they don't produce data that needs to be live).
+        match op {
+            // Pure register writers: R(A) receives the result.
+            LuauOpcode::LoadNil
+            | LuauOpcode::LoadB
+            | LuauOpcode::LoadN
+            | LuauOpcode::LoadK
+            | LuauOpcode::LoadKX
+            | LuauOpcode::Move
+            | LuauOpcode::GetGlobal
+            | LuauOpcode::GetUpval
+            | LuauOpcode::GetImport
+            | LuauOpcode::GetTable
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN
+            | LuauOpcode::NewClosure
+            | LuauOpcode::DupClosure
+            | LuauOpcode::NewTable
+            | LuauOpcode::DupTable
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::IDiv
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::IDivK
+            | LuauOpcode::And
+            | LuauOpcode::Or
+            | LuauOpcode::AndK
+            | LuauOpcode::OrK
+            | LuauOpcode::Concat
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::SubRK
+            | LuauOpcode::DivRK
+            | LuauOpcode::NameCall
+            | LuauOpcode::Call
+            | LuauOpcode::Band
+            | LuauOpcode::Bor
+            | LuauOpcode::Bxor
+            | LuauOpcode::Bnot
+            | LuauOpcode::Shl
+            | LuauOpcode::Shr
+            | LuauOpcode::Bandk
+            | LuauOpcode::Bork
+            | LuauOpcode::RbxExt92
+            | LuauOpcode::RbxExt93
+            | LuauOpcode::RbxExt94
+            | LuauOpcode::RbxExt95
+            | LuauOpcode::RbxExt96
+            | LuauOpcode::RbxExt97
+            | LuauOpcode::RbxExt98
+            | LuauOpcode::RbxExt99
+            | LuauOpcode::RbxExt100
+            | LuauOpcode::RbxExt101
+            | LuauOpcode::RbxExt102
+            | LuauOpcode::RbxExt103
+            | LuauOpcode::RbxExt104
+            | LuauOpcode::RbxExt105
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::GetVarargs => {
+                out.insert(a);
+            }
+            _ => {}
+        }
+        // Advance PC: skip AUX word for opcodes that carry one.
+        if op.has_aux() {
+            pc += 2;
+        } else {
+            pc += 1;
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn absorb_numeric_for_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], reg: usize) -> Expr {
+    let reg_name = match regs.get(reg) {
+        Some(RegVal::Expr(Expr::Name(n))) => n.as_str(),
+        _ => return reg_expr(regs, reg),
+    };
+
+    if let Some(last) = stmts.last() {
+        let (names, values) = match last {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                (names.as_slice(), values.as_slice())
+            }
+            Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+                if let Expr::Name(n) = &targets[0] {
+                    if n == reg_name {
+                        let val = values[0].clone();
+                        stmts.pop();
+                        return val;
+                    }
+                }
+                return reg_expr(regs, reg);
+            }
+            _ => return reg_expr(regs, reg),
+        };
+
+        if names[0] == reg_name {
+            let val = values[0].clone();
+            stmts.pop();
+            return val;
+        }
+    }
+    reg_expr(regs, reg)
+}
+
+/// Force-materialize loop-carried registers as named locals before a loop.
+///
+/// The lifter is a symbolic-execution engine: `store_complex` parks "inlinable"
+/// values in `regs` without emitting a statement. For a loop-carried
+/// accumulator like `local sum = 0; while ... do sum = sum + i end`, `LOADN R1,
+/// 0` parks `Number(0)` with no statement, and the body's `ADD R1, R1, R4`
+/// builds `BinOp{Number(0), Add, Name(i)}` — which is *also* inlinable, so it
+/// too emits nothing. The net result is an empty loop body plus a stale
+/// one-iteration expression leaking past the loop. For `while`/`repeat` the
+/// damage is worse: the branch condition is extracted from the still-literal
+/// register, producing constant-true conditions like `while 1 <= 5` — an
+/// infinite loop.
+///
+/// Materializing the register up front turns it into `local v1 = 0`, after
+/// which the body's ADD reads `Name(v1) + Name(i)` and the self-mutation
+/// detection in `store_complex` emits the expected `v1 = v1 + i`.
+///
+/// `writes` is the candidate register set (see `collect_body_writes`); `skip`
+/// lists loop-control/loop-variable registers that must NOT be materialized
+/// because they are either already absorbed into the loop header or about to be
+/// rebound to the loop variable name.
+///
+/// `pin_range` pins the chosen name over the loop's PC span. Without it,
+/// `ctx.reg_name` can answer `import` here and `import2` at the body PC, which
+/// the body then treats as a semantic rename and emits `local import2 = ...`
+/// inside the loop — re-declaring the accumulator every iteration instead of
+/// updating it. Pass `None` to preserve a call site's historical naming.
+fn premateralize_loop_carried(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    writes: &[usize],
+    skip: &[usize],
+    pc: usize,
+    pin_range: Option<(usize, usize)>,
+) {
+    for &reg in writes {
+        if skip.contains(&reg) {
+            continue;
+        }
+        let is_live_literal = matches!(
+            regs.get(reg),
+            Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_))
+        );
+        if !is_live_literal {
+            continue;
+        }
+        // Snapshot the pending value and force-emit it as a local.
+        // Phase B0.49: classify_write for shadow-on-rename.
+        let pending = match &regs[reg] {
+            RegVal::Expr(e) => e.clone(),
+            _ => continue,
+        };
+        // C10d: stdlib-shadow sanitize at force-materialize path.
+        let pending = sanitize_leaked_global_string(pending);
+        let new_name = ctx.reg_name(proto, reg as u8, pc);
+        let (kind, name) = locals.classify_write(reg, &new_name);
+        match kind {
+            WriteKind::FirstDecl | WriteKind::Shadow => {
+                stmts.push(Stat::Local {
+                    names: vec![name.clone()],
+                    values: vec![pending],
+                });
+            }
+            WriteKind::Reassign => {
+                stmts.push(Stat::Assign {
+                    targets: vec![Expr::Name(name.clone())],
+                    values: vec![pending],
+                });
+            }
+        }
+        if let Some((pin_start, pin_end)) = pin_range {
+            ctx.pin_reg_name(reg as u8, &name, pin_start, pin_end);
+        }
+        regs[reg] = RegVal::Expr(Expr::Name(name));
+    }
+}
+
+/// Try to absorb the iterator setup from the preceding statement for a generic
+/// for-loop.  When a CALL immediately precedes FORGPREP, the emitted code
+/// typically looks like `local v5, v6, v7 = pairs(t)`.  We want to fold that
+/// into `for k, v in pairs(t)` instead of `for k, v in v5`.
+///
+/// Returns the list of iterator expressions to pass to `Stat::GenericFor`:
+///   - `[call_expr]` when a matching preceding `local v = pairs(t)` / `v = pairs(t)`
+///     assignment is absorbed (the common `for k, v in pairs(t) do` shape).
+///   - `[regs[a], regs[a+1], regs[a+2]]` fallback when no absorption is
+///     possible — trailing `Nil`/`Unknown` registers are trimmed, so the
+///     result has between 1 and 3 elements.
+///
+/// The 3-element fallback is essential for `for k, v in next, t do` and
+/// `for k, v in next, t, nil do` style code, which the Luau compiler emits as:
+///   ```text
+///   GETIMPORT r_a next
+///   MOVE      r_{a+1} t
+///   [LOADNIL  r_{a+2}]            -- optional, defaults to nil
+///   FORGPREP_NEXT r_a -> D
+///   ```
+/// There is *no* `CALL` in this shape — the compiler has already set up the
+/// three-value iterator triple in registers — so the absorb path fails and
+/// pre-Phase-B0.7 would render it as `for k, v in next do`, losing the table.
+fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Vec<Expr> {
+    if let Some(RegVal::Expr(Expr::Name(reg_name))) = regs.get(a) {
+        let reg_name = reg_name.clone();
+        if let Some(last) = stmts.last() {
+            // Extract the first assigned name and the value expression
+            let matched = match last {
+                Stat::Local { names, values } if !names.is_empty() && values.len() == 1 => {
+                    Some((names[0].as_str(), values))
+                }
+                Stat::Assign { targets, values } if !targets.is_empty() && values.len() == 1 => {
+                    if let Expr::Name(n) = &targets[0] {
+                        Some((n.as_str(), values))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some((first_name, values)) = matched {
+                // Check if the assigned name matches register a and value is a call
+                if first_name == reg_name {
+                    let value = &values[0];
+                    if matches!(value, Expr::Call { .. } | Expr::MethodCall { .. }) {
+                        let expr = value.clone();
+                        stmts.pop();
+                        return vec![expr];
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: build an explicit iterator tuple from regs[a..a+3].
+    // This recovers `for k, v in next, t do` style source that the Luau
+    // compiler emits without a preceding `CALL`.
+    //
+    // Only whitelisted Expr variants are accepted for the state/control
+    // slots — everything else is treated as noise and elided. The whitelist
+    // is narrow on purpose: real iterator state/control are almost always
+    // a Name, Field, Index, or a Call/MethodCall result (when absorption
+    // couldn't fold the preceding CALL). Literals (Nil/Bool/Number/String),
+    // arithmetic (BinOp/UnOp), tables, vectors, and — crucially — Function
+    // placeholders (including the lifter's "unresolved closure" comment
+    // shape) are rejected because surfacing them inside the `for ... in`
+    // header is strictly worse than omitting the slot. See Phase B0.7
+    // sweep: file `06039b020c557365_33314b` had a FORGPREP where regs[a+2]
+    // held an unresolved NEWCLOSURE, which we initially rendered as a
+    // multi-line `function() -- unresolved closure end` inside the
+    // `for ... in` clause — completely unreadable.
+    fn is_valid_iterator_slot(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Name(_)
+                | Expr::Field { .. }
+                | Expr::Index { .. }
+                | Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::Varargs
+                // Luau has generalized iteration, so `for k, v in {..} do` is
+                // valid and is what the bytecode built with NEWTABLE+SETLIST or
+                // DUPTABLE. Rejecting it minted a `vN` that free_var_decls then
+                // declared at chunk top with nothing to assign it.
+                //
+                // The Function / UnOp / BinOp rejections stay: the failure this
+                // guard was built for was an unresolved NEWCLOSURE rendering a
+                // multi-line body inside the `in` clause, and a leaked NAMECALL
+                // method-name string. Neither is a table.
+                | Expr::Table { .. }
+        )
+    }
+
+    let generator = {
+        let raw = reg_expr(regs, a);
+        if is_valid_iterator_slot(&raw) {
+            raw
+        } else {
+            // Phase B0.119: generator register can hold a leaked NAMECALL
+            // method-name string (e.g. Expr::String) which produces invalid
+            // `for k, v in "MethodName" do`.  Fall back to a register name.
+            let n = format!("v{}", a);
+            crate::decompiler::mint_trace::note("FORGPREP_GEN_REJECT", &n);
+            Expr::Name(n)
+        }
+    };
+    let second = regs.get(a + 1).and_then(|r| match r {
+        RegVal::Expr(e) if is_valid_iterator_slot(e) => Some(e.clone()),
+        _ => None,
+    });
+    // Third iterator (initial control). Include only if it's a real non-nil
+    // expression — Luau's `for k, v in f, s do` is equivalent to `... f, s, nil do`,
+    // and LOADNIL on r_{a+2} produces the canonical nil default we should elide.
+    let third = regs.get(a + 2).and_then(|r| match r {
+        RegVal::Expr(e) if is_valid_iterator_slot(e) => Some(e.clone()),
+        _ => None,
+    });
+
+    // Phase B0.8: deduplicate same-name iterators.
+    //
+    // Root cause: both GETIMPORT R[A] and GETGLOBAL R[A+1] can resolve to the
+    // same constant string — observed as `for k, v in pairs, pairs do` on
+    // `06038f010d557365_10830b.luac` where GETIMPORT R0 and GETGLOBAL R1 both
+    // yielded Name("pairs") from the same K0="pairs" constant slot. The B0.7
+    // fallback faithfully surfaced both registers, producing the duplicate.
+    //
+    // Dedup rule (narrow): if the state candidate is `Expr::Name(s)` and the
+    // generator is also `Expr::Name(g)` where s == g, drop the state. This is
+    // strictly limited to exact-same-Name pairs — it does NOT collapse
+    //   • `Name("next"), Name("t")`           (different names → preserved ✓)
+    //   • `Field { .. }, Field { .. }`        (Fields not compared → preserved ✓)
+    //   • `Name("x"), Name("y")`              (different names → preserved ✓)
+    // Only `Name("pairs"), Name("pairs")` and analogous identical-Name pairs
+    // are collapsed, which is always an artifact of duplicate GETIMPORT/GETGLOBAL
+    // resolution, not a user-intentional self-referential iterator triple.
+    fn same_name(gen: &Expr, state: &Expr) -> bool {
+        match (gen, state) {
+            (Expr::Name(g), Expr::Name(s)) => g == s,
+            _ => false,
+        }
+    }
+
+    let mut iterators = vec![generator.clone()];
+    if let Some(s) = second {
+        if !same_name(&generator, &s) {
+            iterators.push(s.clone());
+            // Third only makes sense if the second was also present (a `nil, x`
+            // initial control without a state is invalid Luau).
+            if let Some(t) = third {
+                if !same_name(&generator, &t) && !same_name(&s, &t) {
+                    iterators.push(t);
+                }
+            }
+        }
+    }
+
+    // Phase B0.9: generator-call folding for known iterator names.
+    //
+    // When the fallback path produces exactly [Name("pairs"), state] or
+    // [Name("ipairs"), state], fold into [pairs(state)] / [ipairs(state)].
+    // This recovers the common `for k, v in pairs(t) do` source form.
+    //
+    // Background: Luau's FORGPREP_NEXT / FORGPREP_INEXT optimizations inline
+    // `pairs(t)` as a direct register triple — GETIMPORT generator + MOVE state
+    // + LOADNIL control — without a preceding CALL.  The B0.7 fallback
+    // faithfully surfaces those registers; B0.9 then refolds the known-iterator
+    // names back into call syntax, recovering the original source.
+    //
+    // Whitelist is intentionally narrow:
+    //   • "pairs"  → `pairs(state)`  ✓
+    //   • "ipairs" → `ipairs(state)` ✓
+    //   • "next"   → NOT folded.  `for k, v in next, t do` is valid Luau that
+    //     appears in real source (direct use of the `next` iterator function)
+    //     and must not be silently rewritten as `next(t)`, which has different
+    //     semantics: `next(t)` returns the first key/value pair, not an
+    //     iterator triple.
+    //   • Arbitrary functions — NOT folded.  We never emit spurious `f(s)`.
+    //
+    // B0.8 dedup runs first, so by the time we reach this check the vec is
+    // already free of duplicate-name artifacts.
+    // The absorption path returns early (vec![call_expr]), so this only fires
+    // on the register-triple fallback.
+    const FOLDABLE_ITERATORS: &[&str] = &["pairs", "ipairs"];
+    let should_fold = iterators.len() == 2
+        && matches!(&iterators[0], Expr::Name(n) if FOLDABLE_ITERATORS.contains(&n.as_str()));
+    if should_fold {
+        if let Expr::Name(gen_name) = iterators.remove(0) {
+            let state = iterators.remove(0);
+            iterators.push(Expr::Call {
+                func: Box::new(Expr::Name(gen_name)),
+                args: vec![state],
+            });
+        }
+    }
+
+    iterators
+}
+
+pub(super) fn reg_expr(regs: &[RegVal], idx: usize) -> Expr {
+    match regs.get(idx) {
+        Some(RegVal::Expr(e)) => e.clone(),
+        Some(RegVal::LoopVar(s)) => Expr::Name(s.clone()),
+        other => {
+            let n = format!("v{}", idx);
+            // Read side of LUAU_REG_WATCH: the moment an Unknown register is
+            // rendered as a minted `vN`. Pairing this with the write-side watch
+            // is what identifies WHICH read lost its value, rather than
+            // assuming the nearest preceding call was responsible - an
+            // assumption that cost rotations 40, 42 and 44.
+            if let Ok(w) = std::env::var("LUAU_REG_WATCH") {
+                if w.parse::<usize>() == Ok(idx) {
+                    eprintln!("READ  reg={} MINTED {} (register held {:?})", idx, n, other);
+                }
+            }
+            // PROTO-QUALIFIED mint record. Without it a hoisted `vN` cannot be
+            // traced back to the function that minted it, which is what made
+            // rotation 116's watch land in the wrong proto.
+            if crate::decompiler::mint_trace::enabled() {
+                eprintln!(
+                    "MINTAT	{}	reg={}	name={}	held={}",
+                    current_dce_proto(),
+                    idx,
+                    n,
+                    match other {
+                        None => "OUT_OF_RANGE",
+                        Some(RegVal::Unknown) => "Unknown",
+                        _ => "other",
+                    }
+                );
+            }
+            crate::decompiler::mint_trace::note(
+                match other {
+                    None => "REG_EXPR_OUT_OF_RANGE",
+                    _ => "REG_EXPR_UNKNOWN",
+                },
+                &n,
+            );
+            // This arm is one call site with several upstream causes, and they
+            // do not all deserve the same treatment -- a register cleared above
+            // a call result genuinely holds nothing, while one the lifter gave
+            // up on is a dropped value. Attribute it so the two can be counted
+            // apart before either is "fixed".
+            if matches!(other, Some(_)) {
+                crate::decompiler::mint_trace::note(
+                    crate::decompiler::mint_trace::unknown_origin(idx),
+                    &n,
+                );
+            }
+            Expr::Name(n)
+        }
+    }
+}
+
+/// Like `reg_expr`, but guards against bare string/number/bool literals being
+/// used as a table base.  In valid Luau bytecode the table operand of
+/// GET/SETTABLE(KS/N) and NAMECALL is always a register holding an object, but
+/// when a preceding LOADK loads a string constant (e.g. "game") into the same
+/// register, `reg_expr` returns `Expr::String("game")`.  Using that directly
+/// produces garbage like `"game".field = val`.  Instead, fall back to the
+/// variable name for the register so the output is `vN.field = val`.
+///
+/// B0.59: also reject compound expressions whose result type CAN'T be a table
+/// (arithmetic BinOp → number, comparison BinOp → bool, Concat → string,
+/// UnOp Length/Negate/BNot → number, UnOp Not → bool). Without this, the
+/// corpus had ~200 garbage emissions like `(#v32).lastUpdate = X`,
+/// `(-self).Visible = ...`, `(Instance + self).Magnitude = X` — all invalid
+/// Luau. And/Or ops are KEPT: `a or b` can legitimately yield a table
+/// in Lua's short-circuit semantics (common `t or default_t` pattern).
+pub(super) fn table_expr(regs: &[RegVal], idx: usize) -> Expr {
+    let e = reg_expr(regs, idx);
+    if is_impossible_as_table(&e) {
+        let n = format!("v{}", idx);
+        crate::decompiler::mint_trace::note("TABLE_EXPR_REJECT", &n);
+        if crate::decompiler::mint_trace::enabled() {
+            eprintln!("REJECT\tTABLE_EXPR\t{}\tdiscarded={:?}", n, e);
+        }
+        return Expr::Name(n);
+    }
+    e
+}
+
+/// Receiver resolution for NAMECALL (`obj:method()`).
+///
+/// Deliberately more permissive than `table_expr`. Arithmetic, concat, length
+/// and negation results are rejected there because a *table base* built from
+/// them (`(#v32).lastUpdate = X`) is almost always a decode artifact — but as a
+/// *method receiver* they are legitimate: Luau's `__add`/`__sub`/`__mul`/
+/// `__div`/`__mod`/`__pow`/`__idiv`/`__concat`/`__unm`/`__len` metamethods may
+/// all return a table, so `(a + b):method()` is valid operator-overload code.
+///
+/// Only values whose runtime type no metamethod can change are rejected:
+/// number/bool/nil literals, `not x`, and comparisons (Luau coerces the results
+/// of `__eq`/`__lt`/`__le` to boolean).
+pub(super) fn method_receiver_expr(regs: &[RegVal], idx: usize) -> Expr {
+    let e = reg_expr(regs, idx);
+    let impossible = match &e {
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
+        Expr::UnOp { op, .. } => matches!(op, UnOp::Not),
+        Expr::BinOp { op, .. } => matches!(
+            op,
+            BinOp::Eq | BinOp::NotEq | BinOp::LT | BinOp::LE | BinOp::GT | BinOp::GE
+        ),
+        _ => false,
+    };
+    if impossible {
+        let n = format!("v{}", idx);
+        crate::decompiler::mint_trace::note("METHOD_RECV_REJECT", &n);
+        if crate::decompiler::mint_trace::enabled() {
+            // Proto-qualified: rotation 123 could name the discarded value but
+            // not the function it happened in, and every trace in this session
+            // that omitted the proto sent a rotation to the wrong one.
+            eprintln!(
+                "REJECT	METHOD_RECV	{}	reg={}	proto={}	discarded={:?}",
+                n,
+                idx,
+                current_dce_proto(),
+                e
+            );
+        }
+        return Expr::Name(n);
+    }
+    e
+}
+
+/// B0.59 — is this expression's runtime type known to be NOT a table?
+/// Used by `table_expr` to reject invalid table bases that would emit
+/// `(number).field = X` or similar. Conservative: expressions with
+/// ambiguous/polymorphic result types (And, Or, Call, MethodCall,
+/// Field, Index, Name, Varargs) are allowed through.
+pub(super) fn is_impossible_as_table(e: &Expr) -> bool {
+    match e {
+        // `Expr::String` is deliberately NOT rejected: Luau strings carry a
+        // metatable, so `("x"):upper()` and `s:sub(1, 5)` are legal. Rejecting
+        // them made `table_expr` invent the undeclared name `vN`, which emitted
+        // `v1:upper()` for a perfectly good string literal.
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
+        Expr::UnOp { op, .. } => matches!(
+            op,
+            UnOp::Negate | UnOp::Length | UnOp::BNot | UnOp::Not
+        ),
+        Expr::BinOp { op, .. } => matches!(
+            op,
+            // Add/Sub/Mul/Div are NOT rejected. B0.59 assumed "arith → number",
+            // which is false in Roblox Luau: Vector3/Vector2/CFrame/UDim2 all
+            // overload exactly these four operators and their results are
+            // indexed constantly — `(a - b).magnitude` is the idiomatic
+            // distance. The round-3 defect census measured every value this
+            // guard discarded across the 111-defect corpus: Sub x92 / Add x12 /
+            // Mul x11 / Div x3 and NOTHING else, each one the exact expression
+            // the bytecode then indexes (473_DragManager pc31 SUB → pc39/47
+            // GETTABLEKS .X/.Y; 511_TriangleMaker pc21 SUB → pc22 GETTABLEKS
+            // .magnitude — raw-field traces under the measured v9 map).
+            // Rejecting them converted correct values into unbound `vN` nils.
+            BinOp::Mod | BinOp::Pow | BinOp::IDiv | BinOp::Concat
+            | BinOp::Eq | BinOp::NotEq
+            | BinOp::LT | BinOp::LE | BinOp::GT | BinOp::GE
+            | BinOp::BAnd | BinOp::BOr | BinOp::BXor
+            | BinOp::Shl | BinOp::Shr
+            // And / Or intentionally NOT rejected — short-circuit semantics
+            // mean `a or b` can legitimately yield a table operand.
+        ),
+        _ => false,
+    }
+}
+
+pub(super) fn mk_binop(regs: &[RegVal], left: usize, right: usize, op: BinOp) -> Expr {
+    let left_expr = reg_expr(regs, left);
+    let right_expr = reg_expr(regs, right);
+    // B0.58: arithmetic ops on non-numeric literals are always a misfire
+    // (the instruction was misidentified, or upstream register state was
+    // corrupted). Returning `Expr::BinOp(Mod, Bool(false), Bool(false))`
+    // produces `false % false` in the output, a runtime error in real
+    // Luau and visibly garbage in the corpus (62 occurrences before this
+    // guard). Reject when EITHER operand is a non-numeric literal and
+    // return the left operand as the salvage value.
+    //
+    // Previously: only guarded against Expr::String (from B0.43-era). Now
+    // includes Bool and Nil (the common forms seen in practice).
+    let is_numeric_op = matches!(op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+        | BinOp::Mod | BinOp::Pow | BinOp::IDiv
+        // B0.121: bitwise ops also require numeric operands; strings from
+        // NAMECALL method name leaking produce `bit32.band("PrimaryPart", ...)`.
+        | BinOp::BAnd | BinOp::BOr | BinOp::BXor);
+    if is_numeric_op {
+        let bad = |e: &Expr| matches!(e,
+            Expr::String(_) | Expr::Bool(_) | Expr::Nil);
+        if bad(&left_expr) || bad(&right_expr) {
+            // Prefer returning a side that isn't itself a non-numeric
+            // literal; if both are, fall back to left (matches B0.43
+            // behavior for pure-string operands).
+            if !matches!(left_expr, Expr::String(_) | Expr::Bool(_) | Expr::Nil) {
+                return left_expr;
+            }
+            if !matches!(right_expr, Expr::String(_) | Expr::Bool(_) | Expr::Nil) {
+                return right_expr;
+            }
+            return left_expr;
+        }
+    }
+    // B0.126: And/Or string leakage guard. NAMECALL/GETTABLEKS AUX strings
+    // leak into registers and get picked up as And/Or operands, producing
+    // garbage like `v3 and "GetPlayers"`, `workspace or "workspace"`.
+    // Real Luau `x and "literal"` / `x or "default"` patterns always have
+    // user-visible strings (error messages, defaults with spaces, etc.).
+    // Identifier-shaped strings (valid Luau identifiers matching method/
+    // property names) are always leakage. Guard: if either operand is
+    // Expr::String(s) where s is a valid identifier, replace it with the
+    // register name fallback.
+    if matches!(op, BinOp::And | BinOp::Or) {
+        let is_ident_string = |e: &Expr| -> bool {
+            if let Expr::String(s) = e {
+                !s.is_empty()
+                    && s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            } else {
+                false
+            }
+        };
+        let left_leaked = is_ident_string(&left_expr);
+        let right_leaked = is_ident_string(&right_expr);
+        if left_leaked && right_leaked {
+            // Both are leaked strings — return left register name.
+            let n = format!("v{}", left);
+            crate::decompiler::mint_trace::note("BINOP_ANDOR_LEAK", &n);
+            return Expr::Name(n);
+        }
+        if right_leaked {
+            // Right is leaked — return left (the meaningful operand).
+            return left_expr;
+        }
+        if left_leaked {
+            // Left is leaked — return right (the meaningful operand).
+            return right_expr;
+        }
+    }
+    Expr::BinOp {
+        left: Box::new(left_expr),
+        op,
+        right: Box::new(right_expr),
+    }
+}
+
+pub(super) fn mk_binop_k(proto: &Proto, strings: &[String], regs: &[RegVal], left: usize, kidx: u32, op: BinOp) -> Expr {
+    // For arithmetic ops, the constant should be a Number. If it's not (e.g.,
+    // Import/String constant in dead code), return just the constant expression
+    // to avoid garbage like `v0 % "game"`.
+    let right_expr = get_const_expr(proto, strings, kidx);
+    let left_expr = reg_expr(regs, left);
+    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow | BinOp::IDiv) {
+        if !matches!(right_expr, Expr::Number(_)) {
+            return right_expr;
+        }
+        // B0.73: If left operand is non-numeric (String, Table, Bool, Function),
+        // this is a Roblox passthrough K-variant — return just the left register.
+        // Evidence: `"Pulse" + 100`, `table.create("Name" + 2)`.
+        if matches!(left_expr, Expr::String(_) | Expr::Table { .. } | Expr::Bool(_)
+                           | Expr::Function { .. }) {
+            return left_expr;
+        }
+    }
+    // B0.121: bitwise K-ops (BANDK, BORK) also require numeric constant.
+    // String constants (from NAMECALL method name leaking into the constant
+    // index) produce garbage like `bit32.band("PrimaryPart", "PrimaryPart")`.
+    if matches!(op, BinOp::BAnd | BinOp::BOr | BinOp::BXor) {
+        if matches!(right_expr, Expr::String(_)) {
+            return left_expr;
+        }
+        if matches!(left_expr, Expr::String(_) | Expr::Table { .. } | Expr::Bool(_)
+                           | Expr::Function { .. }) {
+            return left_expr;
+        }
+    }
+    // B0.126: And/Or K-constant string leakage guard. Same logic as mk_binop:
+    // identifier-shaped strings are NAMECALL leakage, not real operands.
+    if matches!(op, BinOp::And | BinOp::Or) {
+        let is_ident_string = |e: &Expr| -> bool {
+            if let Expr::String(s) = e {
+                !s.is_empty()
+                    && s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            } else {
+                false
+            }
+        };
+        let left_leaked = is_ident_string(&left_expr);
+        let right_leaked = is_ident_string(&right_expr);
+        if left_leaked && right_leaked {
+            let n = format!("v{}", left);
+            crate::decompiler::mint_trace::note("BINOPK_ANDOR_LEAK", &n);
+            return Expr::Name(n);
+        }
+        if right_leaked {
+            return left_expr;
+        }
+        if left_leaked {
+            return right_expr;
+        }
+    }
+    Expr::BinOp {
+        left: Box::new(left_expr),
+        op,
+        right: Box::new(right_expr),
+    }
+}
+
+/// Phase B0.67 — construct a unary op while rejecting operand types that
+/// make the op trivially invalid. Mirrors the pattern from `mk_binop`
+/// (B0.58): when a misidentified opcode reads a register holding an
+/// Instance/Name/Field expression, the lifter would previously emit
+/// `-ReplicatedStorage`, `#game`, `~"string"`, etc. — syntactically valid
+/// Luau but runtime errors and visibly garbage in the corpus.
+///
+/// Per-op rejection rules:
+///   * `Negate` (unary minus): reject Bool, Nil, String, Table, Function,
+///     Varargs, and bare `Name(n)` where `is_stdlib_shadow_name(n)` (those
+///     name Roblox services/instances exclusively: `game`, `workspace`,
+///     `script`, `task`, `pcall`, etc.).
+///   * `Not`: no operand is rejected. Luau's `not x` is defined for all
+///     types.
+///   * `Length` (`#x`): reject Bool, Nil, Number, Function, Varargs, and
+///     `Name(n)` with `is_stdlib_shadow_name(n)`. (Strings and tables are
+///     the only legitimate targets; strings not listed here because
+///     `#"literal"` is rare but legal.)
+///   * `BNot` (bitwise `~`): reject Bool, Nil, String, Table, Function,
+///     Varargs, and `Name(n)` with `is_stdlib_shadow_name(n)`.
+///
+/// Salvage: return `Expr::Name(format!("v{}", src))` — same shape as
+/// `reg_expr`'s fallback, matching the spirit of B0.58's mk_binop
+/// salvage (which returns a non-literal operand).
+pub(crate) fn mk_unop(regs: &[RegVal], src: usize, op: UnOp) -> Expr {
+    let operand = reg_expr(regs, src);
+    let is_stdlib_name = |e: &Expr| matches!(e, Expr::Name(n) if is_stdlib_shadow_name(n));
+    let rejected = match op {
+        UnOp::Not => false, // `not x` accepts any operand type in Luau
+        UnOp::Negate => matches!(
+            &operand,
+            Expr::Bool(_) | Expr::Nil | Expr::String(_)
+                | Expr::Table { .. } | Expr::Function { .. } | Expr::Varargs
+        ) || is_stdlib_name(&operand),
+        UnOp::Length => matches!(
+            &operand,
+            Expr::Bool(_) | Expr::Nil | Expr::Number(_)
+                | Expr::Function { .. } | Expr::Varargs
+        ) || is_stdlib_name(&operand),
+        UnOp::BNot => matches!(
+            &operand,
+            Expr::Bool(_) | Expr::Nil | Expr::String(_)
+                | Expr::Table { .. } | Expr::Function { .. } | Expr::Varargs
+        ) || is_stdlib_name(&operand),
+    };
+    if rejected {
+        // Phase B0.99: return the source register's expression as-is.
+        // Previously returned `v{src}`, losing the real name/value.
+        // For Roblox passthrough opcodes (type annotations), this
+        // preserves the source register's expression through the no-op.
+        return operand;
+    }
+    Expr::UnOp { op, operand: Box::new(operand) }
+}
+
+/// B0.68 — is this expression an impossible operand for the Luau `..` concat
+/// operator? Luau's concat only accepts strings and numbers at runtime;
+/// anything else (bool, nil, table, function, vararg) is a type error.
+///
+/// When the lifter sees one of these on either side of a concat it means
+/// either (a) the opcode was misidentified as CONCAT, or (b) upstream
+/// register state was corrupted. Either way, emitting
+/// `Expr::BinOp { op: Concat, .. }` against an impossible operand produces
+/// visibly broken output like `((v1 .. false) .. v3) .. false` in the
+/// corpus (observed dozens of times pre-B0.68).
+///
+/// The `is_stdlib_shadow_name` branch catches the common misfire where an
+/// opcode stream produces a concat whose operand resolved to `workspace`,
+/// `script`, `game`, `Players` etc. These globals are never legitimate
+/// concat operands — any such emission is always a bug.
+///
+/// Kept as-is:
+///   - `Expr::String`, `Expr::Number`       — valid primitives
+///   - `Expr::Name(non-stdlib)`              — could be any typed var
+///   - `Expr::Field`, `Expr::Index`          — table access, may be string
+///   - `Expr::Call`, `Expr::MethodCall`      — may return string/number
+///   - `Expr::BinOp`                          — allows chained `a..b..c`
+///   - `Expr::UnOp`                           — allows tostring-style ops
+pub(super) fn is_invalid_concat_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Bool(_) | Expr::Nil | Expr::Function { .. }
+        | Expr::Table { .. } | Expr::Varargs => true,
+        Expr::Name(n) => is_stdlib_shadow_name(n),
+        _ => false,
+    }
+}
+
+/// B0.68 — build a CONCAT BinOp node, guarding against operand types that
+/// Luau's `..` operator cannot consume at runtime. When either side fails
+/// `is_invalid_concat_operand`, salvage by returning the other (valid)
+/// operand directly rather than emitting a poisoned BinOp. If both are
+/// invalid, fall through to `left` — matches the B0.58 `mk_binop` salvage
+/// shape.
+///
+/// This is the CONCAT analogue of the B0.58 arithmetic-guard patch on
+/// `mk_binop` and the B0.43 string-rejection patch that preceded it.
+/// Before B0.68 the CONCAT handler built the chained BinOp inline with no
+/// validation, so misidentified opcodes whose operands resolved to `Bool`,
+/// `Nil`, or a global name like `workspace` produced garbage like
+/// `((v1 .. false) .. v3) .. false` in 746-script corpus runs.
+pub(crate) fn mk_concat(left: Expr, right: Expr) -> Expr {
+    let left_bad = is_invalid_concat_operand(&left);
+    let right_bad = is_invalid_concat_operand(&right);
+    if left_bad || right_bad {
+        if !left_bad {
+            return left;
+        }
+        if !right_bad {
+            return right;
+        }
+        return left;
+    }
+    Expr::BinOp {
+        left: Box::new(left),
+        op: BinOp::Concat,
+        right: Box::new(right),
+    }
+}
+
+/// Phase B0.127: convert `Expr::String(s)` to `Expr::Name(s)` when `s` is a
+/// known stdlib / Roblox global name (per `is_stdlib_shadow_name`).
+///
+/// In Luau bytecode, global names like `math`, `game`, `workspace`, `task`,
+/// etc. are always accessed via GETIMPORT, which produces `Expr::Name(s)`.
+/// The Luau compiler never emits LOADK to load these names as string literals.
+/// When an `Expr::String("math")` appears as an *assignment value* (right-hand
+/// side of SETTABLEKS, SETTABLEN, SETTABLE, SETGLOBAL, SETUPVAL), it is
+/// virtually always NAMECALL/AUX leakage or a misidentified opcode reading
+/// the constant table at the wrong index.
+///
+/// Applying this guard in call-argument positions would be wrong: `print("game")`
+/// is legitimate Luau. So this function is called ONLY in assignment-value
+/// contexts by the per-opcode handlers.
+pub(super) fn sanitize_leaked_global_string(val: Expr) -> Expr {
+    if let Expr::String(ref s) = val {
+        if is_stdlib_shadow_name(s) {
+            return Expr::Name(s.clone());
+        }
+    }
+    val
+}
+
+/// C10L: detect a NumericFor bound that resolved to a stdlib name reference.
+/// `for i = os, v1, v2 do` is always a decompiler artifact from a deep-proto
+/// register leak — you cannot iterate from a library table.
+pub(super) fn is_stdlib_name_corruption(val: &Expr) -> bool {
+    matches!(val, Expr::Name(s) if is_stdlib_shadow_name(s))
+}
+
+pub(super) fn emit_assign(stmts: &mut Vec<Stat>, target: Expr, value: Expr) {
+    // B0.111: validate that the assignment target is a valid Luau lvalue.
+    // Luau only allows assignment to: Name, Name.field, Name[key], and
+    // deeper chains rooted in a Name. Expressions like ({})[k] = v,
+    // Instance.new(x).field = v, or (function()end).f = v are syntactically
+    // invalid and cause parse failures. When the root is not a Name, emit
+    // as a comment instead of a broken assignment.
+    if !is_valid_lvalue(&target) {
+        // Phase B0.115: include the invalid target in the comment for diagnostics.
+        let target_dbg = format!("{:?}", target);
+        let value_dbg = format!("{:?}", value);
+        let trunc_t = if target_dbg.len() > 80 { &target_dbg[..80] } else { &target_dbg };
+        let trunc_v = if value_dbg.len() > 80 { &value_dbg[..80] } else { &value_dbg };
+        stmts.push(Stat::Comment(format!(
+            "invalid lvalue: {} = {}", trunc_t, trunc_v
+        )));
+        return;
+    }
+    stmts.push(Stat::Assign {
+        targets: vec![target],
+        values: vec![value],
+    });
+}
+
+/// Check whether an expression is a valid Luau assignment target (lvalue).
+/// Valid lvalues must be rooted in a Name that is a valid identifier:
+/// `x`, `x.f`, `x[k]`, `x.f.g[k]`, etc. Names that are not valid identifiers
+/// (e.g., "AtomicBinding:BindRoot") get emitted as string literals by the
+/// emitter, making them invalid lvalue roots.
+fn is_valid_lvalue(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => is_identifier(n),
+        Expr::Field { object, .. } | Expr::Index { object, .. } => {
+            is_lvalue_root(object)
+        }
+        _ => false,
+    }
+}
+
+/// Walk down field/index chains to find the root expression.
+/// Returns true only if the root is a Name with a valid identifier.
+fn is_lvalue_root(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => is_identifier(n),
+        Expr::Field { object, .. } | Expr::Index { object, .. } => {
+            is_lvalue_root(object)
+        }
+        _ => false,
+    }
+}
+
+/// Quick identifier check: starts with [a-zA-Z_], rest [a-zA-Z0-9_], non-empty.
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Extract a string from a constant, regardless of its type.
+/// Returns the string for String constants, or resolves Import constants
+/// to their dot-separated name. Returns None for non-string-like constants.
+fn const_to_string(k: &Constant, strings: &[String], proto_constants: &[Constant]) -> Option<String> {
+    match k {
+        Constant::String(s) => Some(s.clone()),
+        Constant::Import(val) => {
+            let ids = decode_import(*val);
+            let parts: Vec<String> = ids.iter().filter_map(|&id| {
+                if let Some(Constant::String(s)) = proto_constants.get(id as usize) {
+                    Some(s.clone())
+                } else {
+                    strings.get(id as usize).cloned()
+                }
+            }).collect();
+            if !parts.is_empty() { Some(parts.join(".")) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Compute the Luau string hash (matches `luaS_hash` in the Luau VM).
+///
+/// This is a variant of FNV-1a used by Luau's string table and is the value
+/// stored in the AUX word of GETGLOBAL/SETGLOBAL instructions. We use it to
+/// build a reverse-lookup table: hash -> string name.
+///
+/// Algorithm (from Luau `lstring.cpp`):
+///   seed = len
+///   step = (len >> 5) + 1
+///   for i in (len..=1).step_by(step):  seed ^= (seed<<5) + (seed>>2) + byte[i-1]
+fn luau_hash(s: &[u8]) -> u32 {
+    let len = s.len();
+    let mut h = len as u32;
+    let step = (len >> 5) + 1;
+    let mut i = len;
+    while i >= step {
+        h ^= h.wrapping_shl(5)
+            .wrapping_add(h.wrapping_shr(2))
+            .wrapping_add(s[i - 1] as u32);
+        i -= step;
+    }
+    h
+}
+
+/// Try to find a string in `candidates` whose Luau hash equals `hash_val`.
+/// Returns the first match found. Used as a last-resort lookup when index-based
+/// strategies fail — the AUX is likely a hash, not an index.
+fn reverse_hash_lookup(candidates: &[String], hash_val: u32) -> Option<String> {
+    for s in candidates {
+        if luau_hash(s.as_bytes()) == hash_val {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+/// Resolve an AUX value to a string name, trying multiple lookup strategies.
+/// Used by GETGLOBAL/SETGLOBAL/GETTABLEKS/SETTABLEKS/NAMECALL.
+///
+/// Strategy tiers (each tier is tried with successively transformed index values):
+///
+/// **Tier A — Direct index lookups (raw AUX):**
+///   1. proto.constants[aux] as String/Import (0-based, matches Luau VM: VM_KV(aux))
+///   2. chunk.strings[aux] (0-based)
+///   3. proto.constants[aux-1] (1-based)
+///   4. chunk.strings[aux-1] (1-based, matches read_string_ref convention)
+///
+/// **Tier B — Lower-16-bit masked index** (upper bits may contain hash/flags):
+///   5-8. Same four lookups with `aux & 0xFFFF`
+///
+/// **Tier C — Upper-16-bit index** (some encodings pack index in high half):
+///   9-12. Same four lookups with `aux >> 16`
+///
+/// **Tier D — Lower-10-bit index** (import-style 10-bit field packing):
+///   13-16. Same four lookups with `aux & 0x3FF`
+///
+/// **Tier E — Hash reverse lookup** (AUX is a Luau string hash):
+///   17. Compute `luau_hash(s)` for every string in proto.constants and
+///       chunk.strings; return the first match.
+///   18. Same with `aux & 0xFFFF` as hash (masked variant).
+///
+/// Returns None if all lookups fail.
+fn resolve_aux_string(proto: &Proto, strings: &[String], aux: u32) -> Option<String> {
+    // Tier A: raw AUX as index
+    if let Some(s) = resolve_aux_string_at(proto, strings, aux) {
+        return Some(s);
+    }
+
+    // Tier B: lower 16 bits as index (upper bits may be hash/flags)
+    let masked16 = aux & 0xFFFF;
+    if masked16 != aux {
+        if let Some(s) = resolve_aux_string_at(proto, strings, masked16) {
+            return Some(s);
+        }
+    }
+
+    // Tier C: upper 16 bits as index
+    let upper16 = aux >> 16;
+    if upper16 > 0 && upper16 != aux {
+        if let Some(s) = resolve_aux_string_at(proto, strings, upper16) {
+            return Some(s);
+        }
+    }
+
+    // Tier D: lower 10 bits as index (import-style 10-bit packing)
+    let masked10 = aux & 0x3FF;
+    if masked10 != aux && masked10 != masked16 {
+        if let Some(s) = resolve_aux_string_at(proto, strings, masked10) {
+            return Some(s);
+        }
+    }
+
+    // Tier E: Luau hash reverse-lookup.
+    // The AUX word for GETGLOBAL/SETGLOBAL is canonically a string hash.
+    // For GETTABLEKS/SETTABLEKS/NAMECALL it is normally an index, but when
+    // index lookups all fail the AUX may have been misinterpreted and is
+    // actually a hash too (or the constant table is incomplete).
+    // We search proto string constants first (smaller, more likely), then
+    // chunk.strings.
+
+    // Collect all candidate strings from proto.constants (string constants only)
+    let proto_strings: Vec<&String> = proto.constants.iter().filter_map(|k| {
+        if let Constant::String(s) = k { Some(s) } else { None }
+    }).collect();
+
+    // Try hash match against proto string constants
+    for s in &proto_strings {
+        if luau_hash(s.as_bytes()) == aux {
+            return Some((*s).clone());
+        }
+    }
+    // Try hash match against chunk.strings
+    if let Some(s) = reverse_hash_lookup(strings, aux) {
+        return Some(s);
+    }
+    // Try masked hash variant
+    if masked16 != aux {
+        for s in &proto_strings {
+            if luau_hash(s.as_bytes()) == masked16 {
+                return Some((*s).clone());
+            }
+        }
+        if let Some(s) = reverse_hash_lookup(strings, masked16) {
+            return Some(s);
+        }
+    }
+
+    None
+}
+
+/// Try to resolve a single index value to a string via proto.constants and
+/// chunk.strings, with 0-based, 1-based, and +1 offset indexing.
+fn resolve_aux_string_at(proto: &Proto, strings: &[String], idx: u32) -> Option<String> {
+    // Strategy 1: proto.constants with 0-based indexing (primary path)
+    if let Some(k) = proto.constants.get(idx as usize) {
+        if let Some(s) = const_to_string(k, strings, &proto.constants) {
+            return Some(s);
+        }
+    }
+    // Strategy 2: chunk.strings with 0-based indexing
+    if let Some(s) = strings.get(idx as usize) {
+        return Some(s.clone());
+    }
+    // Strategy 3: proto.constants with 1-based indexing (idx-1)
+    if idx > 0 {
+        if let Some(k) = proto.constants.get((idx as usize) - 1) {
+            if let Some(s) = const_to_string(k, strings, &proto.constants) {
+                return Some(s);
+            }
+        }
+    }
+    // Strategy 4: chunk.strings with 1-based indexing (idx-1)
+    // The bytecode string table uses 1-based refs (read_string_ref subtracts 1),
+    // so AUX values from some opcodes may follow that convention.
+    if idx > 0 {
+        if let Some(s) = strings.get((idx as usize) - 1) {
+            return Some(s.clone());
+        }
+    }
+    // Strategy 5: proto.constants with idx+1 (off-by-one in the other direction)
+    if let Some(k) = proto.constants.get((idx as usize) + 1) {
+        if let Some(s) = const_to_string(k, strings, &proto.constants) {
+            return Some(s);
+        }
+    }
+    // Strategy 6: chunk.strings with idx+1
+    if let Some(s) = strings.get((idx as usize) + 1) {
+        return Some(s.clone());
+    }
+    None
+}
+
+/// Resolve a global name for GETGLOBAL/SETGLOBAL using both the D field
+/// (constant index K[D]) and the AUX word (which may be a hash or index).
+///
+/// In the Luau VM, GETGLOBAL is `A D [AUX]` where:
+///   - K[D] is the String constant holding the global's name
+///   - AUX is typically a hash of that string (used for fast table lookup)
+///
+/// However, in Roblox's shuffled bytecode, AUX sometimes doubles as a
+/// constant index. We try K[D] first (the canonical source), then fall back
+/// to AUX-based resolution, then finally to known-globals inference.
+pub(super) fn resolve_global_name(proto: &Proto, strings: &[String], d: i16, aux: Option<u32>) -> Option<String> {
+    // Primary: K[D] — the D field is a signed 16-bit constant index
+    let d_unsigned = d as u16 as usize;
+    if let Some(k) = proto.constants.get(d_unsigned) {
+        if let Some(s) = const_to_string(k, strings, &proto.constants) {
+            return Some(s);
+        }
+    }
+
+    // Also try chunk.strings[D] directly (0-based)
+    if let Some(s) = strings.get(d_unsigned) {
+        return Some(s.clone());
+    }
+
+    // Try 1-based K[D-1]
+    if d_unsigned > 0 {
+        if let Some(k) = proto.constants.get(d_unsigned - 1) {
+            if let Some(s) = const_to_string(k, strings, &proto.constants) {
+                return Some(s);
+            }
+        }
+        if let Some(s) = strings.get(d_unsigned - 1) {
+            return Some(s.clone());
+        }
+    }
+
+    // Try K[D+1] (off-by-one other direction)
+    if let Some(k) = proto.constants.get(d_unsigned + 1) {
+        if let Some(s) = const_to_string(k, strings, &proto.constants) {
+            return Some(s);
+        }
+    }
+
+    // Fallback: AUX-based resolution (multi-strategy including hash reverse lookup)
+    if let Some(ax) = aux {
+        if let Some(s) = resolve_aux_string(proto, strings, ax) {
+            return Some(s);
+        }
+    }
+
+    None
+}
+
+/// The canonical AUX resolution: `proto.constants[aux]` read as a string, which
+/// is exactly what the Luau VM does for GETTABLEKS/SETTABLEKS (`VM_KV(aux)`).
+///
+/// This tier is deliberately NOT filtered by [`is_plausible_field_name`]. That
+/// guard exists to reject garbage produced by the *speculative* tiers (masked
+/// indices, hash reverse-lookup), and applying it here rejected legitimate keys.
+/// `pprint`'s escape table is keyed by control characters — `"\7"`, `"\9"` and
+/// friends — and every one of them was thrown away and replaced by a fabricated
+/// `field_N`, so the table it built could never match the characters it was
+/// meant to escape.
+///
+/// Matches `Constant::String` directly rather than going through
+/// `const_to_string`, which also stringifies `Constant::Import` by joining its
+/// parts. An Import is not a field key, and admitting one here unfiltered would
+/// be a new way to emit a wrong name.
+fn resolve_aux_string_canonical(proto: &Proto, aux: u32) -> Option<String> {
+    match proto.constants.get(aux as usize) {
+        Some(Constant::String(s)) if !s.is_empty() && s.len() <= 200 => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Get a string from AUX value for GETTABLEKS/SETTABLEKS.
+pub(super) fn get_table_string_from_aux(proto: &Proto, strings: &[String], aux: u32) -> String {
+    // Canonical tier first, unfiltered: if the VM would read this constant, so do we.
+    if let Some(s) = resolve_aux_string_canonical(proto, aux) {
+        return s;
+    }
+    resolve_aux_string(proto, strings, aux)
+        .filter(|s| is_plausible_field_name(s))
+        .unwrap_or_else(|| {
+            log::warn!(
+                "UNRESOLVED field AUX: aux=0x{:08X} ({}) | proto.constants.len()={} | chunk.strings.len()={} | aux_as_insn: op=0x{:02X} A=0x{:02X} B=0x{:02X} C=0x{:02X}",
+                aux, aux, proto.constants.len(), strings.len(),
+                aux & 0xFF, (aux >> 8) & 0xFF, (aux >> 16) & 0xFF, (aux >> 24) & 0xFF
+            );
+            format!("field_{}", aux & 0xFFFF)
+        })
+}
+
+/// Phase B0.113: reject garbage strings resolved by the fallback tiers.
+/// Real field/method names never contain control characters, newlines, or
+/// null bytes. Pattern strings like `%*\n%*` (format strings or error
+/// messages) that get matched via hash reverse-lookup are caught here.
+fn is_plausible_field_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.bytes().any(|b| b < 0x20 || b == 0x7F)
+}
+
+/// Get a string from AUX value for NAMECALL (method name).
+/// Same resolution as get_table_string_from_aux but with "method" fallback prefix
+/// so unresolved method names don't masquerade as field accesses.
+pub(super) fn get_method_string_from_aux(proto: &Proto, strings: &[String], aux: u32) -> String {
+    resolve_aux_string(proto, strings, aux)
+        .filter(|s| is_plausible_field_name(s))
+        .unwrap_or_else(|| {
+            log::warn!(
+                "UNRESOLVED method AUX: aux=0x{:08X} ({}) | proto.constants.len()={} | chunk.strings.len()={}",
+                aux, aux, proto.constants.len(), strings.len()
+            );
+            format!("method_{}", aux & 0xFFFF)
+        })
+}
+
+#[allow(dead_code)]
+fn const_type_name(k: &Constant) -> &'static str {
+    match k {
+        Constant::Nil => "Nil",
+        Constant::Boolean(_) => "Bool",
+        Constant::Number(_) => "Number",
+        Constant::String(_) => "String",
+        Constant::Import(_) => "Import",
+        Constant::Table(_) => "Table",
+        Constant::Closure(_) => "Closure",
+        Constant::Vector(..) => "Vector",
+    }
+}
+
+pub(super) fn get_const_expr(proto: &Proto, strings: &[String], idx: u32) -> Expr {
+    // Primary: proto.constants with 0-based indexing (bounds-checked via .get())
+    if let Some(k) = proto.constants.get(idx as usize) {
+        return constant_to_expr(k, strings, &proto.constants);
+    }
+    // Fallback: chunk.strings with 0-based indexing
+    if let Some(s) = strings.get(idx as usize) {
+        return Expr::String(s.clone());
+    }
+    // AUX is wrong — emit nil instead of a visible placeholder
+    Expr::Nil
+}
+
+// ---------------------------------------------------------------------------
+// Upvalue renaming pass
+// ---------------------------------------------------------------------------
+
+/// Returns true if `name` matches the pattern `upval_N` (an unresolved upvalue).
+fn is_upval_name(name: &str) -> bool {
+    name.starts_with("upval_") && name.len() > 6 && name[6..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Scan a statement list (and all nested bodies) for usage patterns of
+/// `upval_N` names. Returns a map from each upval name to the best
+/// inferred replacement name (a Roblox global like `game`, `script`, etc.).
+///
+/// Evidence collection is exhaustive: every expression and statement is walked
+/// recursively (including into nested closures). The decision tree at the end
+/// is ordered from most-specific to least-specific so that ambiguous cases
+/// resolve to the most useful name.
+fn infer_upval_names(stmts: &[Stat]) -> HashMap<String, String> {
+    #[derive(Default)]
+    struct Evidence {
+        // --- game ---
+        get_service: bool,
+        // --- Players (service) ---
+        local_player: bool,
+        // --- script ---
+        find_first_child: bool,
+        wait_for_child: bool,
+        parent_access: bool,            // .Parent, .Name, .ClassName
+        shared_client_server: bool,     // .Shared, .Client, .Server (module hierarchy)
+        // --- workspace ---
+        workspace_methods: bool,        // :Raycast, :Blockcast, :FindPartOnRay, etc.
+        // --- CFrame / Vector3 ---
+        cframe_methods: bool,
+        has_new_field: bool,            // .new (constructor access -- CFrame.new, etc.)
+        // --- Roblox datatype disambiguation for .new ---
+        vector3_evidence: bool,         // .Magnitude, .Unit, :Cross, :Dot
+        udim2_evidence: bool,           // .fromScale, .fromOffset
+        color3_evidence: bool,          // .R, .G, .B, :ToHSV, .fromRGB, .fromHSV
+        // --- Instance methods ---
+        clone_destroy: bool,            // :Clone, :Destroy, :IsA, etc.
+        // --- TweenService ---
+        create_method: bool,            // :Create
+        // --- Remote events/functions ---
+        remote_fire: bool,              // :FireServer, :InvokeServer
+        remote_listen: bool,            // .OnServerEvent, .OnClientEvent
+        connect_method: bool,           // :Connect, :Once
+        // --- Assignment evidence ---
+        assigned_from_pairs: bool,      // upval_N = pairs
+        assigned_from_ipairs: bool,     // upval_N = ipairs
+        assigned_from_require: bool,    // upval_N = require(...)
+        // Phase B0.83: direct assignment name from RHS expression
+        // (e.g., upval_N = game:GetService("Players") → "Players")
+        assigned_name: Option<String>,
+        // --- Every field and method accessed (for library heuristics) ---
+        all_fields: Vec<String>,
+        all_methods: Vec<String>,
+    }
+
+    let mut evidence: HashMap<String, Evidence> = HashMap::new();
+
+    fn scan_expr(expr: &Expr, evidence: &mut HashMap<String, Evidence>) {
+        match expr {
+            Expr::MethodCall { object, method, args, .. } => {
+                if let Expr::Name(name) = object.as_ref() {
+                    if is_upval_name(name) {
+                        let ev = evidence.entry(name.clone()).or_default();
+                        ev.all_methods.push(method.clone());
+                        match method.as_str() {
+                            "GetService" | "FindService" => ev.get_service = true,
+                            "FindFirstChild" | "FindFirstChildOfClass"
+                            | "FindFirstChildWhichIsA" => ev.find_first_child = true,
+                            "WaitForChild" => ev.wait_for_child = true,
+                            "Clone" | "Destroy" | "GetChildren" | "GetDescendants"
+                            | "IsA" | "GetAttribute" | "SetAttribute"
+                            | "GetPropertyChangedSignal" => ev.clone_destroy = true,
+                            "Create" => ev.create_method = true,
+                            "Connect" | "connect" | "Once" | "once"
+                            | "Wait" | "wait" => ev.connect_method = true,
+                            // CFrame/rotation methods
+                            "toEulerAnglesYXZ" | "ToEulerAnglesYXZ"
+                            | "Inverse" | "inverse" | "Lerp" | "lerp"
+                            | "ToWorldSpace" | "ToObjectSpace"
+                            | "toWorldSpace" | "toObjectSpace"
+                            | "PointToWorldSpace" | "PointToObjectSpace"
+                            | "VectorToWorldSpace" | "VectorToObjectSpace"
+                            | "components" => ev.cframe_methods = true,
+                            // Workspace raycasting
+                            "Raycast" | "Blockcast" | "Spherecast" | "Shapecast"
+                            | "FindPartOnRay" | "FindPartOnRayWithIgnoreList"
+                            | "FindPartOnRayWithWhitelist"
+                            | "FindPartsInRegion3" | "FindPartsInRegion3WithIgnoreList" => ev.workspace_methods = true,
+                            // Remote events/functions
+                            "FireServer" | "InvokeServer"
+                            | "FireClient" | "InvokeClient"
+                            | "FireAllClients" => ev.remote_fire = true,
+                            // Vector3 methods
+                            "Cross" | "Dot" | "FuzzyEq" => ev.vector3_evidence = true,
+                            // Color3 methods
+                            "ToHSV" => ev.color3_evidence = true,
+                            _ => {}
+                        }
+                    }
+                }
+                scan_expr(object, evidence);
+                for arg in args { scan_expr(arg, evidence); }
+            }
+            Expr::Field { object, field, .. } => {
+                if let Expr::Name(name) = object.as_ref() {
+                    if is_upval_name(name) {
+                        let ev = evidence.entry(name.clone()).or_default();
+                        ev.all_fields.push(field.clone());
+                        match field.as_str() {
+                            "LocalPlayer" => ev.local_player = true,
+                            "Parent" | "Name" | "ClassName" => ev.parent_access = true,
+                            "Shared" | "Client" | "Server" => ev.shared_client_server = true,
+                            "new" => ev.has_new_field = true,
+                            // Remote event/function signals
+                            "OnServerEvent" | "OnClientEvent"
+                            | "OnServerInvoke" | "OnClientInvoke" => ev.remote_listen = true,
+                            // Vector3-specific fields
+                            "Magnitude" | "Unit" => ev.vector3_evidence = true,
+                            // Color3-specific fields
+                            "R" | "G" | "B" | "fromRGB" | "fromHSV" => ev.color3_evidence = true,
+                            // UDim2 hints
+                            "fromScale" | "fromOffset" => ev.udim2_evidence = true,
+                            _ => {}
+                        }
+                    }
+                }
+                scan_expr(object, evidence);
+            }
+            Expr::Call { func, args } => {
+                // Detect upval used as direct call target: upval_N(...)
+                if let Expr::Name(name) = func.as_ref() {
+                    if is_upval_name(name) {
+                        let ev = evidence.entry(name.clone()).or_default();
+                        ev.all_methods.push("__call__".to_string());
+                    }
+                }
+                scan_expr(func, evidence);
+                for arg in args { scan_expr(arg, evidence); }
+            }
+            Expr::BinOp { left, right, .. } => {
+                scan_expr(left, evidence);
+                scan_expr(right, evidence);
+            }
+            Expr::UnOp { operand, .. } => scan_expr(operand, evidence),
+            Expr::Index { object, key } => {
+                scan_expr(object, evidence);
+                scan_expr(key, evidence);
+            }
+            Expr::Table { fields } => {
+                for f in fields {
+                    match f {
+                        TableField::Sequential(e) => scan_expr(e, evidence),
+                        TableField::Named(_, e) => scan_expr(e, evidence),
+                        TableField::Indexed(k, v) => {
+                            scan_expr(k, evidence);
+                            scan_expr(v, evidence);
+                        }
+                    }
+                }
+            }
+            Expr::Function { body, .. } => scan_stmts(body, evidence),
+            _ => {}
+        }
+    }
+
+    /// Check assignment RHS for known value patterns.
+    ///
+    /// Phase B0.83: extended to extract direct names from assignment RHS:
+    /// - `upval_N = X:GetService("Players")` → assigned_name = "Players"
+    /// - `upval_N = X:FindFirstChild("Module")` → assigned_name = "Module"
+    /// - `upval_N = X.FieldName` → assigned_name = "FieldName"
+    fn check_assign_value(upval_name: &str, value: &Expr, evidence: &mut HashMap<String, Evidence>) {
+        match value {
+            Expr::Name(rhs) => {
+                match rhs.as_str() {
+                    "pairs" => evidence.entry(upval_name.to_string()).or_default().assigned_from_pairs = true,
+                    "ipairs" => evidence.entry(upval_name.to_string()).or_default().assigned_from_ipairs = true,
+                    _ => {
+                        // B0.131b: upval_N = LocalName → use LocalName as
+                        // assigned_name fallback (only when the RHS is a
+                        // non-generic, non-stdlib semantic identifier).
+                        if is_valid_luau_identifier(rhs)
+                            && !is_stdlib_shadow_name(rhs)
+                            && !is_upval_name(rhs)
+                            && !(rhs.starts_with('v') && rhs.len() > 1 && rhs[1..].chars().all(|c| c.is_ascii_digit()))
+                            && !(rhs.starts_with("arg") && rhs.len() > 3 && rhs[3..].chars().all(|c| c.is_ascii_digit()))
+                            && !(rhs.starts_with("fn") && rhs.len() > 2 && rhs[2..].chars().all(|c| c.is_ascii_digit()))
+                        {
+                            let ev = evidence.entry(upval_name.to_string()).or_default();
+                            if ev.assigned_name.is_none() {
+                                ev.assigned_name = Some(rhs.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Call { func, .. } => {
+                if let Expr::Name(fname) = func.as_ref() {
+                    if fname == "require" {
+                        evidence.entry(upval_name.to_string()).or_default().assigned_from_require = true;
+                    }
+                }
+            }
+            // Phase B0.83: extract name from method call patterns
+            // upval_N = X:GetService("Players") → "Players"
+            Expr::MethodCall { method, args, .. } => {
+                const NAMING_METHODS: &[&str] = &[
+                    "GetService", "FindFirstChild", "FindFirstChildOfClass",
+                    "FindFirstChildWhichIsA", "FindFirstAncestor",
+                    "FindFirstAncestorOfClass", "FindFirstAncestorWhichIsA",
+                    "WaitForChild",
+                ];
+                if NAMING_METHODS.contains(&method.as_str()) {
+                    if let Some(Expr::String(s)) = args.first() {
+                        if is_valid_luau_identifier(s) && !is_stdlib_shadow_name(s) {
+                            let ev = evidence.entry(upval_name.to_string()).or_default();
+                            if ev.assigned_name.is_none() {
+                                ev.assigned_name = Some(s.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Phase B0.83: extract name from field access
+            // upval_N = X.FieldName → "FieldName"
+            Expr::Field { field, .. } => {
+                if is_valid_luau_identifier(field) && !is_stdlib_shadow_name(field) {
+                    let ev = evidence.entry(upval_name.to_string()).or_default();
+                    if ev.assigned_name.is_none() {
+                        ev.assigned_name = Some(field.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(stmts: &[Stat], evidence: &mut HashMap<String, Evidence>) {
+        for stmt in stmts {
+            match stmt {
+                Stat::Local { values, .. } => {
+                    for v in values { scan_expr(v, evidence); }
+                }
+                Stat::Assign { targets, values } => {
+                    // Check for assignment TO an upval_N (upval_N = <value>)
+                    for (i, t) in targets.iter().enumerate() {
+                        if let Expr::Name(name) = t {
+                            if is_upval_name(name) {
+                                if let Some(val) = values.get(i) {
+                                    check_assign_value(name, val, evidence);
+                                }
+                            }
+                        }
+                        scan_expr(t, evidence);
+                    }
+                    for v in values { scan_expr(v, evidence); }
+                }
+                Stat::ExprStat(e) => scan_expr(e, evidence),
+                Stat::Return { values } => {
+                    for v in values { scan_expr(v, evidence); }
+                }
+                Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                    scan_expr(condition, evidence);
+                    scan_stmts(then_body, evidence);
+                    for (cond, body) in elseif_clauses {
+                        scan_expr(cond, evidence);
+                        scan_stmts(body, evidence);
+                    }
+                    if let Some(eb) = else_body { scan_stmts(eb, evidence); }
+                }
+                Stat::While { condition, body } => {
+                    scan_expr(condition, evidence);
+                    scan_stmts(body, evidence);
+                }
+                Stat::Repeat { body, condition } => {
+                    scan_stmts(body, evidence);
+                    scan_expr(condition, evidence);
+                }
+                Stat::NumericFor { start, stop, step, body, .. } => {
+                    scan_expr(start, evidence);
+                    scan_expr(stop, evidence);
+                    if let Some(s) = step { scan_expr(s, evidence); }
+                    scan_stmts(body, evidence);
+                }
+                Stat::GenericFor { iterators, body, .. } => {
+                    for it in iterators { scan_expr(it, evidence); }
+                    scan_stmts(body, evidence);
+                }
+                Stat::DoBlock { body } => scan_stmts(body, evidence),
+                _ => {}
+            }
+        }
+    }
+
+    scan_stmts(stmts, &mut evidence);
+
+    let mut renames: HashMap<String, String> = HashMap::new();
+    let mut used_replacements: HashSet<String> = HashSet::new();
+
+    let mut upvals: Vec<(String, Evidence)> = evidence.into_iter().collect();
+    upvals.sort_by(|a, b| {
+        let a_idx: usize = a.0[6..].parse().unwrap_or(usize::MAX);
+        let b_idx: usize = b.0[6..].parse().unwrap_or(usize::MAX);
+        a_idx.cmp(&b_idx)
+    });
+
+    for (upval_name, ev) in upvals {
+        // Phase B0.83: direct assignment name takes highest priority
+        // when the upval has no strong usage-based evidence that
+        // would contradict it (e.g., GetService usage still wins).
+        let replacement = if ev.get_service {
+            // Definitive: :GetService() is unique to `game`
+            "game"
+        } else if ev.workspace_methods {
+            // Raycasting methods are unique to workspace
+            "workspace"
+        } else if ev.remote_fire || ev.remote_listen {
+            // :FireServer / .OnServerEvent -- remote event/function
+            "remoteEvent"
+        } else if ev.local_player && !ev.shared_client_server {
+            // .LocalPlayer without module-path fields -- Players service
+            "Players"
+        } else if ev.shared_client_server {
+            // .Shared, .Client, .Server -- module hierarchy on script
+            "script"
+        } else if ev.find_first_child || ev.wait_for_child || ev.parent_access {
+            // Instance navigation -- usually script in main closures
+            "script"
+        } else if ev.cframe_methods && !ev.has_new_field {
+            // CFrame instance (not the CFrame constructor)
+            "cframe"
+        } else if ev.has_new_field {
+            // .new constructor -- try to distinguish which datatype
+            if ev.color3_evidence || has_any_field(&ev.all_fields, &["fromRGB", "fromHSV"]) {
+                "Color3"
+            } else if ev.udim2_evidence || has_any_field(&ev.all_fields, &["fromScale", "fromOffset"]) {
+                "UDim2"
+            } else if ev.vector3_evidence || has_any_field(&ev.all_fields, &["Magnitude", "Unit"]) {
+                "Vector3"
+            } else if ev.cframe_methods
+                || has_any_field(&ev.all_fields, &["Angles", "fromEulerAnglesXYZ",
+                   "fromEulerAnglesYXZ", "lookAt", "identity"])
+            {
+                "CFrame"
+            } else if has_any_field(&ev.all_fields, &["xAxis", "yAxis", "zAxis", "one", "zero"]) {
+                "Vector3"
+            } else {
+                // Generic .new -- default to Instance
+                "Instance"
+            }
+        } else if ev.create_method {
+            "TweenService"
+        } else if ev.clone_destroy {
+            "instance"
+        } else if ev.connect_method {
+            "event"
+        } else if ev.assigned_from_pairs || ev.assigned_from_ipairs {
+            // upval_N = pairs/ipairs -- stdlib capture, skip renaming
+            continue;
+        } else if ev.assigned_from_require {
+            "module"
+        } else if is_math_library(&ev.all_fields) {
+            "math"
+        } else if is_string_library(&ev.all_methods) {
+            "string"
+        } else if is_table_library(&ev.all_fields) {
+            "table"
+        } else if is_bit32_library(&ev.all_fields, &ev.all_methods) {
+            "bit32"
+        } else if is_coroutine_library(&ev.all_methods) {
+            "coroutine"
+        } else if is_debug_library(&ev.all_methods) {
+            "debug"
+        } else if is_os_library(&ev.all_fields) {
+            "os"
+        } else if !ev.all_methods.is_empty() && ev.all_methods.iter().all(|m| m == "__call__") {
+            // Only used as a direct call — it's a function
+            "func"
+        } else if let Some(ref name) = ev.assigned_name {
+            // Phase B0.83: direct assignment name as fallback when
+            // usage-based heuristics don't give a strong signal.
+            // e.g., `upval_N = game:GetService("Players")` → "Players"
+            name.as_str()
+        } else if !ev.all_fields.is_empty() || !ev.all_methods.is_empty() {
+            // Has some usage but no strong signal — generic module/lib
+            "lib"
+        } else {
+            // No usage evidence at all — leave as upval_N
+            continue;
+        };
+
+        let final_name = if used_replacements.contains(replacement) {
+            let mut suffix = 2;
+            loop {
+                let candidate = format!("{}_{}", replacement, suffix);
+                if !used_replacements.contains(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            }
+        } else {
+            replacement.to_string()
+        };
+
+        used_replacements.insert(final_name.clone());
+        renames.insert(upval_name, final_name);
+    }
+
+    renames
+}
+
+/// Check if any of `needles` appear in a list of field names.
+fn has_any_field(fields: &[String], needles: &[&str]) -> bool {
+    fields.iter().any(|f| needles.contains(&f.as_str()))
+}
+
+/// Heuristic: does the set of accessed fields look like the `math` library?
+fn is_math_library(fields: &[String]) -> bool {
+    const MATH_FIELDS: &[&str] = &[
+        "floor", "ceil", "abs", "sqrt", "sin", "cos", "tan", "asin", "acos",
+        "atan", "atan2", "exp", "log", "log10", "max", "min", "pow", "random",
+        "randomseed", "huge", "pi", "clamp", "sign", "round", "noise",
+        "rad", "deg", "fmod", "modf", "frexp", "ldexp",
+    ];
+    let matches = fields.iter().filter(|f| MATH_FIELDS.contains(&f.as_str())).count();
+    // Lower threshold to 1 — single math field access is sufficient signal
+    matches >= 1
+}
+
+/// Heuristic: does the set of called methods look like the `string` library?
+fn is_string_library(methods: &[String]) -> bool {
+    const STRING_METHODS: &[&str] = &[
+        "format", "find", "match", "gmatch", "gsub", "sub", "rep",
+        "reverse", "upper", "lower", "byte", "char", "len", "split",
+    ];
+    let matches = methods.iter().filter(|m| STRING_METHODS.contains(&m.as_str())).count();
+    matches >= 1
+}
+
+/// Heuristic: does the set of accessed fields look like the `table` library?
+fn is_table_library(fields: &[String]) -> bool {
+    const TABLE_FIELDS: &[&str] = &[
+        "insert", "remove", "sort", "concat", "move", "create",
+        "find", "pack", "unpack", "freeze", "isfrozen", "clone",
+        "clear", "getn", "foreach", "foreachi",
+    ];
+    let matches = fields.iter().filter(|f| TABLE_FIELDS.contains(&f.as_str())).count();
+    matches >= 1
+}
+
+
+fn rename_expr(expr: &mut Expr, renames: &HashMap<String, String>) {
+    match expr {
+        Expr::Name(name) => {
+            if let Some(replacement) = renames.get(name.as_str()) {
+                *name = replacement.clone();
+            }
+        }
+        Expr::Field { object, .. } => rename_expr(object, renames),
+        Expr::Index { object, key } => {
+            rename_expr(object, renames);
+            rename_expr(key, renames);
+        }
+        Expr::BinOp { left, right, .. } => {
+            rename_expr(left, renames);
+            rename_expr(right, renames);
+        }
+        Expr::UnOp { operand, .. } => rename_expr(operand, renames),
+        Expr::Call { func, args } => {
+            rename_expr(func, renames);
+            for arg in args { rename_expr(arg, renames); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            rename_expr(object, renames);
+            for arg in args { rename_expr(arg, renames); }
+        }
+        Expr::Function { body, .. } => {
+            apply_renames_to_stmts(body, renames);
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => rename_expr(e, renames),
+                    TableField::Named(_, e) => rename_expr(e, renames),
+                    TableField::Indexed(k, v) => {
+                        rename_expr(k, renames);
+                        rename_expr(v, renames);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_renames_to_stmts(stmts: &mut [Stat], renames: &HashMap<String, String>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::Local { names, values } => {
+                for name in names.iter_mut() {
+                    if let Some(replacement) = renames.get(name.as_str()) {
+                        *name = replacement.clone();
+                    }
+                }
+                for v in values { rename_expr(v, renames); }
+            }
+            Stat::Assign { targets, values } => {
+                for t in targets { rename_expr(t, renames); }
+                for v in values { rename_expr(v, renames); }
+            }
+            Stat::ExprStat(e) => rename_expr(e, renames),
+            Stat::Return { values } => {
+                for v in values { rename_expr(v, renames); }
+            }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                rename_expr(condition, renames);
+                apply_renames_to_stmts(then_body, renames);
+                for (cond, body) in elseif_clauses {
+                    rename_expr(cond, renames);
+                    apply_renames_to_stmts(body, renames);
+                }
+                if let Some(eb) = else_body { apply_renames_to_stmts(eb, renames); }
+            }
+            Stat::While { condition, body } => {
+                rename_expr(condition, renames);
+                apply_renames_to_stmts(body, renames);
+            }
+            Stat::Repeat { body, condition } => {
+                apply_renames_to_stmts(body, renames);
+                rename_expr(condition, renames);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                rename_expr(start, renames);
+                rename_expr(stop, renames);
+                if let Some(s) = step { rename_expr(s, renames); }
+                apply_renames_to_stmts(body, renames);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                for it in iterators { rename_expr(it, renames); }
+                apply_renames_to_stmts(body, renames);
+            }
+            Stat::DoBlock { body } => apply_renames_to_stmts(body, renames),
+            _ => {}
+        }
+    }
+}
+
+/// Post-processing pass: scan the AST for `upval_N` usage patterns and
+/// rename them to likely Roblox globals based on how they are used.
+fn rename_upvals(stmts: &mut Vec<Stat>) {
+    let renames = infer_upval_names(stmts);
+    if !renames.is_empty() {
+        apply_renames_to_stmts(stmts, &renames);
+    }
+}
+
+// Phase C2 pass #2: recursive upvalue name propagation.
+//
+// Iteration cap for the bounded fixpoint. Deep closure nests in Roblox scripts
+// rarely exceed 3 levels; 5 is a generous ceiling that still guarantees fast
+// termination on malformed (cyclic) parent-link maps.
+pub(crate) const PROPAGATE_UPVAL_MAX_ITERATIONS: usize = 5;
+
+/// Single pass of parent→child upvalue-name propagation.
+///
+/// For every entry in `links` (maps `child_proto_index` → list of
+/// `(child_upval_slot, parent_proto_index, parent_upval_slot)`), if the parent's
+/// upvalue slot already has a resolved name in `inferred` (or in the parent's
+/// debug info via lookup) AND the child's slot is still an empty/`upval_N`
+/// placeholder, copy the parent name into the child slot.
+///
+/// Returns `true` when at least one slot was updated. Invoke inside a bounded
+/// loop to propagate multi-level chains (grandchild → grandparent).
+///
+/// Defensive against malformed `links` maps: bogus proto indices or out-of-range
+/// upvalue slots are skipped rather than panicking, and the caller's iteration
+/// cap prevents infinite loops on genuinely cyclic links.
+fn propagate_upval_names_once(
+    protos: &[Proto],
+    inferred: &mut HashMap<usize, Vec<String>>,
+    links: &HashMap<usize, Vec<(usize, usize, u8)>>,
+) -> bool {
+    let num_protos = protos.len();
+    let mut changed = false;
+
+    // Snapshot the links to keep the borrow of `links` read-only while we mutate
+    // `inferred`. The clone cost is trivial (at most a few entries per proto).
+    let snapshot: Vec<(usize, Vec<(usize, usize, u8)>)> = links
+        .iter()
+        .map(|(child_idx, l)| (*child_idx, l.clone()))
+        .collect();
+
+    for (child_idx, child_links) in snapshot {
+        if child_idx >= num_protos { continue; }
+        for (child_slot, parent_pi, parent_upval) in child_links {
+            if parent_pi >= num_protos { continue; }
+
+            // Resolve parent name. Priority: debug info > inferred map. Bail
+            // early if no resolved name is available yet (still `upval_N`).
+            let parent_proto = &protos[parent_pi];
+            let parent_name = parent_upvalue_resolved_name(
+                parent_proto,
+                inferred.get(&parent_pi).map(|v| v.as_slice()),
+                parent_upval,
+            );
+            let parent_name = match parent_name {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Propagate into child's slot. Grow the vec to the full upvalue
+            // count if necessary — early lifting may have left a shorter vec.
+            let num_upvals_child = protos[child_idx].num_upvalues as usize;
+            let entry = inferred
+                .entry(child_idx)
+                .or_insert_with(|| vec![String::new(); num_upvals_child]);
+            if entry.len() < num_upvals_child {
+                entry.resize(num_upvals_child, String::new());
+            }
+            if let Some(slot) = entry.get_mut(child_slot) {
+                if slot.is_empty() || slot.starts_with("upval_") {
+                    *slot = parent_name;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Resolve the real name for `parent_proto`'s `upval_slot`, using debug info
+/// first (if present and valid), then the inferred-names map. Returns `None`
+/// when still unresolved (i.e., the caller should leave the child alone).
+fn parent_upvalue_resolved_name(
+    parent_proto: &Proto,
+    inferred_for_parent: Option<&[String]>,
+    upval_slot: u8,
+) -> Option<String> {
+    let idx = upval_slot as usize;
+    // Debug info (non-stripped bytecode).
+    if let Some(ref debug) = parent_proto.debug_info {
+        if let Some(name) = debug.upvalue_names.get(idx) {
+            if !name.is_empty()
+                && is_valid_luau_identifier(name)
+                && !is_stdlib_shadow_name(name)
+            {
+                return Some(name.clone());
+            }
+        }
+    }
+    // Inferred names.
+    if let Some(names) = inferred_for_parent {
+        if let Some(name) = names.get(idx) {
+            if !name.is_empty() && !name.starts_with("upval_") {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Heuristic: does the set of fields look like the `bit32` library?
+fn is_bit32_library(fields: &[String], methods: &[String]) -> bool {
+    const BIT32: &[&str] = &[
+        "band", "bor", "bxor", "bnot", "lshift", "rshift", "arshift",
+        "lrotate", "rrotate", "extract", "replace", "countlz", "countrz",
+        "btest", "byteswap",
+    ];
+    let f = fields.iter().filter(|f| BIT32.contains(&f.as_str())).count();
+    let m = methods.iter().filter(|m| BIT32.contains(&m.as_str())).count();
+    (f + m) >= 1
+}
+
+/// Heuristic: does the set of methods look like the `coroutine` library?
+fn is_coroutine_library(methods: &[String]) -> bool {
+    const COROUTINE: &[&str] = &[
+        "create", "resume", "yield", "wrap", "status", "running",
+        "isyieldable", "close",
+    ];
+    methods.iter().filter(|m| COROUTINE.contains(&m.as_str())).count() >= 1
+}
+
+/// Heuristic: does the set of methods look like the `debug` library?
+fn is_debug_library(methods: &[String]) -> bool {
+    const DEBUG: &[&str] = &[
+        "traceback", "info", "profilebegin", "profileend",
+        "getinfo", "getlocal", "setlocal", "getupvalue", "setupvalue",
+        "getmetatable", "setmetatable",
+    ];
+    methods.iter().filter(|m| DEBUG.contains(&m.as_str())).count() >= 1
+}
+
+/// Heuristic: does the set of fields look like the `os` library?
+fn is_os_library(fields: &[String]) -> bool {
+    const OS: &[&str] = &["time", "clock", "difftime", "date"];
+    fields.iter().filter(|f| OS.contains(&f.as_str())).count() >= 1
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// METHOD CHAIN COLLAPSE — combines sequential method calls into chains
+// ═══════════════════════════════════════════════════════════════════
+
+/// Post-processing pass: collapse patterns like:
+///   local v0 = obj:Method1(a1)
+///   v0 = v0:Method2(a2)
+///   v0 = v0:Method3(a3)
+/// Into:
+///   local v0 = obj:Method1(a1):Method2(a2):Method3(a3)
+fn collapse_method_chains(stmts: &mut Vec<Stat>) {
+    // Recurse into nested blocks first
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                collapse_method_chains(then_body);
+                for (_, body) in elseif_clauses {
+                    collapse_method_chains(body);
+                }
+                if let Some(eb) = else_body { collapse_method_chains(eb); }
+            }
+            Stat::While { body, .. } => collapse_method_chains(body),
+            Stat::Repeat { body, .. } => collapse_method_chains(body),
+            Stat::NumericFor { body, .. } => collapse_method_chains(body),
+            Stat::GenericFor { body, .. } => collapse_method_chains(body),
+            Stat::DoBlock { body } => collapse_method_chains(body),
+            _ => {}
+        }
+    }
+
+    // Collapse consecutive call/method chains.
+    // Handles two patterns:
+    // 1. Same-name:  `local v0 = obj:M1()` + `v0 = v0:M2()` → `local v0 = obj:M1():M2()`
+    // 2. Diff-name:  `local call = obj:M1()` + `call2 = call:M2()` → `call2 = obj:M1():M2()`
+    //    (removes the intermediate temp and inlines the expression)
+    let mut i = 0;
+    while i + 1 < stmts.len() {
+        // Extract definition: variable name from a call/method expression
+        let prev_name = match &stmts[i] {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                match &values[0] {
+                    Expr::Call { .. } | Expr::MethodCall { .. } => names[0].clone(),
+                    _ => { i += 1; continue; }
+                }
+            }
+            Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+                match (&targets[0], &values[0]) {
+                    (Expr::Name(n), Expr::Call { .. } | Expr::MethodCall { .. }) => n.clone(),
+                    _ => { i += 1; continue; }
+                }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Check if stmt[i+1] uses prev_name as the method object or call function
+        let chain_info = extract_chain_info(&stmts[i + 1], &prev_name);
+
+        if let Some(is_same_name) = chain_info {
+            if !is_same_name {
+                // For different-name chains, verify prev_name isn't read later
+                let used_later = stmts[i + 2..].iter().any(|s| stmt_reads_name(s, &prev_name));
+                if used_later {
+                    i += 1;
+                    continue;
+                }
+                // Also verify prev_name isn't used in stmt[i+1]'s call args
+                let used_in_args = match &stmts[i + 1] {
+                    Stat::Assign { values, .. } if values.len() == 1 => {
+                        match &values[0] {
+                            Expr::MethodCall { args, .. } | Expr::Call { args, .. } => {
+                                args.iter().any(|a| expr_uses_name(a, &prev_name))
+                            }
+                            _ => false,
+                        }
+                    }
+                    Stat::Local { values, .. } if values.len() == 1 => {
+                        match &values[0] {
+                            Expr::MethodCall { args, .. } | Expr::Call { args, .. } => {
+                                args.iter().any(|a| expr_uses_name(a, &prev_name))
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if used_in_args {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Get the original expression from stmt[i]
+            let orig_expr = match &stmts[i] {
+                Stat::Local { values, .. } => values[0].clone(),
+                Stat::Assign { values, .. } => values[0].clone(),
+                _ => unreachable!(),
+            };
+
+            // Get the chain expression from stmt[i+1] and replace the object
+            let chain_val = match &stmts[i + 1] {
+                Stat::Assign { values, .. } => values[0].clone(),
+                Stat::Local { values, .. } => values[0].clone(),
+                _ => unreachable!(),
+            };
+
+            let new_expr = match chain_val {
+                Expr::MethodCall { method, args, .. } => {
+                    Expr::MethodCall {
+                        object: Box::new(orig_expr),
+                        method,
+                        args,
+                    }
+                }
+                Expr::Call { args, .. } => {
+                    Expr::Call {
+                        func: Box::new(orig_expr),
+                        args,
+                    }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            if is_same_name {
+                // Same-name: update stmt[i]'s value, remove stmt[i+1]
+                match &mut stmts[i] {
+                    Stat::Local { values, .. } => values[0] = new_expr,
+                    Stat::Assign { values, .. } => values[0] = new_expr,
+                    _ => unreachable!(),
+                }
+                stmts.remove(i + 1);
+            } else {
+                // Diff-name: update stmt[i+1]'s value, remove stmt[i]
+                match &mut stmts[i + 1] {
+                    Stat::Assign { values, .. } => values[0] = new_expr,
+                    Stat::Local { values, .. } => values[0] = new_expr,
+                    _ => unreachable!(),
+                }
+                stmts.remove(i);
+            }
+            // Don't advance i — check if we can chain more
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Extract chain continuation info from a statement.
+/// Returns Some(is_same_name) if the statement uses `prev_name` as the
+/// method call object or call function.
+/// `is_same_name` is true when the assignment target equals prev_name.
+fn extract_chain_info(stmt: &Stat, prev_name: &str) -> Option<bool> {
+    match stmt {
+        Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            if let Expr::Name(target) = &targets[0] {
+                let obj_is_prev = match &values[0] {
+                    Expr::MethodCall { object, .. } => {
+                        matches!(object.as_ref(), Expr::Name(n) if n == prev_name)
+                    }
+                    Expr::Call { func, .. } => {
+                        matches!(func.as_ref(), Expr::Name(n) if n == prev_name)
+                    }
+                    _ => false,
+                };
+                if obj_is_prev {
+                    Some(target == prev_name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            let obj_is_prev = match &values[0] {
+                Expr::MethodCall { object, .. } => {
+                    matches!(object.as_ref(), Expr::Name(n) if n == prev_name)
+                }
+                Expr::Call { func, .. } => {
+                    matches!(func.as_ref(), Expr::Name(n) if n == prev_name)
+                }
+                _ => false,
+            };
+            if obj_is_prev { Some(false) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Check if a name is read (not just defined/assigned-to) in a statement.
+/// Used for safety checks in chain collapse and inlining.
+pub(super) fn stmt_reads_name(stmt: &Stat, name: &str) -> bool {
+    match stmt {
+        Stat::Local { values, .. } => values.iter().any(|v| expr_uses_name(v, name)),
+        Stat::Assign { targets, values } => {
+            let in_values = values.iter().any(|v| expr_uses_name(v, name));
+            // Name(x) as target is a write, not a read. But Field{obj=x}/Index{obj=x}
+            // targets DO read x (to look up the object for field/index assignment).
+            let in_targets = targets.iter().any(|t| match t {
+                Expr::Name(_) => false,
+                other => expr_uses_name(other, name),
+            });
+            in_values || in_targets
+        }
+        Stat::ExprStat(e) => expr_uses_name(e, name),
+        Stat::Return { values } => values.iter().any(|v| expr_uses_name(v, name)),
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            expr_uses_name(condition, name)
+            || then_body.iter().any(|s| stmt_reads_name(s, name))
+            || elseif_clauses.iter().any(|(c, b)|
+                expr_uses_name(c, name) || b.iter().any(|s| stmt_reads_name(s, name)))
+            || else_body.as_ref().map_or(false, |eb| eb.iter().any(|s| stmt_reads_name(s, name)))
+        }
+        Stat::While { condition, body } => {
+            expr_uses_name(condition, name) || body.iter().any(|s| stmt_reads_name(s, name))
+        }
+        Stat::Repeat { body, condition } => {
+            body.iter().any(|s| stmt_reads_name(s, name)) || expr_uses_name(condition, name)
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            expr_uses_name(start, name) || expr_uses_name(stop, name)
+            || step.as_ref().map_or(false, |s| expr_uses_name(s, name))
+            || body.iter().any(|s| stmt_reads_name(s, name))
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().any(|it| expr_uses_name(it, name))
+            || body.iter().any(|s| stmt_reads_name(s, name))
+        }
+        Stat::DoBlock { body } => body.iter().any(|s| stmt_reads_name(s, name)),
+        _ => false,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INLINE SINGLE-USE TEMPS — fold intermediate variables into use sites
+// ═══════════════════════════════════════════════════════════════════
+
+/// Post-processing pass: inline temporary variables that are defined by a
+/// side-effect-free expression and used exactly once later. Handles Call,
+/// MethodCall, Field, Index, Name, BinOp, UnOp, and literal expressions.
+/// Does NOT inline Function literals (closure state) or Table constructors
+/// (may be mutated). Examples:
+///   local call7 = chain:Build()
+///   call8 = call3:AddPermanentItem(call7)
+/// becomes:
+///   call8 = call3:AddPermanentItem(chain:Build())
+/// and:
+///   local v0 = game.Players
+///   someFunc(v0)
+/// becomes:
+///   someFunc(game.Players)
+/// Return true if the expression is a call whose function name indicates
+/// it has observable side effects or reads external state (require, pcall,
+/// spawn, etc.). Inlining these changes semantic timing.
+pub(super) fn is_side_effect_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { func, .. } => {
+            match &**func {
+                Expr::Name(n) => matches!(n.as_str(),
+                    "require" | "pcall" | "xpcall" | "spawn" | "delay"
+                    | "coroutine" | "loadstring" | "load" | "loadfile"
+                    | "dofile" | "print" | "warn" | "error" | "assert"
+                    | "next" | "pairs" | "ipairs" | "setmetatable" | "getmetatable"
+                    | "rawset" | "rawget" | "rawequal" | "rawlen"
+                    | "getfenv" | "setfenv" | "newproxy"
+                ),
+                // `game:GetService(...)` — don't inline, it's a Roblox API call
+                _ => false,
+            }
+        }
+        Expr::MethodCall { method, .. } => {
+            matches!(method.as_str(),
+                "GetService" | "WaitForChild" | "FindFirstChild"
+                | "FindFirstChildOfClass" | "FindFirstChildWhichIsA"
+                | "Clone" | "Destroy" | "Fire" | "Invoke"
+                | "Connect" | "Once" | "connect" | "once"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Phase B0.45A: Return true if an expression is "pure" — contains no
+/// function/method calls and reads no external state that intervening
+/// statements could alter. Pure expressions are safe to inline across
+/// intervening side-effect statements.
+///
+/// Pure:
+///   - Literals: Nil, Bool, Number, String, Varargs, Vector
+///   - Name (reads a local/global; separately gated by is_name_reassigned_between)
+///   - Field / Index with pure object and key
+///   - BinOp / UnOp whose operands are pure
+///   - Table with only pure-expression fields
+///
+/// Impure:
+///   - Call / MethodCall (can have observable effects, can re-evaluate)
+///   - Function literals (closure capture semantics)
+pub(super) fn is_pure_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_)
+        | Expr::Varargs | Expr::Vector(_, _, _) | Expr::Name(_) => true,
+        Expr::Field { object, .. } => is_pure_expr(object),
+        Expr::Index { object, key } => is_pure_expr(object) && is_pure_expr(key),
+        Expr::BinOp { left, right, .. } => is_pure_expr(left) && is_pure_expr(right),
+        Expr::UnOp { operand, .. } => is_pure_expr(operand),
+        Expr::Table { fields } => fields.iter().all(|f| match f {
+            TableField::Sequential(e) => is_pure_expr(e),
+            TableField::Named(_, e) => is_pure_expr(e),
+            TableField::Indexed(k, v) => is_pure_expr(k) && is_pure_expr(v),
+        }),
+        // Phase B0.52P10: ternary is pure iff every sub-expression is pure.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            is_pure_expr(cond) && is_pure_expr(then_expr) && is_pure_expr(else_expr)
+        }
+        // Calls, method calls, and function literals are never pure for the
+        // purpose of reorder safety.
+        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Function { .. } => false,
+    }
+}
+
+/// Phase B0.45A: return true if an expression contains any call or
+/// method-call node. Used to detect RHS that must not be duplicated
+/// by inlining into a loop body (where it would re-evaluate).
+pub(super) fn expr_contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } | Expr::MethodCall { .. } => true,
+        Expr::Field { object, .. } => expr_contains_call(object),
+        Expr::Index { object, key } => expr_contains_call(object) || expr_contains_call(key),
+        Expr::BinOp { left, right, .. } => expr_contains_call(left) || expr_contains_call(right),
+        Expr::UnOp { operand, .. } => expr_contains_call(operand),
+        Expr::Table { fields } => fields.iter().any(|f| match f {
+            TableField::Sequential(e) => expr_contains_call(e),
+            TableField::Named(_, e) => expr_contains_call(e),
+            TableField::Indexed(k, v) => expr_contains_call(k) || expr_contains_call(v),
+        }),
+        // Treat any sub-function as "may contain call" for conservative dupe check
+        Expr::Function { .. } => true,
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_contains_call(cond) || expr_contains_call(then_expr) || expr_contains_call(else_expr)
+        }
+        _ => false,
+    }
+}
+
+/// Phase B0.45A: return true if a statement might have observable
+/// side effects that could change the value of a later expression
+/// re-evaluating the same RHS. Conservatively treats any call or
+/// any assignment/loop/if/etc. as a side effect (since assignments
+/// to Field/Index or globals can mutate shared state).
+///
+/// Returns false for statements that only bind a local (Stat::Local)
+/// to an RHS that itself has no side effects (no call, no sub-function).
+/// Assignments to simple names are treated as side effects because
+/// the target might be a global or an upvalue.
+pub(super) fn stmt_has_observable_side_effect(stmt: &Stat) -> bool {
+    match stmt {
+        // Local-to-pure: does not mutate shared state.
+        Stat::Local { values, .. } => {
+            values.iter().any(|v| expr_contains_call(v))
+        }
+        // Any assignment potentially mutates external state
+        // (global, upvalue, or field on an object shared with later code).
+        Stat::Assign { .. } => true,
+        // Bare expression statements (call statements) are side effects.
+        Stat::ExprStat(e) => expr_contains_call(e),
+        // Returns / break / continue do not execute after the current point.
+        Stat::Return { .. } | Stat::Break | Stat::Continue | Stat::Comment(_) => false,
+        // Control-flow blocks are conservatively treated as side-effectful
+        // because their bodies may contain calls / assigns.
+        Stat::If { .. } | Stat::While { .. } | Stat::Repeat { .. }
+        | Stat::NumericFor { .. } | Stat::GenericFor { .. }
+        | Stat::DoBlock { .. } => true,
+        // Phase B0.52P10: LocalFunction binds a fresh local whose RHS is a
+        // function literal — function literals do not execute at the decl
+        // site, so this is not an observable side effect by itself.
+        Stat::LocalFunction { .. } => false,
+        // `function obj:method() ... end` assigns to a field on `obj`,
+        // which is externally observable (just like Stat::Assign).
+        Stat::MethodFunction { .. } => true,
+    }
+}
+
+/// Phase B0.45A: return true if any Stat in the slice writes to a
+/// local/global named `name` (at the current block level, not
+/// recursing into nested blocks — those are already handled by the
+/// recursive pre-pass and have their own inlining pass).
+pub(super) fn stmts_reassign_name(stmts: &[Stat], name: &str) -> bool {
+    for s in stmts {
+        match s {
+            Stat::Local { names, .. } => {
+                if names.iter().any(|n| n == name) { return true; }
+            }
+            Stat::Assign { targets, .. } => {
+                if targets.iter().any(|t| matches!(t, Expr::Name(n) if n == name)) {
+                    return true;
+                }
+            }
+            // Deep control-flow blocks are treated conservatively elsewhere —
+            // this helper is only used on a pre-filtered segment (already
+            // guaranteed no side effects by caller), so control-flow bodies
+            // cannot occur in that segment.
+            Stat::If { .. } | Stat::While { .. } | Stat::Repeat { .. }
+            | Stat::NumericFor { .. } | Stat::GenericFor { .. }
+            | Stat::DoBlock { .. } => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Phase B0.45A: return true if the first statement at or below the
+/// given statement that reads `name` is nested inside a loop body
+/// (While, Repeat, NumericFor, GenericFor). If the read is inside a
+/// loop, inlining an RHS with side effects or calls would change
+/// evaluation count semantics (executed N times instead of once).
+///
+/// Returns Some(true) if read is inside a loop, Some(false) if read
+/// is not inside a loop, None if stmt doesn't read the name at all.
+pub(super) fn read_is_inside_loop(stmt: &Stat, name: &str) -> Option<bool> {
+    // Helper: does any statement in body read the name?
+    fn body_reads(body: &[Stat], name: &str) -> bool {
+        body.iter().any(|s| stmt_reads_name(s, name))
+    }
+    match stmt {
+        // Direct non-loop reads: not inside a loop.
+        Stat::Local { values, .. } => {
+            if values.iter().any(|v| expr_uses_name(v, name)) { Some(false) } else { None }
+        }
+        Stat::Assign { targets, values } => {
+            let in_values = values.iter().any(|v| expr_uses_name(v, name));
+            let in_targets = targets.iter().any(|t| match t {
+                Expr::Name(_) => false,
+                other => expr_uses_name(other, name),
+            });
+            if in_values || in_targets { Some(false) } else { None }
+        }
+        Stat::ExprStat(e) => {
+            if expr_uses_name(e, name) { Some(false) } else { None }
+        }
+        Stat::Return { values } => {
+            if values.iter().any(|v| expr_uses_name(v, name)) { Some(false) } else { None }
+        }
+        // For NumericFor / GenericFor / While / Repeat: if name is read in
+        // the body, report "inside a loop". If read only in header
+        // (start/stop/step/iterators/condition), that evaluates once.
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            let in_header = expr_uses_name(start, name)
+                || expr_uses_name(stop, name)
+                || step.as_ref().map_or(false, |s| expr_uses_name(s, name));
+            let in_body = body_reads(body, name);
+            if in_body { Some(true) }
+            else if in_header { Some(false) }
+            else { None }
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            let in_header = iterators.iter().any(|it| expr_uses_name(it, name));
+            let in_body = body_reads(body, name);
+            if in_body { Some(true) }
+            else if in_header { Some(false) }
+            else { None }
+        }
+        Stat::While { condition, body } => {
+            // While condition evaluates each iteration — still a loop-execution position.
+            let in_cond = expr_uses_name(condition, name);
+            let in_body = body_reads(body, name);
+            if in_cond || in_body { Some(true) } else { None }
+        }
+        Stat::Repeat { body, condition } => {
+            let in_cond = expr_uses_name(condition, name);
+            let in_body = body_reads(body, name);
+            if in_cond || in_body { Some(true) } else { None }
+        }
+        // If / DoBlock: not loops; reads inside are evaluated at most once.
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            let in_cond = expr_uses_name(condition, name);
+            let in_then = body_reads(then_body, name);
+            let in_elif = elseif_clauses.iter().any(|(c, b)|
+                expr_uses_name(c, name) || body_reads(b, name));
+            let in_else = else_body.as_ref().map_or(false, |eb| body_reads(eb, name));
+            if in_cond || in_then || in_elif || in_else { Some(false) } else { None }
+        }
+        Stat::DoBlock { body } => {
+            if body_reads(body, name) { Some(false) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Phase B0.45A: collect all `Expr::Name` identifiers inside an
+/// expression tree into `out`.  Used to determine which names in a
+/// pure RHS could be invalidated by intervening reassignments.
+pub(super) fn collect_names_in_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Name(n) => out.push(n.clone()),
+        Expr::Field { object, .. } => collect_names_in_expr(object, out),
+        Expr::Index { object, key } => {
+            collect_names_in_expr(object, out);
+            collect_names_in_expr(key, out);
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_names_in_expr(left, out);
+            collect_names_in_expr(right, out);
+        }
+        Expr::UnOp { operand, .. } => collect_names_in_expr(operand, out),
+        Expr::Call { func, args } => {
+            collect_names_in_expr(func, out);
+            for a in args { collect_names_in_expr(a, out); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            collect_names_in_expr(object, out);
+            for a in args { collect_names_in_expr(a, out); }
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => collect_names_in_expr(e, out),
+                    TableField::Named(_, e) => collect_names_in_expr(e, out),
+                    TableField::Indexed(k, v) => {
+                        collect_names_in_expr(k, out);
+                        collect_names_in_expr(v, out);
+                    }
+                }
+            }
+        }
+        Expr::Function { .. } => {} // closures don't propagate name equivalence
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            collect_names_in_expr(cond, out);
+            collect_names_in_expr(then_expr, out);
+            collect_names_in_expr(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
+/// Count how many times a name is READ (not defined) in a statement.
+pub(super) fn count_name_reads_in_stmt(stmt: &Stat, name: &str) -> usize {
+    match stmt {
+        Stat::Local { values, .. } => {
+            values.iter().map(|v| count_name_reads_in_expr(v, name)).sum()
+        }
+        Stat::Assign { targets, values } => {
+            let in_values: usize = values.iter().map(|v| count_name_reads_in_expr(v, name)).sum();
+            let in_targets: usize = targets.iter().map(|t| match t {
+                Expr::Name(_) => 0, // writing to name, not reading
+                other => count_name_reads_in_expr(other, name),
+            }).sum();
+            in_values + in_targets
+        }
+        Stat::ExprStat(e) => count_name_reads_in_expr(e, name),
+        Stat::Return { values } => values.iter().map(|v| count_name_reads_in_expr(v, name)).sum(),
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            let mut c = count_name_reads_in_expr(condition, name);
+            c += then_body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>();
+            for (cond, body) in elseif_clauses {
+                c += count_name_reads_in_expr(cond, name);
+                c += body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>();
+            }
+            if let Some(eb) = else_body {
+                c += eb.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>();
+            }
+            c
+        }
+        Stat::While { condition, body } => {
+            count_name_reads_in_expr(condition, name)
+            + body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>()
+        }
+        Stat::Repeat { body, condition } => {
+            body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>()
+            + count_name_reads_in_expr(condition, name)
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            count_name_reads_in_expr(start, name) + count_name_reads_in_expr(stop, name)
+            + step.as_ref().map_or(0, |s| count_name_reads_in_expr(s, name))
+            + body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>()
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().map(|it| count_name_reads_in_expr(it, name)).sum::<usize>()
+            + body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum::<usize>()
+        }
+        Stat::DoBlock { body } => body.iter().map(|s| count_name_reads_in_stmt(s, name)).sum(),
+        // Phase B0.92: recurse into LocalFunction/MethodFunction bodies.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            count_name_reads_in_expr(func, name)
+        }
+        _ => 0,
+    }
+}
+
+/// Count how many times a name appears in an expression.
+fn count_name_reads_in_expr(expr: &Expr, name: &str) -> usize {
+    match expr {
+        Expr::Name(n) => if n == name { 1 } else { 0 },
+        Expr::Field { object, .. } => count_name_reads_in_expr(object, name),
+        Expr::Index { object, key } => {
+            count_name_reads_in_expr(object, name) + count_name_reads_in_expr(key, name)
+        }
+        Expr::BinOp { left, right, .. } => {
+            count_name_reads_in_expr(left, name) + count_name_reads_in_expr(right, name)
+        }
+        Expr::UnOp { operand, .. } => count_name_reads_in_expr(operand, name),
+        Expr::Call { func, args } => {
+            count_name_reads_in_expr(func, name)
+            + args.iter().map(|a| count_name_reads_in_expr(a, name)).sum::<usize>()
+        }
+        Expr::MethodCall { object, args, .. } => {
+            count_name_reads_in_expr(object, name)
+            + args.iter().map(|a| count_name_reads_in_expr(a, name)).sum::<usize>()
+        }
+        Expr::Table { fields } => {
+            fields.iter().map(|f| match f {
+                TableField::Sequential(e) => count_name_reads_in_expr(e, name),
+                TableField::Named(_, e) => count_name_reads_in_expr(e, name),
+                TableField::Indexed(k, v) => count_name_reads_in_expr(k, name) + count_name_reads_in_expr(v, name),
+            }).sum()
+        }
+        Expr::Function { .. } => 0, // closures capture by upvalue, not name
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            count_name_reads_in_expr(cond, name)
+            + count_name_reads_in_expr(then_expr, name)
+            + count_name_reads_in_expr(else_expr, name)
+        }
+        _ => 0,
+    }
+}
+
+/// Replace all occurrences of Name(name) in a statement with the given expression.
+pub(super) fn replace_name_in_stmt(stmt: &mut Stat, name: &str, replacement: &Expr) {
+    match stmt {
+        Stat::Local { values, .. } => {
+            for v in values { replace_name_in_expr(v, name, replacement); }
+        }
+        Stat::Assign { targets, values } => {
+            for t in targets {
+                // Don't replace simple Name targets (those are assignment destinations),
+                // but DO replace names inside Field/Index targets
+                match t {
+                    Expr::Name(_) => {}
+                    other => replace_name_in_expr(other, name, replacement),
+                }
+            }
+            for v in values { replace_name_in_expr(v, name, replacement); }
+        }
+        Stat::ExprStat(e) => replace_name_in_expr(e, name, replacement),
+        Stat::Return { values } => {
+            for v in values { replace_name_in_expr(v, name, replacement); }
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            replace_name_in_expr(condition, name, replacement);
+            for s in then_body { replace_name_in_stmt(s, name, replacement); }
+            for (c, body) in elseif_clauses {
+                replace_name_in_expr(c, name, replacement);
+                for s in body { replace_name_in_stmt(s, name, replacement); }
+            }
+            if let Some(eb) = else_body {
+                for s in eb { replace_name_in_stmt(s, name, replacement); }
+            }
+        }
+        Stat::While { condition, body } => {
+            replace_name_in_expr(condition, name, replacement);
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+        }
+        Stat::Repeat { body, condition } => {
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+            replace_name_in_expr(condition, name, replacement);
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            replace_name_in_expr(start, name, replacement);
+            replace_name_in_expr(stop, name, replacement);
+            if let Some(s) = step { replace_name_in_expr(s, name, replacement); }
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            for it in iterators { replace_name_in_expr(it, name, replacement); }
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+        }
+        Stat::DoBlock { body } => {
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+        }
+        // Phase B0.92: recurse into LocalFunction/MethodFunction bodies.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            replace_name_in_expr(func, name, replacement);
+        }
+        _ => {}
+    }
+}
+
+/// Replace all occurrences of Name(name) in an expression with the replacement.
+fn replace_name_in_expr(expr: &mut Expr, name: &str, replacement: &Expr) {
+    match expr {
+        Expr::Name(n) if n == name => {
+            *expr = replacement.clone();
+        }
+        Expr::Field { object, .. } => replace_name_in_expr(object, name, replacement),
+        Expr::Index { object, key } => {
+            replace_name_in_expr(object, name, replacement);
+            replace_name_in_expr(key, name, replacement);
+        }
+        Expr::BinOp { left, right, .. } => {
+            replace_name_in_expr(left, name, replacement);
+            replace_name_in_expr(right, name, replacement);
+        }
+        Expr::UnOp { operand, .. } => replace_name_in_expr(operand, name, replacement),
+        Expr::Call { func, args } => {
+            replace_name_in_expr(func, name, replacement);
+            for a in args { replace_name_in_expr(a, name, replacement); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            replace_name_in_expr(object, name, replacement);
+            for a in args { replace_name_in_expr(a, name, replacement); }
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => replace_name_in_expr(e, name, replacement),
+                    TableField::Named(_, e) => replace_name_in_expr(e, name, replacement),
+                    TableField::Indexed(k, v) => {
+                        replace_name_in_expr(k, name, replacement);
+                        replace_name_in_expr(v, name, replacement);
+                    }
+                }
+            }
+        }
+        Expr::Function { body, .. } => {
+            for s in body { replace_name_in_stmt(s, name, replacement); }
+        }
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            replace_name_in_expr(cond, name, replacement);
+            replace_name_in_expr(then_expr, name, replacement);
+            replace_name_in_expr(else_expr, name, replacement);
+        }
+        _ => {}
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CLEANUP PASS — eliminates common decompiler artifacts
+// ═══════════════════════════════════════════════════════════════════
+
+/// Post-processing pass: remove decompiler artifacts from the AST.
+fn cleanup_stmts(stmts: &mut Vec<Stat>) {
+    // Remove self-assignments, dead if-nil blocks, empty do-blocks, etc.
+    stmts.retain(|stmt| !is_dead_stmt(stmt));
+
+    // Clean nil/artifact expressions in all statements
+    for stmt in stmts.iter_mut() {
+        cleanup_exprs_in_stmt(stmt);
+    }
+
+    // Recurse into nested blocks
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, condition } => {
+                // if nil then X else Y end → just Y (nil is always falsy)
+                if matches!(condition, Expr::Nil) {
+                    if let Some(eb) = else_body {
+                        cleanup_stmts(eb);
+                    }
+                    // The if-nil itself gets cleaned in a second pass below
+                }
+                cleanup_stmts(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    cleanup_stmts(body);
+                }
+                if let Some(eb) = else_body {
+                    cleanup_stmts(eb);
+                }
+            }
+            Stat::While { body, .. } => cleanup_stmts(body),
+            Stat::Repeat { body, .. } => cleanup_stmts(body),
+            Stat::NumericFor { body, .. } => cleanup_stmts(body),
+            Stat::GenericFor { body, .. } => cleanup_stmts(body),
+            Stat::DoBlock { body } => cleanup_stmts(body),
+            _ => {}
+        }
+    }
+
+    // Second pass: replace `if nil then X else Y end` with just Y
+    let mut i = 0;
+    while i < stmts.len() {
+        let replace = if let Stat::If { condition, .. } = &stmts[i] {
+            matches!(condition, Expr::Nil) || matches!(condition, Expr::Bool(false))
+        } else {
+            false
+        };
+        if replace {
+            if let Stat::If { else_body, .. } = stmts.remove(i) {
+                if let Some(eb) = else_body {
+                    for (j, s) in eb.into_iter().enumerate() {
+                        stmts.insert(i + j, s);
+                    }
+                }
+                // Don't increment i — we need to re-check what we just inserted
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Remove empty do-blocks that may have resulted from cleanup
+    stmts.retain(|stmt| {
+        !matches!(stmt, Stat::DoBlock { body } if body.is_empty())
+    });
+}
+
+/// Clean nil and other artifact expressions within a statement.
+fn cleanup_exprs_in_stmt(stmt: &mut Stat) {
+    match stmt {
+        Stat::Local { values, .. } => {
+            for v in values { cleanup_expr(v); }
+        }
+        Stat::Assign { targets, values } => {
+            for t in targets { cleanup_expr(t); }
+            for v in values { cleanup_expr(v); }
+        }
+        Stat::ExprStat(e) => cleanup_expr(e),
+        Stat::Return { values } => {
+            for v in values { cleanup_expr(v); }
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            cleanup_expr(condition);
+            for s in then_body { cleanup_exprs_in_stmt(s); }
+            for (cond, body) in elseif_clauses {
+                cleanup_expr(cond);
+                for s in body { cleanup_exprs_in_stmt(s); }
+            }
+            if let Some(eb) = else_body {
+                for s in eb { cleanup_exprs_in_stmt(s); }
+            }
+        }
+        Stat::While { condition, body } => {
+            cleanup_expr(condition);
+            for s in body { cleanup_exprs_in_stmt(s); }
+        }
+        Stat::Repeat { body, condition } => {
+            for s in body { cleanup_exprs_in_stmt(s); }
+            cleanup_expr(condition);
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            cleanup_expr(start);
+            cleanup_expr(stop);
+            if let Some(s) = step { cleanup_expr(s); }
+            for s in body { cleanup_exprs_in_stmt(s); }
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            for it in iterators { cleanup_expr(it); }
+            for s in body { cleanup_exprs_in_stmt(s); }
+        }
+        Stat::DoBlock { body } => {
+            for s in body { cleanup_exprs_in_stmt(s); }
+        }
+        // Phase B0.92: recurse into LocalFunction/MethodFunction bodies.
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            cleanup_expr(func);
+        }
+        _ => {}
+    }
+}
+
+/// Clean artifact patterns in expressions recursively.
+fn cleanup_expr(expr: &mut Expr) {
+    // Recurse first (bottom-up)
+    match expr {
+        Expr::BinOp { left, right, .. } => {
+            cleanup_expr(left);
+            cleanup_expr(right);
+        }
+        Expr::UnOp { operand, .. } => cleanup_expr(operand),
+        Expr::Call { func, args } => {
+            cleanup_expr(func);
+            for a in args { cleanup_expr(a); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            cleanup_expr(object);
+            for a in args { cleanup_expr(a); }
+        }
+        Expr::Field { object, .. } => cleanup_expr(object),
+        Expr::Index { object, key } => {
+            cleanup_expr(object);
+            cleanup_expr(key);
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => cleanup_expr(e),
+                    TableField::Named(_, e) => cleanup_expr(e),
+                    TableField::Indexed(k, v) => { cleanup_expr(k); cleanup_expr(v); }
+                }
+            }
+        }
+        Expr::Function { body, .. } => {
+            for s in body { cleanup_exprs_in_stmt(s); }
+        }
+        // Phase B0.92: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            cleanup_expr(cond);
+            cleanup_expr(then_expr);
+            cleanup_expr(else_expr);
+        }
+        _ => {}
+    }
+
+    // Now clean this node
+    let replacement = match expr {
+        // nil[key] → key (table indexed by nil is always an artifact)
+        Expr::Index { object, key } if matches!(object.as_ref(), Expr::Nil) => {
+            Some(key.as_ref().clone())
+        }
+        // obj[nil] → obj (nil key is always an artifact)
+        Expr::Index { object, key } if matches!(key.as_ref(), Expr::Nil) => {
+            Some(object.as_ref().clone())
+        }
+        // nil.field → Name(field) (field access on nil is an artifact)
+        Expr::Field { field, .. } if matches!(expr, Expr::Field { object, .. } if matches!(object.as_ref(), Expr::Nil)) => {
+            None // handled below due to borrow issues
+        }
+        // nil op X or X op nil where op is arithmetic → just the other side
+        Expr::BinOp { op, left, right } => {
+            let left_nil = matches!(left.as_ref(), Expr::Nil);
+            let right_nil = matches!(right.as_ref(), Expr::Nil);
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div |
+                BinOp::IDiv | BinOp::Mod | BinOp::Pow => {
+                    if left_nil && right_nil {
+                        Some(Expr::Number(0.0))
+                    } else if left_nil {
+                        Some(right.as_ref().clone())
+                    } else if right_nil {
+                        Some(left.as_ref().clone())
+                    } else {
+                        None
+                    }
+                }
+                BinOp::Concat => {
+                    // nil .. X → X, X .. nil → X
+                    if left_nil && right_nil {
+                        Some(Expr::String(String::new()))
+                    } else if left_nil {
+                        Some(right.as_ref().clone())
+                    } else if right_nil {
+                        Some(left.as_ref().clone())
+                    } else {
+                        None
+                    }
+                }
+                // "str" and "str" → "str" (common artifact in conditionals)
+                BinOp::And => {
+                    if let (Expr::String(a), Expr::String(b)) = (left.as_ref(), right.as_ref()) {
+                        if a == b {
+                            Some(Expr::String(a.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                // "str" or "str" → "str"
+                BinOp::Or => {
+                    if let (Expr::String(a), Expr::String(b)) = (left.as_ref(), right.as_ref()) {
+                        if a == b {
+                            Some(Expr::String(a.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(r) = replacement {
+        *expr = r;
+    }
+
+    // Handle nil.field separately (couldn't do it above due to borrow rules)
+    if let Expr::Field { object, field } = expr {
+        if matches!(object.as_ref(), Expr::Nil) {
+            *expr = Expr::Name(field.clone());
+        }
+    }
+}
+
+/// Check if a statement is a decompiler artifact that should be removed.
+fn is_dead_stmt(stmt: &Stat) -> bool {
+    match stmt {
+        // Self-assignment: x = x, or compound self-assignment: a.b = a.b
+        // Phase B0.92: use exprs_structurally_equal for comprehensive comparison
+        Stat::Assign { targets, values } => {
+            if targets.len() == values.len() {
+                targets.iter().zip(values.iter()).all(|(t, v)| exprs_structurally_equal(t, v))
+            } else {
+                false
+            }
+        }
+        // Redundant local: local x = x
+        Stat::Local { names, values } => {
+            if names.len() == values.len() && !values.is_empty() {
+                names.iter().zip(values.iter()).all(|(n, v)| {
+                    matches!(v, Expr::Name(vn) if vn == n)
+                })
+            } else {
+                false
+            }
+        }
+        // Empty do-end block
+        Stat::DoBlock { body } => body.is_empty(),
+        // Phase B0.95b: expression statement with a trivially pure value
+        // (name, literal) is dead code — a lifter artifact from unused register reads.
+        // Keep field/index accesses (may have __index metamethods in Roblox).
+        Stat::ExprStat(e) => matches!(e,
+            Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
+            | Expr::String(_) | Expr::Varargs),
+        _ => false,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONSTANT FOLDING — simplify constant expressions at compile time
+// ═══════════════════════════════════════════════════════════════════
+
+/// Post-processing pass: fold constant expressions.
+/// C10h: collapse `if Bool(true) then X else Y end` → X,
+/// `if Bool(false) then X else Y end` → Y. Runs after fold_constants
+/// so literal-compare folds into a concrete Bool first.
+fn collapse_constant_ifs(stmts: &mut Vec<Stat>) {
+    // Recurse into nested bodies first (bottom-up).
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                collapse_constant_ifs(then_body);
+                for (_, body) in elseif_clauses.iter_mut() {
+                    collapse_constant_ifs(body);
+                }
+                if let Some(eb) = else_body.as_mut() {
+                    collapse_constant_ifs(eb);
+                }
+            }
+            Stat::While { body, .. }
+            | Stat::Repeat { body, .. }
+            | Stat::DoBlock { body }
+            | Stat::NumericFor { body, .. }
+            | Stat::GenericFor { body, .. } => {
+                collapse_constant_ifs(body);
+            }
+            Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+                if let Expr::Function { body, .. } = func {
+                    collapse_constant_ifs(body);
+                }
+            }
+            Stat::Local { values, .. } | Stat::Assign { values, .. } => {
+                for v in values.iter_mut() {
+                    if let Expr::Function { body, .. } = v {
+                        collapse_constant_ifs(body);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: replace constant-condition Ifs with their taken branch.
+    let mut i = 0;
+    while i < stmts.len() {
+        let splice = match &stmts[i] {
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                match condition {
+                    Expr::Bool(true) => Some(then_body.clone()),
+                    Expr::Bool(false) => {
+                        // Try first elseif whose condition is true-ish; else else_body; else nothing.
+                        let mut taken: Option<Vec<Stat>> = None;
+                        for (c, b) in elseif_clauses {
+                            if matches!(c, Expr::Bool(true)) {
+                                taken = Some(b.clone());
+                                break;
+                            }
+                            if matches!(c, Expr::Bool(false)) {
+                                continue;
+                            }
+                            // Unknown elseif condition — can't collapse whole if.
+                            taken = None;
+                            break;
+                        }
+                        if taken.is_none() && elseif_clauses.iter().all(|(c,_)| matches!(c, Expr::Bool(false))) {
+                            taken = Some(else_body.clone().unwrap_or_default());
+                        }
+                        taken
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(body) = splice {
+            stmts.splice(i..=i, body);
+            // Don't advance i — recheck the newly-spliced content.
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn fold_constants_in_stmts(stmts: &mut Vec<Stat>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::Local { values, .. } => {
+                for v in values { fold_expr(v); }
+            }
+            Stat::Assign { targets, values } => {
+                for t in targets { fold_expr(t); }
+                for v in values { fold_expr(v); }
+            }
+            Stat::ExprStat(e) => fold_expr(e),
+            Stat::Return { values } => {
+                for v in values { fold_expr(v); }
+            }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                fold_expr(condition);
+                fold_constants_in_stmts(then_body);
+                for (cond, body) in elseif_clauses {
+                    fold_expr(cond);
+                    fold_constants_in_stmts(body);
+                }
+                if let Some(eb) = else_body { fold_constants_in_stmts(eb); }
+            }
+            Stat::While { condition, body } => {
+                fold_expr(condition);
+                fold_constants_in_stmts(body);
+            }
+            Stat::Repeat { body, condition } => {
+                fold_constants_in_stmts(body);
+                fold_expr(condition);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                fold_expr(start);
+                fold_expr(stop);
+                if let Some(s) = step { fold_expr(s); }
+                fold_constants_in_stmts(body);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                for it in iterators { fold_expr(it); }
+                fold_constants_in_stmts(body);
+            }
+            Stat::DoBlock { body } => fold_constants_in_stmts(body),
+            Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+                fold_expr(func);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively fold constant sub-expressions bottom-up.
+fn fold_expr(expr: &mut Expr) {
+    // First recurse into sub-expressions
+    match expr {
+        Expr::BinOp { left, right, .. } => {
+            fold_expr(left);
+            fold_expr(right);
+        }
+        Expr::UnOp { operand, .. } => fold_expr(operand),
+        Expr::Call { func, args } => {
+            fold_expr(func);
+            for a in args { fold_expr(a); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            fold_expr(object);
+            for a in args { fold_expr(a); }
+        }
+        Expr::Field { object, .. } => fold_expr(object),
+        Expr::Index { object, key } => {
+            fold_expr(object);
+            fold_expr(key);
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => fold_expr(e),
+                    TableField::Named(_, e) => fold_expr(e),
+                    TableField::Indexed(k, v) => { fold_expr(k); fold_expr(v); }
+                }
+            }
+        }
+        Expr::Function { body, .. } => fold_constants_in_stmts(body),
+        // Phase B0.90: recurse into Ternary sub-expressions.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            fold_expr(cond);
+            fold_expr(then_expr);
+            fold_expr(else_expr);
+        }
+        _ => {}
+    }
+
+    // Now try to fold this node
+    let replacement = match expr {
+        Expr::BinOp { op, left, right } => {
+            match (left.as_ref(), right.as_ref()) {
+                // Number op Number
+                (Expr::Number(a), Expr::Number(b)) => {
+                    match op {
+                        BinOp::Add => Some(Expr::Number(a + b)),
+                        BinOp::Sub => Some(Expr::Number(a - b)),
+                        BinOp::Mul => Some(Expr::Number(a * b)),
+                        BinOp::Div if *b != 0.0 => Some(Expr::Number(a / b)),
+                        BinOp::Mod if *b != 0.0 => Some(Expr::Number(a % b)),
+                        BinOp::Pow => Some(Expr::Number(a.powf(*b))),
+                        _ => None,
+                    }
+                }
+                // String .. String and equality comparisons
+                (Expr::String(a), Expr::String(b)) => {
+                    match op {
+                        BinOp::Concat => Some(Expr::String(format!("{}{}", a, b))),
+                        // C10h: fold `"X" == "Y"` and `"X" ~= "Y"` to Bool.
+                        // Covers `if "utf8" == "utf8"` artifacts and similar.
+                        BinOp::Eq => Some(Expr::Bool(a == b)),
+                        BinOp::NotEq => Some(Expr::Bool(a != b)),
+                        _ => None,
+                    }
+                }
+                // C10h: Bool==/~=Bool folds. Number==/~=Number is already
+                // covered by the unguarded Number/Number arm above (which
+                // returns None for Eq/NotEq); guarded Number arms here would be
+                // unreachable, so they are intentionally omitted to preserve
+                // existing behavior.
+                (Expr::Bool(a), Expr::Bool(b)) if *op == BinOp::Eq => {
+                    Some(Expr::Bool(a == b))
+                }
+                (Expr::Bool(a), Expr::Bool(b)) if *op == BinOp::NotEq => {
+                    Some(Expr::Bool(a != b))
+                }
+                (Expr::Nil, Expr::Nil) if *op == BinOp::Eq => Some(Expr::Bool(true)),
+                (Expr::Nil, Expr::Nil) if *op == BinOp::NotEq => Some(Expr::Bool(false)),
+                // Boolean logic
+                (Expr::Bool(true), _) if *op == BinOp::And => Some(right.as_ref().clone()),
+                (Expr::Bool(false), _) if *op == BinOp::And => Some(Expr::Bool(false)),
+                (Expr::Bool(true), _) if *op == BinOp::Or => Some(Expr::Bool(true)),
+                (Expr::Bool(false), _) if *op == BinOp::Or => Some(right.as_ref().clone()),
+                // Phase B0.92: nil short-circuits — nil is falsy.
+                (Expr::Nil, _) if *op == BinOp::And => Some(Expr::Nil),
+                (Expr::Nil, _) if *op == BinOp::Or => Some(right.as_ref().clone()),
+                _ => None,
+            }
+        }
+        Expr::UnOp { op, operand } => {
+            match (op, operand.as_ref()) {
+                (UnOp::Not, Expr::Bool(b)) => Some(Expr::Bool(!b)),
+                (UnOp::Not, Expr::Nil) => Some(Expr::Bool(true)),
+                (UnOp::Negate, Expr::Number(n)) => Some(Expr::Number(-n)),
+                (UnOp::Length, Expr::String(s)) => Some(Expr::Number(s.len() as f64)),
+                // Phase B0.92: `not <truthy-literal>` → false.
+                // Numbers and strings are always truthy in Lua.
+                (UnOp::Not, Expr::Number(_)) | (UnOp::Not, Expr::String(_)) => Some(Expr::Bool(false)),
+                // Phase B0.91: `not (a == b)` → `a ~= b`, etc.
+                // Invert comparison operators under `not` for cleaner output.
+                (UnOp::Not, Expr::BinOp { left, op: cmp_op, right }) => {
+                    let inverted = match cmp_op {
+                        BinOp::Eq    => Some(BinOp::NotEq),
+                        BinOp::NotEq => Some(BinOp::Eq),
+                        BinOp::LT    => Some(BinOp::GE),
+                        BinOp::LE    => Some(BinOp::GT),
+                        BinOp::GT    => Some(BinOp::LE),
+                        BinOp::GE    => Some(BinOp::LT),
+                        _ => None,
+                    };
+                    inverted.map(|new_op| Expr::BinOp {
+                        left: left.clone(),
+                        op: new_op,
+                        right: right.clone(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        // Phase B0.90: fold Ternary with constant condition.
+        // Phase B0.92: also fold identical branches.
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            match cond.as_ref() {
+                // `if true then a else b` → a
+                Expr::Bool(true) => Some(then_expr.as_ref().clone()),
+                // `if false then a else b` → b
+                Expr::Bool(false) => Some(else_expr.as_ref().clone()),
+                // `if nil then a else b` → b  (nil is falsy)
+                Expr::Nil => Some(else_expr.as_ref().clone()),
+                _ => {
+                    // `if c then X else X` → X  (identical branches)
+                    if exprs_structurally_equal(then_expr, else_expr) {
+                        Some(then_expr.as_ref().clone())
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(r) = replacement {
+        *expr = r;
+    }
+}
+
+// ============================================================================
+// Tests (split into per-phase files under `lifter/tests/` in Phase B0.52P6).
+// ============================================================================
+
+#[cfg(test)]
+mod tests;
