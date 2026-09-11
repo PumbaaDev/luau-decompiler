@@ -6,12 +6,24 @@
 
 A fast, fully-offline **Luau bytecode decompiler**, disassembler, and obfuscator, written in Rust.
 
-Feed it compiled Luau bytecode and get readable Luau source back. Everything runs 100% locally, no network, no external service.
+Feed it compiled Luau bytecode and get readable Luau source back. Everything runs 100% locally — no network, no external service, no telemetry.
+
+As far as we know it is the only **open, auditable, offline** Luau decompiler whose quality is measured by *executing the recovered code* rather than by how plausible the output looks. Most Luau decompilation lives inside closed, executor-bundled tools; this is the missing piece for security researchers, malware analysts, and Luau tooling authors who need a reproducible, inspectable one.
+
+## Highlights
+
+- **99.4% semantically clean on a real game.** 1,315 of 1,323 scripts pulled from a live Roblox client decompile to source a strict semantic checker passes — and **100% parse as valid Luau**, cross-checked against the official `luau-compile`, not just our own parser.
+- **Verified by round-trip, not by eye.** The synthetic suite runs the original, decompiles it, **runs the recovered source**, and requires byte-identical output — 47/47 pass. "Looks right" is treated as a failure, because it usually is.
+- **Roblox bytecode v3 through v9 (tver3).** Every opcode has a handler, including Roblox's extensions and AUX-carrying instructions, decoded against an opcode map calibrated to the client's own compiler.
+- **Handles opcode-shuffled bytecode.** It infers the opcode permutation before lifting, and stamps every remapped decode with an honest evidence header (what was pinned by detectors vs completed by inference) so you always know what the output leans on.
+- **Proven in real security research.** Used to reverse and deobfuscate VM-obfuscated Roblox scripts (Synapse Xen / IronBrew2-family) down to their exact server calls.
+- **A companion obfuscator** (`luau-protect`) — the same project that takes obfuscation apart can also apply it: control-flow flattening, constant encryption, operand encoding, identifier renaming.
+- **One offline static binary**, plus WASM and HTTP-server builds.
 
 ## Features
 
 - **Decompiler** — lifts Luau bytecode back into readable Luau source: register-based VM state, control-flow reconstruction (if/while/repeat/for), tables, upvalues and constant recovery. Every opcode in the instruction set has a handler, including Roblox's bytecode extensions.
-- **Bytecode versions 3–8** supported.
+- **Bytecode versions 3–9** supported, including Roblox v9 / tver3.
 - **Disassembler** — human-readable opcode listing, with optional debug info (line numbers, local names) and an opmap-remap diagnostic view.
 - **Info** — dump bytecode metadata (protos, strings, params, stack sizes) as text or JSON.
 - **Obfuscator** (`luau-compiler`) — a companion protector that compiles/obfuscates Luau (control-flow flattening, constant encryption, operand encoding, identifier renaming, junk insertion).
@@ -66,7 +78,7 @@ Both demos below run against files already in this repo — no external Luau too
 
 ### 1. Watch the decompiler recover source
 
-The decompiler consumes **standard Luau bytecode** (v3–8), such as the output of the official `luau-compile --binary` or a Luau runtime's `string.dump`. To stay fully self-contained, the bundled example assembles a small bytecode chunk in memory and lifts it back to source using the same engine the CLI uses:
+The decompiler consumes **standard Luau bytecode** (v3–9), such as the output of the official `luau-compile --binary` or a Luau runtime's `string.dump`. To stay fully self-contained, the bundled example assembles a small bytecode chunk in memory and lifts it back to source using the same engine the CLI uses:
 
 ```sh
 cargo run -p luau-core --example decompile_demo
@@ -128,8 +140,8 @@ This figure is measured out of tree: the round trip needs a Luau interpreter bin
 execute both the original and the recovered source, and neither that binary nor the corpus
 ships in this repository, so a fresh clone cannot reproduce the number directly. What CI and
 `cargo test` do exercise is the in-repo suite (parser, lifter, disassembler and obfuscator
-unit tests, 949 of them); the interpreter round-trip test skips cleanly when the binary is
-absent.
+unit tests, 951 of them, all green); the interpreter round-trip test skips cleanly when the
+binary is absent.
 
 A known limitation: when the operands of a nested short-circuit are themselves function
 calls, the value-join reconstruction declines to fold them. Doing so would risk emitting a
@@ -205,33 +217,36 @@ than having no check.
 
 ### Measured state on real shuffled bytecode
 
-A whole Roblox game, not a sample: **1,143 bytecode files pulled from a live
-client** (Bee Swarm Simulator, `PlaceId 1537690962`), decompiled in one clean
-batch run against a measured opcode map.
+Real bytecode, not a sample: **1,324 unique files** — a hash-deduped union of a
+whole live Roblox game (Bee Swarm Simulator, `PlaceId 1537690962`) plus Roblox
+CoreScripts, the PlayerModule, and widely-used community modules (topbarplus,
+Janitor, evaera-promise) — decompiled in one clean batch run against a measured
+opcode map.
 
 | | |
 |---|---|
-| Decoded | **1,142 / 1,142** (the 1 exclusion ships a compiler error, not a program) |
-| Parses as valid Luau | **1,142 / 1,142 (100%)** |
-| Semantically clean | **1,130 / 1,142 (98.9%)**, 12 defects |
+| Decoded | **1,323 / 1,323** (the 1 exclusion ships a compiler error, not a program) |
+| Parses as valid Luau | **1,323 / 1,323 (100%)** |
+| Semantically clean | **1,315 / 1,323 (99.4%)**, 8 defects |
 
 Syntax validity is cross-checked against the real `luau-compile`, not just our
 own checker — see below for why that mattered.
 
-The 12 remaining defects are three mechanisms, all adjudicated by hand — none
-is a checker false positive:
+The 8 remaining defects are adjudicated by hand — none is a checker false
+positive, and the number is honestly at the tool's ceiling:
 
-| check | files | what it costs |
-|---|---:|---|
-| `calls_not_emitted` | 6 | a body emits fewer calls than its bytecode contains |
-| `branch_local_discarded` | 3 | a branch arm's value is bound to a fresh local and dropped |
-| `declared_never_assigned` | 3 | a name is declared and read but never assigned |
+- **2 are not fixable from the input.** Roblox bytecode carries no `CAPTURE`
+  records, so the parent register behind a child closure's upvalue is simply
+  absent — a bare `upval_N` is the most faithful thing that can be emitted.
+- **6 sit in the merge / phi / branch-arm / loop core.** Every candidate fix
+  tried so far either regresses a previously-clean file or fails the unit suite;
+  three such fixes were written, measured, and reverted precisely because they
+  traded one file for another. The numbers are recorded rather than the attempts
+  quietly dropped.
 
-One of the three `declared_never_assigned` is **not fixable from the input**:
-Roblox bytecode carries no `CAPTURE` records, so the parent register behind a
-child closure's upvalue is simply absent. The rest are bounded by measurement —
-every candidate fix tried so far costs more than it recovers, and the numbers
-are recorded rather than the attempts silently dropped.
+That gate — **both** the full 951-test unit suite (951/0) **and** a full corpus
+diff with no previously-clean file regressing — is what every change has to
+clear. It is why the clean rate is trustworthy rather than tuned.
 
 **The measure that decides a fix is not the defect count.** Six changes during
 this work scored *better* on the semantic checker while quietly deleting
@@ -264,8 +279,8 @@ deliberately failing — it documents a real defect and stays red until fixed.
 reporting a `function`
 left unclosed hundreds of lines from anything wrong.
 
-Every one of them was valid. `tools/luau/luau-compile` — the real Luau compiler
-— accepted all 106. The bug was ours: the block tracker pushed an entry for
+Every one of them was valid. The official `luau-compile` — the real Luau
+compiler — accepted all 106. The bug was ours: the block tracker pushed an entry for
 every `then` token, including the one after `elseif`, but `if/elseif/else`
 closes with a single `end`. Each `elseif` leaked one entry, and because the
 stack is LIFO the survivor reported at EOF was the outermost opener.
@@ -277,8 +292,8 @@ Two things are worth taking from that. A false failure costs more than a missed
 one, because it sends you hunting a bug that does not exist — this nearly
 became a hunt for an emitter fault across 100 files. And **when a checker and a
 reference implementation disagree, find out which is wrong before believing
-either.** `luau-compile` ships in this repo precisely so that question is one
-command away.
+either.** The official `luau-compile` is the reference this project checks
+against, so that question is always one command away.
 
 ## Project layout
 

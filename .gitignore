@@ -43,3 +43,56 @@ tools/roblox_api_names.json
 tools/test_phone_behaviors.py
 tools/run_phone_agent.bat
 tools/Modelfile.uncensored-*
+
+# local security-audit backups (copies of deliberately-untracked private-AI code)
+.audit_backup_20260831/
+
+# --- Internal working files — kept locally, NEVER in the public repo ---
+# The whole tools/ dir (local-AI stack + internal audit scripts) and docs/
+# (personal workflow + defect ledgers) stay private; the public product is the
+# Rust crates + README + LICENSE + CI + opmap_db + probe fixtures.
+/tools/
+/docs/
+/CLAUDE.md
+/decompiler_journal.md
+/dna.tsv
+/merge_sweeps.py
+/sweep_*.jsonl
+
+# --- Working-directory scratch / scans / harvested data — never public ---
+# The public product is exactly: crates/, opmap_db/, probes/, .github/, Cargo.*,
+# README.md, LICENSE. Everything below is local scratch, benchmark output, corpus
+# scans and harvested data that lives in the repo root but must never be pushed.
+# Patterns are root-anchored (leading /) so they never touch the crates.
+/$OUT
+/.drive_scan/
+/.serena/
+/bc/
+/bin/
+/temp/
+/reference/
+/knowledge_decompiled/
+/knowledge_ledgers/
+/scratch_batch_in/
+/scratch_batch_out/
+/msys
+/CODEBASE_DIGEST.md
+/DECOMPILED_RUN_PATHS.txt
+/LifterProbe.luau
+/scratch_*
+/_*.py
+/final_*.py
+/verdict_*.py
+/tune_low.py
+/pct.py
+/check_cov.py
+/bench_code_*.py
+/*.jsonl
+/*.json
+/*.html
+/*.mp4
+/*.xlsx
+/*.txt
+/*.tsv
+/*.bat
+/audit_report.md
