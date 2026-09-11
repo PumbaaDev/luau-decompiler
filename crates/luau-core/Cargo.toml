@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+# Doc comments in this crate carry illustrative disassembly and pseudo-code, not
+# runnable Rust examples, so doc-tests are disabled (the test gate is --lib).
+doctest = false
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true

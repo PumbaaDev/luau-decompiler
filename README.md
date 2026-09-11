@@ -18,7 +18,7 @@ As far as we know it is the only **open, auditable, offline** Luau decompiler wh
 - **Handles opcode-shuffled bytecode.** It infers the opcode permutation before lifting, and stamps every remapped decode with an honest evidence header (what was pinned by detectors vs completed by inference) so you always know what the output leans on.
 - **Proven in real security research.** Used to reverse and deobfuscate VM-obfuscated Roblox scripts (Synapse Xen / IronBrew2-family) down to their exact server calls.
 - **A companion obfuscator** (`luau-protect`) — the same project that takes obfuscation apart can also apply it: control-flow flattening, constant encryption, operand encoding, identifier renaming.
-- **One offline static binary**, plus WASM and HTTP-server builds.
+- **One offline static binary** — no runtime, no network, no services.
 
 ## Features
 
@@ -58,10 +58,10 @@ luau-decompiler disassemble script.bin --debug-info
 luau-decompiler info script.bin --json
 
 # Batch-decompile every bytecode file in a folder
-luau-decompiler batch ./bytecode -o ./out
+luau-decompiler batch ./bytecode --out-dir ./out
 
 # Watch a folder and decompile files as they land
-luau-decompiler watch ./drop -o ./out
+luau-decompiler watch ./drop --out-dir ./out
 
 # Syntax-check a Luau file
 luau-decompiler validate script.lua
@@ -88,11 +88,11 @@ Output:
 
 ```lua
 for i = 1, 10 do
-    local function run()
+    local function closure()
         return i
     end
     local tbl = {
-        run = run
+        run = closure
     }
     tbl.run()
 end
@@ -140,8 +140,8 @@ This figure is measured out of tree: the round trip needs a Luau interpreter bin
 execute both the original and the recovered source, and neither that binary nor the corpus
 ships in this repository, so a fresh clone cannot reproduce the number directly. What CI and
 `cargo test` do exercise is the in-repo suite (parser, lifter, disassembler and obfuscator
-unit tests, 951 of them, all green); the interpreter round-trip test skips cleanly when the
-binary is absent.
+tests across the workspace, over 1,000 in all and 951 in the `luau-core` library alone, all
+green); the interpreter round-trip test skips cleanly when the binary is absent.
 
 A known limitation: when the operands of a nested short-circuit are themselves function
 calls, the value-join reconstruction declines to fold them. Doing so would risk emitting a
@@ -229,8 +229,11 @@ opcode map.
 | Parses as valid Luau | **1,323 / 1,323 (100%)** |
 | Semantically clean | **1,315 / 1,323 (99.4%)**, 8 defects |
 
-Syntax validity is cross-checked against the real `luau-compile`, not just our
-own checker — see below for why that mattered.
+This corpus is a live-client capture and, like the round-trip corpus above, is
+not shipped in the repository, so the 99.4% figure cannot be reproduced from a
+fresh clone; it is recorded here as the project's measured result. Syntax
+validity is cross-checked against the real `luau-compile`, not just our own
+checker — see below for why that mattered.
 
 The 8 remaining defects are adjudicated by hand — none is a checker false
 positive, and the number is honestly at the tool's ceiling:
@@ -244,7 +247,7 @@ positive, and the number is honestly at the tool's ceiling:
   traded one file for another. The numbers are recorded rather than the attempts
   quietly dropped.
 
-That gate — **both** the full 951-test unit suite (951/0) **and** a full corpus
+That gate — **both** the full `luau-core` unit suite (951/0) **and** a full corpus
 diff with no previously-clean file regressing — is what every change has to
 clear. It is why the clean rate is trustworthy rather than tuned.
 

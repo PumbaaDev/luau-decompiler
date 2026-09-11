@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
-const BYTECODE_DIR: &str = r"C:\Users\jep\AppData\Local\Potassium\workspace\decompiler";
+// Bytecode dir comes from the BC_CORPUS env var; the test skips when unset.
 
 /// Decompile with the measured opmap database when it covers this chunk,
 /// exactly as `luau-cli` does. Falls back to detector inference only when the
@@ -72,7 +72,8 @@ fn decompile_like_product(bytes: &[u8]) -> Option<String> {
 }
 
 fn bytecode_files() -> Vec<PathBuf> {
-    let dir = Path::new(BYTECODE_DIR);
+    let bc = std::env::var("BC_CORPUS").unwrap_or_default();
+    let dir = Path::new(&bc);
     if !dir.exists() {
         return Vec::new();
     }

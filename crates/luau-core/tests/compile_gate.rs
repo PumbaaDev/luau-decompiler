@@ -29,16 +29,17 @@
 //!     -- --nocapture
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// `luau-compile --binary` exits non-zero and prints a diagnostic on failure.
 fn luau_compile() -> Option<PathBuf> {
-    let candidates = [
-        r"C:\Users\jep\Downloads\luau-decompiler-v2\tools\luau\luau-compile.exe",
-        r"C:\Users\jep\.luau_tools\luau-compile.exe",
-    ];
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+    // Point LUAU_COMPILE at a `luau-compile` binary to run this gate; without it
+    // the test skips.
+    std::env::var("LUAU_COMPILE")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
 }
 
 /// The compiler's diagnostic, with the leading file path stripped.
@@ -217,7 +218,7 @@ fn reference_output_compiles() {
     }
     let total = ok + bad;
     eprintln!();
-    eprintln!("  REFERENCE (Potassium) through the same gate:");
+    eprintln!("  REFERENCE decompiler through the same gate:");
     eprintln!(
         "    compiles {}/{} ({:.1}%)",
         ok,

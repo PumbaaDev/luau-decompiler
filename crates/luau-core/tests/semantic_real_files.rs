@@ -19,10 +19,9 @@ fn report(label: &str, path: &str, protos: Option<usize>) {
 
 #[test]
 fn scan_real_decompiled_files() {
-    let bs = concat!(
-        r"C:\Users\jep\AppData\Local\Potassium\workspace\decompiler\",
-        r"beeswarm_final_191648\ReplicatedStorage"
-    );
+    // Point OUR_CORPUS at a ReplicatedStorage dir of decompiled .lua to run
+    // this; each file is skipped when absent.
+    let bs = std::env::var("OUR_CORPUS").unwrap_or_default();
     report("Events.lua", &format!(r"{}\Events.lua", bs), Some(13));
     report("Activatables/Hives.lua", &format!(r"{}\Activatables\Hives.lua", bs), Some(8));
     report("Collectibles.lua", &format!(r"{}\Collectibles.lua", bs), Some(23));

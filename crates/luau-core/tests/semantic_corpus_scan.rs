@@ -35,9 +35,8 @@ fn proto_count(src: &str) -> Option<usize> {
 
 #[test]
 fn scan_whole_corpus() {
-    let root = Path::new(
-        r"C:\Users\jep\AppData\Local\Potassium\workspace\decompiler\beeswarm_final_191648",
-    );
+    let corpus = std::env::var("OUR_CORPUS").unwrap_or_default();
+    let root = Path::new(&corpus);
     if !root.exists() {
         eprintln!("SKIP: corpus not present at {}", root.display());
         return;

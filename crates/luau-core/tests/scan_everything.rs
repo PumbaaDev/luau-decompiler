@@ -1,38 +1,34 @@
-//! Full-machine semantic scan — every Lua/Luau file reachable on this PC.
+//! Semantic scan over a configurable set of local Lua/Luau roots.
 //!
-//! 27,446 files, ~5.67M lines. Reading that by hand is not possible; reading it
-//! programmatically is, and that is what this does. Coverage here is genuinely
-//! 100% of files found, and the count of files actually opened is reported so
-//! the claim can be checked rather than trusted.
+//! Reads every `.lua`/`.luau` file under the directories named in the
+//! `LUAU_SCAN_ROOTS` environment variable (`;`-separated). With the variable
+//! unset there are no roots, so the scan is a no-op and the test passes
+//! trivially; point it at one or more directories to exercise it locally. The
+//! count of files actually opened is reported so coverage can be checked
+//! rather than trusted.
 //!
 //! Findings are grouped by ROOT so machine-generated decompiler output (which
 //! dominates by volume) can be told apart from hand-written source.
 //!
 //! Run with:
-//!   cargo test -p luau-core --test scan_everything -- --nocapture
+//!   LUAU_SCAN_ROOTS="dir1;dir2" \
+//!     cargo test -p luau-core --test scan_everything -- --nocapture
 
 use luau_core::decompiler::semantic_check::{check, Severity};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-// The first five were the original list. A drive-wide search afterwards found
-// 1,522 further files outside them -- including `.luau_tools\corpus`, which is
-// the round-trip corpus the README's correctness claim rests on. Scanning
-// everything except the reference corpus would have been a poor joke.
-//
-// Before adding a root here, re-run the drive-wide check:
-//   find /c -maxdepth 6 \( -name "*.lua" -o -name "*.luau" \) | grep -v <roots>
-const ROOTS: &[&str] = &[
-    r"C:\Users\jep\AppData\Local\Potassium",
-    r"C:\Users\jep\Downloads",
-    r"C:\Users\jep\Desktop",
-    r"C:\Users\jep\Documents",
-    r"C:\Projects",
-    r"C:\Users\jep\.luau_tools",
-    r"C:\tmp",
-    r"C:\Users\jep\.claude",
-    r"C:\Users\jep\AppData\Local\Temp\claude",
-];
+/// Roots to scan, taken from the `LUAU_SCAN_ROOTS` env var (`;`-separated).
+/// Empty when the variable is unset, which makes the scan a no-op.
+fn roots() -> Vec<String> {
+    std::env::var("LUAU_SCAN_ROOTS")
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > 24 {
@@ -69,36 +65,10 @@ fn proto_count(src: &str) -> Option<usize> {
     })
 }
 
-/// Bucket a path by which root it came from.
-///
-/// The fallback arm used to be `"Projects"`, which quietly absorbed every root
-/// added later -- the first expanded run reported "Projects: 4,834 files" when
-/// C:\Projects holds 3. A catch-all that names a real bucket produces a wrong
-/// number rather than an obviously missing one, so the fallback is now
-/// explicitly "other".
-fn root_label(p: &Path) -> &'static str {
-    let s = p.to_string_lossy();
-    if s.contains(r"\Potassium\") {
-        "Potassium"
-    } else if s.contains(r"\.luau_tools\") {
-        "luau_tools"
-    } else if s.contains(r"\.claude\") {
-        "claude"
-    } else if s.contains(r"\Temp\claude") {
-        "temp-claude"
-    } else if s.starts_with(r"C:\tmp") {
-        "tmp"
-    } else if s.contains(r"\Downloads\") {
-        "Downloads"
-    } else if s.contains(r"\Desktop\") {
-        "Desktop"
-    } else if s.contains(r"\Documents\") {
-        "Documents"
-    } else if s.starts_with(r"C:\Projects") {
-        "Projects"
-    } else {
-        "other"
-    }
+/// Bucket for grouped reporting. Kept generic so no machine-specific layout is
+/// baked in; all scanned files share one bucket.
+fn root_label(_p: &Path) -> &'static str {
+    "scanned"
 }
 
 /// Machine-generated decompiler output carries our own header.
@@ -111,8 +81,8 @@ fn is_decompiler_output(src: &str) -> bool {
 #[test]
 fn scan_every_lua_file_on_this_machine() {
     let mut files = Vec::new();
-    for r in ROOTS {
-        let p = Path::new(r);
+    for r in roots() {
+        let p = Path::new(&r);
         if p.exists() {
             walk(p, &mut files, 0);
         }

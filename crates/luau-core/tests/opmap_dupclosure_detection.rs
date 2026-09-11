@@ -43,10 +43,10 @@
 
 use std::path::{Path, PathBuf};
 
-const CORPUS: &str = r"C:\Users\jep\AppData\Local\Potassium\workspace\bc_extract_1786138100";
-
 fn bytecode_files() -> Vec<PathBuf> {
-    let dir = Path::new(CORPUS);
+    // Corpus dir comes from the BC_CORPUS env var; the test skips when unset.
+    let corpus = std::env::var("BC_CORPUS").unwrap_or_default();
+    let dir = Path::new(&corpus);
     if !dir.exists() {
         return Vec::new();
     }

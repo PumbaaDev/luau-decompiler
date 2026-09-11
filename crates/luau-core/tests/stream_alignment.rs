@@ -36,9 +36,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn corpus() -> Vec<PathBuf> {
-    let dir = std::env::var("BC_CORPUS").unwrap_or_else(|_| {
-        r"C:\Users\jep\AppData\Local\Potassium\workspace\bc_extract_1786138100".to_string()
-    });
+    let dir = std::env::var("BC_CORPUS").unwrap_or_default();
     let p = Path::new(&dir);
     if !p.exists() {
         return Vec::new();

@@ -1,4 +1,4 @@
-//! Compare our output against Potassium's own decompiler.
+//! Compare our output against an independent reference decompiler.
 //!
 //! ── WHY THIS MATTERS ────────────────────────────────────────────────────
 //! Every quality measure in this project so far has been my own heuristic
@@ -7,8 +7,8 @@
 //! declared-but-nil). A second, independent decompiler is a real oracle: it
 //! cannot be blunted by changes to this codebase.
 //!
-//! Potassium decompiles the same 628 scripts from the same live client. Where
-//! it recovers a function and we do not, that is our defect, not a
+//! The reference decompiler processes the same scripts from the same client.
+//! Where it recovers a function and we do not, that is our defect, not a
 //! disagreement about style.
 //!
 //! ── MATCHING ────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ fn ours_recovers_what_the_reference_recovers() {
 
     eprintln!();
     eprintln!("================================================================");
-    eprintln!("  OURS vs POTASSIUM REFERENCE");
+    eprintln!("  OURS vs REFERENCE");
     eprintln!("================================================================");
     eprintln!("  matched pairs            {:>6}", pairs);
     eprintln!("  functions (reference)    {:>6}", fn_ref_total);

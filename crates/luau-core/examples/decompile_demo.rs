@@ -1,6 +1,6 @@
 //! End-to-end decompiler demo — no external toolchain required.
 //!
-//! The `luau-decompiler` CLI consumes *standard* Luau bytecode (v3–8), such as
+//! The `luau-decompiler` CLI consumes *standard* Luau bytecode (v3–9), such as
 //! the output of the official `luau-compile --binary` or a Luau runtime's
 //! `string.dump`. To keep this example fully self-contained, we hand-assemble a
 //! tiny bytecode chunk in memory instead of shelling out to a compiler, then

@@ -5,11 +5,10 @@
 //! bytecode with the CURRENT code and checks that output, which is the only
 //! way to see a fix land.
 
-use luau_core::decompiler::semantic_check::{check, format_report, Severity};
+use luau_core::decompiler::semantic_check::{check, Severity};
 use std::path::Path;
 
-const BYTECODE_DIR: &str =
-    r"C:\Users\jep\AppData\Local\Potassium\workspace\decompiler";
+// Bytecode dir comes from the BC_CORPUS env var; the test skips when unset.
 
 fn proto_count(src: &str) -> Option<usize> {
     src.lines().take(20).find_map(|l| {
@@ -20,7 +19,8 @@ fn proto_count(src: &str) -> Option<usize> {
 
 #[test]
 fn decompile_and_check_live_bytecode() {
-    let dir = Path::new(BYTECODE_DIR);
+    let bc = std::env::var("BC_CORPUS").unwrap_or_default();
+    let dir = Path::new(&bc);
     if !dir.exists() {
         eprintln!("SKIP: no bytecode dir at {}", dir.display());
         return;
@@ -94,7 +94,8 @@ fn decompile_and_check_live_bytecode() {
 /// Focused: the pass must not shadow real globals in real output.
 #[test]
 fn fix_does_not_shadow_globals() {
-    let dir = Path::new(BYTECODE_DIR);
+    let bc = std::env::var("BC_CORPUS").unwrap_or_default();
+    let dir = Path::new(&bc);
     if !dir.exists() {
         return;
     }

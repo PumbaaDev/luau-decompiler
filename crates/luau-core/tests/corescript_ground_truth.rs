@@ -6,8 +6,8 @@
 //!   * the semantic checks are mine, and twice a fix of mine silently
 //!     blunted the check meant to catch it (marker counting; then
 //!     free_var_decls masking dropped values as declared-but-nil)
-//!   * the Potassium reference is a second opinion, not ground truth — it
-//!     loses functions entirely on 4 files where we do not
+//!   * an independent reference decompiler is a second opinion, not ground
+//!     truth — it loses functions entirely on some files where we do not
 //!
 //! Seven wrong theories were formed in a single session by validating
 //! against sources that were themselves unvalidated.
@@ -73,9 +73,7 @@ const CASES: &[CoreScriptCase] = &[CoreScriptCase {
 }];
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BC_CORPUS").unwrap_or_else(|_| {
-        r"C:\Users\jep\AppData\Local\Potassium\workspace\bc_extract_1786138100".to_string()
-    }))
+    PathBuf::from(std::env::var("BC_CORPUS").unwrap_or_default())
 }
 
 fn find_bin(dir: &Path, needle: &str) -> Option<PathBuf> {

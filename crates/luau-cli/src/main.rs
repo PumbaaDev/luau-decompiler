@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
     about = "The best Luau bytecode decompiler — runs 100% locally",
     version,
     long_about = "A fast, fully offline Luau bytecode decompiler.\n\
-                   Supports bytecode v3-8 | Windows, macOS, Linux.\n\n\
+                   Supports bytecode v3-9 | Windows, macOS, Linux.\n\n\
                    Quick start:\n  \
                      luau-decompiler script.bin         # decompile a file\n  \
                      luau-decompiler watch ./dir        # auto-decompile folder\n  \

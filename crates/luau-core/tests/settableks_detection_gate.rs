@@ -74,9 +74,7 @@ use std::path::PathBuf;
 const SUBJECT: u8 = LuauOpcode::SetTableKS as u8;
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BC_CORPUS").unwrap_or_else(|_| {
-        r"C:\Users\jep\AppData\Local\Potassium\workspace\bc_extract_1786138100".to_string()
-    }))
+    PathBuf::from(std::env::var("BC_CORPUS").unwrap_or_default())
 }
 
 /// One chunk's independent reading of the shuffle.
