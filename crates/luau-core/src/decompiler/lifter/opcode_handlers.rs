@@ -200,6 +200,171 @@ fn reg_expr_ref(regs: &[RegVal], idx: usize) -> Expr {
     }
 }
 
+/// May `op` appear in a foldable type-guard span?
+///
+/// A type-guard span is a short straight-line computation whose result feeds a
+/// conditional jump — the `x:IsA(T)` / `type(x)` idiom. Only value setup plus
+/// the guard's own call is allowed; a `SET*`, table build, closure or capture
+/// is a real side effect that must stay a statement in the arm, so it rejects
+/// the fold.
+fn is_guard_span_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Nop
+            | LuauOpcode::LoadNil
+            | LuauOpcode::LoadB
+            | LuauOpcode::LoadN
+            | LuauOpcode::LoadK
+            | LuauOpcode::LoadKX
+            | LuauOpcode::Move
+            | LuauOpcode::GetUpval
+            | LuauOpcode::GetGlobal
+            | LuauOpcode::GetImport
+            | LuauOpcode::GetTable
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::NameCall
+            | LuauOpcode::Call
+            | LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3
+    )
+}
+
+/// Within a then-arm `[arm_start, then_end)`, is the leading run of value
+/// computation a short-circuit `and` term — a call whose result gates the arm
+/// by jumping to the arm's own else on failure?
+///
+/// `if x and x:IsA(T) then keep else make end` compiles to two `JUMPIFNOT`s
+/// that BOTH skip to the else; lifted one jump at a time the second — whose
+/// target is the else, one past this arm's end — is silently dropped and the
+/// `x:IsA(T)` call parks as a dead `local`, losing the type check. This spots
+/// that inner guard so the caller can fold it back into the condition.
+///
+/// Returns `(guard_pc, is_jumpif, tested_register)`. Deliberately narrow: the
+/// span before the jump must be pure value setup ending in a call that DEFINES
+/// the tested register (`is_guard_span_op`), and the FIRST control-flow op seen
+/// must be that guard jump to `else_start` — anything else is real nested
+/// control flow and returns None, so an ordinary `a and b` register test (no
+/// call, empty span) or a genuine inner branch is left untouched.
+fn find_leading_guard_jump(
+    code: &[u32],
+    arm_start: usize,
+    then_end: usize,
+    else_start: usize,
+) -> Option<(usize, bool, usize)> {
+    let mut w = arm_start;
+    let mut saw_call = false;
+    let mut defines_reg = false;
+    let mut last_def: Option<usize> = None;
+    while w < then_end && w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        match op {
+            LuauOpcode::JumpIf | LuauOpcode::JumpIfNot => {
+                let t = (w as i64 + insn_d(code[w]) as i64 + 1) as usize;
+                let reg = insn_a(code[w]) as usize;
+                // The tested register must be the value this span just computed
+                // with a call: the guard idiom, not a bare second register test.
+                if t == else_start && saw_call && last_def == Some(reg) && defines_reg {
+                    return Some((w, op == LuauOpcode::JumpIf, reg));
+                }
+                return None;
+            }
+            _ => {}
+        }
+        if !is_guard_span_op(op) {
+            return None;
+        }
+        if matches!(op, LuauOpcode::NameCall | LuauOpcode::Call) {
+            saw_call = true;
+        }
+        if insn_defines_reg_a(op) {
+            defines_reg = true;
+            last_def = Some(insn_a(code[w]) as usize);
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    None
+}
+
+/// Recover the value a folded guard span left in `g_reg` as an expression,
+/// so it can move into the `if` condition. The lift of the span either parks
+/// the call in the register (no statement) or, because its only reader — the
+/// guard jump — is out of range and gets dropped, materialises it as a single
+/// dead `local n = <call>`. In the latter case the dead declaration is removed
+/// (nothing reads it) and its value returned. Any other shape returns None and
+/// the caller abandons the fold.
+fn recover_guard_expr(
+    stmts: &mut Vec<Stat>,
+    regs: &[RegVal],
+    g_reg: usize,
+    before_len: usize,
+) -> Option<Expr> {
+    match regs.get(g_reg) {
+        Some(RegVal::Expr(Expr::Name(n))) => {
+            let n = n.clone();
+            if stmts.len() == before_len + 1 {
+                if let Some(Stat::Local { names, values }) = stmts.last() {
+                    if names.len() == 1
+                        && values.len() == 1
+                        && names[0] == n
+                        && !expr_references_name(&values[0], &n)
+                    {
+                        let v = values[0].clone();
+                        stmts.truncate(before_len);
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        }
+        Some(RegVal::Expr(e)) if stmts.len() == before_len => Some(e.clone()),
+        _ => None,
+    }
+}
+
+/// Does `[start, end)` contain an observable side effect — a call or a store?
+///
+/// Used to keep the type-guard fold safe. Folding the guard's call into the
+/// condition is only sound if the resulting `if` will SURVIVE: a branch whose
+/// arms merely select a value into a register can be dropped by a later pass
+/// once that register turns out dead, and dropping `if x and x:m() then r=a
+/// else r=b end` degrades the short-circuit call `x:m()` into an unconditional
+/// one that errors when `x` is nil (`rc_0066`). Requiring a real side effect in
+/// an arm means the branch keeps its shape and the guard stays protected.
+fn range_has_side_effect(code: &[u32], start: usize, end: usize) -> bool {
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(
+            op,
+            LuauOpcode::Call
+                | LuauOpcode::NameCall
+                | LuauOpcode::SetGlobal
+                | LuauOpcode::SetUpval
+                | LuauOpcode::SetTable
+                | LuauOpcode::SetTableKS
+                | LuauOpcode::SetTableN
+                | LuauOpcode::SetList
+                | LuauOpcode::CloseUpvals
+                | LuauOpcode::FastCall
+                | LuauOpcode::FastCall1
+                | LuauOpcode::FastCall2
+                | LuauOpcode::FastCall2K
+                | LuauOpcode::FastCall3
+        ) {
+            return true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Given a then-body spanning `[then_start, target)`, check whether its final
 /// instruction is an unconditional forward JUMP that lands past `target` but
 /// still inside `end`. That jump is the compiler's else-skip, so the real then
@@ -3831,6 +3996,12 @@ pub(super) fn lift_instruction_range(
                 }
                 let cond = reg_expr(regs, a);
                 let mut target = (pc as i32 + d as i32 + 1) as usize;
+                // The RAW jump target, before `extended_arm_end` may push it out
+                // to a later construct end. The type-guard fold only applies when
+                // this jump directly skips to the else; a jump that lands INSIDE
+                // the then-arm (its target was extended) is an `a or b` short-
+                // circuit whose first operand jumps to the body, not an `and`.
+                let raw_target = target;
 
                 // THE ARM ENDS WHERE THE CONSTRUCT ENDS, NOT AT THE FIRST TARGET
                 // SEEN. A branch inside the arm targeting past it is the
@@ -3960,11 +4131,12 @@ pub(super) fn lift_instruction_range(
                     // The condition SKIPS to target, so the "then" body is the code between
                     // JumpIfNot condition means: if NOT cond, skip to target
                     // So the "then" body runs when cond IS true (JumpIfNot) or NOT true (JumpIf)
-                    let condition = if op == LuauOpcode::JumpIfNot {
+                    let mut condition = if op == LuauOpcode::JumpIfNot {
                         cond // JumpIfNot: skip when false, so then-body runs when true
                     } else {
                         Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) } // JumpIf: skip when true
                     };
+                    let base_condition = condition.clone();
                     let jump_next = pc + 1 + if op.has_aux() { 1 } else { 0 };
 
                     // If/else diamond: see the JumpXEqK* arm below.
@@ -4028,7 +4200,7 @@ pub(super) fn lift_instruction_range(
                     if let Ok(w) = std::env::var("LUAU_ARM_ENTRY") {
                         if let Ok(w) = w.parse::<usize>() {
                             eprintln!(
-                                "ARMENTRY	pass={}	{}	arm={}..{}	reg={}	value={:?}",
+                                "ARMENTRY\tpass={}\t{}\tarm={}..{}\treg={}\tvalue={:?}",
                                 pass_id,
                                 crate::decompiler::lifter::current_dce_proto(),
                                 jump_next,
@@ -4038,7 +4210,111 @@ pub(super) fn lift_instruction_range(
                             );
                         }
                     }
-                    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+
+                    // SHORT-CIRCUIT TYPE-GUARD FOLD.
+                    //
+                    // `if x and x:IsA(T) then keep else make end` compiles to two
+                    // JUMPIFNOTs that BOTH skip to the else: the first tests `x`,
+                    // the second tests the `x:IsA(T)` call. This outer jump owns
+                    // `if x`; the inner one -- whose target is the else, one past
+                    // this arm's end -- is otherwise dropped, parking the call as a
+                    // dead `local` and running the arm body unconditionally, so the
+                    // type check is lost (`rc_0051`, and the corpus-wide
+                    // `dropped_arm_value` shape). Fold each such leading guard into
+                    // the condition as an `and` term so the check survives and the
+                    // arm body starts past it. Gated to the call-producing guard
+                    // idiom; kill-switch `LUAU_NO_TG` restores the old behaviour.
+                    //
+                    // Decide the fold PURELY STRUCTURALLY first, before lifting
+                    // anything: the guard-span lift mints names into the shared
+                    // context, which cannot be rolled back, so a lift-then-abort
+                    // corrupts later naming. Phase 1 walks the guard chain with no
+                    // side effects; phase 2 gates it; only then does phase 3 lift.
+                    let mut arm_start = jump_next;
+                    if std::env::var("LUAU_NO_TG").is_err() {
+                        // Only fold when this jump skips DIRECTLY to the else. If
+                        // `extended_arm_end` moved the target, the jump lands
+                        // inside the then-arm — an `a or b` whose first operand
+                        // jumps to the body — and folding it as `and` would drop
+                        // that operand's path (`rc_0136`).
+                        if let Some((else_start, _)) =
+                            else_range.filter(|(es, _)| *es == raw_target)
+                        {
+                            // Phase 1: locate the guard chain (no lifting).
+                            let mut probe = jump_next;
+                            loop {
+                                match find_leading_guard_jump(code, probe, then_end, else_start) {
+                                    Some((g, _, _)) if g > probe => probe = g + 1,
+                                    _ => break,
+                                }
+                            }
+                            // Phase 2: only fold when an arm carries a real side
+                            // effect, so the resulting `if` survives later passes.
+                            // A pure value-select branch can be dropped once its
+                            // register turns out dead, which would degrade the
+                            // short-circuit guard call into an unconditional one
+                            // that errors on nil (`rc_0066`). See
+                            // `range_has_side_effect`.
+                            let else_effect = else_range
+                                .map_or(false, |(es, ee)| range_has_side_effect(code, es, ee));
+                            let do_fold = probe > jump_next
+                                && (range_has_side_effect(code, probe, then_end) || else_effect);
+                            // Phase 3: lift each guard span and fold its call into
+                            // the condition as an `and` term.
+                            if do_fold {
+                                loop {
+                                    let Some((g, g_is_if, g_reg)) =
+                                        find_leading_guard_jump(code, arm_start, then_end, else_start)
+                                    else {
+                                        break;
+                                    };
+                                    if g <= arm_start {
+                                        break;
+                                    }
+                                    let before_len = then_stmts.len();
+                                    lift_instruction_range(
+                                        ctx, proto, proto_index, depth + 1, arm_start, g, regs,
+                                        locals, &mut then_stmts, in_loop,
+                                    );
+                                    match recover_guard_expr(&mut then_stmts, regs, g_reg, before_len)
+                                    {
+                                        Some(rc) => {
+                                            // Body runs when the guard does NOT fire:
+                                            // JUMPIFNOT fires on falsy (needs `rc`),
+                                            // JUMPIF fires on truthy (needs `not rc`).
+                                            let term = if g_is_if {
+                                                Expr::UnOp {
+                                                    op: UnOp::Not,
+                                                    operand: Box::new(rc),
+                                                }
+                                            } else {
+                                                rc
+                                            };
+                                            condition = Expr::BinOp {
+                                                left: Box::new(condition),
+                                                op: BinOp::And,
+                                                right: Box::new(simplify_expr(&term)),
+                                            };
+                                            arm_start = g + 1;
+                                        }
+                                        None => {
+                                            // Defensive: the structural match said
+                                            // this was a clean call guard but the
+                                            // lift disagreed. Abandon and lift the
+                                            // arm as it was (rare; naming may drift).
+                                            *regs = regs_snapshot.clone();
+                                            condition = base_condition.clone();
+                                            then_stmts.clear();
+                                            arm_start = jump_next;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    lift_instruction_range(ctx, proto, proto_index, depth + 1, arm_start, then_end, regs, locals, &mut then_stmts, in_loop);
                     bind_arm_merge_seeds(ctx, regs, locals, &mut then_stmts, &regs_snapshot, jump_next, construct_end);
 
                     let else_body = if let Some((es, ee)) = else_range {
