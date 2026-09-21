@@ -1392,7 +1392,7 @@ pub(crate) fn range_contains_nested_for(code: &[u32], start: usize, end: usize) 
 ///
 /// The LAST instruction specifically: an arm containing a return somewhere in
 /// the middle has its own internal structure and is not a guard.
-fn arm_terminates(code: &[u32], start: usize, end: usize) -> bool {
+pub(crate) fn arm_terminates(code: &[u32], start: usize, end: usize) -> bool {
     if end <= start || end > code.len() {
         return false;
     }

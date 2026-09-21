@@ -3644,7 +3644,18 @@ pub(super) fn lift_instruction_range(
                 }
                 // Strip trailing redundant empty return. Luau always emits
                 // RETURN 0 1 as the last instruction but real source omits it.
-                let is_trailing_empty = values.is_empty() && pc + 1 >= end;
+                //
+                // Guard on the PROTO tail, not merely the lifted range end: a
+                // bare early `return` inside a guard (`if x then return end`)
+                // is lifted as its own sub-range and would otherwise satisfy
+                // `pc + 1 >= end` — the range end cannot tell the function's
+                // implicit final RETURN from a real early return that merely
+                // sits at a sub-range boundary. `lv_0883 monitorSegments` drops
+                // two in-loop `return` guards this way once the generic-for is
+                // recovered and the guards become their own InlineIfThenInLoop
+                // sub-ranges.
+                let is_trailing_empty =
+                    values.is_empty() && pc + 1 >= end && end >= proto.code.len();
                 if !is_trailing_empty {
                     stmts.push(Stat::Return { values });
                 }

@@ -1712,6 +1712,53 @@ fn lift_branch_region(
             runs.iter().map(|&(lo, hi)| (ranges[lo].0, ranges[hi].1)).collect();
         eprintln!("RUNS proto@{} blocks={:?} runs={:?}", proto.line_defined, rs, spans);
     }
+
+    // A nested for-loop whose FORGPREP and FORGLOOP land in DIFFERENT contiguous
+    // runs is invisible to the per-run `range_contains_nested_for` check below:
+    // each run holds only half the prep→loop pair, so both halves are lifted
+    // flat and the loop is lost — the iterator CALL flattens to a bare 3-value
+    // local and the loop variables are never bound (`declared_never_assigned`).
+    //
+    // The runs fragment ONLY because early-exit blocks were dropped from this
+    // region's block set: `lv_0883 monitorSegments` is a `for _, v in ipairs(t)`
+    // whose body holds two `return` guards, and those RETURN-terminated blocks
+    // are not in the natural loop body, so the block list has PC gaps at them.
+    // Each gap sits strictly inside the region's own PC extent and is a benign
+    // early exit, so re-structuring the whole `[lo, hi]` span claims nothing a
+    // sibling region owns — the same collapse the `early_ret` path above makes,
+    // just triggered by a straddling loop instead of an in-range RETURN.
+    if runs.len() > 1 {
+        let span_lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let span_hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+        let for_straddles_gap =
+            crate::analysis::structuring::range_contains_nested_for(&proto.code, span_lo, span_hi)
+                && !runs.iter().any(|&(lo, hi)| {
+                    crate::analysis::structuring::range_contains_nested_for(
+                        &proto.code,
+                        ranges[lo].0,
+                        ranges[hi].1,
+                    )
+                });
+        if for_straddles_gap {
+            let gaps_are_early_exit = runs.windows(2).all(|w| {
+                let gap_start = ranges[w[0].1].1; // end pc of the earlier run
+                let gap_end = ranges[w[1].0].0; // start pc of the later run
+                gap_start < gap_end
+                    && crate::analysis::structuring::arm_terminates(
+                        &proto.code,
+                        gap_start,
+                        gap_end,
+                    )
+            });
+            if gaps_are_early_exit {
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, span_lo, span_hi, regs, locals, out,
+                    in_loop,
+                );
+                return;
+            }
+        }
+    }
     for &(lo, hi) in &runs {
         let start = ranges[lo].0;
         let end = ranges[hi].1;
