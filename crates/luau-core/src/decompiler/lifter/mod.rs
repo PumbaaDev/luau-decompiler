@@ -8023,6 +8023,8 @@ fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize)
             Op::Call => {
                 // Reads function + args FIRST, then writes results.
                 if b == 0 {
+                    // MULTRET args occupy [a, top): a register at or above the
+                    // call base is read as an argument.
                     if reg >= a {
                         return true;
                     }
@@ -8032,15 +8034,32 @@ fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize)
                     }
                 }
                 if c == 0 {
-                    // Writes A..top — unknowable; stop conservatively unless
-                    // the read set already claimed it.
+                    // MULTRET results occupy [a, top). A register at or above
+                    // the call base may be overwritten by a result whose count
+                    // we cannot know, so stop conservatively unless it was
+                    // already read. A register strictly BELOW the base is
+                    // provably untouched — a call never writes below its own
+                    // base — so the scan CONTINUES past it instead of bailing.
+                    //
+                    // Without this, an unrelated `f(...)` MULTRET call sitting
+                    // between a branch merge and the real first read of a lower
+                    // register defeated the whole check: rc_0037
+                    // GateController::refresh has a `if 0 < n then R19 = q/n
+                    // else R19 = 1 end` diamond whose seed was suppressed by a
+                    // `CALL R31 …=multret` at the merge (R19 < 31), while R19's
+                    // true first touch is a read (`MOVE R29 R19` feeding
+                    // `UDim2.fromScale(R19, 1)`).
                     if reads.contains(&reg) {
                         return true;
                     }
-                    return false;
-                }
-                for r in a..(a + c).saturating_sub(1) {
-                    writes.push(r);
+                    if reg >= a {
+                        return false;
+                    }
+                    // reg < a: transparent to this call, keep scanning.
+                } else {
+                    for r in a..(a + c).saturating_sub(1) {
+                        writes.push(r);
+                    }
                 }
             }
             Op::Return => {
