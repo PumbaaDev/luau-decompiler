@@ -1900,6 +1900,9 @@ fn lift_structured_run(
                 Region::InlineIfThenInLoop { cond_pc, body, .. } => {
                     ("InlineIfThenInLoop", *cond_pc, 0, Some(body))
                 }
+                Region::GuardedTailIf { guards, merge, .. } => {
+                    ("GuardedTailIf", guards.first().map(|g| g.0).unwrap_or(0), *merge, None)
+                }
             };
             eprintln!(
                 "RUNREG	{}@{}	run={}..{}	{}{}	{}..{}	nested={}",
@@ -1944,6 +1947,7 @@ fn lift_structured_run(
                 }
                 Region::InlineLoopInLoop { .. } => ("InlineLoopInLoop", 0, 0),
                 Region::InlineIfThenInLoop { .. } => ("InlineIfThenInLoop", 0, 0),
+                Region::GuardedTailIf { merge, .. } => ("GuardedTailIf", 0, *merge),
             };
             eprintln!(
                 "RUNREG	{}	run={}..{}	{}	{}..{}",
@@ -2087,6 +2091,7 @@ fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
         Region::IfThenElse { .. }
         | Region::WhileTrue { .. }
         | Region::WhileDo { .. }
+        | Region::GuardedTailIf { .. }
         | Region::RepeatUntil { .. } => false,
     }
 }
@@ -2635,6 +2640,76 @@ fn lift_value_join(
     });
 }
 
+/// Lift a `Region::GuardedTailIf`: a short-circuit `and`-chain of guards gating
+/// an out-of-line tail. Emits `if <g0 and g1 and ...> then <tail> end`.
+///
+/// The register file is left at the POST-GUARD state (not the post-tail state):
+/// the continuation — the `merge` block, lifted as its own region immediately
+/// after — is reached exactly when the guard chain fails, i.e. without executing
+/// the tail, so it must see the registers as they were before the tail ran.
+fn lift_guarded_tail_if(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    guards: &[(usize, bool)],
+    tail: &[usize],
+    _merge: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+) {
+    // Build the compound condition. Each guard's pre-branch setup only PARKS
+    // pure values in registers (verified by `is_pure_guard_block` at detection),
+    // so lifting it here populates the register the branch reads without any
+    // observable effect; a pure temp it might emit is dropped, and the parked
+    // expression flows straight into the condition instead.
+    let mut condition = Expr::Bool(true);
+    for &(g, advance_is_taken) in guards {
+        let Some(block) = cfg.blocks.get(&g) else { continue };
+        let branch_pc = block_branch_pc(block);
+        let mut scratch = Vec::new();
+        lift_instruction_range(
+            ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, &mut scratch,
+            false,
+        );
+        let fall_cond = extract_branch_condition(ctx, proto, branch_pc, regs);
+        // `advance_is_taken` is true when the edge advancing the chain toward the
+        // tail is the branch (taken) edge, whose condition is the negation of the
+        // fall-through condition `extract_branch_condition` returns.
+        let this = if advance_is_taken {
+            negate_condition(&fall_cond)
+        } else {
+            fall_cond
+        };
+        condition = and_conditions(&condition, this);
+    }
+
+    let regs_after_guards = regs.clone();
+    let mut tail_sorted = tail.to_vec();
+    tail_sorted.sort_unstable();
+    let mut then_stmts = Vec::new();
+    lift_branch_region(
+        ctx, proto, proto_index, cfg, depth, &tail_sorted, regs, locals, &mut then_stmts, false,
+    );
+    *regs = regs_after_guards;
+
+    if matches!(&condition, Expr::Bool(true)) {
+        // No reconstructable guard survived — emit the body unguarded rather
+        // than drop it. Detection requires conditional branches, so this is a
+        // defensive fallback, not the normal path.
+        stmts.extend(then_stmts);
+    } else {
+        stmts.push(Stat::If {
+            condition,
+            then_body: then_stmts,
+            elseif_clauses: vec![],
+            else_body: None,
+        });
+    }
+}
+
 /// Lift a single region into statements
 fn lift_region(
     ctx: &mut DecompileContext,
@@ -2655,6 +2730,12 @@ fn lift_region(
         Region::ValueJoin { entry, arms, join } => {
             lift_value_join(
                 ctx, proto, proto_index, cfg, *entry, arms, *join, regs, locals, depth, stmts, false,
+            );
+        }
+
+        Region::GuardedTailIf { guards, tail, merge } => {
+            lift_guarded_tail_if(
+                ctx, proto, proto_index, cfg, depth, guards, tail, *merge, regs, locals, stmts,
             );
         }
 
