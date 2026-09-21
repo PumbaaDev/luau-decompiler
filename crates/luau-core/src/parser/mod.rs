@@ -353,19 +353,42 @@ impl<'a> BytecodeReader<'a> {
             let mut j = 0;
             while j < code.len() {
                 let raw = (code[j] & 0xFF) as u8;
-                if raw == LOP_CALLFB {
-                    code[j] = (code[j] & 0xFFFF_FF00) | LOP_CALL; // CALLFB -> CALL
-                    if j + 1 < code.len() {
-                        code[j + 1] = 0; // feedback aux word -> NOP
+                match raw {
+                    LOP_CALLFB => {
+                        code[j] = (code[j] & 0xFFFF_FF00) | LOP_CALL; // CALLFB -> CALL
+                        if j + 1 < code.len() {
+                            code[j + 1] = 0; // feedback aux word -> NOP
+                        }
+                        j += 2;
+                        continue;
                     }
-                    j += 2;
-                    continue;
+                    // The other upstream opcodes in the 84-90 range carry an aux
+                    // word upstream but are read as no-aux bitwise ops by the
+                    // Roblox map (SETUDATAKS 84, NAMECALLUDATA 85, NEWCLASSMEMBER
+                    // 86, CMPPROTO 88, FASTPCALL 89, NEWCLASS 90). They belong to
+                    // Luau classes / typed-userdata / proto-compare, none of which
+                    // occur in ordinary game code. We do not model them, and a
+                    // no-aux walk over them would desync into garbage -- so refuse
+                    // cleanly rather than emit plausible-but-wrong output.
+                    84..=86 | 88..=90 => {
+                        bail!(
+                            "v{} chunk uses upstream opcode {} (Luau class / \
+                             typed-userdata / proto-compare) which the lifter does \
+                             not model; refusing rather than emitting garbage",
+                            version,
+                            raw
+                        );
+                    }
+                    _ => {
+                        j += if crate::parser::opcodes::LuauOpcode::from_u8(raw)
+                            .has_aux()
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                    }
                 }
-                j += if crate::parser::opcodes::LuauOpcode::from_u8(raw).has_aux() {
-                    2
-                } else {
-                    1
-                };
             }
         }
 
