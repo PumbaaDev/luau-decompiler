@@ -12,16 +12,24 @@ structure is below.
 
 Parsing the container is necessary but NOT sufficient to DECODE v10+ safely. The
 lifter models ROBLOX opcode semantics, and upstream Luau diverges in opcode
-NUMBERING at >= 84: upstream `CALLFB` is opcode 87, which the Roblox map reads as
-`BNOT` (87). A v11/v12 chunk compiled with call-feedback ON therefore lifts to
-plausible-but-wrong code (measured 2026-09-21: a call-heavy body collapsed to
-`local c = c .. c; return c`). The collision is with a valid opcode, so there is no
-reliable structural guard. Default behaviour is a clear rejection with an actionable
-message; `LUAU_ALLOW_V10PLUS=1` forces the decode for the safe cases:
-  - a chunk compiled with call-feedback OFF (`--fflags=LuauEmitCallFeedback=false`),
-    which uses only shared opcodes <= 83 — decodes CORRECTLY (verified), or
-  - genuine Roblox v10+ bytecode, whose opcodes match the model (forward capability;
-    the corpus is 100% v9 today, so this is unmeasured until Roblox ships v10+).
+NUMBERING at the newest opcodes: upstream `CALLFB` is opcode 87, which the Roblox
+map reads as `BNOT` (87). A v11/v12 chunk compiled with call feedback ON therefore
+lifted to plausible-but-wrong code (measured 2026-09-21: a call-heavy body collapsed
+to `local c = c .. c; return c`).
+
+**The common case (CALLFB) is now handled** (2026-09-21): the parser normalises
+CALLFB -> CALL + NOP-aux in the v>=10 path, so feedback-ON v11/v12 now decode
+CORRECTLY (verified on multiple samples, including method calls). Only opcode 87
+diverges for this producer; verified because the same source compiled feedback-OFF
+already decodes correctly, so every other opcode's length matches the map.
+
+The gate stays opt-in because OTHER newest opcodes could still diverge without a
+reliable structural guard (Luau class opcodes NEWCLASSMEMBER/NEWCLASS + the
+CLASS_SHAPE constant, CMPPROTO, the userdata-KS opcodes) -- none appear in ordinary
+game/script code, but a chunk that used one would mis-decode. Default rejects v10+
+with an actionable message; `LUAU_ALLOW_V10PLUS=1` decodes:
+  - any feedback-on OR feedback-off v11/v12 of ordinary code -- CORRECTLY (verified), and
+  - genuine Roblox v10+ bytecode, forward capability (corpus is 100% v9 today).
 
 ## Verified deltas over v9 (all guarded, so v3-9 decode is byte-identical)
 
@@ -54,8 +62,8 @@ message; `LUAU_ALLOW_V10PLUS=1` forces the decode for the safe cases:
   1315/1323 (99.4%), the same 8 defect files as baseline (zero regression, by
   construction: every new branch is `version >= 11/12/13`).
 
-## Known follow-up (NOT this change)
-v12 chunks compiled with call-feedback ON use feedback-carrying opcode variants
-(CALLFB etc.) that the LIFTER does not yet model, so one call can be dropped. Getting
-feedback-ON v12 to full parity is a lifter/opmap task, separate from container parsing.
-Feedback-OFF v12 (and any v10-v14 chunk using only the v9 opcode set) decompiles fully.
+## Known follow-up (NOT yet handled)
+Luau CLASS opcodes (NEWCLASSMEMBER/NEWCLASS + CLASS_SHAPE constant), CMPPROTO, and
+the userdata-KS opcodes are not modelled. They never appear in ordinary game/script
+code, but a chunk using one would mis-decode -- which is why v10+ stays opt-in. The
+common feedback-ON case (CALLFB) IS handled as of 2026-09-21.

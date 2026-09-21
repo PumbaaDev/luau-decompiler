@@ -62,5 +62,33 @@ fn v12_default_rejects_optin_parses_to_eof() {
     assert!(!loop_chunk.protos.is_empty());
     assert!((loop_chunk.main_proto as usize) < loop_chunk.protos.len());
 
+    // 3) CALL-FEEDBACK normalisation: a v12 chunk compiled with call feedback ON
+    //    uses CALLFB (opcode 87 = CALL + feedback aux). The parser must rewrite
+    //    every CALLFB to CALL (21) so the Roblox-canonical lifter does not read 87
+    //    as BNOT and desync into garbage. Assert no opcode 87 survives in any
+    //    proto's code (the feedback aux becomes a NOP, opcode 0).
+    let fbon = fixture("callheavy_v12_fbon.luac");
+    assert_eq!(fbon[0], 0x0c, "fixture must be bytecode version 12");
+    let fbon_chunk = luau_core::parser::parse(&fbon).expect("feedback-on v12 must parse when opted in");
+    assert_eq!(fbon_chunk.version, 12);
+    let leftover_callfb: usize = fbon_chunk
+        .protos
+        .iter()
+        .flat_map(|p| p.code.iter())
+        .filter(|w| (*w & 0xFF) as u8 == 87)
+        .count();
+    assert_eq!(
+        leftover_callfb, 0,
+        "CALLFB (opcode 87) must be normalised to CALL; {leftover_callfb} left"
+    );
+    // and it must contain at least one plain CALL (the calls it normalised)
+    let call_count: usize = fbon_chunk
+        .protos
+        .iter()
+        .flat_map(|p| p.code.iter())
+        .filter(|w| (*w & 0xFF) as u8 == 21)
+        .count();
+    assert!(call_count > 0, "expected normalised CALL instructions, found none");
+
     std::env::remove_var("LUAU_ALLOW_V10PLUS");
 }

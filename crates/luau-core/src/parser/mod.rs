@@ -336,6 +336,39 @@ impl<'a> BytecodeReader<'a> {
             code.push(self.read_u32()?);
         }
 
+        // v10+ (opt-in) call-feedback opcode normalisation. When call feedback is
+        // enabled, the Luau compiler emits CALLFB (opcode 87 = CALL plus one
+        // feedback-slot aux word) in place of CALL. The lifter uses the
+        // Roblox-canonical opcode map, where 87 is BNOT (no aux), so an
+        // un-normalised CALLFB desyncs the instruction stream into plausible
+        // garbage. Rewrite each CALLFB to a plain CALL (identical A/B/C operands)
+        // and neutralise its feedback aux to a NOP, preserving every instruction
+        // offset. Only opcode 87 diverges for this producer -- verified: the
+        // feedback-off output of the same source decodes correctly, so every
+        // other opcode's length already matches the map. Guarded by version >= 10,
+        // so v3-9 (the whole corpus) is byte-identical and cannot regress.
+        if version >= 10 {
+            const LOP_CALL: u32 = 21;
+            const LOP_CALLFB: u8 = 87;
+            let mut j = 0;
+            while j < code.len() {
+                let raw = (code[j] & 0xFF) as u8;
+                if raw == LOP_CALLFB {
+                    code[j] = (code[j] & 0xFFFF_FF00) | LOP_CALL; // CALLFB -> CALL
+                    if j + 1 < code.len() {
+                        code[j + 1] = 0; // feedback aux word -> NOP
+                    }
+                    j += 2;
+                    continue;
+                }
+                j += if crate::parser::opcodes::LuauOpcode::from_u8(raw).has_aux() {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+
         // Constants
         let size_k = self.read_varint()? as usize;
         let mut constants = Vec::with_capacity(size_k);
