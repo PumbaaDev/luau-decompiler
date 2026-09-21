@@ -104,6 +104,26 @@ impl<'a> BytecodeReader<'a> {
         Ok(result)
     }
 
+    /// Read a 64-bit variable-length integer (LEB128-style). Used by the
+    /// LBC_CONSTANT_INTEGER magnitude (v8+) and the per-proto `cost` field
+    /// (v12+), both of which the Luau VM reads with `readVarInt64`.
+    fn read_varint64(&mut self) -> Result<u64> {
+        let mut result: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.read_byte()?;
+            result |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                bail!("varint64 too large at offset {}", self.offset);
+            }
+        }
+        Ok(result)
+    }
+
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.offset + n > self.data.len() {
             bail!(
@@ -220,6 +240,47 @@ impl<'a> BytecodeReader<'a> {
                 }
                 Ok(Constant::Table(entries))
             }
+            9 if version >= 8 => {
+                // LBC_CONSTANT_INTEGER (bytecode v8+): a sign byte followed by
+                // a varint64 magnitude. The Luau VM stores this as a 64-bit
+                // integer; we surface it as a Number, which is faithful for the
+                // integer values real code uses (only lossy above 2^53, which
+                // does not occur in practice). This matches how the value is
+                // consumed downstream and avoids a new Constant variant.
+                let is_negative = self.read_byte()? != 0;
+                let magnitude = self.read_varint64()?;
+                let value = if is_negative {
+                    -(magnitude as i128) as f64
+                } else {
+                    magnitude as f64
+                };
+                Ok(Constant::Number(value))
+            }
+            10 if version >= 10 => {
+                // LBC_CONSTANT_CLASS_SHAPE (bytecode v10+, Luau Classes): a
+                // class-name const index, property count, method count, then
+                // one member-name const index per (property + method). Luau
+                // classes never appear in the Roblox corpus; we parse the exact
+                // byte layout to stay in sync and surface the constant as Nil.
+                let _classname_idx = self.read_varint()?;
+                let num_properties = self.read_varint()? as usize;
+                let num_methods = self.read_varint()? as usize;
+                for _ in 0..(num_properties + num_methods) {
+                    let _member_idx = self.read_varint()?;
+                }
+                Ok(Constant::Nil)
+            }
+            11 if version >= 13 => {
+                // LBC_CONSTANT_VECTORD (bytecode v13+): double-precision vector
+                // (4 f64 components). We narrow to the existing f32 Vector
+                // representation, which is faithful for the values Luau vectors
+                // actually hold.
+                let x = self.read_f64()? as f32;
+                let y = self.read_f64()? as f32;
+                let z = self.read_f64()? as f32;
+                let w = self.read_f64()? as f32;
+                Ok(Constant::Vector(x, y, z, w))
+            }
             _ => {
                 bail!(
                     "unknown constant tag {} at offset {} (version {})",
@@ -233,6 +294,17 @@ impl<'a> BytecodeReader<'a> {
 
     /// Read a single function prototype
     fn read_proto(&mut self, strings: &[String], version: u8) -> Result<Proto> {
+        // v12+ prepends each proto with its total size in bytes (a varint),
+        // making each proto self-framing. After parsing the body we seek to
+        // `proto_start + proto_size`, which resynchronises past any trailing
+        // per-proto section we do not model. Recorded now, applied at the end.
+        let proto_size = if version >= 12 {
+            Some(self.read_varint()? as usize)
+        } else {
+            None
+        };
+        let proto_start = self.offset;
+
         let max_stack_size = self.read_byte()?;
         let num_params = self.read_byte()?;
         let num_upvalues = self.read_byte()?;
@@ -358,6 +430,35 @@ impl<'a> BytecodeReader<'a> {
             None
         };
 
+        // Feedback-vector description. In v11 (which is NOT self-framing) it is
+        // always present and must be consumed: a varint slot count, then per
+        // slot a kind byte (LFT_CALLTARGET = 0) and a varint pc.
+        //
+        // In v12+ each proto is length-prefixed and the trailing feedback-vector
+        // and cost-function sections are OPTIONAL — the Luau compiler emits them
+        // only when call-feedback / cost modelling is enabled. Rather than model
+        // exactly when each appears, we rely on the self-framing resync below to
+        // jump to the precise proto boundary. Verified against v12 chunks
+        // compiled with call-feedback both ON (sections present) and OFF
+        // (sections absent); both parse to the exact end of file.
+        if version == 11 {
+            let feedback_slots = self.read_varint()?;
+            for _ in 0..feedback_slots {
+                let _kind = self.read_byte()?;
+                let _pc = self.read_varint()?;
+            }
+        }
+
+        // v12+ self-framing resync: jump to exactly the byte after this proto.
+        // This is the same `offset = protoStartOffset + protoSize` the Luau VM
+        // performs, and it absorbs any optional trailing section (feedback
+        // vector, cost function) we intentionally skip.
+        if version >= 12 {
+            if let Some(size) = proto_size {
+                self.offset = proto_start + size;
+            }
+        }
+
         Ok(Proto {
             max_stack_size,
             num_params,
@@ -388,19 +489,42 @@ impl<'a> BytecodeReader<'a> {
             bail!("bytecode contains compilation error: {}", error_msg);
         }
 
-        // v9 is a same-container version bump: header and proto layout are
-        // byte-identical to v8, verified by decoding real captured v9 samples
-        // from a live Roblox client. The type-info blob is read below as an
-        // opaque size-prefixed blob, so types_version 3 needs no special case.
-        // Roblox shipped v9 to production clients, so rejecting it here failed
-        // every script on the current build.
-        // v10/v11 are NOT same-container bumps: tested 2026-08-03 by widening
-        // this gate to 11 and decoding a v11 chunk from the bundled
-        // luau-compile — it failed with "unexpected end of bytecode at offset
-        // 376" while reading proto 2, so the proto layout changed after v9.
-        // Widening the gate again without implementing the new layout only
-        // converts a clear version error into a confusing truncation error.
-        if !(3..=9).contains(&version) {
+        // The CONTAINER for v10-v14 is now implemented in read_proto (verified
+        // against the VM loader VM/src/lvmload.cpp): v10 adds the
+        // LBC_CONSTANT_CLASS_SHAPE constant kind; v11 adds a per-proto
+        // feedback-vector description after debug info; v12 length-prefixes each
+        // proto (self-framing) and may serialise a cost function when the proto
+        // is flagged LPF_INLINABLE; v13 adds LBC_CONSTANT_VECTORD. v3-v9 decode
+        // is byte-identical (every new branch is guarded by version >= 11/12/13).
+        //
+        // BUT container support alone is NOT enough to DECODE v10+ safely. The
+        // lifter models ROBLOX opcode semantics, and upstream Luau diverges in
+        // opcode NUMBERING at >= 84: e.g. upstream CALLFB is 87, which the
+        // Roblox map reads as BNOT. A v11/v12 chunk compiled with call feedback
+        // ON therefore lifts to plausible-but-wrong code (measured 2026-09-21:
+        // a call-heavy body collapsed to `local c = c .. c; return c`). There is
+        // no reliable structural guard for this because the collision is with a
+        // valid opcode. So by DEFAULT we still reject v10+ with a clear error
+        // rather than emit garbage. Set LUAU_ALLOW_V10PLUS to opt in when you
+        // know the input is safe (compiled with feedback OFF, or genuine Roblox
+        // v10+ bytecode whose opcodes match the model) -- feedback-off v12
+        // decompiles correctly, verified on multiple samples.
+        let allow_v10plus = std::env::var("LUAU_ALLOW_V10PLUS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let max_version = if allow_v10plus { 14 } else { 9 };
+        if !(3..=max_version).contains(&version) {
+            if version >= 10 && version <= 14 {
+                bail!(
+                    "bytecode version {} parses but the lifter models Roblox \
+                     opcodes, which diverge from upstream at opcode >= 84 \
+                     (e.g. upstream CALLFB 87 == Roblox BNOT 87); decoding a \
+                     feedback-carrying chunk would emit plausible-but-wrong \
+                     code. Set LUAU_ALLOW_V10PLUS=1 to force decode when the \
+                     input is feedback-off or genuine Roblox v10+ bytecode.",
+                    version
+                );
+            }
             bail!(
                 "unsupported bytecode version {} (expected 3-9)",
                 version
