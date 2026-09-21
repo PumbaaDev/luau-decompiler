@@ -50,6 +50,7 @@ use super::{
     mk_concat,
     mk_unop,
     reg_expr,
+    expr_references_name,
     sanitize_leaked_global_string,
     simplify_expr,
     premateralize_branch_escapes_split,
@@ -627,6 +628,121 @@ fn restore_regs_keeping_dead_defs(regs: &mut Vec<RegVal>, snapshot: &[RegVal], p
                 );
             }
             *slot = v.clone();
+        }
+    }
+}
+
+/// Bind an arm's final value for a premateralized MERGE-SEED register to the
+/// seed name.
+///
+/// `premateralize_branch_escapes_split` seeds `local Seed` before a diamond and
+/// pins the merge register to `Seed` across the arms so BOTH arms write it and
+/// the post-join read is defined. When an arm carries an INTERNAL short-circuit
+/// on that register (`x = f(a) or f(b)`), the pin is deliberately WITHHELD for
+/// that arm (see mod.rs `DO NOT PIN ACROSS A NESTED SHORT-CIRCUIT`): pinning
+/// during the operand lifts would collapse the `or` chain and drop operands.
+/// But withholding the pin lets the arm's FINAL collapsed write MINT A FRESH
+/// local (`local Text6 = .. or ..`) instead of assigning the seed, so the seed
+/// is never written and the merge reads it undefined. The sibling arm is lost
+/// too: the fresh mint poisons `current_names[reg]` (not snapshotted per-arm),
+/// so its `pinned_write_consumed` name-match guard fails and its write is parked
+/// and annihilated. Measured on `rc_0047 setTile` R6:
+///
+///     local Text4                       -- seed, never assigned
+///     if arg2 then
+///         local Text6 = RARITY_COLOR[..] or Color3.new(1,1,1)   -- dropped
+///     end                               -- else `Text4 = color` GONE
+///     TextColor34.TextColor3 = Text4    -- undefined
+///
+/// This runs AFTER an arm is fully lifted — the `or` chain has already collapsed
+/// cleanly (recognize_or_and_chain ran with the pin withheld, so its operand
+/// folds were not sabotaged), so the arm's final value is known and correct. It
+/// routes that value through the seed binding:
+///  * Case A — the arm's LAST statement is `local Fresh = <value>` and the
+///    register now holds `Fresh`: rewrite it to `Seed = <value>`.
+///  * Case B — the arm parked its final value as a bare bound name with no
+///    statement (a MOVE / GETUPVAL inlined into the register file): append
+///    `Seed = <name>` — exactly what the withheld pin would have emitted.
+///
+/// Also repairs `current_names[reg]` to the seed via `record_name`, which un-
+/// poisons the sibling arm's pin guard so it binds the seed on its own.
+///
+/// Gated to premat merge seeds ONLY: the register must have entered the branch
+/// bound to a non-generic named local that is PINNED somewhere in the construct
+/// span. Only `premateralize_*` pins registers, and inside a branch diamond a
+/// pinned register is a merge seed — an ordinary carried local is never pinned,
+/// so never matches. An arm that already bound the seed leaves it in the
+/// register and is skipped, so a correctly-lifted diamond is byte-identical.
+fn bind_arm_merge_seeds(
+    ctx: &DecompileContext,
+    regs: &mut [RegVal],
+    locals: &mut LocalTracker,
+    arm_stmts: &mut Vec<Stat>,
+    regs_snapshot: &[RegVal],
+    construct_start: usize,
+    construct_end: usize,
+) {
+    let nregs = regs.len().min(regs_snapshot.len());
+    for reg in 0..nregs {
+        // The seed name the register carried INTO the branch.
+        let seed = match &regs_snapshot[reg] {
+            RegVal::Expr(Expr::Name(n)) => n.clone(),
+            _ => continue,
+        };
+        if is_generic_placeholder(&seed) {
+            continue;
+        }
+        // Only a premateralized merge seed is pinned inside the construct span.
+        let is_merge_seed =
+            (construct_start..construct_end).any(|pc| ctx.is_pinned_reg(reg as u8, pc));
+        if !is_merge_seed {
+            continue;
+        }
+        // What the arm actually left in the register.
+        let arm_final = match &regs[reg] {
+            RegVal::Expr(Expr::Name(n)) => n.clone(),
+            _ => continue,
+        };
+        if arm_final == seed {
+            // Arm already bound the seed — nothing to do.
+            continue;
+        }
+        // Case A: the arm's last statement declares `arm_final` as a fresh local
+        // holding its final value. Rebind that value onto the seed. The value
+        // must NOT read `arm_final` (a self-referential `local x = x + 1` would
+        // become an undefined read once the declaration is gone).
+        let case_a = matches!(
+            arm_stmts.last(),
+            Some(Stat::Local { names, values })
+                if names.len() == 1
+                    && values.len() == 1
+                    && names[0] == arm_final
+                    && !expr_references_name(&values[0], &arm_final)
+        );
+        if case_a {
+            if let Some(Stat::Local { values, .. }) = arm_stmts.last() {
+                let value = values[0].clone();
+                *arm_stmts.last_mut().unwrap() = Stat::Assign {
+                    targets: vec![Expr::Name(seed.clone())],
+                    values: vec![value],
+                };
+                regs[reg] = RegVal::Expr(Expr::Name(seed.clone()));
+                locals.record_name(reg, &seed);
+            }
+            continue;
+        }
+        // Case B: the arm parked its final value as a bare bound name with no
+        // emitted statement. Emit the assignment the withheld pin would have.
+        // `is_bound_name` confirms the name is a live local/alias — a pure,
+        // side-effect-free reference safe to assign to the seed here (still
+        // inside the arm's own scope).
+        if locals.is_bound_name(&arm_final) {
+            arm_stmts.push(Stat::Assign {
+                targets: vec![Expr::Name(seed.clone())],
+                values: vec![Expr::Name(arm_final.clone())],
+            });
+            regs[reg] = RegVal::Expr(Expr::Name(seed.clone()));
+            locals.record_name(reg, &seed);
         }
     }
 }
@@ -3870,11 +3986,13 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+                    bind_arm_merge_seeds(ctx, regs, locals, &mut then_stmts, &regs_snapshot, jump_next, construct_end);
 
                     let else_body = if let Some((es, ee)) = else_range {
                         *regs = regs_snapshot.clone();
                         let mut else_stmts = Vec::new();
                         lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        bind_arm_merge_seeds(ctx, regs, locals, &mut else_stmts, &regs_snapshot, jump_next, construct_end);
                         Some(else_stmts)
                     } else {
                         None
@@ -4055,11 +4173,13 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+                    bind_arm_merge_seeds(ctx, regs, locals, &mut then_stmts, &regs_snapshot, jump_next, construct_end);
 
                     let else_body = if let Some((es, ee)) = else_range {
                         *regs = regs_snapshot.clone();
                         let mut else_stmts = Vec::new();
                         lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        bind_arm_merge_seeds(ctx, regs, locals, &mut else_stmts, &regs_snapshot, jump_next, construct_end);
                         Some(else_stmts)
                     } else {
                         None
@@ -4228,11 +4348,13 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                     lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, then_end, regs, locals, &mut then_stmts, in_loop);
+                    bind_arm_merge_seeds(ctx, regs, locals, &mut then_stmts, &regs_snapshot, jump_next, construct_end);
 
                     let else_body = if let Some((es, ee)) = else_range {
                         *regs = regs_snapshot.clone();
                         let mut else_stmts = Vec::new();
                         lift_instruction_range(ctx, proto, proto_index, depth + 1, es, ee, regs, locals, &mut else_stmts, in_loop);
+                        bind_arm_merge_seeds(ctx, regs, locals, &mut else_stmts, &regs_snapshot, jump_next, construct_end);
                         Some(else_stmts)
                     } else {
                         None
