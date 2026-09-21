@@ -2470,6 +2470,29 @@ pub(super) fn lift_instruction_range(
                                 _ => String::new(),
                             };
 
+                            // A REF capture (type 1) whose source register is a
+                            // PARAMETER shares that parameter's CELL for the life
+                            // of the closure. A parameter register never
+                            // re-declares (`classify_write` returns Reassign for
+                            // reg < num_params), so its cell identity is the
+                            // parameter — but the value tracker can move ahead of
+                            // it: `arg = arg or game` overwrites `regs[arg]` with
+                            // the global `game`, and the `Some(Expr::Name(n))` arm
+                            // above then names the upvalue after that global. A
+                            // global/stdlib name can NEVER be the correct name for
+                            // a ref-captured local cell, so in that case — and only
+                            // that case, to leave every already-correct heuristic
+                            // name untouched — bind to the parameter name instead.
+                            let name = if cap_type == 1
+                                && cap_op == LuauOpcode::Capture
+                                && (cap_idx as usize) < proto.num_params as usize
+                                && is_stdlib_shadow_name(&name)
+                            {
+                                ctx.reg_name(proto, cap_idx, 0)
+                            } else {
+                                name
+                            };
+
                             // A register captured by CAPTURE VAL/REF is by
                             // definition a named, addressable location — but
                             // `store_complex` parks "inlinable" values in `regs`
@@ -2592,6 +2615,25 @@ pub(super) fn lift_instruction_range(
                                 }
                             }
 
+                            // Record a trusted global-ref capture: the name is one
+                            // of the three Roblox instance globals AND the source
+                            // register genuinely held that exact global expression
+                            // at capture time. `upval_name` uses this to let the
+                            // name through the stdlib-shadow guard — safe because
+                            // the captured value IS that global.
+                            if cap_op == LuauOpcode::Capture
+                                && matches!(name.as_str(), "game" | "workspace" | "script")
+                            {
+                                if let Some(RegVal::Expr(Expr::Name(n))) = regs.get(cap_idx as usize)
+                                {
+                                    if n == &name {
+                                        ctx.capture_global_upvals
+                                            .entry(child_global_idx)
+                                            .or_default()
+                                            .insert(inferred_upval_names.len() as u8);
+                                    }
+                                }
+                            }
                             inferred_upval_names.push(name);
                             cap_pc += 1;
                         } else {

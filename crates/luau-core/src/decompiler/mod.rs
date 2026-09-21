@@ -221,6 +221,13 @@ pub struct DecompileContext<'a> {
     /// Maps child_proto_index -> vec of (child_upval_slot, parent_proto_index, parent_upval_slot).
     /// After rename_upvals resolves the parent's names, we re-propagate to children.
     pub upval_parent_links: std::collections::HashMap<usize, Vec<(usize, usize, u8)>>,
+    /// Upvalue slots whose CAPTURE source register genuinely held a Roblox
+    /// instance global (`game` / `workspace` / `script`) at capture time.
+    /// Naming such an upvalue after the global is EXACT — the captured value IS
+    /// that global — so `upval_name` lets it through the `is_stdlib_shadow_name`
+    /// guard that otherwise (correctly) rejects a MISINFERRED global name.
+    /// Keyed by child proto index -> set of upvalue slot indices.
+    pub capture_global_upvals: std::collections::HashMap<usize, std::collections::HashSet<u8>>,
     /// True when the chunk is canonical open-source Luau bytecode rather than
     /// Roblox's shuffled dialect.
     ///
@@ -274,6 +281,7 @@ impl<'a> DecompileContext<'a> {
             proto_naming: std::collections::HashMap::new(),
             current_proto_index: None,
             upval_parent_links: std::collections::HashMap::new(),
+            capture_global_upvals: std::collections::HashMap::new(),
             is_canonical_luau: false,
             unary: crate::parser::opmap_db::UnarySemantics::default(),
             arity_pinned_temps: std::collections::HashSet::new(),
@@ -912,8 +920,23 @@ impl<'a> DecompileContext<'a> {
         // Second: check names inferred from parent CAPTURE instructions
         if let Some(names) = self.inferred_upvalue_names.get(&proto_index) {
             if let Some(name) = names.get(idx as usize) {
-                // Phase B0.106: same guard for inferred names
-                if !name.is_empty() && is_valid_luau_identifier(name) && !is_stdlib_shadow_name(name) {
+                // Phase B0.106: same guard for inferred names.
+                // Exception: a CAPTURE whose source register genuinely held a
+                // Roblox instance global (game/workspace/script) is EXACT — the
+                // upvalue's value IS that global — so it may keep the global name
+                // even though `is_stdlib_shadow_name` lists those three. The
+                // trusted set is populated ONLY from a real remapped CAPTURE
+                // whose register held that exact global expression, never from a
+                // usage-based guess, so this cannot resurrect a misinference.
+                let trusted_global = matches!(name.as_str(), "game" | "workspace" | "script")
+                    && self
+                        .capture_global_upvals
+                        .get(&proto_index)
+                        .is_some_and(|s| s.contains(&idx));
+                if !name.is_empty()
+                    && is_valid_luau_identifier(name)
+                    && (!is_stdlib_shadow_name(name) || trusted_global)
+                {
                     return name.clone();
                 }
             }
