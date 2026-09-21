@@ -61,6 +61,7 @@ mod phase_c6_require_naming_tests;
 mod phase_c8_require_wrapper_unwrap_tests;
 #[cfg(test)]
 mod namecall_orphan_diagnosis_tests;
+mod type_guard_fold_tests;
 #[cfg(test)]
 mod phase_c10q_kv_drop_any_name_tests;
 #[cfg(test)]
