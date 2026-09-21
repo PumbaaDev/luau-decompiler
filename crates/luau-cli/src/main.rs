@@ -81,6 +81,21 @@ enum Commands {
         input: Option<PathBuf>,
     },
 
+    /// Decompile ONE file and report every semantic finding (Wrong + Suspicious)
+    ///
+    /// The batch command writes SEMANTIC_REPORT.tsv / SEMANTIC_SUSPECT.tsv over a
+    /// whole corpus; this runs the same checks on a single file so a defect can
+    /// be located without setting up a batch directory. Wrong findings are
+    /// provable defects; Suspicious findings are dropped-value / gaming-risk
+    /// candidates that never count toward the corpus defect rate.
+    Diagnose {
+        /// Bytecode file (- for stdin)
+        input: Option<PathBuf>,
+        /// Also print the decompiled source above the findings
+        #[arg(long)]
+        source: bool,
+    },
+
     /// Disassemble bytecode into readable opcodes
     Disassemble {
         input: Option<PathBuf>,
@@ -341,6 +356,49 @@ fn main() -> Result<()> {
             let data = read_input(input.as_deref())?;
             let source = decompile_with_store(&data, store.as_ref(), &db)?;
             write_output(cli.output.as_deref(), &source)?;
+        }
+
+        Some(Commands::Diagnose { input, source }) => {
+            use luau_core::decompiler::semantic_check::{check, Severity};
+            let data = read_input(input.as_deref())?;
+            let src = decompile_with_store(&data, store.as_ref(), &db)?;
+            if source {
+                println!("{src}");
+                println!("{}", "-".repeat(72));
+            }
+            // Proto count from the header comment, same source the batch uses.
+            let protos = src.lines().take(20).find_map(|l| {
+                l.trim().strip_prefix("-- Protos:")?.trim().split_whitespace().next()?.parse().ok()
+            });
+            let findings = check(&src, protos);
+            let wrong: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Wrong).collect();
+            let suspect: Vec<_> =
+                findings.iter().filter(|f| f.severity == Severity::Suspicious).collect();
+            let name = input
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<stdin>".to_string());
+            println!(
+                "{name}: {} provable defect(s), {} suspicious candidate(s)",
+                wrong.len(),
+                suspect.len()
+            );
+            let print_group = |label: &str, group: &[&luau_core::decompiler::semantic_check::Finding]| {
+                if group.is_empty() {
+                    return;
+                }
+                println!("\n{label}:");
+                for f in group {
+                    let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                    let func = enclosing_function(&src, f.line).unwrap_or_else(|| "-".into());
+                    println!("  [{}] {}:{}  ({})\n      {}", f.check, name, line, func, f.detail);
+                }
+            };
+            print_group("WRONG (provable defects)", &wrong);
+            print_group("SUSPICIOUS (dropped-value / gaming-risk candidates)", &suspect);
+            if wrong.is_empty() && suspect.is_empty() {
+                println!("no findings — no provable defect and no suspicious candidate.");
+            }
         }
 
         Some(Commands::Disassemble { input, debug_info, opmap }) => {
