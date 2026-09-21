@@ -4952,6 +4952,33 @@ pub(super) fn store_complex(
         } else {
             existing_name
         };
+        // TRACK-NC correctness fix: a stdlib/global-shadow name (`game`,
+        // `workspace`, `math`, `pcall`, …) can NEVER be a correct assignment
+        // TARGET. It only ever lands in `regs[reg]` because an inlined
+        // GETIMPORT/GETGLOBAL parked the global's expression there without
+        // emitting a statement (globals are `Expr::Name`), so a later
+        // store to the SAME register would reuse that global name as the LHS.
+        //
+        // The flagship symptom is `lv_0579` Translate: `arg2 = arg2 or game`
+        // compiles to `JUMPIF R1; GETIMPORT R1 game` (R1 is the arg2 param).
+        // The false arm inlines `Name("game")` into `regs[1]`, then the
+        // OR-merge fold reuses that carried "game" and emits
+        // `game = arg2 or game` — mutating the read-only global AND dropping
+        // the parameter's reassignment. Dropping the carried global name
+        // routes through the `reg_name`+`classify_write` path below, which at
+        // the merge PC resolves R1 to its real binding (the `arg2` param, the
+        // import hint being out of scope before the GETIMPORT).
+        //
+        // This mirrors the identical rule already applied to ref-captured
+        // cells (search "A global/stdlib name can NEVER be the correct name").
+        // `reg_name` itself never mints a stdlib-shadow name (name_from_import
+        // / synthesize_name sanitise them to `import`/`value`), so this only
+        // ever discards a name that leaked in from an inlined global — never a
+        // legitimately-synthesised binding.
+        let existing_name = match existing_name {
+            Some(ref n) if !carried_is_loopvar && is_stdlib_shadow_name(n) => None,
+            other => other,
+        };
         if let Some(name) = existing_name {
             // Consult the fresh hint when the carried source is a plain
             // `Expr::Name` (not LoopVar).
