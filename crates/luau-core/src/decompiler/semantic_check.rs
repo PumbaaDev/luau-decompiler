@@ -258,7 +258,19 @@ fn check_branch_local_discarded(code: &str, out: &mut Vec<Finding>) {
         if occ.get(name).map_or(0, |v| v.len()) != 1 {
             continue;
         }
-        let rhs = rest[eq + 1..].trim_start().trim_start_matches('(');
+        // The base must be the RHS's OWN leading identifier — `base + k`, not a
+        // sub-operand nested inside a parenthesised group. A leading `(` means
+        // the top-level operation applies to the whole group, so the first
+        // identifier is not the thing being extended: `(arg3 + arg2) / 2` is a
+        // midpoint over BOTH args, not an accumulate onto `arg3`, and the
+        // bytecode writes it to a fresh dead register exactly as a fresh local
+        // faithfully reproduces (measured on lv_0919 `CheckOcclusion`). Stripping
+        // the paren fabricated `arg3` as the base and mis-fired. Every genuine
+        // dropped accumulate this check exists for (`Lvl4 = Lvl3 + 2`,
+        // `Size = arg3 + arg2.Size.X / 2`) leads with the bare base, unparenthesised,
+        // so leaving the paren in place — where `base_end == 0` skips it — costs
+        // no real finding.
+        let rhs = rest[eq + 1..].trim_start();
         let base_end = rhs
             .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rhs.len());

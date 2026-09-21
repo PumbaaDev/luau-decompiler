@@ -487,6 +487,61 @@ pub fn structure_control_flow(
             }
         }
 
+        // OR-CHAIN RETURN GUARD.
+        //
+        // `if a or b or c then return end` compiles to a chain of conditional
+        // blocks that all branch to ONE shared terminal RETURN block, the last
+        // falling through to the continuation. `find_merge_point` reports that
+        // shared terminal as the merge (it is trivially reachable from every
+        // arm), so the return block is parked as the "merge", emitted last in
+        // RPO — after the function's real trailing `return` — and then dropped
+        // as unreachable. The whole guard vanishes. Measured on lv_0919
+        // `CheckOcclusion`: the three-raycast occlusion guard was silently gone.
+        //
+        // Recognising the chain and emitting each link as its own guard
+        // (`if a then return end  if b then return end  ...`) is semantically
+        // exact and keeps the shared return in every link. Gated tight — a
+        // chain of at least two links, every non-entry link a BARE conditional
+        // (no side effects to duplicate), sharing one TERMINAL return block,
+        // with a distinct continuation — so it never touches the both-arm-write
+        // merge shape (neither arm is directly terminal there) or a genuine
+        // two-return if (both arms terminal).
+        if block.successors.len() == 2 {
+            if let Some((chain, terminal, cont)) =
+                find_or_chain_return_guard(cfg, code, block_id, &handled)
+            {
+                for &bid in &chain {
+                    let Some(b) = cfg.blocks.get(&bid) else { continue };
+                    // `terminal` is the shared return; its polarity decides which
+                    // arm carries it. successors[0] is the fall-through, [1] the
+                    // jump target. When the terminal is the jump target we emit
+                    // an empty then + return else, and the DCE phase-4 negate/swap
+                    // turns `if not c then else return end` into `if c then return
+                    // end`. When it is the fall-through we emit it directly.
+                    let terminal_is_fallthrough = b.successors.first() == Some(&terminal);
+                    let (then_region, else_region) = if terminal_is_fallthrough {
+                        (vec![terminal], vec![])
+                    } else {
+                        (vec![], vec![terminal])
+                    };
+                    regions.push(Region::IfThenElse {
+                        cond_pc: bid,
+                        then_region,
+                        else_region,
+                        // No merge: each link is a self-contained guard whose
+                        // continuation is the next sibling region, not a join.
+                        merge_pc: None,
+                    });
+                    handled.insert(bid);
+                }
+                handled.insert(terminal);
+                // `cont` is intentionally left unhandled — the continuation is a
+                // sibling region, lifted on its own.
+                let _ = cont;
+                continue;
+            }
+        }
+
         // Check if this is a conditional branch (if-then-else)
         if block.successors.len() == 2 {
             let fallthrough = block.successors[0]; // usually the "then" path
@@ -966,6 +1021,124 @@ fn try_match_guarded_tail_if(
         return Some((guards, tail_blocks, m_try));
     }
     None
+}
+
+/// Is `block_id` a TERMINAL block whose last real instruction is a RETURN?
+///
+/// Zero successors in the CFG already implies a RETURN (only `Return` leaves a
+/// block without successors), but the RETURN opcode is checked explicitly so a
+/// malformed empty block never counts.
+fn block_is_terminal_return(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    block_id: usize,
+) -> bool {
+    let Some(block) = cfg.blocks.get(&block_id) else { return false };
+    if !block.successors.is_empty() {
+        return false;
+    }
+    match block.branch_pc {
+        Some(pc) if pc < code.len() => {
+            matches!(LuauOpcode::from_u8(insn_op(code[pc])), LuauOpcode::Return)
+        }
+        _ => false,
+    }
+}
+
+/// Is `block_id` a BARE conditional block — one whose only real instruction is
+/// its two-way conditional branch (no preamble to lift, so no side effect can
+/// be lost when it is emitted as a guard condition)?
+fn block_is_bare_conditional(cfg: &ControlFlowGraph, block_id: usize) -> bool {
+    let Some(block) = cfg.blocks.get(&block_id) else { return false };
+    block.successors.len() == 2 && block.branch_pc == Some(block.start)
+}
+
+/// Recognise an `if a or b or c then return end` chain rooted at `entry`.
+///
+/// Shape: a chain of conditional blocks `[entry, B1, .., Bk]` (k >= 1, so at
+/// least two links total) where every link has ONE shared TERMINAL return block
+/// `T` as a successor, each link's OTHER successor is the next link, and the
+/// last link's other successor is the continuation `C` (which is not `T`). Every
+/// link after `entry` must be a BARE conditional (the entry may carry preamble,
+/// e.g. the calls whose results the chain tests). No link may already be
+/// handled.
+///
+/// Returns `(chain, terminal, continuation)`. The narrow gate — exactly one
+/// terminal successor per link, chain length >= 2, bare interior links — keeps
+/// it clear of the both-arm-write merge (neither arm terminal) and the genuine
+/// two-return `if` (both arms terminal).
+fn find_or_chain_return_guard(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    handled: &BTreeSet<usize>,
+) -> Option<(Vec<usize>, usize, usize)> {
+    if handled.contains(&entry) {
+        return None;
+    }
+    let eb = cfg.blocks.get(&entry)?;
+    if eb.successors.len() != 2 {
+        return None;
+    }
+    // Exactly one of the entry's successors must be a terminal return block —
+    // that is the shared guard body `T`.
+    let s0 = eb.successors[0];
+    let s1 = eb.successors[1];
+    let t0 = block_is_terminal_return(cfg, code, s0);
+    let t1 = block_is_terminal_return(cfg, code, s1);
+    let terminal = match (t0, t1) {
+        (true, false) => s0,
+        (false, true) => s1,
+        _ => return None, // both or neither terminal: not this shape
+    };
+    let mut chain = vec![entry];
+    let mut cur = if terminal == s0 { s1 } else { s0 };
+    // Walk the chain. Each interior link must be a bare conditional that also
+    // branches to the same `T`; its other successor is the next link.
+    loop {
+        if handled.contains(&cur) || chain.contains(&cur) {
+            break;
+        }
+        if !block_is_bare_conditional(cfg, cur) {
+            break;
+        }
+        let cb = cfg.blocks.get(&cur)?;
+        let cs0 = cb.successors[0];
+        let cs1 = cb.successors[1];
+        let next = if cs0 == terminal {
+            cs1
+        } else if cs1 == terminal {
+            cs0
+        } else {
+            // This link does not target the shared return — the chain ended at
+            // the previous link, and `cur` is the continuation.
+            break;
+        };
+        chain.push(cur);
+        cur = next;
+    }
+    // `cur` is the continuation `C`. Require a real chain (>= 2 links) and a
+    // continuation distinct from the terminal body.
+    if chain.len() < 2 || cur == terminal || chain.contains(&cur) {
+        return None;
+    }
+    // THE TERMINAL MUST NOT BE THE FUNCTION'S OWN LAST BLOCK.
+    //
+    // This is the line between the bug and a correctly-structured guard. When
+    // the shared terminal is an EARLY return that sits before more code (a real
+    // trailing `return`, a loop, another guard), RPO emits it last — after that
+    // later code's own return — where it is unreachable and dropped, and the
+    // whole guard vanishes (lv_0919: `if a or b or c then return false end`
+    // before the occlusion loop). When the terminal IS the function's natural
+    // end (an `if a and b then body end` whose falsy arms fall through to the
+    // trailing `return nil`), emitting it last is correct and the generic
+    // if/else already nests it properly — reshaping it here would DROP those
+    // nil-guards (measured on lv_0463 `find`). So fire only when a block starts
+    // AFTER the terminal, i.e. the terminal is stranded rather than final.
+    if !cfg.blocks.keys().any(|&b| b > terminal) {
+        return None;
+    }
+    Some((chain, terminal, cur))
 }
 
 /// Check if a detected natural loop is a REAL loop by verifying that the
