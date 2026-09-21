@@ -148,6 +148,43 @@ pub enum Region {
         /// GenericFor, or (rarely) further InlineIfThenInLoop variants.
         body: Vec<Region>,
     },
+
+    /// A short-circuit `and`-chain of guard blocks that together gate a `tail`
+    /// the compiler laid out AFTER the fall-through continuation.
+    ///
+    /// The shape (measured on `lv_0124 ClientStatCache::Update`):
+    ///
+    /// ```text
+    ///   B0: GETUPVAL R2 U0 ; JUMPXEQKNIL U0 == nil  -> M   ; U0 == nil exits
+    ///   B1:                  JUMPXEQKNIL arg ~= nil  -> T   ; both set  goes to T
+    ///   M : <continuation — the fall-through path>
+    ///   ...
+    ///   T : <guarded body, ends in RETURN>
+    /// ```
+    ///
+    /// Every guard's "exit" edge lands on the shared `merge` block `M`; its
+    /// "advance" edge moves to the next guard, and the last guard's advance edge
+    /// reaches `tail` (`T`). Because `T` sits PAST `M` in PC order and is reached
+    /// only through the whole chain, the plain `IfThenElse` structurer collapses
+    /// each guard to a flat (empty) then-block and orphans `T` as a bare `Linear`
+    /// region — which, emitted before the continuation and ending in its own
+    /// `return`, makes the live continuation look dead and get truncated by DCE
+    /// (`calls_not_emitted`). This variant keeps the guard so the lifter emits
+    /// `if <g0 and g1 and ...> then <tail> end` ahead of the continuation.
+    GuardedTailIf {
+        /// Guard blocks in evaluation order. The bool is `true` when the edge
+        /// that ADVANCES the chain toward the tail is the guard's branch (taken)
+        /// edge, `false` when it is the fall-through edge — this selects whether
+        /// the lifter conjoins the branch's fall-through condition or its
+        /// negation.
+        guards: Vec<(usize, bool)>,
+        /// The guarded tail blocks, ascending by PC. Closed: every exit either
+        /// returns or stays inside the set.
+        tail: Vec<usize>,
+        /// The shared continuation every guard's exit edge lands on. NOT a
+        /// member here — it keeps its own region and is lifted exactly once.
+        merge: usize,
+    },
 }
 
 /// Analyze CFG and produce ordered regions
@@ -427,6 +464,29 @@ pub fn structure_control_flow(
             }
         }
 
+        // A short-circuit `and`-chain of guards gating an out-of-line tail must
+        // be matched before the plain if/else fallback: that fallback would
+        // flatten the inner guard(s) to nothing and orphan the tail as a bare
+        // Linear region emitted before the continuation, which DCE then treats
+        // as dead after its own return (the `calls_not_emitted` shape on
+        // `lv_0124 Update`). See `Region::GuardedTailIf`.
+        if block.successors.len() == 2 {
+            if let Some((guards, tail, merge)) =
+                try_match_guarded_tail_if(cfg, code, block_id, &handled, &loop_headers_all)
+            {
+                for &(g, _) in &guards {
+                    handled.insert(g);
+                }
+                for &t in &tail {
+                    handled.insert(t);
+                }
+                // `merge` is intentionally left unhandled: it is the region's
+                // continuation, not part of it.
+                regions.push(Region::GuardedTailIf { guards, tail, merge });
+                continue;
+            }
+        }
+
         // Check if this is a conditional branch (if-then-else)
         if block.successors.len() == 2 {
             let fallthrough = block.successors[0]; // usually the "then" path
@@ -652,6 +712,260 @@ fn collect_region_blocks(
     // Sort by block start PC so instructions are lifted in program order
     result.sort_unstable();
     result
+}
+
+/// Opcodes that a nil/value guard may compute BEFORE its branch: they only park
+/// a value in a register, so folding them into a short-circuit condition is
+/// faithful (Lua evaluates the right operand of `and` only when the left held).
+/// Deliberately excludes CALL, NAMECALL, every SET*, closure/upvalue capture,
+/// table allocation and RETURN — anything with an observable effect.
+fn is_pure_guard_setup_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Nop
+            | LuauOpcode::LoadNil
+            | LuauOpcode::LoadB
+            | LuauOpcode::LoadN
+            | LuauOpcode::LoadK
+            | LuauOpcode::LoadKX
+            | LuauOpcode::Move
+            | LuauOpcode::GetUpval
+            | LuauOpcode::GetGlobal
+            | LuauOpcode::GetImport
+            | LuauOpcode::GetTable
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN
+    )
+}
+
+/// A conditional branch whose fall-through condition `extract_branch_condition`
+/// can reconstruct. Unconditional `Jump`/`JumpBack` yield no usable predicate.
+fn is_conditional_branch_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    )
+}
+
+/// Is `block` a pure guard — every instruction before its terminator only parks
+/// a value, and the terminator is a reconstructable conditional branch?
+fn is_pure_guard_block(code: &[u32], block: &BasicBlock) -> bool {
+    let branch_pc = match block.branch_pc {
+        Some(p) => p,
+        None => return false,
+    };
+    if branch_pc >= code.len() {
+        return false;
+    }
+    let mut i = block.start;
+    while i < branch_pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if !is_pure_guard_setup_op(op) {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    is_conditional_branch_op(LuauOpcode::from_u8(insn_op(code[branch_pc])))
+}
+
+/// Does `block`'s last instruction return?
+fn block_ends_in_return(code: &[u32], block: &BasicBlock) -> bool {
+    let mut last = block.start;
+    let mut i = block.start;
+    while i < block.end && i < code.len() {
+        last = i;
+        i += if LuauOpcode::from_u8(insn_op(code[i])).has_aux() {
+            2
+        } else {
+            1
+        };
+    }
+    last < code.len() && LuauOpcode::from_u8(insn_op(code[last])) == LuauOpcode::Return
+}
+
+/// Detect a short-circuit `and`-chain of guard blocks gating a `tail` that the
+/// compiler placed AFTER the shared continuation. See `Region::GuardedTailIf`.
+///
+/// Returns `(guards, tail_blocks, merge)` on a match. The chain must be at least
+/// two guards long — a single guard branching to an out-of-line tail is already
+/// structured correctly as `if/else` (both arms present, nothing orphaned); it
+/// is only when the FIRST guard's advance edge lands on a SECOND guard that the
+/// plain structurer flattens the inner guard to nothing and orphans the tail.
+fn try_match_guarded_tail_if(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    handled: &BTreeSet<usize>,
+    loop_headers: &BTreeSet<usize>,
+) -> Option<(Vec<(usize, bool)>, Vec<usize>, usize)> {
+    const MAX_GUARDS: usize = 4;
+    let trace = std::env::var("LUAU_GTI_TRACE").is_ok();
+    let eb = cfg.blocks.get(&entry)?;
+    if trace {
+        eprintln!(
+            "GTI entry={} succ={:?} preds={:?}",
+            entry, eb.successors, eb.predecessors
+        );
+    }
+    if eb.successors.len() != 2 || handled.contains(&entry) || loop_headers.contains(&entry) {
+        return None;
+    }
+
+    // The merge `M` is the block every guard's exit edge lands on. It is one of
+    // the entry guard's two successors; try each.
+    for &m_try in &[eb.successors[1], eb.successors[0]] {
+        let m_start = match cfg.blocks.get(&m_try) {
+            Some(b) => b.start,
+            None => continue,
+        };
+        let mut guards: Vec<(usize, bool)> = Vec::new();
+        let mut cur = entry;
+        let mut tail: Option<usize> = None;
+        while guards.len() < MAX_GUARDS {
+            let b = match cfg.blocks.get(&cur) {
+                Some(b) => b,
+                None => break,
+            };
+            // A guard: two successors, precedes the merge, pure test, unclaimed.
+            if b.successors.len() != 2
+                || b.start >= m_start
+                || handled.contains(&cur)
+                || loop_headers.contains(&cur)
+                || !is_pure_guard_block(code, b)
+            {
+                break;
+            }
+            let s0 = b.successors[0]; // fall-through
+            let s1 = b.successors[1]; // branch (taken)
+            let (advance, advance_is_taken) = if s0 == m_try && s1 != m_try {
+                (s1, true)
+            } else if s1 == m_try && s0 != m_try {
+                (s0, false)
+            } else {
+                break; // neither, or both, exit to M — not this shape
+            };
+            guards.push((cur, advance_is_taken));
+
+            // The advance target is another guard (before M) or the tail (after
+            // M). Guards precede the merge; the tail sits past it. That PC split
+            // is what makes the tail unmistakable and the walk terminating.
+            let ab = match cfg.blocks.get(&advance) {
+                Some(b) => b,
+                None => break,
+            };
+            let is_next_guard = ab.start < m_start
+                && ab.successors.len() == 2
+                && !handled.contains(&advance)
+                && !loop_headers.contains(&advance)
+                && is_pure_guard_block(code, ab)
+                && ab.successors.iter().any(|&s| s == m_try);
+            if is_next_guard {
+                cur = advance;
+                continue;
+            }
+            if ab.start > m_start {
+                tail = Some(advance);
+            }
+            break;
+        }
+
+        if trace {
+            eprintln!(
+                "GTI  m_try={} m_start={} guards={:?} tail={:?}",
+                m_try, m_start, guards, tail
+            );
+        }
+        let tail = match tail {
+            Some(t) if guards.len() >= 2 => t,
+            _ => continue,
+        };
+        if handled.contains(&tail) || loop_headers.contains(&tail) {
+            continue;
+        }
+        let tb = match cfg.blocks.get(&tail) {
+            Some(b) => b,
+            None => continue,
+        };
+        // The tail is reached ONLY through the chain: its sole predecessor is
+        // the last guard. Otherwise nesting it under the guard would be unsound.
+        let last_guard = guards.last().unwrap().0;
+        if trace {
+            eprintln!(
+                "GTI  tail={} preds={:?} last_guard={}",
+                tail, tb.predecessors, last_guard
+            );
+        }
+        if tb.predecessors.len() != 1 || tb.predecessors[0] != last_guard {
+            continue;
+        }
+        // Collect the tail's forward region and require it CLOSED: every block
+        // after the merge, none a guard or the merge, no loop header, and every
+        // successor stays inside the set (so it cannot leak back into the
+        // continuation). A closed acyclic region necessarily ends in RETURN.
+        let tail_blocks = collect_region_blocks(cfg, tail, None, handled);
+        if tail_blocks.is_empty() {
+            continue;
+        }
+        let tail_set: BTreeSet<usize> = tail_blocks.iter().copied().collect();
+        let guard_ids: BTreeSet<usize> = guards.iter().map(|g| g.0).collect();
+        let closed = tail_blocks.iter().all(|&t| {
+            let blk = match cfg.blocks.get(&t) {
+                Some(b) => b,
+                None => return false,
+            };
+            blk.start > m_start
+                && t != m_try
+                && !guard_ids.contains(&t)
+                && !loop_headers.contains(&t)
+                && blk.successors.iter().all(|s| tail_set.contains(s))
+        });
+        if !closed {
+            continue;
+        }
+        // The furthest-PC exit must actually return.
+        let has_return_exit = tail_blocks.iter().any(|t| {
+            cfg.blocks
+                .get(t)
+                .map_or(false, |b| b.successors.is_empty() && block_ends_in_return(code, b))
+        });
+        if !has_return_exit {
+            continue;
+        }
+        // SOUNDNESS NARROWING: accept only a SINGLE-basic-block tail.
+        //
+        // A multi-block tail carries internal control flow, and re-lifting it
+        // out-of-line through `lift_branch_region` can mis-structure that flow
+        // and silently drop live calls: measured on `rc_0054 drawSpotlight`,
+        // where a branchy tail lost 4 `UDim2.fromOffset` calls (ast 19 -> 15
+        // against bc 19) while the plain structurer emitted it correctly. That
+        // loss is invisible to the file-level `calls_not_emitted` checker
+        // because fastcalled builtins elsewhere in the file inflate its total,
+        // so it has to be excluded structurally, not caught after the fact.
+        //
+        // A single straight-line block has no structuring decision to get wrong,
+        // so its lift is lossless by construction — which is exactly the shape
+        // that motivated this region: `lv_0124 Update`'s out-of-line tail is the
+        // one-block `ClientCall("RetrievePlayerStat", arg2); self:Set(...);
+        // return` continuation, while the big guarded body is the `merge` the
+        // normal structurer already lifts in full. Widening past one block needs
+        // a lossless multi-block tail lift, not a wider match here.
+        if tail_blocks.len() != 1 {
+            continue;
+        }
+        return Some((guards, tail_blocks, m_try));
+    }
+    None
 }
 
 /// Check if a detected natural loop is a REAL loop by verifying that the
