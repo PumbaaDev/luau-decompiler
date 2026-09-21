@@ -79,6 +79,8 @@ mod branch_merge_reg_tests;
 #[cfg(test)]
 mod ref_capture_write_pin_tests;
 #[cfg(test)]
+mod capture_param_global_upval_tests;
+#[cfg(test)]
 mod branch_seed_shape_tests;
 #[cfg(test)]
 mod pinned_arm_write_tests;
