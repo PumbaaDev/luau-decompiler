@@ -1368,6 +1368,20 @@ impl OpcodeMap {
                 let insn = proto.code[i];
                 let op = insn_op(insn);
                 let new_op = self.shuffled_to_standard[op as usize];
+                if new_op == super::opcodes::LuauOpcode::CallFb as u8 {
+                    // CALLFB (Roblox v11+ call feedback) = a plain CALL plus one
+                    // feedback-slot AUX word. Normalise to a bare CALL and turn the
+                    // feedback word into a NOP: instruction count and every jump
+                    // offset stay identical, and the lifter sees ordinary CALL
+                    // semantics with no CALLFB-specific handling required.
+                    proto.code[i] =
+                        (insn & 0xFFFFFF00) | (super::opcodes::LuauOpcode::Call as u32);
+                    if i + 1 < proto.code.len() {
+                        proto.code[i + 1] = 0; // NOP
+                    }
+                    i += 2;
+                    continue;
+                }
                 if new_op != 255 {
                     // Remap this instruction's opcode byte
                     proto.code[i] = (insn & 0xFFFFFF00) | (new_op as u32);

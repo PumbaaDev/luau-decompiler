@@ -579,16 +579,30 @@ impl OpmapDb {
         // Gate 4: corroborate against the chunk's own structural reading.
         // Ranked on the net score, floored on raw agreements - see
         // DB_MIN_CORROBORATION for why those have to be two different things.
-        let mut scored: Vec<(&DbEntry, i32, u32)> = fitted
+        let mut scored: Vec<(&DbEntry, i32, u32, u8)> = fitted
             .iter()
             .map(|(e, _)| {
                 let (agree, conflict) = fp.corroboration(&e.map);
-                (*e, agree as i32 - 3 * conflict as i32, agree)
+                // Version distance: an entry measured at a NEWER bytecode version
+                // than the chunk belongs to a LATER client build with a DIFFERENT
+                // opcode shuffle. Among entries that all walk cleanly (small chunks
+                // can coincidentally satisfy a foreign shuffle), the one closest to
+                // the chunk's own version is the right build. v7 CoreScripts and v9
+                // live scripts share one build/shuffle, so the v9 entry (bcv 9)
+                // wins for both a v7 and a v9 chunk; a v12 entry (bcv 12) never
+                // wins a v9 chunk. Gate 1 already guarantees bcv >= chunk.version.
+                let vdist = e.bytecode_version.saturating_sub(chunk.version);
+                (*e, agree as i32 - 3 * conflict as i32, agree, vdist)
             })
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.id.cmp(&b.0.id)));
+        // Closest bytecode version first, then higher corroboration, then id.
+        scored.sort_by(|a, b| {
+            a.3.cmp(&b.3)
+                .then(b.1.cmp(&a.1))
+                .then(a.0.id.cmp(&b.0.id))
+        });
 
-        let (best, best_score, best_agree) = scored[0];
+        let (best, best_score, best_agree, best_vdist) = scored[0];
         // Same reasoning as Gate 3: corroboration ranks rival entries, and a
         // sole measured entry that already walks cleanly has no rival to be
         // ranked against. A small chunk simply cannot corroborate much.
@@ -599,10 +613,16 @@ impl OpmapDb {
             };
         }
         if scored.len() > 1 {
-            let (runner_up, runner_score, _) = scored[1];
-            if best_score - runner_score < DB_SCORE_MARGIN && runner_up.map != best.map {
+            let (runner_up, runner_score, _, runner_vdist) = scored[1];
+            // Only a tie WITHIN the same bytecode version (same client build) is a
+            // genuine ambiguity. A farther-version runner-up already lost on build
+            // proximity above and must not force a refusal into detector fallback.
+            if runner_vdist == best_vdist
+                && best_score - runner_score < DB_SCORE_MARGIN
+                && runner_up.map != best.map
+            {
                 return DbLookup::Ambiguous {
-                    candidates: scored.iter().map(|(e, _, _)| e.id.clone()).collect(),
+                    candidates: scored.iter().map(|(e, _, _, _)| e.id.clone()).collect(),
                     best_score,
                     runner_up_score: runner_score,
                 };

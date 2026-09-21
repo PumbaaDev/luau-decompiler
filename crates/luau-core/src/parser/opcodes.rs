@@ -270,14 +270,22 @@ pub enum LuauOpcode {
     /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
     RbxExt105 = 105,
 
+    /// CALLFB — Roblox v11+ call-feedback opcode: a plain CALL (same A/B/C
+    /// operands) followed by one feedback-slot AUX word. The live v12 client
+    /// emits it in place of CALL wherever call feedback is on. It carries an
+    /// AUX word (see `has_aux`); `remap_chunk` normalises it to a bare CALL and
+    /// neutralises the feedback word to a NOP, so the lifter sees ordinary CALL
+    /// semantics with every jump offset preserved.
+    CallFb = 106,
+
     // Unknown opcode
     Unknown = 255,
 }
 
 impl LuauOpcode {
     /// One past the highest valid canonical opcode number (exclusive upper bound).
-    /// Includes Roblox-specific extensions 92-99.
-    pub const MAX_OPCODE: usize = 106;
+    /// Includes Roblox-specific extensions 92-99 and CALLFB (106).
+    pub const MAX_OPCODE: usize = 107;
 
     pub fn from_u8(val: u8) -> Self {
         match val {
@@ -365,6 +373,7 @@ impl LuauOpcode {
             81 => Self::JumpXEqKS,
             82 => Self::DupClosure,
             83 => Self::FastCall3,
+            106 => Self::CallFb,
             84 => Self::Band,
             85 => Self::Bor,
             86 => Self::Bxor,
@@ -478,6 +487,7 @@ impl LuauOpcode {
             Self::JumpXEqKS => "JUMPXEQKS",
             Self::DupClosure => "DUPCLOSURE",
             Self::FastCall3 => "FASTCALL3",
+            Self::CallFb => "CALLFB",
             Self::Band => "BAND",
             Self::Bor => "BOR",
             Self::Bxor => "BXOR",
@@ -531,6 +541,8 @@ impl LuauOpcode {
                 | Self::JumpXEqKN
                 | Self::JumpXEqKS
                 | Self::NameCall
+                // CALLFB carries one feedback-slot AUX word after the CALL word.
+                | Self::CallFb
                 // Roblox extension: RBX_EXT_101 is observed to have an AUX word
                 // (confirmed via debug-disasm: UNKNOWN 0x00000800 always follows it).
                 | Self::RbxExt101

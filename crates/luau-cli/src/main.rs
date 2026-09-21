@@ -768,6 +768,7 @@ fn decompile_with_store(
     store: Option<&PathBuf>,
     db: &DbSelection,
 ) -> Result<String> {
+    enable_v10plus_for(data);
     if let Some(entry) = resolve_db_entry(db, data)? {
         return luau_core::decompile_with_plan(
             data,
@@ -1234,6 +1235,25 @@ fn run_scan(input: &Path, extensions: &str, store: Option<&PathBuf>) -> Result<(
 }
 
 // ── Helpers ──
+
+/// Live Roblox clients ship v10-v14 bytecode with a shuffled opcode table and
+/// call-feedback (CALLFB) opcodes. The parser gates v10+ behind two env vars so
+/// canonical-upstream callers keep the old behaviour; here, on the user-facing
+/// decode path, we flip both on automatically for a v10-14 chunk. v3-9 is left
+/// untouched (both flags are version-gated to >= 10 inside the parser), so this
+/// cannot change any existing decode. RAW mode is correct because the CLI decodes
+/// Roblox client bytecode, whose CALLFB is un-shuffled and neutralised by the
+/// measured opmap DB entry rather than by the upstream fixup.
+fn enable_v10plus_for(data: &[u8]) {
+    if matches!(data.first(), Some(10..=14)) {
+        if std::env::var_os("LUAU_ALLOW_V10PLUS").is_none() {
+            std::env::set_var("LUAU_ALLOW_V10PLUS", "1");
+        }
+        if std::env::var_os("LUAU_V10PLUS_RAW").is_none() {
+            std::env::set_var("LUAU_V10PLUS_RAW", "1");
+        }
+    }
+}
 
 fn read_input(path: Option<&Path>) -> Result<Vec<u8>> {
     match path {

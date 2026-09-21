@@ -347,7 +347,17 @@ impl<'a> BytecodeReader<'a> {
         // feedback-off output of the same source decodes correctly, so every
         // other opcode's length already matches the map. Guarded by version >= 10,
         // so v3-9 (the whole corpus) is byte-identical and cannot regress.
-        if version >= 10 {
+        //
+        // This whole fixup assumes UPSTREAM (unshuffled) opcode numbering. Roblox
+        // ships v12 to the live client with SHUFFLED opcodes that the opmap DB
+        // un-shuffles downstream, so raw opcode 84/87/etc. are NOT the upstream
+        // class/CALLFB opcodes there (84 is BAND). Set LUAU_V10PLUS_RAW when the
+        // opcodes are shuffled Roblox bytecode (an opmap DB will interpret them):
+        // the upstream fixup is skipped and the raw code passes through untouched.
+        let raw_v10plus = std::env::var("LUAU_V10PLUS_RAW")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if version >= 10 && !raw_v10plus {
             const LOP_CALL: u32 = 21;
             const LOP_CALLFB: u8 = 87;
             let mut j = 0;

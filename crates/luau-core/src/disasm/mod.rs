@@ -182,7 +182,7 @@ fn format_instruction(
             format!("R{} R{}:{}", a, a + 1, name)
         }
 
-        LuauOpcode::Call => {
+        LuauOpcode::Call | LuauOpcode::CallFb => {
             let nargs = if b == 0 {
                 "vararg".to_string()
             } else {

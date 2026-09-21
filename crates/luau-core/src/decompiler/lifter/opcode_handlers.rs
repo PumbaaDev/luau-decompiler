@@ -3104,7 +3104,9 @@ pub(super) fn lift_instruction_range(
                 });
             }
 
-            LuauOpcode::Call => {
+            LuauOpcode::Call | LuauOpcode::CallFb => {
+                // CALLFB is normalised to CALL in remap_chunk, but handle it
+                // here too so the match stays exhaustive and correct either way.
                 // If the function register contains a Table literal (from
                 // DUPTABLE/NEWTABLE + SETTABLEKS), emit it as a local first.
                 // Otherwise we'd produce invalid Luau like `{...}(args)`.
