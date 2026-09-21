@@ -1,0 +1,23 @@
+[package]
+name = "luau-ffi"
+description = "C ABI (FFI) bindings for the Luau decompiler core library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# The crate compiles to a C-callable shared library (cdylib) and a static
+# archive (staticlib). The artifact base name is `luau_ffi` (Cargo replaces the
+# hyphen with an underscore), so the outputs are:
+#   Linux:   libluau_ffi.so   / libluau_ffi.a
+#   macOS:   libluau_ffi.dylib / libluau_ffi.a
+#   Windows: luau_ffi.dll (+ luau_ffi.dll.lib import lib) / luau_ffi.lib
+name = "luau_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# `serde` feature makes luau_core::BytecodeInfo / ProtoInfo derive Serialize,
+# which luau_info_json relies on.
+luau-core = { path = "../luau-core", features = ["serde"] }
+anyhow.workspace = true
+serde_json.workspace = true

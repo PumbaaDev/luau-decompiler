@@ -1,0 +1,487 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+use crate::parser::opcodes::LuauOpcode;
+use crate::parser::types::*;
+
+/// A basic block in the control flow graph
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub id: usize,
+    /// Instruction range [start, end) in the proto's code array
+    pub start: usize,
+    pub end: usize,
+    pub successors: Vec<usize>,
+    pub predecessors: Vec<usize>,
+    /// PC of this block's last real instruction, found by the forward,
+    /// instruction-aligned walk in [`ControlFlowGraph::build`].
+    ///
+    /// This is the block's branch instruction when the block ends in one. It is
+    /// stored rather than recomputed because the same value cannot be derived
+    /// by stepping backward from `end`: see the comment at the walk itself.
+    /// `None` only for a block whose walk produced nothing (empty or malformed
+    /// range), never for a block that ends in a branch.
+    pub branch_pc: Option<usize>,
+}
+
+/// Complete control flow graph for a function
+#[derive(Debug)]
+pub struct ControlFlowGraph {
+    pub blocks: BTreeMap<usize, BasicBlock>,
+    pub entry: usize,
+    pub pc_to_block: HashMap<usize, usize>,
+}
+
+impl ControlFlowGraph {
+    /// Build a CFG from a proto's instruction stream
+    pub fn build(proto: &Proto) -> Self {
+        let code = &proto.code;
+        if code.is_empty() {
+            return Self {
+                blocks: BTreeMap::new(),
+                entry: 0,
+                pc_to_block: HashMap::new(),
+            };
+        }
+
+        // Step 1: Find block leaders
+        //
+        // LUAU_LEADER_TRACE reports every leader with the pc and opcode that
+        // created it. A boundary between two consecutive MOVEs in straight-line
+        // code is not something the emitted Lua can explain, so this is the
+        // only place that can say why one exists.
+        let leader_trace = std::env::var("LUAU_LEADER_TRACE").is_ok();
+        let mut leaders = BTreeSet::new();
+        leaders.insert(0);
+
+        let mut pc = 0usize;
+        while pc < code.len() {
+            let insn = code[pc];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            let d = insn_d(insn);
+            let e = insn_e(insn);
+            let next_pc = if op.has_aux() { pc + 2 } else { pc + 1 };
+
+            match op {
+                LuauOpcode::Jump | LuauOpcode::JumpBack => {
+                    let target = (pc as i32 + d as i32 + 1) as usize;
+                    if target < code.len() {
+                        leaders.insert(target);
+                    }
+                    if next_pc < code.len() {
+                        leaders.insert(next_pc);
+                    }
+                }
+                LuauOpcode::JumpX => {
+                    let target = (pc as i32 + e + 1) as usize;
+                    if target < code.len() {
+                        leaders.insert(target);
+                    }
+                    if next_pc < code.len() {
+                        leaders.insert(next_pc);
+                    }
+                }
+                LuauOpcode::JumpIf | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpIfEq | LuauOpcode::JumpIfLE | LuauOpcode::JumpIfLT
+                | LuauOpcode::JumpIfNotEq | LuauOpcode::JumpIfNotLE | LuauOpcode::JumpIfNotLT
+                | LuauOpcode::JumpXEqKNil | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN | LuauOpcode::JumpXEqKS
+                | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+                | LuauOpcode::Deprecated61 => {
+                    // The compare-to-boolean idiom (`local x = a < b`) is a value
+                    // computation, not control flow. Splitting it into blocks
+                    // makes its two LOADB halves un-pairable downstream, so the
+                    // comparison degenerates into a constant. Keep it whole; the
+                    // lifter recognises the same exact shape and stores the
+                    // comparison straight into the destination register.
+                    //
+                    // The same holds for an `and`/`or` chain — but only while
+                    // the chain really is the sole way into its own span. When
+                    // an *outside* jump lands in the middle of it, the span is
+                    // shared with real control flow: suppressing the split
+                    // deletes the leader that edge needs, the edge is dropped
+                    // as dangling, and the block it pointed at becomes
+                    // unreachable. Keep the boundaries in that case and let the
+                    // value-join structuring handle the shape.
+                    let keep_whole = crate::analysis::bool_idiom::recognize_bool_idiom(code, pc)
+                        .is_some()
+                        || crate::analysis::bool_idiom::recognize_or_and_chain(code, pc).map_or(
+                            false,
+                            |c| {
+                                !crate::analysis::bool_idiom::span_has_external_entry(
+                                    code, pc, c.end_pc,
+                                )
+                            },
+                        );
+                    if keep_whole {
+                        pc = next_pc;
+                        continue;
+                    }
+                    let target = (pc as i32 + d as i32 + 1) as usize;
+                    if target < code.len() {
+                        leaders.insert(target);
+                    }
+                    if next_pc < code.len() {
+                        leaders.insert(next_pc);
+                    }
+                }
+                // For-prep opcodes must start their own block so the structuring
+                // pass can identify them via try_match_for_loop (which checks the
+                // first instruction of each block).
+                LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                    leaders.insert(pc); // prep itself is a leader
+                    let target = (pc as i32 + d as i32 + 1) as usize;
+                    if target < code.len() {
+                        leaders.insert(target);
+                    }
+                    if next_pc < code.len() {
+                        leaders.insert(next_pc);
+                    }
+                }
+                LuauOpcode::Return => {
+                    if next_pc < code.len() {
+                        leaders.insert(next_pc);
+                    }
+                }
+                _ => {}
+            }
+            pc = next_pc;
+        }
+
+        if leader_trace {
+            let ls: Vec<usize> = leaders.iter().copied().collect();
+            let _ = &ls;
+            eprintln!(
+                "LEADERS proto={}@{} {:?}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                ls
+            );
+        }
+        // Step 2: Create blocks
+        let leader_vec: Vec<usize> = leaders.iter().copied().collect();
+        let mut blocks = BTreeMap::new();
+        let mut pc_to_block = HashMap::new();
+
+        for (i, &start) in leader_vec.iter().enumerate() {
+            let end = if i + 1 < leader_vec.len() {
+                leader_vec[i + 1]
+            } else {
+                code.len()
+            };
+            let block = BasicBlock {
+                id: start,
+                start,
+                end,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+                branch_pc: None,
+            };
+            for p in start..end {
+                pc_to_block.insert(p, start);
+            }
+            blocks.insert(start, block);
+        }
+
+        // Step 3: Connect edges
+        for &start in &leader_vec {
+            // Bounds-checked lookup — `start` is always in `blocks` for
+            // well-formed input (leader_vec seeds blocks), but prefer
+            // graceful skip on malformed state.
+            let block_end = match blocks.get(&start) {
+                Some(b) => b.end,
+                None => continue,
+            };
+            if block_end == 0 {
+                continue;
+            }
+
+            // Find the last real instruction by walking the block FORWARD,
+            // instruction-aligned. Stepping backwards and asking whether the
+            // second-to-last word "has an AUX" is not decidable: that word may
+            // itself be an AUX, and an AUX holding e.g. a constant index 7
+            // decodes as GETGLOBAL, which does carry an AUX. A block ending
+            // `GETTABLEKS <aux> JUMPIF` was therefore judged to end at the AUX,
+            // so the conditional jump was never seen and the block lost its
+            // branch edge entirely.
+            let mut last_pc = start;
+            let mut w = start;
+            while w < block_end {
+                last_pc = w;
+                w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() {
+                    2
+                } else {
+                    1
+                };
+            }
+
+            // Publish it. The lifter used to re-derive this by stepping backward
+            // from `end`, which is the exact mistake the comment above describes,
+            // so it read an AUX payload as a comparison instruction and then
+            // consumed the real branch word as that phantom instruction's
+            // operand. Computing it once, forward, and storing it removes the
+            // second, wrong derivation entirely.
+            if let Some(b) = blocks.get_mut(&start) {
+                b.branch_pc = Some(last_pc);
+            }
+
+            // Bounds-checked — malformed `block_end` could exceed code length.
+            let insn = match code.get(last_pc) {
+                Some(&i) => i,
+                None => continue,
+            };
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            let d = insn_d(insn);
+            let e = insn_e(insn);
+
+            let mut successors = Vec::new();
+            match op {
+                LuauOpcode::Jump | LuauOpcode::JumpBack => {
+                    let target = (last_pc as i32 + d as i32 + 1) as usize;
+                    successors.push(target);
+                }
+                LuauOpcode::JumpX => {
+                    let target = (last_pc as i32 + e + 1) as usize;
+                    successors.push(target);
+                }
+                LuauOpcode::JumpIf | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpIfEq | LuauOpcode::JumpIfLE | LuauOpcode::JumpIfLT
+                | LuauOpcode::JumpIfNotEq | LuauOpcode::JumpIfNotLE | LuauOpcode::JumpIfNotLT
+                | LuauOpcode::JumpXEqKNil | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN | LuauOpcode::JumpXEqKS => {
+                    if block_end < code.len() {
+                        successors.push(block_end); // fallthrough
+                    }
+                    let target = (last_pc as i32 + d as i32 + 1) as usize;
+                    successors.push(target); // branch
+                }
+                LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                    if block_end < code.len() {
+                        successors.push(block_end); // into loop
+                    }
+                    let target = (last_pc as i32 + d as i32 + 1) as usize;
+                    successors.push(target); // skip loop
+                }
+                LuauOpcode::ForNLoop | LuauOpcode::ForGLoop | LuauOpcode::Deprecated61 => {
+                    let target = (last_pc as i32 + d as i32 + 1) as usize;
+                    successors.push(target); // loop back
+                    if block_end < code.len() {
+                        successors.push(block_end); // exit
+                    }
+                }
+                LuauOpcode::Return => {} // no successors
+                _ => {
+                    if block_end < code.len() {
+                        successors.push(block_end);
+                    }
+                }
+            }
+
+            let valid: Vec<usize> = successors.into_iter().filter(|s| blocks.contains_key(s)).collect();
+            // Bounds-checked: `start` comes from `leader_vec` which seeds
+            // `blocks`; a missing entry here indicates malformed CFG state
+            // (e.g. a block was removed mid-build). Skip rather than panic.
+            if let Some(b) = blocks.get_mut(&start) {
+                b.successors = valid.clone();
+            } else {
+                continue;
+            }
+            for &succ in &valid {
+                // `valid` was filtered via `blocks.contains_key`, so a missing
+                // entry would only happen under concurrent mutation, which
+                // cannot occur (this is a single-threaded builder). Still,
+                // prefer a graceful fallback over `.unwrap()` for robustness.
+                if let Some(b) = blocks.get_mut(&succ) {
+                    b.predecessors.push(start);
+                }
+            }
+        }
+
+        Self {
+            blocks,
+            entry: 0,
+            pc_to_block,
+        }
+    }
+
+    pub fn compute_dominators(&self) -> HashMap<usize, usize> {
+        let mut idom: HashMap<usize, usize> = HashMap::new();
+        idom.insert(self.entry, self.entry);
+        let rpo = self.reverse_postorder();
+        let rpo_index: HashMap<usize, usize> = rpo.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in &rpo {
+                if b == self.entry { continue; }
+                let preds = &self.blocks[&b].predecessors;
+                let mut new_idom: Option<usize> = None;
+                for &p in preds {
+                    if !idom.contains_key(&p) { continue; }
+                    new_idom = Some(match new_idom {
+                        None => p,
+                        Some(cur) => self.intersect(&idom, &rpo_index, cur, p),
+                    });
+                }
+                if let Some(new) = new_idom {
+                    if idom.get(&b) != Some(&new) {
+                        idom.insert(b, new);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        idom
+    }
+
+    fn intersect(&self, idom: &HashMap<usize, usize>, rpo_index: &HashMap<usize, usize>, mut a: usize, mut b: usize) -> usize {
+        while a != b {
+            while rpo_index.get(&a).copied().unwrap_or(usize::MAX) > rpo_index.get(&b).copied().unwrap_or(usize::MAX) {
+                a = *idom.get(&a).unwrap_or(&a);
+            }
+            while rpo_index.get(&b).copied().unwrap_or(usize::MAX) > rpo_index.get(&a).copied().unwrap_or(usize::MAX) {
+                b = *idom.get(&b).unwrap_or(&b);
+            }
+        }
+        a
+    }
+
+    pub fn reverse_postorder(&self) -> Vec<usize> {
+        let mut visited = BTreeSet::new();
+        let mut order = Vec::new();
+        self.rpo_visit(self.entry, &mut visited, &mut order);
+        order.reverse();
+        order
+    }
+
+    fn rpo_visit(&self, node: usize, visited: &mut BTreeSet<usize>, order: &mut Vec<usize>) {
+        if !visited.insert(node) { return; }
+        if let Some(block) = self.blocks.get(&node) {
+            for &succ in &block.successors {
+                self.rpo_visit(succ, visited, order);
+            }
+        }
+        order.push(node);
+    }
+
+    pub fn find_loops(&self) -> Vec<NaturalLoop> {
+        let idom = self.compute_dominators();
+        let mut loops = Vec::new();
+        for (&block_id, block) in &self.blocks {
+            for &succ in &block.successors {
+                if self.dominates(&idom, succ, block_id) {
+                    let body = self.collect_loop_body(succ, block_id);
+                    loops.push(NaturalLoop { header: succ, back_edge_source: block_id, body });
+                }
+            }
+        }
+        loops
+    }
+
+    fn dominates(&self, idom: &HashMap<usize, usize>, a: usize, mut b: usize) -> bool {
+        loop {
+            if b == a { return true; }
+            match idom.get(&b) {
+                Some(&dom) if dom != b => b = dom,
+                _ => return false,
+            }
+        }
+    }
+
+    fn collect_loop_body(&self, header: usize, back_edge_src: usize) -> BTreeSet<usize> {
+        let mut body = BTreeSet::new();
+        body.insert(header);
+        if header == back_edge_src { return body; }
+        body.insert(back_edge_src);
+        let mut worklist = VecDeque::new();
+        worklist.push_back(back_edge_src);
+        while let Some(node) = worklist.pop_front() {
+            if let Some(block) = self.blocks.get(&node) {
+                for &pred in &block.predecessors {
+                    if body.insert(pred) {
+                        worklist.push_back(pred);
+                    }
+                }
+            }
+        }
+        body
+    }
+
+    /// Find the immediate post-dominator / merge point for a conditional branch.
+    /// This is the first block reachable from BOTH successors.
+    pub fn find_merge_point(&self, true_target: usize, false_target: usize) -> Option<usize> {
+        // BFS from both targets, find first overlap
+        let mut visited_true = BTreeSet::new();
+        let mut visited_false = BTreeSet::new();
+        let mut queue_true = VecDeque::new();
+        let mut queue_false = VecDeque::new();
+
+        visited_true.insert(true_target);
+        visited_false.insert(false_target);
+        queue_true.push_back(true_target);
+        queue_false.push_back(false_target);
+
+        // Check if one is directly the other
+        if true_target == false_target {
+            return Some(true_target);
+        }
+
+        // Rotation 134: why does this find no overlap? `LUAU_MERGEPT_TRACE=<blk>`
+        // prints the successor sets for one conditional. r133 showed
+        // `merge=None` for a two-arm branch whose register IS read afterwards,
+        // so a join exists that this search does not reach.
+        let mp_trace = std::env::var("LUAU_MERGEPT_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if mp_trace.is_some() {
+            let succ = |b: usize| -> Vec<usize> {
+                self.blocks.get(&b).map(|x| x.successors.clone()).unwrap_or_default()
+            };
+            eprintln!(
+                "MERGEPT	true={} succ={:?}	false={} succ={:?}",
+                true_target,
+                succ(true_target),
+                false_target,
+                succ(false_target)
+            );
+        }
+
+        // Alternating BFS
+        for _ in 0..self.blocks.len() * 2 {
+            if let Some(node) = queue_true.pop_front() {
+                if visited_false.contains(&node) {
+                    return Some(node);
+                }
+                if let Some(block) = self.blocks.get(&node) {
+                    for &succ in &block.successors {
+                        if visited_true.insert(succ) {
+                            queue_true.push_back(succ);
+                        }
+                    }
+                }
+            }
+            if let Some(node) = queue_false.pop_front() {
+                if visited_true.contains(&node) {
+                    return Some(node);
+                }
+                if let Some(block) = self.blocks.get(&node) {
+                    for &succ in &block.successors {
+                        if visited_false.insert(succ) {
+                            queue_false.push_back(succ);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NaturalLoop {
+    pub header: usize,
+    pub back_edge_source: usize,
+    pub body: BTreeSet<usize>,
+}
