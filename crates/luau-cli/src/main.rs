@@ -1018,6 +1018,13 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
     let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     // One row per defect: file / check / line / detail.
     let mut report = String::from("file\tproto\tcheck\tline\tdetail\n");
+    // SUSPICIOUS findings are diagnostic candidates, NOT counted as defects and
+    // NOT part of the clean %. They go to a separate ledger so a reviewer can
+    // find dropped-value / gaming-risk sites (e.g. dropped_arm_value) without the
+    // Wrong-based defect count moving. Written to SEMANTIC_SUSPECT.tsv.
+    let mut suspect = String::from("file\tproto\tcheck\tline\tdetail\n");
+    let mut suspect_files = 0usize;
+    let mut suspect_total = 0usize;
 
     for p in &entries {
         let Ok(src) = fs::read_to_string(p) else { continue };
@@ -1030,16 +1037,28 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
                 .parse()
                 .ok()
         });
-        let wrong: Vec<_> = check(&src, protos)
-            .into_iter()
-            .filter(|f| f.severity == Severity::Wrong)
-            .collect();
+        let all = check(&src, protos);
+        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        // Suspicious rows: separate ledger, never affects clean/defect counts.
+        let suspicious: Vec<_> =
+            all.iter().filter(|f| f.severity == Severity::Suspicious).collect();
+        if !suspicious.is_empty() {
+            suspect_files += 1;
+            suspect_total += suspicious.len();
+            for f in &suspicious {
+                let detail = f.detail.replace(['\t', '\n', '\r'], " ");
+                let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+                let proto = enclosing_function(&src, f.line).unwrap_or_else(|| "-".to_string());
+                suspect.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", name, proto, f.check, line, detail));
+            }
+        }
+        let wrong: Vec<_> =
+            all.into_iter().filter(|f| f.severity == Severity::Wrong).collect();
         if wrong.is_empty() {
             clean += 1;
             continue;
         }
         total += wrong.len();
-        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for f in &wrong {
             *seen.entry(f.check).or_insert(0) += 1;
@@ -1073,6 +1092,18 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
     // a caller to assume the report exists.
     if let Err(e) = fs::write(dir.join("SEMANTIC_REPORT.tsv"), &report) {
         eprintln!("warning: could not write SEMANTIC_REPORT.tsv: {e}");
+    }
+    // Suspicious ledger: diagnostic candidates (dropped-value / gaming-risk
+    // sites), separate from the defect count. Always written so a reviewer can
+    // find what the Wrong-only report deliberately excludes.
+    if let Err(e) = fs::write(dir.join("SEMANTIC_SUSPECT.tsv"), &suspect) {
+        eprintln!("warning: could not write SEMANTIC_SUSPECT.tsv: {e}");
+    }
+    if suspect_total > 0 {
+        eprintln!(
+            "Suspect: {} finding(s) across {} file(s) -> SEMANTIC_SUSPECT.tsv (diagnostic only, not in the defect count)",
+            suspect_total, suspect_files
+        );
     }
 
     let mut by_check: Vec<(String, usize, usize)> =

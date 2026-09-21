@@ -186,6 +186,7 @@ pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     check_declared_but_never_assigned(&code, &mut out);
     check_body_recovered(source, proto_count, &mut out);
     check_branch_local_discarded(&code, &mut out);
+    check_dropped_arm_value(&code, &mut out);
     check_discarded_table_writes(source, &mut out);
     check_property_called_as_method(source, &mut out);
     out.sort_by_key(|f| (f.severity, f.line.unwrap_or(0)));
@@ -326,6 +327,157 @@ fn check_branch_local_discarded(code: &str, out: &mut Vec<Finding>) {
             "branch_local_discarded",
             None,
             format!("... and {} further discarded branch values", reported - 6),
+        ));
+    }
+}
+
+
+// ── Check (SUSPICIOUS): a value computed in a branch arm and dropped, while a
+// nil-declared sibling binding is read after the branch ──────────────────────
+//
+// The rc_0047 shape, and the exact gap that let the reverted 21-Sep name-restore
+// fix GAME `declared_never_assigned` (corpus read 99.5% while the then-arm still
+// dropped its value):
+//
+//     local Text4                                       -- nil-declared merge binding
+//     if arg2 then
+//         local Text6 = RARITY_COLOR[k] or Color3.new(1,1,1)   -- computed, DROPPED
+//     else
+//         Text4 = color                                 -- other arm fills Text4
+//     end
+//     TextColor34.TextColor3 = Text4                    -- reads Text4
+//
+// On the `arg2` arm the computed colour goes to a FRESH local (`Text6`) instead
+// of the merge binding (`Text4`), so `Text4` is nil there. `declared_never_assigned`
+// misses it the moment ANY arm assigns `Text4`; `branch_local_discarded` misses it
+// because the value does not "extend a base" (it is an index / `or`-chain).
+//
+// SUSPICIOUS, not Wrong: a legitimate program CAN have a genuinely-dead nested
+// local, so this is a strong indicator, not a proof — proving it needs the
+// bytecode's register writes, which the source-level checker does not hold. The
+// three conditions together keep it precise: (1) a nil-declared `X` (a hoisted
+// merge binding), (2) read after its declaration, (3) with a DEAD, COMPUTED
+// `local Y` nested strictly deeper than `X` (i.e. inside a branch arm) between
+// the declaration and that read.
+fn check_dropped_arm_value(code: &str, out: &mut Vec<Finding>) {
+    let lines: Vec<&str> = code.lines().collect();
+    let indent = |s: &str| s.len() - s.trim_start().len();
+
+    // Occurrence count per identifier (declarations + reads), fields excluded.
+    let mut occ: HashMap<&str, usize> = HashMap::new();
+    for raw in &lines {
+        if raw.trim_start().starts_with("--") {
+            continue;
+        }
+        for tok in bare_idents(raw) {
+            *occ.entry(tok).or_default() += 1;
+        }
+    }
+
+    // Nil-declared merge bindings: `local X` (and `local X, Y`) with no `=`.
+    let mut nil_decls: Vec<(String, usize, usize)> = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        if t.starts_with("--") {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("local ") else { continue };
+        if rest.contains('=') || rest.starts_with("function ") {
+            continue;
+        }
+        for n in rest.split(',') {
+            let n = n.trim();
+            if !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                nil_decls.push((n.to_string(), i, indent(raw)));
+            }
+        }
+    }
+    if nil_decls.is_empty() {
+        return;
+    }
+
+    let mut reported = 0usize;
+    for (x, xline, xindent) in &nil_decls {
+        // X must be READ after its declaration.
+        let Some(xread) = lines.iter().enumerate().skip(*xline + 1).find_map(|(k, l)| {
+            (!l.trim_start().starts_with("--")
+                && bare_idents(l).into_iter().any(|tok| tok == x.as_str()))
+            .then_some(k)
+        }) else {
+            continue;
+        };
+
+        // Locality gate. A real merge binding is read within a few lines of its
+        // branch (the read is the join point right after the `end`). The big
+        // false-positive class is a CHUNK-TOP hoisted free variable declared in
+        // the top `local a, b, c` block and read hundreds of lines later: every
+        // nested dead local in the file sits "between" its declaration and read
+        // by accident. Requiring the read to be close excludes them (measured:
+        // 417 findings across 128 files without this gate, almost all such
+        // chunk-top matches; the rc_0047 Text4->Text6 case has a span of 5).
+        if xread - xline > 30 {
+            continue;
+        }
+
+        // A dead, computed `local Y = ...` nested deeper than X, between decl and read.
+        for j in (*xline + 1)..xread {
+            let raw = lines[j];
+            if indent(raw) <= *xindent {
+                continue; // must be inside a nested block (a branch arm)
+            }
+            let t = raw.trim();
+            let Some(rest) = t.strip_prefix("local ") else { continue };
+            let Some(eq) = rest.find('=') else { continue };
+            let bytes = rest.as_bytes();
+            if rest[eq..].starts_with("==")
+                || (eq > 0 && matches!(bytes[eq - 1], b'~' | b'<' | b'>' | b'='))
+            {
+                continue;
+            }
+            let yname = rest[..eq].trim();
+            if yname.is_empty()
+                || yname.contains(',')
+                || !yname.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            // Y must be DEAD (its only occurrence is this declaration).
+            if occ.get(yname).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            // Y's initialiser must be a COMPUTED value, not a bare literal — a
+            // dead literal is harmless, a dropped computation is the defect.
+            let rhs = rest[eq + 1..].trim();
+            let computed = rhs.contains('(')
+                || rhs.contains('[')
+                || rhs.contains(" or ")
+                || rhs.contains(" and ")
+                || rhs.contains("..")
+                || rhs
+                    .split_whitespace()
+                    .any(|w| matches!(w, "+" | "-" | "*" | "/" | "%" | "^"));
+            if !computed {
+                continue;
+            }
+            reported += 1;
+            if reported <= 6 {
+                out.push(Finding::suspicious(
+                    "dropped_arm_value",
+                    Some(j + 1),
+                    format!(
+                        "`{}` computes a value in a branch arm but is never read, while nil-declared `{}` (line {}) is read at line {} - the arm's value was likely written to a fresh local instead of `{}`, so on that branch `{}` stays nil",
+                        yname, x, xline + 1, xread + 1, x, x
+                    ),
+                ));
+            }
+            break; // at most one report per nil-declared binding
+        }
+    }
+    if reported > 6 {
+        out.push(Finding::suspicious(
+            "dropped_arm_value",
+            None,
+            format!("... and {} further dropped branch values", reported - 6),
         ));
     }
 }
