@@ -7616,7 +7616,28 @@ fn premateralize_branch_escapes_spans(
                 if opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
                     name = format!("sel{}", reg);
                 }
-                let (kind, final_name) = locals.classify_write(reg, &name);
+                // A register whose live value is `Unknown` at the branch is a
+                // REUSED slot: its prior lifetime was already clobbered, so the
+                // stale declaration/name that `classify_write` would preserve
+                // belongs to a dead variable, not this diamond's value. Measured
+                // shape (rc_0040 throwBook@497): pc2 `NAMECALL R3 R4:"Clone"`
+                // binds R4 as the method self-copy (`local v4`), pc4 CALL clobbers
+                // R4 to Unknown, and the compiler REUSES R4 for the `color`
+                // diamond (`R4 = palette[random]` / `LOADNIL R4`) captured into
+                // the `recolor` closure. `classify_write` sees R4 still declared
+                // with the generic `v4` and returns Reassign (two generic names),
+                // which this gate then declines - leaving the captured `v44`
+                // unassigned. Force a FRESH shadow: bound_seed already proved both
+                // arms write the register and the merge reads it before any
+                // redefinition, so the dead pre-branch value is never observed and
+                // a fresh declaration is bit-exact. A fresh name (never the stale
+                // one) keeps clear of the 476_BadgeMenu name-reuse hazard.
+                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown));
+                let (kind, final_name) = if reg_is_dead {
+                    (WriteKind::Shadow, locals.reseed_shadow(reg, &name))
+                } else {
+                    locals.classify_write(reg, &name)
+                };
                 // Shadow is the ONLY outcome that introduces a fresh identity.
                 // Reassign would write the OLD name - precisely the repurposing
                 // this case exists to avoid - so leave those to the gates below

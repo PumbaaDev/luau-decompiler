@@ -133,6 +133,24 @@ impl LocalTracker {
         self.declared.insert(reg);
     }
 
+    /// Force a FRESH shadow identity onto a register, overwriting any stale
+    /// declaration and name. Returns the name to use. This is for the branch
+    /// seed of a register whose PRIOR lifetime is dead (its live value was
+    /// clobbered back to `Unknown`) and which the Luau compiler has REUSED for
+    /// a new two-arm-diamond value. `classify_write` would keep the stale
+    /// generic name and route the arm writes through `Reassign`, which the
+    /// seed gate then rejects, leaving the merge read unbound. Seeding a fresh
+    /// name is bit-exact whenever both arms write the register and the merge
+    /// reads it before redefining it — the pre-branch (dead) value is provably
+    /// never observed — and it never reuses the old name, so the repurposed-slot
+    /// hazard (476_BadgeMenu) cannot arise.
+    pub(super) fn reseed_shadow(&mut self, reg: usize, name: &str) -> String {
+        self.declared.insert(reg);
+        self.current_names.insert(reg, name.to_string());
+        self.alias_regs.remove(&reg);
+        name.to_string()
+    }
+
     /// The local name currently bound to `reg`, if it holds a live binding.
     pub(super) fn current_name(&self, reg: usize) -> Option<&str> {
         self.current_names.get(&reg).map(|s| s.as_str())
