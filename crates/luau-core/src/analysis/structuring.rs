@@ -502,7 +502,8 @@ pub fn structure_control_flow(
         // (`if a then return end  if b then return end  ...`) is semantically
         // exact and keeps the shared return in every link. Gated tight — a
         // chain of at least two links, every non-entry link a BARE conditional
-        // (no side effects to duplicate), sharing one TERMINAL return block,
+        // or a sole-predecessor link with a PURE preamble (lifted once, in
+        // order), sharing one TERMINAL return block,
         // with a distinct continuation — so it never touches the both-arm-write
         // merge shape (neither arm is directly terminal there) or a genuine
         // two-return if (both arms terminal).
@@ -1053,15 +1054,51 @@ fn block_is_bare_conditional(cfg: &ControlFlowGraph, block_id: usize) -> bool {
     block.successors.len() == 2 && block.branch_pc == Some(block.start)
 }
 
+/// Is `block_id` an interior OR-chain link whose test needs a PURE preamble —
+/// e.g. `if item == nil or not t[item.id] then ... return end`, where the second
+/// link computes `t[item.id]` (GETTABLEKS + GETTABLE) before its branch?
+///
+/// Same whitelist `is_pure_guard_block` already applies to `GuardedTailIf`'s
+/// interior guards: only value parks (no CALL/NAMECALL/SET*/closure). The link is
+/// still lifted ONCE, in program order, after the previous link's guard has
+/// returned, so the preamble runs exactly when the bytecode runs it (only when
+/// every earlier link fell through) and nothing is duplicated or hoisted.
+///
+/// Additionally the link must be reached ONLY from the previous link: a block
+/// with a preamble that some other edge also enters is a join, and emitting it
+/// as a sibling guard after the previous one would misplace that edge. A bare
+/// link keeps its original (unrestricted) acceptance via
+/// `block_is_bare_conditional`, so every chain that matched before still does.
+///
+/// Measured shape (AdoptMe `ToppingsHelper`-style, reproduced from canonical
+/// `luau-compile -O1` of the source above): without this the chain stops at one
+/// link, the plain if/else structurer turns the guard into
+/// `if item ~= nil then local x = t[item.id] end return true`, and the shared
+/// `hint(...); return false` body is emitted dead after `return true` and removed
+/// by DCE — the `calls_not_emitted` class.
+fn is_pure_preamble_chain_link(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    block_id: usize,
+    prev_link: usize,
+) -> bool {
+    let Some(block) = cfg.blocks.get(&block_id) else { return false };
+    block.successors.len() == 2
+        && block.predecessors.len() == 1
+        && block.predecessors[0] == prev_link
+        && is_pure_guard_block(code, block)
+}
+
 /// Recognise an `if a or b or c then return end` chain rooted at `entry`.
 ///
 /// Shape: a chain of conditional blocks `[entry, B1, .., Bk]` (k >= 1, so at
 /// least two links total) where every link has ONE shared TERMINAL return block
 /// `T` as a successor, each link's OTHER successor is the next link, and the
 /// last link's other successor is the continuation `C` (which is not `T`). Every
-/// link after `entry` must be a BARE conditional (the entry may carry preamble,
-/// e.g. the calls whose results the chain tests). No link may already be
-/// handled.
+/// link after `entry` must be a BARE conditional, or a single-predecessor link
+/// whose preamble is pure value setup (`is_pure_preamble_chain_link`); the entry
+/// may carry any preamble, e.g. the calls whose results the chain tests. No link
+/// may already be handled.
 ///
 /// Returns `(chain, terminal, continuation)`. The narrow gate — exactly one
 /// terminal successor per link, chain length >= 2, bare interior links — keeps
@@ -1093,14 +1130,31 @@ fn find_or_chain_return_guard(
     };
     let mut chain = vec![entry];
     let mut cur = if terminal == s0 { s1 } else { s0 };
+    let mut used_pure_link = false;
     // Walk the chain. Each interior link must be a bare conditional that also
     // branches to the same `T`; its other successor is the next link.
     loop {
         if handled.contains(&cur) || chain.contains(&cur) {
             break;
         }
-        if !block_is_bare_conditional(cfg, cur) {
-            break;
+        let is_bare = block_is_bare_conditional(cfg, cur);
+        if !is_bare {
+            // A pure-preamble link is accepted only behind a STRAIGHT-LINE
+            // entry (at most one predecessor). An entry that is itself a join
+            // tests a register whose value differs per incoming edge, and the
+            // register file at a join does not always carry that merge: on
+            // StealAnEgg `ContentCreatorsAdminPanel` (`for .. do if id == v then
+            // server = s break end end; if not server or not server.Enabled
+            // then notice(..) return end`) the found-in-loop value is lost, the
+            // entry tests the fall-through `LOADNIL` and folds to `not nil`, and
+            // the guard would become an unconditional `notice(..); return` that
+            // kills the whole function. Bare-link chains keep their original
+            // (unrestricted) acceptance, so nothing that matched before changes.
+            if eb.predecessors.len() > 1
+                || !is_pure_preamble_chain_link(cfg, code, cur, *chain.last()?)
+            {
+                break;
+            }
         }
         let cb = cfg.blocks.get(&cur)?;
         let cs0 = cb.successors[0];
@@ -1114,6 +1168,7 @@ fn find_or_chain_return_guard(
             // the previous link, and `cur` is the continuation.
             break;
         };
+        used_pure_link |= !is_bare;
         chain.push(cur);
         cur = next;
     }
@@ -1121,6 +1176,23 @@ fn find_or_chain_return_guard(
     // continuation distinct from the terminal body.
     if chain.len() < 2 || cur == terminal || chain.contains(&cur) {
         return None;
+    }
+    // A chain that relies on a pure-preamble link must OWN the terminal: every
+    // edge into `T` comes from a chain link. `T` is claimed (handled) by this
+    // region, so an edge from anywhere else would lose its target. That happens
+    // when the walk stops at a link it cannot accept but which still branches to
+    // `T` — AdoptMe `DropBabyHelper.refresh_button_visibility` (`if not a or b ==
+    // nil or #b == 0 then hide() return end show()`): the third link's LENGTH
+    // preamble is not whitelisted, so it became the continuation and its
+    // `#b == 0 -> hide()` arm silently vanished. Bare-only chains are unchanged.
+    if used_pure_link {
+        let owns_terminal = cfg
+            .blocks
+            .get(&terminal)
+            .map_or(false, |t| t.predecessors.iter().all(|p| chain.contains(p)));
+        if !owns_terminal {
+            return None;
+        }
     }
     // THE TERMINAL MUST NOT BE THE FUNCTION'S OWN LAST BLOCK.
     //

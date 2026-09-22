@@ -92,3 +92,5 @@ mod branch_unknown_seed_tests;
 mod self_mutation_peek_tests;
 #[cfg(test)]
 mod exits_on_all_paths_complexity_tests;
+#[cfg(test)]
+mod or_chain_pure_preamble_tests;
