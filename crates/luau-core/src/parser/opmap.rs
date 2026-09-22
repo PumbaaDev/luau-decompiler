@@ -3622,10 +3622,40 @@ fn detect_upvalue_ops(chunk: &Chunk, ctx: &mut DetectCtx) {
 
     // Sort by total hits, byte ascending as deterministic tiebreak.
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    if candidates.len() >= 2 {
-        if candidates[0].1 >= 5 { ctx.try_assign(candidates[0].0, LuauOpcode::GetUpval as u8); }
-        if candidates[1].1 >= 3 { ctx.try_assign(candidates[1].0, LuauOpcode::SetUpval as u8); }
-    } else if candidates.len() == 1 && candidates[0].1 >= 5 {
+    if candidates.len() >= 2 && candidates[0].1 >= 5 && candidates[1].1 >= 3 {
+        // GETUPVAL and SETUPVAL are operand-identical (A=reg, B=upval, C=0), so
+        // frequency alone cannot tell a read from a write. Pooling the frequency
+        // guess across a corpus can land backwards for a byte (rc_0098: an
+        // upvalue READ decoded as SETUPVAL, so the register was never assigned
+        // and `v4`/`v5` came out undefined). Disambiguate by DATA FLOW instead:
+        // GETUPVAL DEFINES its A register (some later instruction reads it),
+        // while SETUPVAL USES its A register (some earlier instruction defined
+        // it). Score each candidate used-after minus defined-before; the higher
+        // score is GETUPVAL. This is ground truth, not a heuristic.
+        let get_score = |op: u8| -> i64 {
+            let mut score: i64 = 0;
+            for proto in &chunk.protos {
+                let code = &proto.code;
+                for i in 0..code.len() {
+                    if insn_op(code[i]) != op { continue; }
+                    let ra = insn_a(code[i]);
+                    let hi = (i + 3).min(code.len().saturating_sub(1));
+                    for j in (i + 1)..=hi {
+                        let n = code[j];
+                        if insn_a(n) == ra || insn_b(n) == ra || insn_c(n) == ra { score += 1; break; }
+                    }
+                    for j in i.saturating_sub(3)..i {
+                        if insn_a(code[j]) == ra { score -= 1; break; }
+                    }
+                }
+            }
+            score
+        };
+        let (a, b) = (candidates[0].0, candidates[1].0);
+        let (get_byte, set_byte) = if get_score(a) >= get_score(b) { (a, b) } else { (b, a) };
+        ctx.try_assign(get_byte, LuauOpcode::GetUpval as u8);
+        ctx.try_assign(set_byte, LuauOpcode::SetUpval as u8);
+    } else if !candidates.is_empty() && candidates[0].1 >= 5 {
         ctx.try_assign(candidates[0].0, LuauOpcode::GetUpval as u8);
     }
 }
