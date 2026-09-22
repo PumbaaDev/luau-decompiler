@@ -568,9 +568,31 @@ impl OpmapDb {
         // future rather than deleted.
         let sole_measured = fitted.len() == 1 && fitted[0].0.provenance.is_measured();
 
+        // A foreign-shuffle rival that only COINCIDENTALLY walks a tiny chunk is
+        // not a genuine alternative build. When the closest-bytecode-version
+        // entry is unique and measured, it is the right build and there is
+        // nothing for the discrimination floors to separate it from -- refusing
+        // it just forces a detector guess. Adding the v12 entry made small v9
+        // chunks stop being `sole_measured` (both entries walk them), which is
+        // exactly what regressed v9 1323 -> 1322 (rc_0098: the correct v9 map was
+        // refused on 2-byte corroboration, so an upvalue read became an undefined
+        // vN). Treat the unique closest-version measured entry as sole here too.
+        let min_vdist = fitted
+            .iter()
+            .map(|(e, _)| e.bytecode_version.saturating_sub(chunk.version))
+            .min()
+            .unwrap_or(u8::MAX);
+        let closest_measured: Vec<&(&DbEntry, usize)> = fitted
+            .iter()
+            .filter(|(e, _)| e.bytecode_version.saturating_sub(chunk.version) == min_vdist)
+            .collect();
+        let sole_at_version =
+            closest_measured.len() == 1 && closest_measured[0].0.provenance.is_measured();
+        let sole = sole_measured || sole_at_version;
+
         // Gate 3: enough of the chunk to be worth being exact about.
         let present = fitted.iter().map(|(_, p)| *p).max().unwrap_or(0);
-        if !sole_measured && present < DB_MIN_PRESENT_BYTES {
+        if !sole && present < DB_MIN_PRESENT_BYTES {
             return DbLookup::TooLittleEvidence {
                 present_bytes: present,
             };
@@ -606,7 +628,7 @@ impl OpmapDb {
         // Same reasoning as Gate 3: corroboration ranks rival entries, and a
         // sole measured entry that already walks cleanly has no rival to be
         // ranked against. A small chunk simply cannot corroborate much.
-        if !sole_measured && best_agree < DB_MIN_CORROBORATION {
+        if !sole && best_agree < DB_MIN_CORROBORATION {
             return DbLookup::LowConfidence {
                 best_id: best.id.clone(),
                 agreements: best_agree,
