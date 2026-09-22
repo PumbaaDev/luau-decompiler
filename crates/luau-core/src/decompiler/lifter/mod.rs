@@ -6994,16 +6994,22 @@ fn exits_on_all_paths(stmts: &[Stat]) -> bool {
                     return true;
                 }
 
-                // If this if has a `break` in its then-body and NO else, check if
-                // remaining stmts after this if also exit. This handles:
-                //   if C then break end
-                //   ... more code ...
-                //   break
+                // If this if has a `break`/`return` in its then-body and NO
+                // else, the whole list exits on all paths iff the suffix does:
+                // the C-true path exits here, the C-false path falls through to
+                // stmts[idx+1..]. Return that result directly.
+                //
+                // This MUST NOT `if exits(suffix) { return true }` and then let
+                // the outer `for` loop fall through and re-scan the same suffix:
+                // that recomputes the suffix's exit-analysis at every guard in a
+                // chain, which is O(2^n) in the guard depth. A deep chain of
+                // `if cond then return end` walls (the shape v12 ability scripts
+                // are built from) made `exits_on_all_paths` run 100M+ times on a
+                // single 741-node proto and hang the decompiler. Returning here
+                // is exactly equivalent — a fall-through guard-if can only make
+                // the list exit-on-all-paths through its suffix — and O(n).
                 if then_exits && else_body.is_none() && elseif_clauses.is_empty() {
-                    // The "else" path falls through to stmts[idx+1..]
-                    if exits_on_all_paths(&stmts[idx + 1..]) {
-                        return true;
-                    }
+                    return exits_on_all_paths(&stmts[idx + 1..]);
                 }
             }
             _ => {}
