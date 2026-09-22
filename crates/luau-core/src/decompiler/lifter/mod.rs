@@ -8864,10 +8864,17 @@ pub(super) fn is_impossible_as_table(e: &Expr) -> bool {
         // them made `table_expr` invent the undeclared name `vN`, which emitted
         // `v1:upper()` for a perfectly good string literal.
         Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
-        Expr::UnOp { op, .. } => matches!(
-            op,
-            UnOp::Negate | UnOp::Length | UnOp::BNot | UnOp::Not
-        ),
+        // `UnOp::Negate` is NOT rejected, for the SAME reason Add/Sub/Mul/Div are
+        // not (see the BinOp arm below): Vector3/Vector2/CFrame/UDim2 all overload
+        // unary minus (`__unm`) and their results are indexed constantly, e.g.
+        // `(-lookVector).Z` / `(-(a - b)).X`. Rejecting it converted a correct
+        // negated-vector value into an unbound `vN` nil (the v15 / RootCamera
+        // defect: `-(self.LastCameraTransform.p - LastUserPanCamera4)` then `.Z`,
+        // proven via mint_trace TABLE_EXPR_REJECT discarding exactly that UnOp).
+        // The twin `method_receiver_expr` already keeps Negate for the identical
+        // metamethod reason. Length (`#x`) and BNot (`~x`) stay rejected: they
+        // yield numbers and `(#x).field` is almost always a decode artifact.
+        Expr::UnOp { op, .. } => matches!(op, UnOp::Length | UnOp::BNot | UnOp::Not),
         Expr::BinOp { op, .. } => matches!(
             op,
             // Add/Sub/Mul/Div are NOT rejected. B0.59 assumed "arith → number",
