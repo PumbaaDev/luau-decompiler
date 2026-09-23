@@ -2896,23 +2896,52 @@ pub(super) fn lift_instruction_range(
                                 }
                             }
 
-                            // Record a trusted global-ref capture: the name is one
-                            // of the three Roblox instance globals AND the source
-                            // register genuinely held that exact global expression
-                            // at capture time. `upval_name` uses this to let the
-                            // name through the stdlib-shadow guard — safe because
-                            // the captured value IS that global.
-                            if cap_op == LuauOpcode::Capture
-                                && matches!(name.as_str(), "game" | "workspace" | "script")
+                            // Record a trusted global-ref capture: the name is a
+                            // stdlib/Roblox global (`is_stdlib_shadow_name` — the
+                            // three Roblox instance globals, or any other stdlib
+                            // name such as `pcall`/`error`/`task`/`coroutine`) AND
+                            // the capture genuinely produces that exact global,
+                            // never a usage-based guess. `upval_name` uses this to
+                            // let the name through the stdlib-shadow guard — safe
+                            // because the captured value IS that global.
+                            //
+                            // Originally scoped to game/workspace/script only;
+                            // widened to any stdlib name because the identical
+                            // loss (CAPTURE -> `upval_N` / a wrong usage-guessed
+                            // placeholder like `func`/`lib`) reproduces for
+                            // `local error = error`-style captures of ordinary
+                            // stdlib globals, not just the three Roblox globals.
+                            if cap_op == LuauOpcode::Capture && is_stdlib_shadow_name(name.as_str())
                             {
-                                if let Some(RegVal::Expr(Expr::Name(n))) = regs.get(cap_idx as usize)
-                                {
-                                    if n == &name {
-                                        ctx.capture_global_upvals
-                                            .entry(child_global_idx)
-                                            .or_default()
-                                            .insert(inferred_upval_names.len() as u8);
-                                    }
+                                let trusted = match cap_type {
+                                    // LCL_VAL / LCL_REF: `cap_idx` is a register
+                                    // in THIS proto. Trust only when it currently,
+                                    // literally holds the Name we are about to
+                                    // register — the same double-check the
+                                    // game/workspace/script precedent used.
+                                    0 | 1 => matches!(
+                                        regs.get(cap_idx as usize),
+                                        Some(RegVal::Expr(Expr::Name(n))) if n == &name
+                                    ),
+                                    // LCL_UPVAL: re-captures the PARENT's own
+                                    // upvalue at slot `cap_idx`. `cap_idx` is an
+                                    // upvalue INDEX here, never a register, so it
+                                    // must never be probed through `regs` (that
+                                    // would test an unrelated register that just
+                                    // happens to share the same small index).
+                                    // Trust propagates iff the parent's own slot
+                                    // is already trusted.
+                                    2 => ctx
+                                        .capture_global_upvals
+                                        .get(&proto_index)
+                                        .is_some_and(|s| s.contains(&cap_idx)),
+                                    _ => false,
+                                };
+                                if trusted {
+                                    ctx.capture_global_upvals
+                                        .entry(child_global_idx)
+                                        .or_default()
+                                        .insert(inferred_upval_names.len() as u8);
                                 }
                             }
                             inferred_upval_names.push(name);

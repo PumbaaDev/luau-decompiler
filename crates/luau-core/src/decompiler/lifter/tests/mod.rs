@@ -82,9 +82,13 @@ mod ref_capture_write_pin_tests;
 #[cfg(test)]
 mod capture_param_global_upval_tests;
 #[cfg(test)]
+mod capture_stdlib_global_tests;
+#[cfg(test)]
 mod branch_seed_shape_tests;
 #[cfg(test)]
 mod pinned_arm_write_tests;
+#[cfg(test)]
+mod multret_forward_inline_tests;
 
 mod arith_table_base_tests;
 #[cfg(test)]
