@@ -2869,10 +2869,58 @@ fn lift_region(
             //
             // Emitting the binding first makes both arms mutate ONE named
             // local, which is what the source did.
-            let pending_tables: Vec<usize> = (0..regs.len())
+            //
+            // ONLY for a table the program can still observe. The register
+            // file is never invalidated when a value is consumed, so it also
+            // holds tables whose last use is already behind us: the list a
+            // `for _, v in {a, b, c} do` iterated (MOVEd into the loop base and
+            // never read again), the constructor passed as a call argument.
+            // Materialising those minted a byte-for-byte copy of the literal
+            // inside the loop / after the call - `local tbl2 = {workspace, ...}`
+            // in one module's `start_server` body, where the bytecode has a
+            // single NEWTABLE+SETLIST before the loop and no reader after it -
+            // a phantom the semantic checker reports as
+            // `discarded_table_write`. The merge-loss this block repairs can
+            // only hurt a LATER reader, so a register that is provably dead at
+            // the branch (`reg_live_at`, which answers "live" on any doubt) has
+            // nothing to protect. It is DROPPED from the register file - the
+            // consumption it missed - not merely left parked: a stale parked
+            // literal re-surfaces at the next branch whose arm reuses the slot,
+            // or as a statement-form phi after an enclosing if (one module's
+            // `{GetByNumber(egg)}` moved from every loop iteration to after the
+            // loop instead of disappearing).
+            //
+            // ...unless an arm REUSES the register. The phantom's binding then
+            // also routes that arm's write through the named-reassignment path,
+            // and dropping it re-parked the arm's value as an inline expression
+            // over names the arm reassigns later - one obfuscated-VM module read
+            // `self530[v326]` after `self530` had been rebound twice. Keeping
+            // the old behaviour whenever any arm touches the register confines
+            // this to the shape measured above, where nothing but the stale
+            // literal ever occupied it.
+            //
+            // ...and unless the parked table carries a field write that happened
+            // AFTER its consumer took its snapshot (`local t = {}; M.t = t;
+            // t.f = fn` - one module's `M.SystemChat = {}` lost both functions
+            // that way). The materialised local is then the only place those
+            // writes appear, and dropping it would hide the loss instead of
+            // fixing it (`pending_table_is_pure_duplicate`).
+            let arm_block_ranges: Vec<(usize, usize)> = then_region
+                .iter()
+                .chain(else_region.iter())
+                .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                .collect();
+            let (pending_tables, consumed_duplicates): (Vec<usize>, Vec<usize>) = (0..regs.len())
                 .filter(|&i| matches!(&regs[i], RegVal::Expr(Expr::Table { .. })))
                 .filter(|&i| locals.is_non_param(i))
-                .collect();
+                .partition(|&i| {
+                    reg_live_at(&proto.code, branch_pc, i)
+                        || reg_touched_in_ranges(&proto.code, &arm_block_ranges, i)
+                        || !pending_table_is_pure_duplicate(&proto.code, branch_pc, i)
+                });
+            for i in consumed_duplicates {
+                regs[i] = RegVal::Unknown;
+            }
             for i in pending_tables {
                 let RegVal::Expr(value) = regs[i].clone() else { continue };
                 let fresh = ctx.reg_name(proto, i as u8, branch_pc);
@@ -7376,6 +7424,302 @@ fn reg_dead_on_entry(code: &[u32], start: usize, end: usize, reg: usize) -> bool
             return false;
         }
         i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Can the value `reg` holds just BEFORE instruction `pc` still be observed by
+/// the source program? A control-flow-aware backward-liveness query over the
+/// raw bytecode, answered from `pc` along every path.
+///
+/// The answer is deliberately one-sided: `false` ("provably dead") is returned
+/// only when EVERY path from `pc` redefines `reg` with a precisely-modelled
+/// definition before anything could read it, or leaves the function. Every
+/// doubt answers `true`:
+///   * reads are over-approximated — outside the few opcodes whose operand
+///     roles are modelled exactly, any A/B/C field equal to `reg` is a read,
+///     as are the AUX register operands of the compare jumps and FASTCALL2/3;
+///   * kills are under-approximated — only a pure definition of exactly `reg`
+///     (load, constructor, MOVE/GETTABLE* destination, NAMECALL pair, a CALL
+///     with a fixed result count, a fixed-count GETVARARGS) ends a path;
+///   * any opcode whose control flow is not modelled (Roblox extensions,
+///     the deprecated slots, unknown bytes) aborts the whole query as live.
+///
+/// FORGLOOP/FORNLOOP are the one exception to "every mention is a read": the
+/// registers they read (A..A+2) are the loop's hidden iteration state, which
+/// no source expression can name. The FORGPREP/FORNPREP that set that state up
+/// DO count as reads — that is where the `in`/range expressions are evaluated.
+fn reg_live_at(code: &[u32], pc: usize, reg: usize) -> bool {
+    use LuauOpcode as Op;
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut work: Vec<usize> = vec![pc];
+    while let Some(start) = work.pop() {
+        let mut i = start;
+        loop {
+            if i >= code.len() {
+                // Walked off the end of a malformed proto: cannot decide.
+                return true;
+            }
+            if !visited.insert(i) {
+                break;
+            }
+            let insn = code[i];
+            let op = Op::from_u8(insn_op(insn));
+            let a = insn_a(insn) as usize;
+            let b = insn_b(insn) as usize;
+            let c = insn_c(insn) as usize;
+            let next = if op.has_aux() { i + 2 } else { i + 1 };
+            let aux = code.get(i + 1).copied().unwrap_or(0);
+            let jump_d = (i as i64 + insn_d(insn) as i64 + 1) as usize;
+            let mentions = a == reg || b == reg || c == reg;
+            // (reads, kills, successors); `None` successors = function exit.
+            let (reads, kills, succ): (bool, bool, Option<Vec<usize>>) = match op {
+                Op::LoadNil | Op::LoadN | Op::LoadK | Op::LoadKX | Op::GetImport
+                | Op::GetGlobal | Op::GetUpval | Op::NewTable | Op::DupTable
+                | Op::NewClosure | Op::DupClosure => (false, a == reg, Some(vec![next])),
+                Op::LoadB => (false, a == reg, Some(vec![i + 1 + c])),
+                Op::Move | Op::GetTableKS | Op::GetTableN | Op::Not | Op::Minus
+                | Op::Length => (b == reg, a == reg && b != reg, Some(vec![next])),
+                Op::GetTable | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod
+                | Op::Pow | Op::IDiv | Op::And | Op::Or | Op::AddK | Op::SubK
+                | Op::MulK | Op::DivK | Op::ModK | Op::PowK | Op::IDivK | Op::AndK
+                | Op::OrK | Op::SubRK | Op::DivRK => {
+                    let r = b == reg || c == reg;
+                    (r, a == reg && !r, Some(vec![next]))
+                }
+                Op::Concat => {
+                    let r = reg >= b && reg <= c;
+                    (r, a == reg && !r, Some(vec![next]))
+                }
+                Op::NameCall => {
+                    (b == reg, (a == reg || a + 1 == reg) && b != reg, Some(vec![next]))
+                }
+                Op::Call => {
+                    let r = if b == 0 { reg > a } else { reg > a && reg < a + b };
+                    let r = r || reg == a;
+                    let k = c > 0 && reg >= a && reg + 1 < a + c;
+                    (r, k && !r, Some(vec![next]))
+                }
+                Op::GetVarargs => (false, b > 0 && reg >= a && reg + 1 < a + b, Some(vec![next])),
+                Op::Return => {
+                    let r = if b == 0 { reg >= a } else { reg >= a && reg + 1 < a + b };
+                    (r, false, None)
+                }
+                Op::Jump | Op::JumpBack => (false, false, Some(vec![jump_d])),
+                Op::JumpX => {
+                    let t = (i as i64 + insn_e(insn) as i64 + 1) as usize;
+                    (false, false, Some(vec![t]))
+                }
+                Op::JumpIf | Op::JumpIfNot | Op::JumpXEqKNil | Op::JumpXEqKB
+                | Op::JumpXEqKN | Op::JumpXEqKS => (a == reg, false, Some(vec![next, jump_d])),
+                Op::JumpIfEq | Op::JumpIfLE | Op::JumpIfLT | Op::JumpIfNotEq
+                | Op::JumpIfNotLE | Op::JumpIfNotLT => {
+                    let r = a == reg || (aux & 0xFF) as usize == reg;
+                    (r, false, Some(vec![next, jump_d]))
+                }
+                Op::ForNPrep | Op::ForGPrep | Op::ForGPrepINext | Op::ForGPrepNext => {
+                    (reg >= a && reg <= a + 2, false, Some(vec![next, jump_d]))
+                }
+                Op::ForNLoop | Op::ForGLoop => (false, false, Some(vec![next, jump_d])),
+                Op::FastCall | Op::FastCall1 | Op::FastCall2K => {
+                    (mentions, false, Some(vec![next]))
+                }
+                Op::FastCall2 => {
+                    (mentions || (aux & 0xFF) as usize == reg, false, Some(vec![next]))
+                }
+                Op::FastCall3 => {
+                    let r = mentions
+                        || (aux & 0xFF) as usize == reg
+                        || ((aux >> 8) & 0xFF) as usize == reg;
+                    (r, false, Some(vec![next]))
+                }
+                Op::SetTable | Op::SetTableKS | Op::SetTableN | Op::SetUpval
+                | Op::SetGlobal | Op::SetList | Op::Capture | Op::CloseUpvals
+                | Op::Nop | Op::Break | Op::Coverage | Op::PrepVarargs
+                | Op::NativeCall => {
+                    // SETLIST reads the value window B..B+C-2 (C == 0: up to
+                    // the stack top).
+                    let r = mentions
+                        || (op == Op::SetList
+                            && reg >= b
+                            && (c == 0 || reg + 1 < b + c));
+                    (r, false, Some(vec![next]))
+                }
+                _ => return true,
+            };
+            if reads {
+                return true;
+            }
+            if kills {
+                break;
+            }
+            match succ {
+                None => break,
+                Some(s) => {
+                    let mut it = s.into_iter();
+                    let Some(first) = it.next() else { break };
+                    work.extend(it);
+                    i = first;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Is the table parked in `reg` at `branch_pc` nothing more than a copy of a
+/// value the output has ALREADY emitted in full?
+///
+/// A parked constructor is folded into whatever consumes it (a MOVE into a
+/// loop base, a call argument, a SETTABLE value), which takes a SNAPSHOT of the
+/// expression at that point. When every field write precedes the first
+/// consumption, the snapshot is the whole table and the register holds a pure
+/// duplicate. When a field write FOLLOWS a consumption (`local t = {}; M.t = t;
+/// t.f = fn` - the consumer got `{}`), that later write lives nowhere but in the
+/// register, and the materialised local is the only place the output shows it.
+/// Dropping that one would hide a lost write, so this answers `true` only for
+/// the first shape, proven on the bytecode:
+///
+///   * the value comes from the LAST `NEWTABLE`/`DUPTABLE`/`MOVE` into `reg`
+///     before `branch_pc` (none found: `false`); a `MOVE` copy (the loop base
+///     of `for _, v in {…}`) must itself copy a pure duplicate;
+///   * after it, table writes into `reg` (`SETTABLE*` with B = reg, `SETLIST`
+///     with A = reg) appear only in the straight-line run before the first
+///     consumption and before any control-flow instruction;
+///   * nothing between it and `branch_pc` redefines `reg`.
+fn pending_table_is_pure_duplicate(code: &[u32], branch_pc: usize, reg: usize) -> bool {
+    pending_table_is_pure_duplicate_at(code, branch_pc, reg, 0)
+}
+
+fn pending_table_is_pure_duplicate_at(code: &[u32], branch_pc: usize, reg: usize, depth: usize) -> bool {
+    use LuauOpcode as Op;
+    const MAX_MOVE_CHAIN: usize = 4;
+    let end = branch_pc.min(code.len());
+    let step = |i: usize| i + if Op::from_u8(insn_op(code[i])).has_aux() { 2 } else { 1 };
+    let mut def_pc = None;
+    let mut i = 0;
+    while i < end {
+        let op = Op::from_u8(insn_op(code[i]));
+        if matches!(op, Op::NewTable | Op::DupTable | Op::Move) && insn_a(code[i]) as usize == reg {
+            def_pc = Some(i);
+        }
+        i = step(i);
+    }
+    let Some(def_pc) = def_pc else { return false };
+    if Op::from_u8(insn_op(code[def_pc])) == Op::Move {
+        let src = insn_b(code[def_pc]) as usize;
+        if depth >= MAX_MOVE_CHAIN
+            || !pending_table_is_pure_duplicate_at(code, def_pc, src, depth + 1)
+        {
+            return false;
+        }
+    }
+    let mut open = true; // still in the constructor's straight-line fill run
+    let mut i = step(def_pc);
+    while i < end {
+        let insn = code[i];
+        let op = Op::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        // Opcodes with unmodelled operands or control flow: cannot prove it.
+        if op as u8 >= Op::Band as u8 || op == Op::Deprecated61 {
+            return false;
+        }
+        let mutation = (matches!(op, Op::SetTable | Op::SetTableKS | Op::SetTableN) && b == reg)
+            || (op == Op::SetList && a == reg);
+        if mutation {
+            if !open {
+                return false;
+            }
+        } else if reg_touched_in_ranges(code, &[(i, i + 1)], reg) {
+            // A redefinition of `reg` means the parked value is not this
+            // constructor's; the only non-redefining touches are reads.
+            let redefines = match op {
+                Op::SetTable | Op::SetTableKS | Op::SetTableN | Op::SetList | Op::SetGlobal
+                | Op::SetUpval | Op::JumpIf | Op::JumpIfNot | Op::JumpIfEq | Op::JumpIfLE
+                | Op::JumpIfLT | Op::JumpIfNotEq | Op::JumpIfNotLE | Op::JumpIfNotLT
+                | Op::JumpXEqKNil | Op::JumpXEqKB | Op::JumpXEqKN | Op::JumpXEqKS | Op::Capture
+                | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K | Op::FastCall3 => false,
+                Op::Call => reg == a || c == 0 || reg + 1 < a + c,
+                Op::Return => false,
+                Op::ForNPrep | Op::ForGPrep | Op::ForGPrepINext | Op::ForGPrepNext => reg > a + 2,
+                Op::Concat => a == reg,
+                _ => a == reg || (op == Op::NameCall && a + 1 == reg) || op == Op::GetVarargs,
+            };
+            if redefines {
+                return false;
+            }
+            open = false;
+        }
+        let control_flow = matches!(
+            op,
+            Op::Jump | Op::JumpBack | Op::JumpX | Op::JumpIf | Op::JumpIfNot | Op::JumpIfEq
+                | Op::JumpIfLE | Op::JumpIfLT | Op::JumpIfNotEq | Op::JumpIfNotLE
+                | Op::JumpIfNotLT | Op::JumpXEqKNil | Op::JumpXEqKB | Op::JumpXEqKN
+                | Op::JumpXEqKS | Op::ForNPrep | Op::ForNLoop | Op::ForGPrep | Op::ForGLoop
+                | Op::ForGPrepINext | Op::ForGPrepNext | Op::Return | Op::FastCall
+                | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K | Op::FastCall3
+        ) || (op == Op::LoadB && c != 0);
+        if control_flow {
+            open = false;
+        }
+        i = step(i);
+    }
+    true
+}
+
+/// Does any instruction in the given ranges read OR write `reg`? An
+/// over-approximation for gating: every register operand counts, including the
+/// register windows no field names — CALL's argument/result window, NAMECALL's
+/// self slot, GETVARARGS and the for-loop register blocks (everything from A
+/// up), SETLIST's value window, CONCAT's operand span and the AUX registers of
+/// the compare jumps and FASTCALL2/3. Fields that hold counts, constants, jump
+/// offsets or builtin ids are not registers and do not count; an opcode whose
+/// operand roles are not modelled counts as touching everything.
+fn reg_touched_in_ranges(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool {
+    use LuauOpcode as Op;
+    for &(s, e) in ranges {
+        let mut i = s;
+        let e = e.min(code.len());
+        while i < e {
+            let insn = code[i];
+            let op = Op::from_u8(insn_op(insn));
+            let a = insn_a(insn) as usize;
+            let b = insn_b(insn) as usize;
+            let c = insn_c(insn) as usize;
+            let aux = code.get(i + 1).copied().unwrap_or(0);
+            let aux_lo = (aux & 0xFF) as usize;
+            let touched = match op {
+                Op::Call | Op::GetVarargs | Op::ForNPrep | Op::ForNLoop | Op::ForGPrep
+                | Op::ForGLoop | Op::ForGPrepINext | Op::ForGPrepNext | Op::Return => reg >= a,
+                Op::NameCall => reg == a || reg == a + 1 || reg == b,
+                Op::GetTableKS | Op::SetTableKS | Op::GetTableN | Op::SetTableN | Op::AddK
+                | Op::SubK | Op::MulK | Op::DivK | Op::ModK | Op::PowK | Op::IDivK | Op::AndK
+                | Op::OrK | Op::Move | Op::Not | Op::Minus | Op::Length => reg == a || reg == b,
+                Op::SubRK | Op::DivRK => reg == a || reg == c,
+                Op::LoadNil | Op::LoadB | Op::LoadN | Op::LoadK | Op::LoadKX | Op::GetImport
+                | Op::GetGlobal | Op::SetGlobal | Op::GetUpval | Op::SetUpval | Op::NewTable
+                | Op::DupTable | Op::NewClosure | Op::DupClosure | Op::JumpIf | Op::JumpIfNot
+                | Op::JumpXEqKNil | Op::JumpXEqKB | Op::JumpXEqKN | Op::JumpXEqKS => reg == a,
+                Op::JumpIfEq | Op::JumpIfLE | Op::JumpIfLT | Op::JumpIfNotEq | Op::JumpIfNotLE
+                | Op::JumpIfNotLT => reg == a || reg == aux_lo,
+                Op::Capture | Op::FastCall1 | Op::FastCall2K => reg == b,
+                Op::FastCall2 => reg == b || reg == aux_lo,
+                Op::FastCall3 => reg == b || reg == aux_lo || reg == ((aux >> 8) & 0xFF) as usize,
+                Op::Jump | Op::JumpBack | Op::JumpX | Op::Nop | Op::Break | Op::PrepVarargs
+                | Op::CloseUpvals | Op::FastCall | Op::Coverage | Op::NativeCall => false,
+                Op::SetList => reg == a || reg >= b,
+                Op::Concat => reg == a || (reg >= b && reg <= c),
+                Op::GetTable | Op::SetTable | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod
+                | Op::Pow | Op::IDiv | Op::And | Op::Or => reg == a || reg == b || reg == c,
+                _ => true,
+            };
+            if touched {
+                return true;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
     }
     false
 }
