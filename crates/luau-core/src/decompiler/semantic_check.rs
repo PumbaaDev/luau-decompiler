@@ -823,8 +823,9 @@ fn string_literals(line: &str) -> Vec<String> {
 fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
     let mut bound: HashSet<String> = HashSet::new();
     let mut first_use: HashMap<String, usize> = HashMap::new();
+    let lines: Vec<&str> = source.lines().collect();
 
-    for (i, raw) in source.lines().enumerate() {
+    for (i, raw) in lines.iter().enumerate() {
         let line = raw.trim();
         if line.starts_with("--") {
             continue;
@@ -859,8 +860,30 @@ fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
                 }
             }
         }
+        // dropped_table_key_constant (26 Sep, campaign3): a table-constructor
+        // NAMED FIELD's key — `v111 = "rbxassetid://...",` — is not a variable
+        // read even when it happens to match the `vN`/`field_N` generated-name
+        // shape. Roblox bytecode genuinely carries string constants like
+        // "v111" as table keys (confirmed via `constant_to_expr`'s Table arm
+        // reading `Constant::String("v111")` straight out of the DupTable
+        // template — see Slayers2 ReplicatedStorage_CAM_Global_Rarities.luac
+        // proto 0 K[38]); this checker's line-based token scan below cannot
+        // tell that apart from a bare-name READ of an unbound `v111`.
+        //
+        // `table_key_field_span` only recognises the exact shape our OWN
+        // emitter produces for a Named table field (emit.rs: `name = value`
+        // per field, comma-joined, no trailing comma on the last field before
+        // `}`) — a single top-level `ident = ...` immediately followed by a
+        // `,`-terminated line or by a bare `}`/`};`/`},` closer. A real
+        // top-level reassignment statement (`field_28 = false`) never sits
+        // directly before a closing-brace line and is never comma-terminated
+        // (both are invalid standalone Luau), so this cannot mask one of
+        // those. It only widens the token scan's start past the key so the
+        // rest of the line (the VALUE) is still checked normally.
+        let key_span_end = table_key_field_span(line, &lines, i);
+
         // Uses of decompiler-generated identifiers.
-        for tok in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        for tok in line[key_span_end..].split(|c: char| !(c.is_alphanumeric() || c == '_')) {
             if is_generated_name(tok) {
                 first_use.entry(tok.to_string()).or_insert(i + 1);
             }
@@ -884,6 +907,51 @@ fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
             None,
             format!("... and {} further undefined identifiers", unbound.len() - 8),
         ));
+    }
+}
+
+/// Returns the byte offset in `line` (trimmed) just past a leading table-key
+/// `ident = ` prefix, if `line` at index `idx` structurally matches a Named
+/// table-constructor field the way this project's own emitter renders one —
+/// see the call site in `check_undefined_locals` for why this exact shape is
+/// safe to trust. Returns 0 (scan the whole line) when the shape does not
+/// match, which is the conservative default: no key is masked in that case.
+fn table_key_field_span(line: &str, lines: &[&str], idx: usize) -> usize {
+    // Identifier: [A-Za-z_][A-Za-z0-9_]*
+    let bytes = line.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return 0;
+    }
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let mut j = i;
+    while j < bytes.len() && bytes[j] == b' ' {
+        j += 1;
+    }
+    // A single `=`, not `==`.
+    if j >= bytes.len() || bytes[j] != b'=' || bytes.get(j + 1) == Some(&b'=') {
+        return 0;
+    }
+    let after_eq = j + 1;
+    if line.starts_with("local ") || line.starts_with("for ") {
+        return 0;
+    }
+    // Either this line itself is comma-terminated (a non-last field), or the
+    // next non-blank, non-comment line is the table's closer (the last
+    // field). Both are shapes only the table-constructor printer produces.
+    let is_comma_terminated = line.trim_end().ends_with(',');
+    let next_is_closer = lines[idx + 1..]
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .map(|l| l == "}" || l.starts_with("},") || l.starts_with("};"))
+        .unwrap_or(false);
+    if is_comma_terminated || next_is_closer {
+        after_eq
+    } else {
+        0
     }
 }
 
@@ -1641,6 +1709,68 @@ end
         let src = "local service3 = {v9}\nreturn service3\n";
         let f = check(src, None);
         assert!(f.iter().any(|x| x.check == "undefined_local"));
+    }
+
+    // ── dropped_table_key_constant: a table-key that merely LOOKS like a
+    // generated name is not a read ────────────────────────────────────────
+    //
+    // Roblox bytecode genuinely carries string constants like "v111" as
+    // table keys (Slayers2 ReplicatedStorage_CAM_Global_Rarities.luac proto 0
+    // K[38]); the decompiler emits them as ordinary Named fields, and the
+    // token scan above must not mistake `v111 = value,` for a bare read of
+    // an unbound `v111`.
+
+    #[test]
+    fn ignores_a_table_key_that_looks_generated_middle_of_table() {
+        let src = "local tbl = {\n    v111 = \"a\",\n    v11 = \"b\",\n    v1 = \"c\"\n}\nreturn tbl\n";
+        let f = check(src, None);
+        assert!(
+            !f.iter().any(|x| x.check == "undefined_local"),
+            "table-constructor keys must not be read as unbound locals: {:?}",
+            f
+        );
+    }
+
+    #[test]
+    fn ignores_a_table_key_that_looks_generated_last_field() {
+        // The last field before `}` carries no trailing comma (emit.rs only
+        // joins non-last fields), so this exercises the next-line-is-closer
+        // branch of the detector rather than the trailing-comma branch.
+        let src = "local tbl = {\n    v2 = \"only\"\n}\nreturn tbl\n";
+        let f = check(src, None);
+        assert!(
+            !f.iter().any(|x| x.check == "undefined_local"),
+            "a last-field table key must not be read as unbound: {:?}",
+            f
+        );
+    }
+
+    #[test]
+    fn still_catches_a_generated_name_used_as_a_table_value() {
+        // The exclusion only widens the scan past the KEY; a genuinely
+        // undefined name on the VALUE side of the same kind of line must
+        // still be caught.
+        let src = "local tbl = {\n    Real = v9\n}\nreturn tbl\n";
+        let f = check(src, None);
+        assert!(
+            f.iter().any(|x| x.check == "undefined_local"),
+            "an undefined value must still be flagged: {:?}",
+            f
+        );
+    }
+
+    #[test]
+    fn still_catches_a_generated_name_reassigned_outside_a_table() {
+        // Same textual shape (`ident = value`) but at statement level, not a
+        // table key: not comma-terminated and not followed by a closing
+        // brace, so the exclusion must not apply.
+        let src = "v9 = 1\nreturn v9\n";
+        let f = check(src, None);
+        assert!(
+            f.iter().any(|x| x.check == "undefined_local"),
+            "a real top-level reassignment must not be masked by the table-key exclusion: {:?}",
+            f
+        );
     }
 
     #[test]
