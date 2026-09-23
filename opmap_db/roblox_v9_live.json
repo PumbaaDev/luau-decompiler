@@ -6,17 +6,14 @@
       },
       "bytecode_version": 12,
       "coverage": {
-        "pinned": 75,
+        "pinned": 78,
         "unpinned": [
           "NOP",
           "BREAK",
-          "ANDK",
           "NATIVECALL",
           "LOADKX",
           "JUMPX",
-          "COVERAGE",
-          "IDIV",
-          "IDIVK"
+          "COVERAGE"
         ]
       },
       "id": "roblox_v12_live",
@@ -72,7 +69,9 @@
         "0xA4": "GETIMPORT",
         "0xA8": "FORNPREP",
         "0xA9": "LOADB",
+        "0xAD": "ANDK",
         "0xB2": "POW",
+        "0xB6": "IDIVK",
         "0xB7": "JUMPIFLT",
         "0xBB": "FASTCALL1",
         "0xBC": "NAMECALL",
@@ -82,6 +81,7 @@
         "0xC6": "LOADNIL",
         "0xCA": "OR",
         "0xCF": "MOD",
+        "0xD3": "IDIV",
         "0xD4": "JUMPIFLE",
         "0xD8": "DIVRK",
         "0xD9": "NEWCLOSURE",
@@ -99,7 +99,7 @@
       },
       "provenance": {
         "method": "probe-align",
-        "notes": "canonical = upstream luau-compile --binary -O2 (feedback on for CALLFB, off otherwise); client = getscriptbytecode of 777 live Bee Swarm v12 scripts, each paired with its own Potassium decompile recompiled canonically. 67 opcodes strict operand-verified alignment (probe align, 0 conflicts on 375 files); 7 from soft positional alignment keeping pre-divergence votes (FORGPREP_NEXT, MODK, CALLFB, MINUS, FORGPREP, NEWCLOSURE, AND, all purity 1.00, 0 disagreements vs the strict 67); CLOSEUPVALS (0xC1) from structural signature (single-A operand, 454 occurrences, aux-synced walk). Whole map cross-validated: full corpus walks with 0 unmapped bytes and BeeTypes decode matches Potassium ground truth. 0x0E=JUMPIF / 0x2B=JUMPIFNOT fixed by canonical ground truth (if-not-x compiles to JUMPIF; the strict-align vote was poisoned by Potassium condition inversions).",
+        "notes": "canonical = upstream luau-compile --binary -O2 (feedback on for CALLFB, off otherwise); client = getscriptbytecode of 777 live Bee Swarm v12 scripts, each paired with its own Potassium decompile recompiled canonically. 67 opcodes strict operand-verified alignment (probe align, 0 conflicts on 375 files); 7 from soft positional alignment keeping pre-divergence votes (FORGPREP_NEXT, MODK, CALLFB, MINUS, FORGPREP, NEWCLOSURE, AND, all purity 1.00, 0 disagreements vs the strict 67); CLOSEUPVALS (0xC1) from structural signature (single-A operand, 454 occurrences, aux-synced walk). Whole map cross-validated: full corpus walks with 0 unmapped bytes and BeeTypes decode matches Potassium ground truth. 0x0E=JUMPIF / 0x2B=JUMPIFNOT fixed by canonical ground truth (if-not-x compiles to JUMPIF; the strict-align vote was poisoned by Potassium condition inversions). | 2026-09-23: +3 opcodes by OPERAND STRUCTURE, not probe-align (absent from the 777 aligned scripts, present in the 21,438-script 11-game corpus): 0xB6=IDIVK (241 uses; C always a NUMBER constant; 77 followed by MODK = canonical `x // 60 % 60` -> IDIVK;MODK), 0xD3=IDIV (78 uses; B and C always registers, C out of constant range 8%), 0xAD=ANDK (20 uses; C always a constant index, kinds bool 13/number 4/string 3 = canonical `x and true`/`x and \"s\"`). Shapes confirmed against upstream luau-compile -O1/-O2 text. No other unmapped byte occurs in the corpus.",
         "probe_programs": 777,
         "producer": "differential aligner: upstream luau-compile v12 (feedback on & off) vs Potassium getscriptbytecode"
       },
