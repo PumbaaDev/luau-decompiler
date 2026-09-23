@@ -1063,6 +1063,380 @@ fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
     false
 }
 
+/// Is the pending table in register `reg` still UNCONSUMED when the MOVE at
+/// `move_pc` copies it out?
+///
+/// Walks from the table's constructor (the last NEWTABLE / DUPTABLE with
+/// A == `reg` before `move_pc`) up to the MOVE and accepts only the
+/// constructor's own fill run: SETTABLE* with B == `reg` storing some OTHER
+/// register, and SETLIST into `reg` from registers above it. Anything else
+/// that mentions `reg` -- the table stored as a value, passed to a call,
+/// captured, returned, concatenated, method-called, field-read, copied, or the
+/// slot overwritten -- means the literal has already been handed out once, so
+/// materialising it again at the MOVE (`bound = {..}`) would mint a SECOND
+/// object where the bytecode has one. Those cases return false and keep the
+/// historical park. A constructor that is not found (the table arrived through
+/// another route) also returns false.
+fn pending_table_unconsumed(code: &[u32], move_pc: usize, reg: usize) -> bool {
+    let end = move_pc.min(code.len());
+    let mut ctor: Option<usize> = None;
+    let mut i = 0usize;
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if matches!(op, LuauOpcode::NewTable | LuauOpcode::DupTable) && insn_a(insn) as usize == reg {
+            ctor = Some(i);
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    let Some(ctor_pc) = ctor else {
+        return false;
+    };
+    let ctor_op = LuauOpcode::from_u8(insn_op(code[ctor_pc]));
+    let mut i = ctor_pc + if ctor_op.has_aux() { 2 } else { 1 };
+    while i < end {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        let b = insn_b(insn) as usize;
+        let c = insn_c(insn) as usize;
+        if is_control_flow_op(op) {
+            return false;
+        }
+        let consumed = match op {
+            // The fill run itself: R(B) is the table, R(A) the stored value.
+            LuauOpcode::SetTableKS | LuauOpcode::SetTableN => a == reg,
+            LuauOpcode::SetTable => a == reg || c == reg,
+            // SETLIST A B C: values R(B)..R(B+C-2); C == 0 is multret to top.
+            LuauOpcode::SetList => {
+                let in_values = reg >= b && (c == 0 || reg + 1 < b + c);
+                if a == reg { b <= reg } else { in_values }
+            }
+            // A call's base and everything above it are read or clobbered.
+            LuauOpcode::Call => a <= reg,
+            LuauOpcode::NameCall => a == reg || a + 1 == reg || b == reg,
+            LuauOpcode::Concat => a == reg || (reg >= b && reg <= c),
+            LuauOpcode::Capture => b == reg,
+            // FASTCALL*'s A is a builtin id, not a register; the CALL that
+            // follows it is what reads the arguments.
+            LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3 => false,
+            // GETVARARGS writes R(A) upward.
+            LuauOpcode::GetVarargs => a <= reg,
+            // B and C both name registers.
+            LuauOpcode::GetTable
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::IDiv
+            | LuauOpcode::And
+            | LuauOpcode::Or => a == reg || b == reg || c == reg,
+            // Only B names a register (C is a constant, hash slot or index).
+            LuauOpcode::Move
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::IDivK
+            | LuauOpcode::AndK
+            | LuauOpcode::OrK
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length => a == reg || b == reg,
+            // Only C names a register (B is a constant).
+            LuauOpcode::SubRK | LuauOpcode::DivRK => a == reg || c == reg,
+            // Every other opcode: an A match is a use (SETUPVAL, SETGLOBAL) or
+            // a redefinition; either way the pending literal is no longer the
+            // sole, untouched value.
+            _ => a == reg,
+        };
+        if consumed {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
+/// Does the instruction at `move_pc` sit in the body of an OR-guarded `if`
+/// (`if A or B then ... end`)?
+///
+/// The shape is a conditional branch `b` that jumps FORWARD INTO the body
+/// (target `t`, `b < t <= move_pc`: A held, skip testing B) with another
+/// conditional branch `c` between them (`b < c < t`) that jumps PAST
+/// `move_pc` (B failed: skip the body). The canonical instance is the loop
+/// "keep the best candidate" idiom,
+///
+/// ```text
+///   JUMPXEQKNIL R7 == nil -> body      ; best == nil      (b)
+///   GETTABLEKS  R26 R7."Score"
+///   JUMPIFNOTLT R25 >= R26 -> latch    ; score >= best    (c)
+///   body: DUPTABLE R26 ; SETTABLEKS ... ; MOVE R7 R26
+///   latch: FORGLOOP
+/// ```
+///
+/// (BloxFruits `AimAssist`, PS99 `SphereCast` / `Machines` / `Pet_Slots` /
+/// `SpendFarmingToken`). The lifter only recovers that guard through the
+/// statement-free phi reconstruction; an arm that EMITS a statement is laid
+/// out flat, so emitting the pinned table write there turned a conditional
+/// `best = {..}` into an unconditional one. Callers keep the old park for
+/// such a MOVE.
+fn cond_branch_target(code: &[u32], pc: usize) -> Option<usize> {
+    let insn = code[pc];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let conditional = matches!(
+        op,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    );
+    if !conditional {
+        return None;
+    }
+    let t = pc as i64 + insn_d(insn) as i64 + 1;
+    (t >= 0).then_some(t as usize)
+}
+
+fn move_in_or_guarded_arm(code: &[u32], move_pc: usize) -> bool {
+    let end = move_pc.min(code.len());
+    let mut branches: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < end {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if let Some(t) = cond_branch_target(code, i) {
+            branches.push((i, t));
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    branches.iter().any(|&(b, t)| {
+        b < t
+            && t <= move_pc
+            && branches
+                .iter()
+                .any(|&(c, ct)| b < c && c < t && ct > move_pc)
+    })
+}
+
+/// Does the instruction at `pc` read register `reg`? Covers the opcodes whose
+/// operands genuinely name registers; anything unlisted counts as no read,
+/// which only WIDENS the window `table_move_blocked` inspects (the safe
+/// direction).
+fn insn_reads_reg(code: &[u32], pc: usize, reg: usize) -> bool {
+    let insn = code[pc];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let a = insn_a(insn) as usize;
+    let b = insn_b(insn) as usize;
+    let c = insn_c(insn) as usize;
+    match op {
+        LuauOpcode::Move
+        | LuauOpcode::GetTableKS
+        | LuauOpcode::GetTableN
+        | LuauOpcode::Not
+        | LuauOpcode::Minus
+        | LuauOpcode::Length
+        | LuauOpcode::AddK
+        | LuauOpcode::SubK
+        | LuauOpcode::MulK
+        | LuauOpcode::DivK
+        | LuauOpcode::ModK
+        | LuauOpcode::PowK
+        | LuauOpcode::IDivK
+        | LuauOpcode::AndK
+        | LuauOpcode::OrK
+        | LuauOpcode::NameCall => b == reg,
+        LuauOpcode::GetTable
+        | LuauOpcode::Add
+        | LuauOpcode::Sub
+        | LuauOpcode::Mul
+        | LuauOpcode::Div
+        | LuauOpcode::Mod
+        | LuauOpcode::Pow
+        | LuauOpcode::IDiv
+        | LuauOpcode::And
+        | LuauOpcode::Or => b == reg || c == reg,
+        LuauOpcode::SubRK | LuauOpcode::DivRK => c == reg,
+        LuauOpcode::SetTableKS | LuauOpcode::SetTableN => a == reg || b == reg,
+        LuauOpcode::SetTable => a == reg || b == reg || c == reg,
+        LuauOpcode::JumpIf
+        | LuauOpcode::JumpIfNot
+        | LuauOpcode::JumpXEqKNil
+        | LuauOpcode::JumpXEqKB
+        | LuauOpcode::JumpXEqKN
+        | LuauOpcode::JumpXEqKS
+        | LuauOpcode::SetUpval
+        | LuauOpcode::SetGlobal => a == reg,
+        LuauOpcode::JumpIfEq
+        | LuauOpcode::JumpIfNotEq
+        | LuauOpcode::JumpIfLE
+        | LuauOpcode::JumpIfNotLE
+        | LuauOpcode::JumpIfLT
+        | LuauOpcode::JumpIfNotLT => {
+            a == reg || code.get(pc + 1).is_some_and(|&aux| aux as usize == reg)
+        }
+        // CALL A B: R(A) is the function, R(A+1)..R(A+B-1) the arguments.
+        LuauOpcode::Call => a <= reg && (b == 0 || reg < a + b),
+        // RETURN A B: R(A)..R(A+B-2).
+        LuauOpcode::Return => a <= reg && (b == 0 || reg + 1 < a + b),
+        LuauOpcode::SetList => a == reg || (reg >= b && (c == 0 || reg + 1 < b + c)),
+        LuauOpcode::Concat => reg >= b && reg <= c,
+        LuauOpcode::Capture => b == reg,
+        LuauOpcode::ForNPrep
+        | LuauOpcode::ForNLoop
+        | LuauOpcode::ForGPrep
+        | LuauOpcode::ForGPrepINext
+        | LuauOpcode::ForGPrepNext
+        | LuauOpcode::ForGLoop => reg >= a && reg <= a + 2,
+        _ => false,
+    }
+}
+
+/// Should the pending-table MOVE into `a` at `move_pc` keep the historical
+/// park because ONE OF ITS SIBLING ARMS cannot be recovered?
+///
+/// The sibling arms of a diamond / if-chain all MOVE into the same merge
+/// register between the last read of it before `move_pc` and the first read
+/// after (the join). If any of those MOVEs sits in an OR-guarded arm
+/// ([`move_in_or_guarded_arm`], which the lifter lays out flat), emitting the
+/// others would recover only part of the merge and silence the orphan-read
+/// symptom while the OR-guarded arm's value is still lost -- RideAPet
+/// `EggPlacing` Conceal (BasePart arm recoverable, `Decal or Texture` and
+/// `ProximityPrompt or ... or Highlight` arms not). The whole merge therefore
+/// stays on the old path, uniformly.
+fn table_move_blocked(code: &[u32], move_pc: usize, a: usize) -> bool {
+    let end = code.len();
+    let mut lo = 0usize;
+    let mut hi = end;
+    let mut i = 0usize;
+    while i < end {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if i != move_pc && insn_reads_reg(code, i, a) {
+            if i < move_pc {
+                lo = i;
+            } else if hi == end {
+                hi = i;
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    let mut i = lo;
+    while i < hi {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::Move && insn_a(insn) as usize == a && move_in_or_guarded_arm(code, i) {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    post_move_guarded_field_write(code, move_pc, a)
+}
+
+/// The first instruction at or after `from` that consumes register `a`'s
+/// CURRENT value as something other than one of its own fill-run field
+/// writes -- i.e. the table is handed off whole (call argument, return,
+/// stored into another table/upvalue/global, concatenated, etc). A plain
+/// SETTABLEKS/SETTABLEN/SETTABLE/SETLIST that TARGETS `a` (writes a field
+/// into it, guarded or not) does not count, so callers can see every field
+/// write up to the point the finished table actually leaves the register.
+fn table_consumption_point(code: &[u32], from: usize, a: usize) -> usize {
+    let mut i = from;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let is_own_fill = match op {
+            LuauOpcode::SetTableKS | LuauOpcode::SetTableN | LuauOpcode::SetTable => {
+                insn_b(insn) as usize == a
+            }
+            LuauOpcode::SetList => insn_a(insn) as usize == a,
+            _ => false,
+        };
+        if !is_own_fill && insn_reads_reg(code, i, a) {
+            return i;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    code.len()
+}
+
+/// Is there a field write into register `a` between `move_pc` and `hi` (the
+/// bound table's next read) that only runs on one side of a later `if` --
+/// i.e. a conditional branch between `move_pc` and `hi` whose SKIPPED region
+/// (branch pc+1 .. its jump target) contains a SETTABLEKS/SETTABLEN/SETTABLE/
+/// SETLIST write to `a`?
+///
+/// Reproduced on RIVALS `WrapController`: after the pinned MOVE binds `props`
+/// to a real name, `if v:IsA("MeshPart") then props.TextureID = v.TextureID
+/// end` (pc70 `JUMPIFNOT R10 -> +130`, pc73 `SETTABLEKS R9."TextureID"`) is a
+/// conditional fill on the now-bound register. While `props` stays a parked
+/// pending `Expr::Table`, that guard is preserved by the ordinary statement
+/// structurer around the SETTABLEKS statement. Once the MOVE materialises it
+/// (`bound = {..}`), the existing jump-threaded-if flattening this single-
+/// statement shape goes through folds it into an unconditional
+/// `bound.TextureID = v.TextureID` -- wrong for every non-MeshPart BasePart,
+/// which the baseline never emitted. Any MOVE with such a downstream guarded
+/// write keeps the historical park; sites with a clean, unconditional run to
+/// `hi` still materialise.
+fn post_move_guarded_field_write(code: &[u32], move_pc: usize, a: usize) -> bool {
+    // `table_move_blocked`'s own `hi` (first `insn_reads_reg` hit) is the
+    // WRONG boundary here: for SETTABLEKS/SETTABLEN/SETTABLE,
+    // `insn_reads_reg` counts B == a (the table being fielded into) as a
+    // read, so `hi` lands on the very guarded write this scan exists to
+    // find, and the `j < scan_end` search never reaches it. Use a boundary
+    // that skips over the table's own fill-run writes (including guarded
+    // ones) and only stops at a genuine hand-off -- the table read as a
+    // whole value (call argument, return, stored into another table, etc).
+    let hi = table_consumption_point(code, move_pc + 1, a);
+    let move_op = LuauOpcode::from_u8(insn_op(code[move_pc]));
+    let mut i = move_pc + if move_op.has_aux() { 2 } else { 1 };
+    while i < hi {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if let Some(t) = cond_branch_target(code, i) {
+            let scan_end = t.min(hi);
+            let branch_len = if op.has_aux() { 2 } else { 1 };
+            let mut j = i + branch_len;
+            while j < scan_end {
+                let insn = code[j];
+                let jop = LuauOpcode::from_u8(insn_op(insn));
+                // SETTABLEKS/SETTABLEN/SETTABLE: A is the stored VALUE, B is the
+                // table register (see `pending_table_unconsumed`'s identical
+                // convention above) -- the table being written into is B, not A.
+                // SETLIST: A is the table register itself.
+                let writes_a = match jop {
+                    LuauOpcode::SetTableKS | LuauOpcode::SetTableN | LuauOpcode::SetTable => {
+                        insn_b(insn) as usize == a
+                    }
+                    LuauOpcode::SetList => insn_a(insn) as usize == a,
+                    _ => false,
+                };
+                if writes_a {
+                    return true;
+                }
+                j += if jop.has_aux() { 2 } else { 1 };
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Recover SETLIST values when the destination register no longer holds a
 /// pending `Expr::Table`.
 ///
@@ -1428,12 +1802,51 @@ pub(super) fn lift_instruction_range(
                 // name. `acc = bit32.bxor(...)` compiles to `CALL R4` +
                 // `MOVE R0 R4`, and swallowing that MOVE left `acc` never
                 // updated while `acc`'s later reads resolved to the loop-body
-                // temp. Table sources stay pending so SETTABLEKS can still fill
-                // them in place.
+                // temp.
+                //
+                // A pending TABLE source is emitted too (`bound = {..}`), and the
+                // source register is re-pointed at `bound` so both registers keep
+                // ONE identity (a later SETTABLEKS through either register emits
+                // `bound.k = v`, never fills a throwaway clone). Excluding tables
+                // here parked the literal in the pinned slot, both arms of the
+                // diamond reached the join holding structurally different
+                // pending tables, and `merge_regs` reset the slot to Unknown --
+                // dropping the table AND every field written into it. Measured
+                // on PS99 `Library_Universal_Charms` (and 17 sibling
+                // `Library_Universal_*` modules sharing the template): each arm
+                // is `DUPTABLE R3 ; SETTABLEKS R3."GetPower" R4 ; MOVE R1 R3`
+                // into the nil-seeded, pinned merge slot R1, and the post-join
+                // `table.freeze(R1)` read an unbound `v1`. Only a literal that
+                // is still UNCONSUMED qualifies (`pending_table_unconsumed`):
+                // re-emitting one that was already stored or passed somewhere
+                // would mint a second object; that case keeps the old park.
+                // And, as in `pinned_write_consumed`, the register must hold
+                // its OWN tracked binding: PS99 `CustomPet` initSerialFX pinned
+                // R14 under an inner seed `sel14` while the tracker still bound
+                // R14 to the outer `rainbowDecals3`; writing the table into the
+                // inner shadow lost the outer variable entirely (it const-folded
+                // to nil at every later read). Finally, if this MOVE or any
+                // sibling arm MOVE into the same merge register sits in the
+                // body of an OR-guarded `if`, the whole merge keeps the park
+                // (`table_move_blocked`): only the statement-free phi path
+                // recovers that guard, and a partial recovery would hide the
+                // arm that is still lost.
+                let table_ok = match &src_expr {
+                    Expr::Table { .. } => {
+                        pending_table_unconsumed(code, pc, b)
+                            && !table_move_blocked(code, pc, a)
+                            && matches!(
+                                regs.get(a),
+                                Some(RegVal::Expr(Expr::Name(n)))
+                                    if locals.current_name(a) == Some(n.as_str())
+                            )
+                    }
+                    _ => true,
+                };
                 let pinned_dest = match regs.get(a) {
                     Some(RegVal::Expr(Expr::Name(n)))
                         if ctx.is_pinned_reg(a as u8, pc)
-                            && !matches!(&src_expr, Expr::Table { .. })
+                            && table_ok
                             && !matches!(&src_expr, Expr::Name(s) if *s == *n) =>
                     {
                         Some(n.clone())
@@ -1441,11 +1854,26 @@ pub(super) fn lift_instruction_range(
                     _ => None,
                 };
                 if let Some(bound) = pinned_dest {
+                    let src_is_table = matches!(&src_expr, Expr::Table { .. });
+                    if src_is_table && std::env::var("LUAU_TABLEPIN_TRACE").is_ok() {
+                        eprintln!(
+                            "TABLEPIN\t{}\tpc={}\tdst=R{}\tsrc=R{}\tbound={}\tcurrent={:?}",
+                            proto.debug_name.as_deref().unwrap_or("?"),
+                            pc,
+                            a,
+                            b,
+                            bound,
+                            locals.current_name(a)
+                        );
+                    }
                     stmts.push(Stat::Assign {
                         targets: vec![Expr::Name(bound.clone())],
                         values: vec![src_expr],
                     });
-                    regs[a] = RegVal::Expr(Expr::Name(bound));
+                    regs[a] = RegVal::Expr(Expr::Name(bound.clone()));
+                    if src_is_table && b != a && b < regs.len() {
+                        regs[b] = RegVal::Expr(Expr::Name(bound));
+                    }
                     pc += 1;
                     continue;
                 }
