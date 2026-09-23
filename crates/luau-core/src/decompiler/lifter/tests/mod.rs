@@ -94,3 +94,5 @@ mod self_mutation_peek_tests;
 mod exits_on_all_paths_complexity_tests;
 #[cfg(test)]
 mod dead_pending_table_tests;
+#[cfg(test)]
+mod or_chain_pure_preamble_tests;
