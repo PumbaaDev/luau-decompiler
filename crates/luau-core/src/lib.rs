@@ -572,6 +572,38 @@ pub fn build_consensus_map(variants: &[[u8; 256]]) -> [u8; 256] {
 /// clean structured error over streaming a multi-megabyte blob to the caller.
 pub const PROTO_SOURCE_BAIL_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 
+/// Number of protos reachable from the main proto through the container's
+/// child lists (`Proto::child_protos`, the protos a function's NEWCLOSURE /
+/// DUPCLOSURE instructions may instantiate), counting main itself. A proto
+/// outside this set can never be instantiated, so it can never run.
+pub fn reachable_proto_count(chunk: &parser::types::Chunk) -> usize {
+    let n = chunk.protos.len();
+    let main = chunk.main_proto as usize;
+    if main >= n {
+        return n;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = vec![main];
+    seen[main] = true;
+    let mut count = 0usize;
+    while let Some(p) = stack.pop() {
+        count += 1;
+        for &c in &chunk.protos[p].child_protos {
+            let c = c as usize;
+            // An out-of-range child index is malformed data: report the whole
+            // chunk as reachable rather than guess.
+            if c >= n {
+                return n;
+            }
+            if !seen[c] {
+                seen[c] = true;
+                stack.push(c);
+            }
+        }
+    }
+    count
+}
+
 /// Phase C1: returns `Err(...)` when `source_len` exceeds
 /// [`PROTO_SOURCE_BAIL_BYTES`]. Pulled out of `decompile_with_opmap` so it
 /// can be unit-tested without building a 20 MB bytecode fixture.
@@ -922,9 +954,28 @@ pub fn decompile_with_plan(
     // Add header with remap info
     if let Some(mapped) = mapped_count {
         let mut header = format!(
-            "{}-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}\n",
+            "{}-- Opcode remapping applied ({} opcodes detected)\n-- Protos: {} total, main={}",
             banner(), mapped, chunk.protos.len(), chunk.main_proto
         );
+        // REACHABLE PROTOS. The Luau compiler compiles every function literal in
+        // the AST, including ones inside code its constant folding then deletes,
+        // so a container can hold protos that no closure instruction ever
+        // instantiates. They cannot run, and the output rightly omits them - but
+        // `semantic_check`'s bodies_dropped check reads this header's proto
+        // count and flagged the omission (one live module: 13 protos, `<main>`
+        // is `DUPCLOSURE R0 proto(0); RETURN R0` and proto 0 is `return game`,
+        // so the complete program is exactly the one function emitted).
+        //
+        // Reachability walks the container's per-proto child lists, which are
+        // serialized structure and independent of the opcode map - a mis-decoded
+        // shuffle cannot shrink this number and hide a genuine drop. Emitted
+        // only when some proto is unreachable, so every other header is
+        // unchanged.
+        let reachable = reachable_proto_count(&chunk);
+        if reachable < chunk.protos.len() {
+            header.push_str(&format!(", reachable={}", reachable));
+        }
+        header.push('\n');
         // CALL RECOVERY. A dropped function body leaves no undefined name and
         // no bad call, so every other check scores it clean; the bytecode's own
         // call count is the only thing that contradicts it. Emitted into the

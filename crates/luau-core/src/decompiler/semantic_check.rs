@@ -176,6 +176,29 @@ fn blank_noncode(source: &str) -> String {
     out
 }
 
+/// The proto count the body-recovery check should hold the output to, read
+/// from the decompiler's own header line
+/// `-- Protos: <total> total, main=<m>[, reachable=<r>]`.
+///
+/// `reachable=` is present only when some protos are never instantiated by any
+/// closure instruction (see `reachable_proto_count`); an unreachable proto can
+/// never run, so omitting it is not a dropped body. Otherwise the total.
+pub fn header_proto_count(source: &str) -> Option<usize> {
+    let rest = source
+        .lines()
+        .take(20)
+        .find_map(|l| l.trim().strip_prefix("-- Protos:"))?
+        .trim();
+    if let Some(r) = rest
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("reachable="))
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return Some(r);
+    }
+    rest.split_whitespace().next()?.parse().ok()
+}
+
 pub fn check(source: &str, proto_count: Option<usize>) -> Vec<Finding> {
     let mut out = Vec::new();
     // Reads string contents on purpose — must see the ORIGINAL source.
@@ -1624,6 +1647,31 @@ end
     fn catches_dropped_bodies() {
         let src = "local tbl = {}\nreturn {}\n";
         let f = check(src, Some(32));
+        assert!(f.iter().any(|x| x.check == "bodies_dropped"));
+    }
+
+    /// The header's `reachable=` count, when present, is what the output is
+    /// held to: protos no closure instruction instantiates can never run.
+    #[test]
+    fn header_proto_count_prefers_reachable() {
+        let full = "-- Protos: 13 total, main=12\nreturn 1\n";
+        assert_eq!(header_proto_count(full), Some(13));
+        let pruned = "-- Protos: 13 total, main=12, reachable=2\nreturn 1\n";
+        assert_eq!(header_proto_count(pruned), Some(2));
+        assert_eq!(header_proto_count("return 1\n"), None);
+    }
+
+    /// One live module: 13 protos, `<main>` is `DUPCLOSURE R0 proto(0);
+    /// RETURN R0` and proto 0 is `return game`. The output below IS the whole
+    /// program, so it must not be reported as dropping bodies - but the same
+    /// output held to all 13 protos still is.
+    #[test]
+    fn unreachable_protos_are_not_dropped_bodies() {
+        let src = "-- Protos: 13 total, main=12, reachable=2\n\
+                   local function fn()\n    return game\nend\nreturn fn\n";
+        let f = check(src, header_proto_count(src));
+        assert!(!f.iter().any(|x| x.check == "bodies_dropped"), "{:?}", f);
+        let f = check(src, Some(13));
         assert!(f.iter().any(|x| x.check == "bodies_dropped"));
     }
 

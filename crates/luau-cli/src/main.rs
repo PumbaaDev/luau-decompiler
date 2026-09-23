@@ -367,9 +367,7 @@ fn main() -> Result<()> {
                 println!("{}", "-".repeat(72));
             }
             // Proto count from the header comment, same source the batch uses.
-            let protos = src.lines().take(20).find_map(|l| {
-                l.trim().strip_prefix("-- Protos:")?.trim().split_whitespace().next()?.parse().ok()
-            });
+            let protos = luau_core::decompiler::semantic_check::header_proto_count(&src);
             let findings = check(&src, protos);
             let wrong: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Wrong).collect();
             let suspect: Vec<_> =
@@ -1087,15 +1085,7 @@ fn summarise_semantics(dir: &Path) -> Option<run_manifest::SemanticSummary> {
 
     for p in &entries {
         let Ok(src) = fs::read_to_string(p) else { continue };
-        let protos = src.lines().take(20).find_map(|l| {
-            l.trim()
-                .strip_prefix("-- Protos:")?
-                .trim()
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        });
+        let protos = luau_core::decompiler::semantic_check::header_proto_count(&src);
         let all = check(&src, protos);
         let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
         // Suspicious rows: separate ledger, never affects clean/defect counts.
