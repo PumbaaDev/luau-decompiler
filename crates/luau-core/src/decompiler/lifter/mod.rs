@@ -8962,6 +8962,28 @@ fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Ve
                 // multi-line body inside the `in` clause, and a leaked NAMECALL
                 // method-name string. Neither is a table.
                 | Expr::Table { .. }
+                // A short-circuit `a and b` / `a or b` IS a value that can be
+                // a table: it yields one of its operands unchanged (the
+                // `t or default_t` idiom), and `table_expr` keeps And/Or as a
+                // table base for exactly that reason. The measured idiom is a
+                // guarded iterable:
+                //
+                //     local d = self and self.Damages
+                //     if not d then return 1 end
+                //     for k in d do ... end
+                //
+                // `MOVE R1 R0; JUMPIFNOT R1; GETTABLEKS R1 R0."Damages"` is
+                // the join, then `MOVE R3 R1; LOADNIL R4; LOADNIL R5;
+                // FORGPREP R3`. The generator register holds exactly
+                // `BinOp(And, self, self.Damages)` (LUAU_REG_WATCH=3 on
+                // BloxFruits DamageScalingHelperUtil `CountDealers`, before
+                // pc 9), and rejecting it minted an unbound `vN`:
+                // `for k in v3 do`, a loop over nil that errors at runtime.
+                // The generator is evaluated once, at loop entry, so keeping
+                // the parked expression moves no evaluation into the loop.
+                // Every other BinOp (arithmetic, comparison, concat) stays
+                // rejected.
+                | Expr::BinOp { op: BinOp::And | BinOp::Or, .. }
         )
     }
 
@@ -8975,6 +8997,14 @@ fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Ve
             // `for k, v in "MethodName" do`.  Fall back to a register name.
             let n = format!("v{}", a);
             crate::decompiler::mint_trace::note("FORGPREP_GEN_REJECT", &n);
+            if crate::decompiler::mint_trace::enabled() {
+                eprintln!(
+                    "REJECT	FORGPREP_GEN	{}	proto={}	discarded={:?}",
+                    n,
+                    current_dce_proto(),
+                    raw
+                );
+            }
             Expr::Name(n)
         }
     };
