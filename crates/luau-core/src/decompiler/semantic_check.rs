@@ -565,7 +565,7 @@ fn check_name_body_agreement(source: &str, out: &mut Vec<Finding>) {
 
     for d in &decls {
         // Names referenced inside string literals in this body.
-        for (line, referenced) in string_referenced_names(source, d) {
+        for (line, referenced) in string_referenced_names(source, d, &decls) {
             if referenced == d.name {
                 continue; // agrees — nothing to report
             }
@@ -643,8 +643,29 @@ struct Decl {
 
 /// Find `function X.Y(...)`, `function X:Y(...)` and `local function Z(...)`
 /// declarations and the line range of each body.
+///
+/// THE RANGE IS FOUND BY COUNTING LUA BLOCK KEYWORDS, not by line shape.
+/// A block is opened by exactly one of `function`, `do` (which also covers
+/// `while`/`for`), `if` or `repeat`, and closed by `end` or `until` -- that is
+/// the grammar, so on well-formed output the count is exact. `elseif`/`then`/
+/// `else` open nothing. Strings and comments are blanked first, so a keyword
+/// in an error message cannot move the count.
+///
+/// The previous line-shape counter got both directions wrong on real v12
+/// output, and every range error surfaced as a false `name_body_mismatch`:
+/// * it never counted an ANONYMOUS function (`WhichDoes = function(a, b)`,
+///   `task.defer(function()`), whose `end` then closed the enclosing decl early.
+///   Brookhaven DebugVisualization: `DefinePiecewiseExpression` ended at line
+///   1918 instead of 1977, so its nested `tbl13.Until`/`ThenDoes`/`FinallyDoes`/
+///   `Evaluate` -- which correctly report under their parent's name -- lost the
+///   nested-helper exemption (4 rows).
+/// * it counted `elseif ... then` as an opener, with no matching `end`, so a
+///   range overshot into its siblings. Slayers2 PlayerProgression:
+///   `GetEarnedStats` ran to line 579 instead of 382 and swallowed `tbl.Add`'s
+///   own correct self-reference.
 fn collect_declarations(source: &str) -> Vec<Decl> {
-    let lines: Vec<&str> = source.lines().collect();
+    let code = blank_noncode(source);
+    let lines: Vec<&str> = code.lines().collect();
     let mut decls = Vec::new();
 
     for (i, raw) in lines.iter().enumerate() {
@@ -661,24 +682,22 @@ fn collect_declarations(source: &str) -> Vec<Decl> {
         };
         let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
 
-        // Walk forward to the matching `end` by tracking block depth.
-        let mut depth = 1usize;
+        // Walk forward to the matching `end` by tracking block depth, starting
+        // ON the declaration line so a one-line body closes on itself.
+        let mut depth = 0i64;
         let mut end = i;
-        for (j, l2) in lines.iter().enumerate().skip(i + 1) {
-            let t = l2.trim();
-            if t.starts_with("function ")
-                || t.starts_with("local function ")
-                || t.ends_with(" do")
-                || t.ends_with(" then")
-                || t == "do"
-            {
-                depth += 1;
-            }
-            if t == "end" || t.starts_with("end)") || t.starts_with("end,") || t == "end;" {
-                depth -= 1;
-                if depth == 0 {
-                    end = j;
-                    break;
+        'walk: for (j, l2) in lines.iter().enumerate().skip(i) {
+            for word in l2.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                match word {
+                    "function" | "do" | "if" | "repeat" => depth += 1,
+                    "end" | "until" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = j;
+                            break 'walk;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -687,25 +706,65 @@ fn collect_declarations(source: &str) -> Vec<Decl> {
     decls
 }
 
-/// Names that appear inside string literals within a declaration's body,
-/// e.g. `error("Events.ServerCall: ...")` yields `ServerCall`.
-fn string_referenced_names(source: &str, d: &Decl) -> Vec<(usize, String)> {
+/// Names a function gives ITSELF in string literals within its own body,
+/// e.g. `error("Events.ServerCall: No event named " .. x)` yields `ServerCall`.
+///
+/// ONLY THE LEADING `Module.Function:` PREFIX OF A LITERAL COUNTS. That is the
+/// self-identifying diagnostic convention this check is built on (see the
+/// worked example above, and 855_Stickers' "Stickers.RepairInvalidStickersInBook:
+/// there are ..."). A dotted name anywhere else in a string is a reference TO
+/// some other function, and correct code is full of those. Every one of the 53
+/// `name_body_mismatch` rows in the 11-game v12 corpus at 3c5aed9 was such a
+/// reference, checked against the proto debug names in the bytecode:
+/// * preconditions naming the function that must run first --
+///   `assert(v, "ClientPlayerPerformanceSingleton.start() has not been called yet")`
+///   in `_logEvent`, "did you forget Networking.namespace(...)";
+/// * a constructor named as a format argument --
+///   `("... created via %s"):format("GetPart", "PartCache.new")` in `GetPart`;
+/// * profiler labels naming the callee -- `debug.profilebegin("CustomPet.processParallel")`.
+///
+/// Lines inside a NESTED declaration are attributed to that declaration only.
+/// A child's self-reference is evidence about the child, not about the
+/// function that encloses it: iris_API's `local function fn2` (lines 11-370)
+/// encloses `function self.NextColumn()`, whose own message names
+/// `NextColumn`, and was reported as `fn2` identifying itself as `NextColumn`.
+fn string_referenced_names(source: &str, d: &Decl, decls: &[Decl]) -> Vec<(usize, String)> {
     let lines: Vec<&str> = source.lines().collect();
+    let nested: Vec<(usize, usize)> = decls
+        .iter()
+        .filter(|o| o.start > d.start && o.end <= d.end)
+        .map(|o| (o.start, o.end))
+        .collect();
+    let in_nested = |i: usize| nested.iter().any(|&(s, e)| (s..=e).contains(&i));
     let mut found = Vec::new();
     for i in (d.start + 1)..=d.end.min(lines.len().saturating_sub(1)) {
-        let line = lines[i];
-        for lit in string_literals(line) {
-            // Take the token after a `.` — the `Module.Function` convention.
-            for part in lit.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
-                if let Some((_, func)) = part.rsplit_once('.') {
-                    if func.len() > 2 && func.chars().next().is_some_and(|c| c.is_alphabetic()) {
-                        found.push((i + 1, func.to_string()));
-                    }
-                }
+        if in_nested(i) {
+            continue;
+        }
+        for lit in string_literals(lines[i]) {
+            if let Some(func) = self_identified_name(&lit) {
+                found.push((i + 1, func.to_string()));
             }
         }
     }
     found
+}
+
+/// `"Events.ServerCall: No event named "` -> `ServerCall`. The literal must
+/// START with a dotted identifier path immediately followed by `:`; anything
+/// else (a URL, a sentence mentioning `X.y()`, a bare `"PartCache.new"`) is not
+/// a self-identification and yields nothing.
+fn self_identified_name(lit: &str) -> Option<&str> {
+    let (prefix, _) = lit.split_once(':')?;
+    let is_ident = |s: &str| {
+        s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if !prefix.split('.').all(is_ident) {
+        return None;
+    }
+    let (_, func) = prefix.rsplit_once('.')?;
+    (func.len() > 2 && func.chars().next().is_some_and(|c| c.is_alphabetic())).then_some(func)
 }
 
 fn string_literals(line: &str) -> Vec<String> {
@@ -1439,6 +1498,119 @@ end
             "correct output must not be flagged: {:?}",
             f
         );
+    }
+
+    fn fires_name_body(src: &str) -> bool {
+        check(src, None).iter().any(|x| x.check == "name_body_mismatch")
+    }
+
+    /// A string that MENTIONS a sibling is not the body identifying itself.
+    /// AdoptMe performance-logger `_logEvent` asserts that `start` ran first;
+    /// BloxFruits PartCache passes "PartCache.new" as a format argument;
+    /// PetSimulator99 CustomPet labels a profiler zone with its callee. All
+    /// correctly paired in the bytecode (proto debug names agree).
+    #[test]
+    fn a_sibling_mentioned_in_a_message_is_not_a_self_reference() {
+        let src = r#"
+function tbl.start()
+    return 1
+end
+function tbl.new(arg1)
+    return arg1
+end
+function tbl._logEvent(arg1)
+    assert(v4, "ClientPlayerPerformanceSingleton.start() has not been called yet")
+    error("did you forget Networking.start(...)? detail: " .. arg1)
+end
+function tbl:GetPart()
+    assert(v5 == tbl, ("Call it via %s"):format("GetPart", "PartCache.new"))
+    debug.profilebegin("CustomPet.start")
+end
+"#;
+        assert!(!fires_name_body(src), "{:?}", check(src, None));
+    }
+
+    /// An anonymous function (`key = function(...)`) opens a block. Uncounted,
+    /// its `end` closed `DefinePiecewiseExpression` early and its nested
+    /// helpers lost the may-name-their-parent exemption (Brookhaven
+    /// DebugVisualization, 4 rows).
+    #[test]
+    fn anonymous_function_does_not_truncate_the_enclosing_range() {
+        let src = r#"
+function tbl.DefinePiecewiseExpression()
+    local tbl13 = {
+        WhichDoes = function(arg1, arg2)
+            return tbl13
+        end
+    }
+    function tbl13.Until(arg1, arg2)
+        error("DebugVisualization.DefinePiecewiseExpression: Cannot call Until")
+    end
+    return tbl13
+end
+"#;
+        assert!(!fires_name_body(src), "{:?}", check(src, None));
+    }
+
+    /// `elseif ... then` opens no block. Counted as one, `GetEarnedStats` ran
+    /// past its own `end` into its sibling and took `Add`'s self-reference as
+    /// its own (Slayers2 PlayerProgression).
+    #[test]
+    fn elseif_does_not_extend_the_range_into_a_sibling() {
+        let src = r#"
+do
+    function tbl.GetEarnedStats(arg1)
+        if arg1 == 1 then
+            return 1
+        elseif arg1 == 2 then
+            return 2
+        end
+        return 0
+    end
+    function tbl.Add(arg1)
+        error("PlayerProgression.Add: is server-only")
+    end
+end
+"#;
+        assert!(!fires_name_body(src), "{:?}", check(src, None));
+    }
+
+    /// A nested child's self-reference belongs to the child, not to the
+    /// function enclosing it (iris_API `fn2` enclosing `self.NextColumn`).
+    #[test]
+    fn nested_child_self_reference_is_not_the_parents() {
+        let src = r#"
+local function fn2(arg1)
+    local self = {}
+    function self.NextColumn()
+        error("Iris.NextColumn: can only be called directly within a table")
+    end
+    return self
+end
+function tbl.Other()
+    return 1
+end
+"#;
+        assert!(!fires_name_body(src), "{:?}", check(src, None));
+    }
+
+    /// The exact range also RAISES recall: a mis-paired body whose
+    /// self-reference sits after an anonymous closure was invisible to the
+    /// old counter, which ended the range at the closure's `end)`.
+    #[test]
+    fn mismatch_after_an_anonymous_closure_still_fires() {
+        let src = r#"
+function tbl.Create(arg1)
+    task.defer(function()
+        print(arg1)
+    end)
+    error("Events.ServerCall: No event named " .. arg1)
+end
+function tbl.ServerCall(arg1)
+    return arg1
+end
+"#;
+        assert!(fires_name_body(src), "{:?}", check(src, None));
     }
 
     #[test]
