@@ -10,6 +10,7 @@ pub mod probe;
 #[cfg(test)]
 pub mod test_fixtures;
 pub mod types;
+pub mod v10plus;
 
 use anyhow::{bail, Context, Result};
 use types::*;
@@ -354,9 +355,8 @@ impl<'a> BytecodeReader<'a> {
         // class/CALLFB opcodes there (84 is BAND). Set LUAU_V10PLUS_RAW when the
         // opcodes are shuffled Roblox bytecode (an opmap DB will interpret them):
         // the upstream fixup is skipped and the raw code passes through untouched.
-        let raw_v10plus = std::env::var("LUAU_V10PLUS_RAW")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        // Environment first, then a per-call policy (see `v10plus`).
+        let raw_v10plus = v10plus::raw_v10plus();
         if version >= 10 && !raw_v10plus {
             const LOP_CALL: u32 = 21;
             const LOP_CALLFB: u8 = 87;
@@ -575,9 +575,8 @@ impl<'a> BytecodeReader<'a> {
         // know the input is safe (compiled with feedback OFF, or genuine Roblox
         // v10+ bytecode whose opcodes match the model) -- feedback-off v12
         // decompiles correctly, verified on multiple samples.
-        let allow_v10plus = std::env::var("LUAU_ALLOW_V10PLUS")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        // Environment first, then a per-call policy (see `v10plus`).
+        let allow_v10plus = v10plus::allow_v10plus();
         let max_version = if allow_v10plus { 14 } else { 9 };
         if !(3..=max_version).contains(&version) {
             if version >= 10 && version <= 14 {

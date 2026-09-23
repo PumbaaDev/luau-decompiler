@@ -633,9 +633,9 @@ pub fn check_source_size_bail(source_len: usize) -> Result<()> {
 /// ```
 ///
 /// A 31-point gap that every library consumer paid and nothing recorded. The
-/// file is ~3 KB, so compiling it in costs nothing and removes the filesystem
+/// file is ~8 KB, so compiling it in costs nothing and removes the filesystem
 /// dependency entirely - which is what makes it usable from WASM at all.
-fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
+pub fn bundled_opmap_db() -> Option<&'static parser::opmap_db::OpmapDb> {
     static DB: std::sync::OnceLock<Option<parser::opmap_db::OpmapDb>> =
         std::sync::OnceLock::new();
     DB.get_or_init(|| {
@@ -645,15 +645,88 @@ fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
     .as_ref()
 }
 
-/// High-level API: decompile raw bytecode into Luau source
+/// Which measured-permutation database [`decompile_with_options`] consults.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum OpmapDbChoice<'a> {
+    /// The database compiled into this crate ([`bundled_opmap_db`]) - the same
+    /// JSON the CLI loads by default. What [`decompile`] uses.
+    #[default]
+    Bundled,
+    /// A caller-supplied database (the library twin of `--opmap-db`).
+    Custom(&'a parser::opmap_db::OpmapDb),
+    /// No database: detector-only decoding, the pre-bundling behaviour.
+    Disabled,
+}
+
+impl<'a> OpmapDbChoice<'a> {
+    fn resolve(self) -> Option<&'a parser::opmap_db::OpmapDb> {
+        match self {
+            OpmapDbChoice::Bundled => bundled_opmap_db(),
+            OpmapDbChoice::Custom(db) => Some(db),
+            OpmapDbChoice::Disabled => None,
+        }
+    }
+}
+
+/// Knobs for [`decompile_with_options`]. The default is exactly what the
+/// `luau-decompiler decompile` command does for a single file.
+#[derive(Clone, Copy, Debug)]
+pub struct DecompileOptions<'a> {
+    /// Measured-permutation database to consult before detection.
+    pub opmap_db: OpmapDbChoice<'a>,
+    /// Decode a v10-v14 chunk as live Roblox client bytecode: accept the
+    /// container and pass its shuffled opcodes through raw for the opmap to
+    /// interpret. The CLI does this unconditionally (`enable_v10plus_for`) by
+    /// setting `LUAU_ALLOW_V10PLUS` / `LUAU_V10PLUS_RAW`; here it is scoped to
+    /// this call and this thread instead (see [`parser::v10plus`]), and an
+    /// explicitly exported variable still wins, as it does in the CLI. Turn it
+    /// off to get the parser's conservative default: reject v10+ unless the
+    /// environment opts in.
+    pub roblox_v10plus: bool,
+}
+
+impl Default for DecompileOptions<'_> {
+    fn default() -> Self {
+        DecompileOptions { opmap_db: OpmapDbChoice::Bundled, roblox_v10plus: true }
+    }
+}
+
+/// High-level API: decompile raw bytecode into Luau source.
 ///
-/// Consults the bundled measured permutation first. `lookup` returns `Hit`
-/// only after checking the chunk against the entry's fingerprint, so bytecode
-/// from any other build falls through to detection byte-for-byte as before -
-/// this can only replace INFERENCE with MEASUREMENT, never override a chunk
-/// the entry does not fit.
+/// Produces the same text as `luau-decompiler decompile <file>`: the bundled
+/// measured permutation is consulted first, and a v10-v14 chunk is decoded as
+/// Roblox client bytecode. See [`decompile_with_options`] to supply or disable
+/// the database.
 pub fn decompile(bytecode: &[u8]) -> Result<String> {
-    if let Some(db) = bundled_db() {
+    decompile_with_options(bytecode, &DecompileOptions::default())
+}
+
+/// [`decompile`] with an explicit database choice and v10+ policy.
+///
+/// The database's `lookup` returns `Hit` only after checking the chunk against
+/// the entry's fingerprint, so bytecode from any other build falls through to
+/// detection byte-for-byte as before - a database can only replace INFERENCE
+/// with MEASUREMENT, never override a chunk the entry does not fit.
+///
+/// WHY v10+ IS HERE. Live Roblox ships v12. Without the policy the parser
+/// rejects every such chunk, so `luau-wasm`, `luau-server` and the `luau-ffi`
+/// C ABI - all of which call [`decompile`] - refused the live client's scripts
+/// that the CLI decodes cleanly from the measured v12 entry.
+pub fn decompile_with_options(bytecode: &[u8], opts: &DecompileOptions<'_>) -> Result<String> {
+    let run = || decompile_via_db(bytecode, opts.opmap_db.resolve());
+    match parser::v10plus::roblox_policy_for(bytecode).filter(|_| opts.roblox_v10plus) {
+        Some(policy) => parser::v10plus::with_policy(policy, run),
+        None => run(),
+    }
+}
+
+/// The CLI's `decompile_with_store` with no store: a verified database entry
+/// short-circuits detection; anything else is detected solo.
+fn decompile_via_db(
+    bytecode: &[u8],
+    db: Option<&parser::opmap_db::OpmapDb>,
+) -> Result<String> {
+    if let Some(db) = db {
         if let Ok(chunk) = parser::parse(bytecode) {
             if let parser::opmap_db::DbLookup::Hit { ref entry_id, .. } = db.lookup(&chunk) {
                 if let Some(entry) = db.get(entry_id) {
