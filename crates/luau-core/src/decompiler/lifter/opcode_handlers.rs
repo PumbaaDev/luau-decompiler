@@ -200,6 +200,28 @@ fn reg_expr_ref(regs: &[RegVal], idx: usize) -> Expr {
     }
 }
 
+/// How many registers a multi-value `GETVARARGS A B` (or its RBX_EXT_97
+/// twin) destructures into `local r0, r1, ... = ...`.
+///
+/// RULE: the instruction writes exactly `count = B-1` registers
+/// R(A)..R(A+count-1), and the proto declares its frame, so the bytecode
+/// bounds this exactly. A count that fits the frame is real whatever its size
+/// and every register gets a name; only a count that does NOT fit (a garbage
+/// B from a misdecode) falls back to the old 10-name cap.
+///
+/// This used to be a flat `count.min(10)`. EVIDENCE: PetSim99
+/// `ExclusiveEggCmds_GargantuanHatch` proto 23 (`play(arg1, arg2, arg3, ...)`)
+/// PC 42 is `GETVARARGS R6 count=14` in a 26+-register frame. The cap named
+/// only R6..R15, so R16..R19 were never written by the lifter: every read of
+/// them - all inside nested `task.delay` / event closures that CAPTURE them -
+/// became an unbound `v16`/`v17`/`v18`/`v19` that evaluates to nil at runtime.
+/// Same rule and the same removal as the CALL-argument `.min(10)` guess, which
+/// was replaced by the exact `max_stack_size` bound for the same reason.
+pub(crate) fn vararg_unpack_width(a: usize, count: usize, max_stack_size: u8) -> usize {
+    let fits_frame = a + count <= max_stack_size as usize;
+    if fits_frame { count } else { count.min(10) }
+}
+
 /// May `op` appear in a foldable type-guard span?
 ///
 /// A type-guard span is a short straight-line computation whose result feeds a
@@ -4796,8 +4818,11 @@ pub(super) fn lift_instruction_range(
                     regs[a] = RegVal::Expr(Expr::Varargs);
                 } else {
                     // Multi-value varargs: emit `local v0, v1, v2 = ...`
+                    // Name EVERY register the instruction writes, bounded by
+                    // the frame, not by a flat `.min(10)` guess. See
+                    // `vararg_unpack_width` for the evidence.
                     let mut names = Vec::new();
-                    for i in 0..count.min(10) {
+                    for i in 0..vararg_unpack_width(a, count, proto.max_stack_size) {
                         if a + i >= regs.len() { break; }
                         names.push(ctx.reg_name(proto, (a + i) as u8, pc));
                     }
@@ -4942,7 +4967,7 @@ pub(super) fn lift_instruction_range(
                     regs[a] = RegVal::Expr(Expr::Varargs);
                 } else {
                     let mut names = Vec::new();
-                    for i in 0..count.min(10) {
+                    for i in 0..vararg_unpack_width(a, count, proto.max_stack_size) {
                         if a + i >= regs.len() { break; }
                         names.push(ctx.reg_name(proto, (a + i) as u8, pc));
                     }
