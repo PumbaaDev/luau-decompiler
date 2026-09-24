@@ -100,3 +100,5 @@ mod dead_pending_table_tests;
 mod or_chain_pure_preamble_tests;
 #[cfg(test)]
 mod dropped_table_key_constant_tests;
+#[cfg(test)]
+mod vararg_unpack_width_tests;
