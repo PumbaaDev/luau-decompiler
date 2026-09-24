@@ -9856,9 +9856,27 @@ pub(super) fn resolve_global_name(proto: &Proto, strings: &[String], d: i16, aux
 /// `const_to_string`, which also stringifies `Constant::Import` by joining its
 /// parts. An Import is not a field key, and admitting one here unfiltered would
 /// be a new way to emit a wrong name.
+///
+/// dropped_table_key_constant (26 Sep, campaign3): an empty string is ALSO a
+/// legitimate `Constant::String` key — `t[""] = v` is valid Luau — and the VM
+/// reads it exactly the same way. Rejecting it here fell through to the
+/// `field_{aux}` placeholder even though the constant at that exact AUX index
+/// resolved cleanly to `Constant::String("")`; two proto-local occurrences of
+/// the SAME logical `[""]` key then printed as two DIFFERENT numbers
+/// (`field_28` on the write, `field_5` on the read — same key, different aux
+/// indices into two different protos), which is what made them look like
+/// unbound locals rather than one dropped key. Confirmed against the raw
+/// bytecode with `examples/inspect_proto.rs`: RIVALS
+/// `Players__superjepy_PlayerScripts_Controllers_MusicController.luac` proto 32
+/// K[28] and proto 0 K[5] are both `Constant::String("")`; DungeonQuestReborn
+/// `JoinRequestClient.luac` proto 25 K[18] likewise, sitting directly beside
+/// the sibling key K[19]="playersNotReady" that resolves fine. The emitter
+/// already renders a non-identifier `Named`/`Field` key as `[""] = ...` /
+/// `obj[""]` (`is_valid_identifier("")` is false in emit.rs), so no downstream
+/// change is needed — only this filter was discarding a real key.
 fn resolve_aux_string_canonical(proto: &Proto, aux: u32) -> Option<String> {
     match proto.constants.get(aux as usize) {
-        Some(Constant::String(s)) if !s.is_empty() && s.len() <= 200 => Some(s.clone()),
+        Some(Constant::String(s)) if s.len() <= 200 => Some(s.clone()),
         _ => None,
     }
 }
