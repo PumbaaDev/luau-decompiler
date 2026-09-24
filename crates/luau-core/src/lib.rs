@@ -719,6 +719,13 @@ pub fn decompile_with_plan(
     let is_canonical_luau = !parser::opmap::OpcodeMap::needs_remapping(&chunk)
         && parser::opmap::OpcodeMap::is_canonical_luau(&chunk);
 
+    // Only the detector branch below decodes by inference. Lifter salvages that
+    // second-guess the bytecode (B0.127 leaked-global-string) consult this and
+    // stay off for a measured, canonical or unshuffled decode.
+    let _inferred_guard = decompiler::lifter::InferredDecodeGuard::install(
+        plan.exact.is_none() && parser::opmap::OpcodeMap::needs_remapping(&chunk),
+    );
+
     // Auto-detect and apply opcode remapping for Roblox-shuffled bytecode
     // No `needs_remapping` filter here. `OpcodeDb::lookup` has already
     // walk-verified this entry against this chunk, and a frequency heuristic

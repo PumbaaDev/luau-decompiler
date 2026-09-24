@@ -96,3 +96,5 @@ mod exits_on_all_paths_complexity_tests;
 mod dead_pending_table_tests;
 #[cfg(test)]
 mod or_chain_pure_preamble_tests;
+#[cfg(test)]
+mod leaked_global_string_tests;
