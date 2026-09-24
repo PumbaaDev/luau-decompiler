@@ -8,7 +8,11 @@
 //! cargo run --release -p luau-core --example library_batch -- [options] <out_dir> <file>...
 //!   --fallback         V10PlusMode::DetectorFallback (the CLI's v10+ behaviour)
 //!   --custom-db PATH   OpmapDbChoice::Custom (the library twin of --opmap-db)
-//!   --disasm           disassemble(bytes, true) instead of decompile -> <stem>.disasm
+//!   --disasm           disassemble_with_options(bytes, true, opts) -> <stem>.disasm
+//!   --disasm-opmap     disassemble_with_opmap_options(bytes, opts) -> <stem>.disasm
+//!                      (the listing through the map the decompile uses)
+//!   --opmap-none       decompile_with_opmap(bytes, None) -> <stem>.lua
+//!   --disasm-opmap-none disassemble_with_opmap(bytes, None) -> <stem>.disasm
 //!   --info             info(bytes) -> <stem>.info (Debug form)
 //! ```
 //!
@@ -21,6 +25,9 @@ use std::path::{Path, PathBuf};
 enum Op {
     Decompile,
     Disasm,
+    DisasmOpmap,
+    OpmapNone,
+    DisasmOpmapNone,
     Info,
 }
 
@@ -35,13 +42,18 @@ fn main() {
                 custom = args.peek().map(PathBuf::from);
             }
             "--disasm" => op = Op::Disasm,
+            "--disasm-opmap" => op = Op::DisasmOpmap,
+            "--opmap-none" => op = Op::OpmapNone,
+            "--disasm-opmap-none" => op = Op::DisasmOpmapNone,
             "--info" => op = Op::Info,
             _ => break,
         }
         args.next();
     }
     let Some(out_dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: library_batch [--fallback] [--custom-db PATH] [--disasm|--info] <out_dir> <file>...");
+        eprintln!(
+            "usage: library_batch [--fallback] [--custom-db PATH]              [--disasm|--disasm-opmap|--opmap-none|--disasm-opmap-none|--info] <out_dir> <file>..."
+        );
         std::process::exit(2);
     };
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
@@ -72,7 +84,14 @@ fn main() {
         };
         let (ext, result) = match op {
             Op::Decompile => ("lua", luau_core::decompile_with_options(&data, &opts)),
-            Op::Disasm => ("disasm", luau_core::disassemble(&data, true)),
+            Op::Disasm => ("disasm", luau_core::disassemble_with_options(&data, true, &opts)),
+            Op::DisasmOpmap => {
+                ("disasm", luau_core::disassemble_with_opmap_options(&data, &opts))
+            }
+            Op::OpmapNone => {
+                ("lua", luau_core::decompile_with_opmap(&data, None).map(|(src, _)| src))
+            }
+            Op::DisasmOpmapNone => ("disasm", luau_core::disassemble_with_opmap(&data, None)),
             Op::Info => ("info", luau_core::info(&data).map(|i| format!("{i:#?}\n"))),
         };
         let written = match result {

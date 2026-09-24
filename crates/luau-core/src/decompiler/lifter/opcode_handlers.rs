@@ -3096,6 +3096,13 @@ pub(super) fn lift_instruction_range(
                         Expr::Name(oname)
                     }
                 };
+                // The operand guard at the top of this function covers A, B and
+                // C, not A+1. A valid NAMECALL has A+1 <= 254, so this grows
+                // the register file only where the index was out of bounds and
+                // the lift used to panic (A = 255 in malformed bytecode).
+                if a + 1 >= regs.len() {
+                    regs.resize(a + 2, RegVal::Unknown);
+                }
                 regs[a + 1] = RegVal::Expr(obj_named.clone());
                 regs[a] = RegVal::Expr(Expr::MethodCall {
                     object: Box::new(obj_named),

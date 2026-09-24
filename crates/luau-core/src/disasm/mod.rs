@@ -179,7 +179,9 @@ fn format_instruction(
 
         LuauOpcode::NameCall => {
             let name = aux.map(|ax| const_str_or_string(proto, strings, ax)).unwrap_or_default();
-            format!("R{} R{}:{}", a, a + 1, name)
+            // Widened like RETURN / SETLIST below: A = 255 (malformed) must not
+            // overflow the u8 (a debug-build panic; release printed "R0").
+            format!("R{} R{}:{}", a, a as u16 + 1, name)
         }
 
         LuauOpcode::Call | LuauOpcode::CallFb => {

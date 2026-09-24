@@ -17,7 +17,10 @@
 //!
 //! Two tiers:
 //! * always-on: the committed v12 fixtures (upstream `luau-compile` output; no
-//!   game bytecode is committed), which the database does not cover;
+//!   game bytecode is committed), which the database does not cover. All are
+//!   refused by the library default; the feedback-off ones must also decode
+//!   identically under the opt-in and the CLI. The feedback-on one decodes to
+//!   known-wrong code there, so nothing beyond the refusal is required of it;
 //! * corpus: set `LUAU_PARITY_CORPUS` to one or more directories
 //!   (`;`-separated on Windows, `:` elsewhere) of `.bin`/`.luac` files, and
 //!   optionally `LUAU_PARITY_PER_DIR` (default 20) for how many files to
@@ -122,7 +125,23 @@ fn library_refuses_unmeasured_v12_fixtures_and_opts_in_like_the_cli() {
     }
     for f in &files {
         // Upstream luau-compile output matches no Roblox entry: the library
-        // must refuse it, and its opt-in must equal the CLI.
+        // default must refuse every one of them.
+        let data = std::fs::read(f).unwrap();
+        let refusal = luau_core::decompile(&data).map(|_| ()).map_err(|e| format!("{e:#}"));
+        assert!(
+            matches!(&refusal, Err(e) if e.starts_with("refusing Luau bytecode v12")),
+            "{}: the library default must refuse it, got {refusal:?}",
+            f.display()
+        );
+        // Built with call feedback ON, the CLI (and the opt-in) decode this one
+        // to known-wrong code (`local c = c .. c`). Nothing may require that
+        // output: a future fix that makes either side refuse it is the safe
+        // outcome, so the refusal above is all that is asserted.
+        if f.file_name().is_some_and(|n| n.to_string_lossy().contains("fbon")) {
+            continue;
+        }
+        // Feedback off: the Roblox model reads these correctly, so the opt-in
+        // must equal the CLI exactly.
         assert_eq!(parity(f), Ok(Parity::IntendedRefusal), "{}", f.display());
     }
 }

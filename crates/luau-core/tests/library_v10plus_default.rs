@@ -22,6 +22,13 @@ use std::path::PathBuf;
 const UPSTREAM_V12: [&str; 3] =
     ["callheavy_v12_fboff.luac", "callheavy_v12_fbon.luac", "loop_v12.luac"];
 
+/// The fixtures compiled with call feedback OFF: they use only opcodes the
+/// Roblox model reads correctly, so decoding them under the opt-in is right.
+/// `callheavy_v12_fbon` is NOT here: under the Roblox policy it decodes to
+/// `local c = c .. c; return c`, known-wrong output no test may require. The
+/// only thing asserted about it is that the default refuses it.
+const FEEDBACK_OFF_V12: [&str; 2] = ["callheavy_v12_fboff.luac", "loop_v12.luac"];
+
 fn fixture(name: &str) -> Vec<u8> {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests/fixtures/v10plus");
@@ -80,7 +87,7 @@ fn detector_fallback_opts_into_the_cli_behaviour() {
         return;
     }
     let opts = DecompileOptions { v10plus: V10PlusMode::DetectorFallback, ..Default::default() };
-    for name in UPSTREAM_V12 {
+    for name in FEEDBACK_OFF_V12 {
         let src = luau_core::decompile_with_options(&fixture(name), &opts)
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
         assert!(!src.trim().is_empty(), "{name}: empty output");

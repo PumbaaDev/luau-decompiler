@@ -32,6 +32,40 @@ impl<'a> BytecodeReader<'a> {
         Self { data, offset: 0 }
     }
 
+    /// Bytes left to read.
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.offset)
+    }
+
+    /// The end offset of an `n`-byte read at the cursor, or an error when the
+    /// input does not hold that many bytes. Checked, so a length read off the
+    /// bytecode can never wrap the cursor (on 32-bit targets too).
+    fn end_of(&self, n: usize, what: &str) -> Result<usize> {
+        match self.offset.checked_add(n) {
+            Some(end) if end <= self.data.len() => Ok(end),
+            _ => bail!(
+                "unexpected end of bytecode reading {} at offset {}",
+                what,
+                self.offset
+            ),
+        }
+    }
+
+    /// A safe `Vec::with_capacity` hint for `count` elements that each occupy
+    /// at least `min_bytes` of input.
+    ///
+    /// Every count in the format (strings, constants, instructions, protos,
+    /// locals...) is read off the bytecode itself, so a malformed input can
+    /// claim four billion of anything. Pre-allocating that asks the allocator
+    /// for terabytes, and an allocation failure ABORTS the process, which no
+    /// caller can catch. Capping the hint by what the remaining input could
+    /// possibly hold changes nothing for valid bytecode (its counts are always
+    /// backed by bytes) and turns a lying count into an ordinary
+    /// end-of-input error when the loop runs out of bytes.
+    fn capacity_for(&self, count: usize, min_bytes: usize) -> usize {
+        count.min(self.remaining() / min_bytes.max(1))
+    }
+
     fn read_byte(&mut self) -> Result<u8> {
         if self.offset >= self.data.len() {
             bail!("unexpected end of bytecode at offset {}", self.offset);
@@ -42,9 +76,7 @@ impl<'a> BytecodeReader<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        if self.offset + 4 > self.data.len() {
-            bail!("unexpected end of bytecode reading u32 at offset {}", self.offset);
-        }
+        self.end_of(4, "u32")?;
         let val = u32::from_le_bytes([
             self.data[self.offset],
             self.data[self.offset + 1],
@@ -56,9 +88,7 @@ impl<'a> BytecodeReader<'a> {
     }
 
     fn read_f64(&mut self) -> Result<f64> {
-        if self.offset + 8 > self.data.len() {
-            bail!("unexpected end of bytecode reading f64 at offset {}", self.offset);
-        }
+        self.end_of(8, "f64")?;
         let val = f64::from_le_bytes([
             self.data[self.offset],
             self.data[self.offset + 1],
@@ -74,9 +104,7 @@ impl<'a> BytecodeReader<'a> {
     }
 
     fn read_f32(&mut self) -> Result<f32> {
-        if self.offset + 4 > self.data.len() {
-            bail!("unexpected end of bytecode reading f32 at offset {}", self.offset);
-        }
+        self.end_of(4, "f32")?;
         let val = f32::from_le_bytes([
             self.data[self.offset],
             self.data[self.offset + 1],
@@ -93,7 +121,11 @@ impl<'a> BytecodeReader<'a> {
         let mut shift = 0u32;
         loop {
             let byte = self.read_byte()?;
-            result |= ((byte & 0x7F) as u32) << shift;
+            // A fifth continuation byte reaches shift 35. `wrapping_shl` is
+            // exactly what `<<` has always done here in release builds (the
+            // shift amount masked to 5 bits), so valid output is unchanged,
+            // and a debug build no longer panics on the overlong varint.
+            result |= ((byte & 0x7F) as u32).wrapping_shl(shift);
             if byte & 0x80 == 0 {
                 break;
             }
@@ -126,22 +158,17 @@ impl<'a> BytecodeReader<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.offset + n > self.data.len() {
-            bail!(
-                "unexpected end of bytecode reading {} bytes at offset {}",
-                n,
-                self.offset
-            );
-        }
-        let slice = &self.data[self.offset..self.offset + n];
-        self.offset += n;
+        let end = self.end_of(n, &format!("{} bytes", n))?;
+        let slice = &self.data[self.offset..end];
+        self.offset = end;
         Ok(slice)
     }
 
     /// Read the string table used by the bytecode
     fn read_string_table(&mut self) -> Result<Vec<String>> {
         let count = self.read_varint()? as usize;
-        let mut strings = Vec::with_capacity(count);
+        // Each entry is at least its one-byte length varint.
+        let mut strings = Vec::with_capacity(self.capacity_for(count, 1));
         for _ in 0..count {
             let len = self.read_varint()? as usize;
             let bytes = self.read_bytes(len)?;
@@ -199,7 +226,7 @@ impl<'a> BytecodeReader<'a> {
                 // indices. Each field is initialized to nil / 0.0 at runtime,
                 // and SETTABLEKS instructions fill in the values afterwards.
                 let len = self.read_varint()? as usize;
-                let mut entries = Vec::with_capacity(len);
+                let mut entries = Vec::with_capacity(self.capacity_for(len, 1));
                 for _ in 0..len {
                     let key = self.read_varint()? as i32;
                     entries.push((key, None));
@@ -232,7 +259,8 @@ impl<'a> BytecodeReader<'a> {
                 // proto member is misaligned — and all named-field table
                 // literals decompile as empty `{}`.
                 let len = self.read_varint()? as usize;
-                let mut entries = Vec::with_capacity(len);
+                // varint key (>= 1 byte) + fixed int32 value index.
+                let mut entries = Vec::with_capacity(self.capacity_for(len, 5));
                 for _ in 0..len {
                     let key = self.read_varint()? as i32;
                     let constant_idx = self.read_u32()? as i32; // int32, -1 == nil
@@ -266,7 +294,10 @@ impl<'a> BytecodeReader<'a> {
                 let _classname_idx = self.read_varint()?;
                 let num_properties = self.read_varint()? as usize;
                 let num_methods = self.read_varint()? as usize;
-                for _ in 0..(num_properties + num_methods) {
+                let Some(num_members) = num_properties.checked_add(num_methods) else {
+                    bail!("class shape member count overflows at offset {}", self.offset);
+                };
+                for _ in 0..num_members {
                     let _member_idx = self.read_varint()?;
                 }
                 Ok(Constant::Nil)
@@ -332,7 +363,7 @@ impl<'a> BytecodeReader<'a> {
 
         // Instructions
         let size_code = self.read_varint()? as usize;
-        let mut code = Vec::with_capacity(size_code);
+        let mut code = Vec::with_capacity(self.capacity_for(size_code, 4));
         for _ in 0..size_code {
             code.push(self.read_u32()?);
         }
@@ -404,14 +435,14 @@ impl<'a> BytecodeReader<'a> {
 
         // Constants
         let size_k = self.read_varint()? as usize;
-        let mut constants = Vec::with_capacity(size_k);
+        let mut constants = Vec::with_capacity(self.capacity_for(size_k, 1));
         for _ in 0..size_k {
             constants.push(self.read_constant(strings, version)?);
         }
 
         // Child proto references
         let size_p = self.read_varint()? as usize;
-        let mut child_protos = Vec::with_capacity(size_p);
+        let mut child_protos = Vec::with_capacity(self.capacity_for(size_p, 1));
         for _ in 0..size_p {
             child_protos.push(self.read_varint()?);
         }
@@ -430,14 +461,21 @@ impl<'a> BytecodeReader<'a> {
             }
 
             // Read line offsets (one per instruction, encoded as deltas)
-            let mut intervals = Vec::with_capacity(size_code);
+            let mut intervals = Vec::with_capacity(self.capacity_for(size_code, 1));
             for _ in 0..size_code {
                 intervals.push(self.read_byte()? as i8 as i32);
             }
 
-            // Read absolute line positions at intervals
-            let interval_size = ((size_code - 1) >> linegaplog2 as usize) + 1;
-            let mut abs_lines = Vec::with_capacity(interval_size);
+            // Read absolute line positions at intervals. The VM computes
+            // `((sizecode - 1) >> linegaplog2) + 1` in signed int, which is 0
+            // for an empty proto. Unsigned `size_code - 1` underflowed there
+            // and asked the allocator for ~2^61 bytes: an uncatchable abort on
+            // a 431-byte input. No code means no intervals.
+            let interval_size = match size_code.checked_sub(1) {
+                Some(last) => (last >> linegaplog2 as usize) + 1,
+                None => 0,
+            };
+            let mut abs_lines = Vec::with_capacity(self.capacity_for(interval_size, 4));
             for _ in 0..interval_size {
                 abs_lines.push(self.read_u32()? as i32);
             }
@@ -450,7 +488,9 @@ impl<'a> BytecodeReader<'a> {
                 if i % gap == 0 {
                     current_line = abs_lines[i / gap];
                 }
-                current_line += intervals[i];
+                // Wrapping, as release builds always did: a corrupt delta run
+                // must not panic a debug build.
+                current_line = current_line.wrapping_add(intervals[i]);
                 lines.push(current_line);
             }
 
@@ -466,7 +506,8 @@ impl<'a> BytecodeReader<'a> {
         let debug_info = if self.read_byte()? != 0 {
             // Local variables
             let size_locals = self.read_varint()? as usize;
-            let mut locals = Vec::with_capacity(size_locals);
+            // name ref + start pc + end pc (varints) + register byte.
+            let mut locals = Vec::with_capacity(self.capacity_for(size_locals, 4));
             for _ in 0..size_locals {
                 let name = self.read_string_ref(strings)?.unwrap_or_default();
                 let start_pc = self.read_varint()?;
@@ -482,7 +523,7 @@ impl<'a> BytecodeReader<'a> {
 
             // Upvalue names
             let size_upvalues = self.read_varint()? as usize;
-            let mut upvalue_names = Vec::with_capacity(size_upvalues);
+            let mut upvalue_names = Vec::with_capacity(self.capacity_for(size_upvalues, 1));
             for _ in 0..size_upvalues {
                 upvalue_names
                     .push(self.read_string_ref(strings)?.unwrap_or_default());
@@ -519,9 +560,28 @@ impl<'a> BytecodeReader<'a> {
         // This is the same `offset = protoStartOffset + protoSize` the Luau VM
         // performs, and it absorbs any optional trailing section (feedback
         // vector, cost function) we intentionally skip.
+        //
+        // The declared size is bytecode, so it is checked before the cursor
+        // moves: the parsed body must fit inside it (the optional sections
+        // only ever FOLLOW the body), and the proto must end inside the input.
+        // A size that pointed backwards would re-read bytes already consumed,
+        // letting a small input fan out into quadratic work.
         if version >= 12 {
             if let Some(size) = proto_size {
-                self.offset = proto_start + size;
+                let end = proto_start
+                    .checked_add(size)
+                    .filter(|&end| end >= self.offset && end <= self.data.len());
+                let Some(end) = end else {
+                    bail!(
+                        "proto size {} at offset {} does not frame its body \
+                         (body ends at {}, input is {} bytes)",
+                        size,
+                        proto_start,
+                        self.offset,
+                        self.data.len()
+                    );
+                };
+                self.offset = end;
             }
         }
 
@@ -626,7 +686,8 @@ impl<'a> BytecodeReader<'a> {
         let proto_count = self.read_varint()? as usize;
         log::debug!("Proto count: {}", proto_count);
 
-        let mut protos = Vec::with_capacity(proto_count);
+        // Every proto occupies at least one byte of input.
+        let mut protos = Vec::with_capacity(self.capacity_for(proto_count, 1));
         for i in 0..proto_count {
             let proto = self
                 .read_proto(&strings, version)
