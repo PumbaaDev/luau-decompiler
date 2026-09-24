@@ -108,3 +108,5 @@ mod or_chain_pure_preamble_tests;
 mod dropped_table_key_constant_tests;
 #[cfg(test)]
 mod vararg_unpack_width_tests;
+#[cfg(test)]
+mod generic_for_short_circuit_generator_tests;
