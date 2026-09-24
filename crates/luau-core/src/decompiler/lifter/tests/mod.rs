@@ -85,6 +85,8 @@ mod capture_param_global_upval_tests;
 mod branch_seed_shape_tests;
 #[cfg(test)]
 mod pinned_arm_write_tests;
+#[cfg(test)]
+mod pinned_table_move_tests;
 
 mod arith_table_base_tests;
 #[cfg(test)]
