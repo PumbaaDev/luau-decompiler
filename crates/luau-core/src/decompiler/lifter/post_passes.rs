@@ -689,6 +689,80 @@ fn stmt_uses_name_in_tail_position(stmt: &Stat, name: &str) -> bool {
     }
 }
 
+/// Does `name` appear as the SOLE argument of a `Call`/`MethodCall`,
+/// recursively? Unlike [`expr_uses_name_in_tail_position`] (which accepts
+/// `name` as merely the LAST of possibly several arguments), this requires
+/// `args.len() == 1` — there is no sibling expression before or after it in
+/// that argument list to reorder relative to.
+///
+/// This is the exact shape a genuinely correct nested call restores:
+/// `pack(pcall(f, ...))` compiles to one CALL with `results=multret`
+/// (`pcall`) immediately followed by another CALL that consumes ALL of
+/// those results as its sole argument list (`pack`). The lifter always
+/// materializes a CALL's result as its own `Stat::Local` first — nesting
+/// only happens later, via [`inline_single_use_temps_pinned`] re-splicing a
+/// single-use temp back into its read site — so when that pass declines to
+/// inline (`is_side_effect_call` — `pcall`, `require`, …), the temp is left
+/// as a separate statement and Lua's `local x = pcall(...)` truncates the
+/// multret result down to ONE value: `pack(x)` then only ever receives that
+/// one value instead of every result `pcall` produced.
+fn expr_uses_name_as_sole_call_arg(expr: &Expr, name: &str) -> bool {
+    let is_target = |e: &Expr| matches!(e, Expr::Name(n) if n == name);
+    match expr {
+        Expr::Call { func, args } => {
+            (args.len() == 1 && is_target(&args[0]))
+                || expr_uses_name_as_sole_call_arg(func, name)
+                || args.iter().any(|a| expr_uses_name_as_sole_call_arg(a, name))
+        }
+        Expr::MethodCall { object, args, .. } => {
+            (args.len() == 1 && is_target(&args[0]))
+                || expr_uses_name_as_sole_call_arg(object, name)
+                || args.iter().any(|a| expr_uses_name_as_sole_call_arg(a, name))
+        }
+        Expr::Field { object, .. } => expr_uses_name_as_sole_call_arg(object, name),
+        Expr::Index { object, key } => {
+            expr_uses_name_as_sole_call_arg(object, name)
+                || expr_uses_name_as_sole_call_arg(key, name)
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_uses_name_as_sole_call_arg(left, name)
+                || expr_uses_name_as_sole_call_arg(right, name)
+        }
+        Expr::UnOp { operand, .. } => expr_uses_name_as_sole_call_arg(operand, name),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            expr_uses_name_as_sole_call_arg(cond, name)
+                || expr_uses_name_as_sole_call_arg(then_expr, name)
+                || expr_uses_name_as_sole_call_arg(else_expr, name)
+        }
+        _ => false,
+    }
+}
+
+/// Statement-level wrapper for [`expr_uses_name_as_sole_call_arg`]. Also
+/// treats a `return name` / `local x = name` / `x = name` whose value list
+/// is exactly `[name]` as the same shape — nothing else is evaluated in
+/// that slot either, so restoring the nested call there cannot reorder
+/// anything.
+fn stmt_uses_name_as_sole_call_arg(stmt: &Stat, name: &str) -> bool {
+    let is_target = |e: &Expr| matches!(e, Expr::Name(n) if n == name);
+    let sole_of = |vals: &Vec<Expr>| vals.len() == 1 && is_target(&vals[0]);
+    match stmt {
+        Stat::Return { values } => {
+            sole_of(values) || values.iter().any(|v| expr_uses_name_as_sole_call_arg(v, name))
+        }
+        Stat::Local { values, .. } => {
+            sole_of(values) || values.iter().any(|v| expr_uses_name_as_sole_call_arg(v, name))
+        }
+        Stat::Assign { targets, values } => {
+            sole_of(values)
+                || values.iter().any(|v| expr_uses_name_as_sole_call_arg(v, name))
+                || targets.iter().any(|t| expr_uses_name_as_sole_call_arg(t, name))
+        }
+        Stat::ExprStat(e) => expr_uses_name_as_sole_call_arg(e, name),
+        _ => false,
+    }
+}
+
 /// Convenience entry point with no arity-pinned temps. Used by the unit tests,
 /// which build ASTs directly and therefore have no bytecode-level arity info.
 #[cfg(test)]
@@ -773,9 +847,30 @@ pub(super) fn inline_single_use_temps_pinned(
             // moving them to the use site changes evaluation timing. Also skip
             // if the name is Konstant-style semantic (Capitalized, likely a
             // module-import local the user would want to keep visible).
+            //
+            // Exception: the temp is read exactly once, in the VERY NEXT
+            // statement, as the SOLE argument of that statement's call (or
+            // its sole return/assignment value) — `local x = pcall(...)`
+            // immediately followed by `local y = pack(x)`. There is no
+            // sibling statement between them and no sibling expression
+            // beside `x` in that slot, so splicing the call back in cannot
+            // reorder it against anything — the two forms run in identical
+            // order. This is also the ONE shape this bytecode pattern
+            // actually needs restored: `pcall(...)` compiles with
+            // `results=multret` feeding directly into the next CALL's
+            // argument list, so leaving it split truncates Lua's
+            // single-value `local x = pcall(...)` down to just the first
+            // result — `pack(x)` then silently drops pcall's error message /
+            // extra results instead of forwarding all of them. See
+            // `expr_uses_name_as_sole_call_arg` for the exact shape.
             if is_side_effect_call(&def_expr) {
-                i += 1;
-                continue;
+                let adjacent_sole_use = stmts
+                    .get(i + 1)
+                    .is_some_and(|s| stmt_uses_name_as_sole_call_arg(s, &def_name));
+                if !adjacent_sole_use {
+                    i += 1;
+                    continue;
+                }
             }
             if def_name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                 // Capitalized name suggests a module/class import; keep as-is

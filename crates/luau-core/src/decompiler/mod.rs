@@ -221,12 +221,14 @@ pub struct DecompileContext<'a> {
     /// Maps child_proto_index -> vec of (child_upval_slot, parent_proto_index, parent_upval_slot).
     /// After rename_upvals resolves the parent's names, we re-propagate to children.
     pub upval_parent_links: std::collections::HashMap<usize, Vec<(usize, usize, u8)>>,
-    /// Upvalue slots whose CAPTURE source register genuinely held a Roblox
-    /// instance global (`game` / `workspace` / `script`) at capture time.
-    /// Naming such an upvalue after the global is EXACT — the captured value IS
-    /// that global — so `upval_name` lets it through the `is_stdlib_shadow_name`
-    /// guard that otherwise (correctly) rejects a MISINFERRED global name.
-    /// Keyed by child proto index -> set of upvalue slot indices.
+    /// Upvalue slots whose CAPTURE source register genuinely held a
+    /// stdlib/Roblox global (`game` / `workspace` / `script`, or any other
+    /// `is_stdlib_shadow_name` global such as `pcall`/`error`/`task`) at
+    /// capture time. Naming such an upvalue after the global is EXACT — the
+    /// captured value IS that global — so `upval_name` lets it through the
+    /// `is_stdlib_shadow_name` guard that otherwise (correctly) rejects a
+    /// MISINFERRED global name. Keyed by child proto index -> set of upvalue
+    /// slot indices.
     pub capture_global_upvals: std::collections::HashMap<usize, std::collections::HashSet<u8>>,
     /// True when the chunk is canonical open-source Luau bytecode rather than
     /// Roblox's shuffled dialect.
@@ -922,17 +924,27 @@ impl<'a> DecompileContext<'a> {
             if let Some(name) = names.get(idx as usize) {
                 // Phase B0.106: same guard for inferred names.
                 // Exception: a CAPTURE whose source register genuinely held a
-                // Roblox instance global (game/workspace/script) is EXACT — the
-                // upvalue's value IS that global — so it may keep the global name
-                // even though `is_stdlib_shadow_name` lists those three. The
-                // trusted set is populated ONLY from a real remapped CAPTURE
-                // whose register held that exact global expression, never from a
-                // usage-based guess, so this cannot resurrect a misinference.
-                let trusted_global = matches!(name.as_str(), "game" | "workspace" | "script")
-                    && self
-                        .capture_global_upvals
-                        .get(&proto_index)
-                        .is_some_and(|s| s.contains(&idx));
+                // stdlib/Roblox global (game/workspace/script, or any other
+                // name `is_stdlib_shadow_name` lists — pcall, error, warn,
+                // task, coroutine, ...) is EXACT — the upvalue's value IS that
+                // global — so it may keep the global name even though
+                // `is_stdlib_shadow_name` rejects it by default. The trusted
+                // set is populated ONLY from a real remapped CAPTURE (type
+                // VAL/REF, never the structural fallback) whose register held
+                // that exact global expression at capture time (`n == &name`
+                // in opcode_handlers.rs), never from a usage-based guess, so
+                // membership here cannot resurrect a misinference — it can
+                // only let a name through that a live register snapshot
+                // already proved correct. Originally scoped to the three
+                // Roblox instance globals only; widened to any stdlib name
+                // because the same loss (capture -> `upval_N` / a wrong
+                // usage-guessed placeholder like `func`/`lib`) reproduces for
+                // `local error = error`-style captures of ordinary stdlib
+                // globals, not just game/workspace/script.
+                let trusted_global = self
+                    .capture_global_upvals
+                    .get(&proto_index)
+                    .is_some_and(|s| s.contains(&idx));
                 if !name.is_empty()
                     && is_valid_luau_identifier(name)
                     && (!is_stdlib_shadow_name(name) || trusted_global)
