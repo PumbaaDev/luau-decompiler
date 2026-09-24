@@ -1,28 +1,64 @@
-//! Decompile files through the LIBRARY entry point (`luau_core::decompile`),
-//! the exact call `luau-wasm`, `luau-server` and the `luau-ffi` C ABI make.
+//! Run files through the LIBRARY entry points, the calls `luau-wasm`,
+//! `luau-server` and the `luau-ffi` C ABI make.
 //!
-//! Exists to measure library-vs-CLI parity: run it and `luau-decompiler
-//! decompile` over the same inputs and diff the two output folders.
+//! Exists to measure library-vs-CLI parity: run it and `luau-decompiler` over
+//! the same inputs and diff the two output folders.
 //!
 //! ```text
-//! cargo run --release -p luau-core --example library_batch -- <out_dir> <file>...
+//! cargo run --release -p luau-core --example library_batch -- [options] <out_dir> <file>...
+//!   --fallback         V10PlusMode::DetectorFallback (the CLI's v10+ behaviour)
+//!   --custom-db PATH   OpmapDbChoice::Custom (the library twin of --opmap-db)
+//!   --disasm           disassemble(bytes, true) instead of decompile -> <stem>.disasm
+//!   --info             info(bytes) -> <stem>.info (Debug form)
 //! ```
 //!
-//! Each `<stem>.lua` is the library's output; a failure writes
-//! `<stem>.err` holding the error, so a refusal is visible rather than silent.
+//! Each output is written per input stem; a failure writes `<stem>.err`
+//! holding the error, so a refusal is visible rather than silent.
 
+use luau_core::{DecompileOptions, OpmapDbChoice, V10PlusMode};
 use std::path::{Path, PathBuf};
 
+enum Op {
+    Decompile,
+    Disasm,
+    Info,
+}
+
 fn main() {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
+    let (mut fallback, mut custom, mut op) = (false, None::<PathBuf>, Op::Decompile);
+    while let Some(flag) = args.peek().and_then(|a| a.to_str()).map(str::to_owned) {
+        match flag.as_str() {
+            "--fallback" => fallback = true,
+            "--custom-db" => {
+                args.next();
+                custom = args.peek().map(PathBuf::from);
+            }
+            "--disasm" => op = Op::Disasm,
+            "--info" => op = Op::Info,
+            _ => break,
+        }
+        args.next();
+    }
     let Some(out_dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: library_batch <out_dir> <file>...");
+        eprintln!("usage: library_batch [--fallback] [--custom-db PATH] [--disasm|--info] <out_dir> <file>...");
         std::process::exit(2);
     };
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         eprintln!("cannot create {}: {e}", out_dir.display());
         std::process::exit(1);
     }
+    let custom_db = custom.map(|p| match luau_core::parser::opmap_db::OpmapDb::load(&p) {
+        Ok((db, _)) => db,
+        Err(e) => {
+            eprintln!("custom db {}: {e:#}", p.display());
+            std::process::exit(1);
+        }
+    });
+    let opts = DecompileOptions {
+        opmap_db: custom_db.as_ref().map_or(OpmapDbChoice::Bundled, OpmapDbChoice::Custom),
+        v10plus: if fallback { V10PlusMode::DetectorFallback } else { V10PlusMode::MeasuredOnly },
+    };
     let (mut ok, mut failed) = (0usize, 0usize);
     for input in args.map(PathBuf::from) {
         let stem = stem_of(&input);
@@ -34,10 +70,15 @@ fn main() {
                 continue;
             }
         };
-        let written = match luau_core::decompile(&data) {
-            Ok(src) => {
+        let (ext, result) = match op {
+            Op::Decompile => ("lua", luau_core::decompile_with_options(&data, &opts)),
+            Op::Disasm => ("disasm", luau_core::disassemble(&data, true)),
+            Op::Info => ("info", luau_core::info(&data).map(|i| format!("{i:#?}\n"))),
+        };
+        let written = match result {
+            Ok(text) => {
                 ok += 1;
-                std::fs::write(out_dir.join(format!("{stem}.lua")), src)
+                std::fs::write(out_dir.join(format!("{stem}.{ext}")), text)
             }
             Err(e) => {
                 failed += 1;

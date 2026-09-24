@@ -411,6 +411,11 @@ fn main() -> Result<()> {
                 // so on any chunk a measured entry covers this printed a
                 // detector map the decompile never touched — the case where
                 // the listing is most likely to be believed.
+                //
+                // v10-v14 is read the way `decompile_with_store` reads it, so
+                // the listing honours `--opmap-db` and, on a database miss,
+                // shows the detector map the decompile falls back to.
+                enable_v10plus_for(&data);
                 if let Some(entry) = resolve_db_entry(&db, &data)? {
                     luau_core::disassemble_with_plan(
                         &data,
@@ -782,7 +787,14 @@ fn decompile_with_store(
         return luau_core::decompile(data);
     };
     let (prior, ballot) = consult_store(path, data);
-    let out = luau_core::decompile_with_opmap(data, prior.as_ref()).map(|(src, _)| src);
+    // Detection with the pooled prior and NO database: the database was
+    // consulted above. (`decompile_with_opmap(data, None)` now means
+    // `decompile`, which would consult the bundled database a second time.)
+    let out = luau_core::decompile_with_plan(
+        data,
+        &luau_core::DecodePlan { prior: prior.as_ref(), exact: None },
+    )
+    .map(|(src, _)| src);
     // Cast only after a successful decode, and only what this script itself
     // observed — never the prior it was handed.
     if out.is_ok() {

@@ -23,6 +23,13 @@
 //!
 //! The CLI only sets a variable that is absent, so an explicit environment
 //! setting wins there too - the two front ends agree for every environment.
+//!
+//! WHEN the library installs the policy is decided in `lib.rs`: only for a
+//! chunk a measured opcode-database entry verifies (unless the caller opts
+//! into the CLI's detector fallback). Applied to every v10-14 chunk, RAW mode
+//! turns stock `luau-compile` v12 (call feedback on by default) into
+//! plausible-but-wrong code, which is what the environment gate exists to
+//! refuse.
 
 use std::cell::Cell;
 
@@ -51,6 +58,16 @@ thread_local! {
 /// (both switches are version-gated to >= 10 inside the parser anyway).
 pub fn roblox_policy_for(bytecode: &[u8]) -> Option<V10PlusPolicy> {
     matches!(bytecode.first(), Some(10..=14)).then_some(V10PlusPolicy::ROBLOX_CLIENT)
+}
+
+/// Has the host configured v10+ decoding itself? True when
+/// `LUAU_ALLOW_V10PLUS` is present in the environment at all (empty means an
+/// explicit "off"). The library's v10+ gate then stands aside entirely, so an
+/// explicit configuration behaves exactly as it did before the gate existed.
+/// The CLI exports the variable for every v10-14 input, which is why its output
+/// does not depend on the library's gate.
+pub fn environment_configures_v10plus() -> bool {
+    std::env::var_os("LUAU_ALLOW_V10PLUS").is_some()
 }
 
 /// Run `f` with `policy` in force for parses on the current thread.
