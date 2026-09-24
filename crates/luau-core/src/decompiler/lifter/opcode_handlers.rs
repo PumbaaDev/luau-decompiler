@@ -3432,13 +3432,41 @@ pub(super) fn lift_instruction_range(
                             let prev_a = insn_a(prev_insn) as usize;
                             let prev_d = insn_d(prev_insn);
                             if prev_a == arg_reg {
-                                // This instruction targeted our argument register.
-                                // Try interpreting its D field as a constant index.
-                                let kidx = prev_d as u16 as usize;
-                                if let Some(Constant::String(s)) = proto.constants.get(kidx) {
-                                    if is_valid_luau_identifier(s) {
-                                        *arg = Expr::String(s.clone());
-                                        resolved = true;
+                                // Ground truth (MobileUIController.lua:297,
+                                // "Cooldown:SetAttribute('Percentage', Text2)"
+                                // decoded as ...SetAttribute('Percentage',
+                                // 'CooldownLabel')): the writer here was a real
+                                // `MOVE R19 R15` (an ABC-format instruction,
+                                // copying a live DIV-result local into the arg
+                                // register), not a LOADK. MOVE has no constant
+                                // index — its D-field reinterpretation is just
+                                // the B/C register bytes read back as a number
+                                // (here B=15 the source register, which by raw
+                                // coincidence equals a VALID string constant
+                                // slot, K15="CooldownLabel", the completely
+                                // unrelated string this same proto loads a few
+                                // lines earlier for `FindFirstChild`). Reading
+                                // any instruction's D field as a constant index
+                                // is only sound when that instruction actually
+                                // is an AD-format LOADK: require the decoded
+                                // opcode to match before trusting prev_d. A
+                                // genuinely misidentified LOADK still decodes
+                                // as LuauOpcode::LoadK once the opmap DB has
+                                // resolved the byte (measured DB, not detector
+                                // guessing), so real opcode-shuffling cases this
+                                // heuristic exists for are unaffected; only a
+                                // same-register write by an unrelated ABC op
+                                // (MOVE/ADD/DIV/GETTABLE/...) is now rejected.
+                                let prev_op = LuauOpcode::from_u8(insn_op(prev_insn));
+                                if prev_op == LuauOpcode::LoadK {
+                                    // This instruction targeted our argument register.
+                                    // Try interpreting its D field as a constant index.
+                                    let kidx = prev_d as u16 as usize;
+                                    if let Some(Constant::String(s)) = proto.constants.get(kidx) {
+                                        if is_valid_luau_identifier(s) {
+                                            *arg = Expr::String(s.clone());
+                                            resolved = true;
+                                        }
                                     }
                                 }
                                 break;
