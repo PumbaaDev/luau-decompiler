@@ -411,20 +411,47 @@ fn main() -> Result<()> {
                 // so on any chunk a measured entry covers this printed a
                 // detector map the decompile never touched — the case where
                 // the listing is most likely to be believed.
+                //
+                // Every branch below mirrors one branch of
+                // `decompile_with_store`, in the same order, so the listing is
+                // always through the map that decode uses: the `--opmap-db`
+                // entry; on a miss with a store, detection with the pooled
+                // prior and no database; on a miss without one, what
+                // `luau_core::decompile` does (the BUNDLED database, then
+                // detection). Before, a custom-database miss went straight to
+                // detection here while the decompile found the bundled
+                // measured entry, so the listing showed a map it never used.
+                enable_v10plus_for(&data);
                 if let Some(entry) = resolve_db_entry(&db, &data)? {
                     luau_core::disassemble_with_plan(
                         &data,
                         &luau_core::DecodePlan { prior: None, exact: Some(&entry) },
                     )?
-                } else {
-                    let consulted = store.as_ref().map(|p| consult_store(p, &data));
-                    let prior = consulted.as_ref().and_then(|(m, _)| *m);
-                    let text = luau_core::disassemble_with_opmap(&data, prior.as_ref())?;
-                    if let (Some(p), Some((_, Some(b)))) = (store.as_ref(), consulted.as_ref()) {
-                        cast_ballot(p, b);
+                } else if let Some(p) = store.as_ref() {
+                    let (prior, ballot) = consult_store(p, &data);
+                    let text = luau_core::disassemble_with_plan(
+                        &data,
+                        &luau_core::DecodePlan { prior: prior.as_ref(), exact: None },
+                    )?;
+                    if let Some(b) = ballot {
+                        cast_ballot(p, &b);
                     }
                     text
+                } else {
+                    luau_core::disassemble_with_opmap(&data, None)?
                 }
+            } else if matches!(data.first(), Some(10..=14)) {
+                // The plain listing of a v10-v14 chunk goes through a measured
+                // map (its raw stream is shuffled), so it must be the entry
+                // the decompile would pick: `--opmap-db` first, then bundled.
+                let loaded = db.path.as_deref().map(opmap_db_cmd::load).transpose()?;
+                let opts = luau_core::DecompileOptions {
+                    opmap_db: loaded
+                        .as_ref()
+                        .map_or(luau_core::OpmapDbChoice::Bundled, luau_core::OpmapDbChoice::Custom),
+                    ..Default::default()
+                };
+                luau_core::disassemble_with_options(&data, debug_info, &opts)?
             } else {
                 luau_core::disassemble(&data, debug_info)?
             };
@@ -782,7 +809,14 @@ fn decompile_with_store(
         return luau_core::decompile(data);
     };
     let (prior, ballot) = consult_store(path, data);
-    let out = luau_core::decompile_with_opmap(data, prior.as_ref()).map(|(src, _)| src);
+    // Detection with the pooled prior and NO database: the database was
+    // consulted above. (`decompile_with_opmap(data, None)` now means
+    // `decompile`, which would consult the bundled database a second time.)
+    let out = luau_core::decompile_with_plan(
+        data,
+        &luau_core::DecodePlan { prior: prior.as_ref(), exact: None },
+    )
+    .map(|(src, _)| src);
     // Cast only after a successful decode, and only what this script itself
     // observed — never the prior it was handed.
     if out.is_ok() {

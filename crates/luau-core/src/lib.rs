@@ -633,9 +633,9 @@ pub fn check_source_size_bail(source_len: usize) -> Result<()> {
 /// ```
 ///
 /// A 31-point gap that every library consumer paid and nothing recorded. The
-/// file is ~3 KB, so compiling it in costs nothing and removes the filesystem
+/// file is ~8 KB, so compiling it in costs nothing and removes the filesystem
 /// dependency entirely - which is what makes it usable from WASM at all.
-fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
+pub fn bundled_opmap_db() -> Option<&'static parser::opmap_db::OpmapDb> {
     static DB: std::sync::OnceLock<Option<parser::opmap_db::OpmapDb>> =
         std::sync::OnceLock::new();
     DB.get_or_init(|| {
@@ -645,59 +645,311 @@ fn bundled_db() -> Option<&'static parser::opmap_db::OpmapDb> {
     .as_ref()
 }
 
-/// High-level API: decompile raw bytecode into Luau source
+/// Which measured-permutation database [`decompile_with_options`] consults.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum OpmapDbChoice<'a> {
+    /// The database compiled into this crate ([`bundled_opmap_db`]) - the same
+    /// JSON the CLI loads by default. What [`decompile`] uses.
+    #[default]
+    Bundled,
+    /// A caller-supplied database, consulted BEFORE the bundled one: the
+    /// library twin of the CLI's `--opmap-db`, which also falls back to the
+    /// bundled database when its own has no entry for a chunk.
+    Custom(&'a parser::opmap_db::OpmapDb),
+    /// No database: detector-only decoding, the pre-bundling behaviour.
+    Disabled,
+}
+
+/// The databases a call consults, in order: the caller's, then the bundled one.
+#[derive(Clone, Copy)]
+struct DbChain<'a> {
+    custom: Option<&'a parser::opmap_db::OpmapDb>,
+    bundled: Option<&'a parser::opmap_db::OpmapDb>,
+}
+
+impl<'a> OpmapDbChoice<'a> {
+    fn chain(self) -> DbChain<'a> {
+        match self {
+            OpmapDbChoice::Bundled => DbChain { custom: None, bundled: bundled_opmap_db() },
+            OpmapDbChoice::Custom(db) => DbChain { custom: Some(db), bundled: bundled_opmap_db() },
+            OpmapDbChoice::Disabled => DbChain { custom: None, bundled: None },
+        }
+    }
+}
+
+/// What the library does with a v10-v14 chunk. Live Roblox ships v12; the
+/// parser on its own rejects v10+ unless `LUAU_ALLOW_V10PLUS` is exported.
 ///
-/// Consults the bundled measured permutation first. `lookup` returns `Hit`
-/// only after checking the chunk against the entry's fingerprint, so bytecode
-/// from any other build falls through to detection byte-for-byte as before -
-/// this can only replace INFERENCE with MEASUREMENT, never override a chunk
-/// the entry does not fit.
+/// An exported `LUAU_ALLOW_V10PLUS` (any value, including empty) means the host
+/// configured v10+ itself, and then EVERY entry point behaves exactly as it did
+/// before this setting existed, whatever the mode. The CLI exports it for a
+/// v10-v14 input, so its output does not depend on this setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum V10PlusMode {
+    /// Decode a v10-v14 chunk as Roblox client bytecode ONLY when a measured
+    /// database entry verifies against it, and refuse it otherwise with an
+    /// error that names the reason. Without a measured map a v10+ chunk can
+    /// only be decoded by opcode detection, which yields plausible-but-wrong
+    /// code: stock `luau-compile` v12 (call feedback is on by default) decodes
+    /// to `local c = c .. c` under the Roblox policy.
+    ///
+    /// What "verifies" guarantees, precisely: the chunk passed the database's
+    /// own lookup checks for that entry (anchor agreement and a clean walk of
+    /// every instruction under the entry's map). It is NOT a proof that the
+    /// chunk came from the build the entry was measured on. A build whose
+    /// shuffle differs from a measured one by only a few rotated opcode bytes
+    /// can pass those checks and is then decoded with the measured map, wrong
+    /// on exactly the rotated opcodes. Measured on 532 live v12 scripts with
+    /// k used opcode bytes rotated among themselves: 55 were still accepted
+    /// (46 at k=2, 9 at k=4); all 771 full random re-shuffles were refused. The
+    /// CLI's `--opmap-db` shares this limit, since it is the same lookup. So
+    /// MeasuredOnly means "decoded only when the database's verification
+    /// passes", which excludes upstream `luau-compile` output and unrelated
+    /// builds, but not a near-copy of a measured shuffle.
+    #[default]
+    MeasuredOnly,
+    /// The CLI's behaviour: decode EVERY v10-v14 chunk as Roblox client
+    /// bytecode, falling back to opcode detection when no entry verifies.
+    DetectorFallback,
+    /// No policy: the parser's environment gate alone decides.
+    Off,
+}
+
+/// Knobs for [`decompile_with_options`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecompileOptions<'a> {
+    /// Measured-permutation database(s) to consult before detection.
+    pub opmap_db: OpmapDbChoice<'a>,
+    /// What to do with a v10-v14 chunk; see [`V10PlusMode`].
+    pub v10plus: V10PlusMode,
+}
+
+/// High-level API: decompile raw bytecode into Luau source.
+///
+/// For v3-v9, and for every v10-v14 chunk the bundled measured database
+/// covers, this is exactly `luau-decompiler decompile <file>`. The one
+/// intended difference: a v10-v14 chunk NO entry verifies for (upstream
+/// `luau-compile` output, or a Roblox client build the database does not know)
+/// is refused here where the CLI decodes it by detection. See
+/// [`decompile_with_options`] to opt into the CLI's behaviour or to supply a
+/// database.
 pub fn decompile(bytecode: &[u8]) -> Result<String> {
-    if let Some(db) = bundled_db() {
-        if let Ok(chunk) = parser::parse(bytecode) {
-            if let parser::opmap_db::DbLookup::Hit { ref entry_id, .. } = db.lookup(&chunk) {
-                if let Some(entry) = db.get(entry_id) {
-                    // A plan failure is not fatal: fall through to detection
-                    // rather than turn a decodable chunk into an error.
-                    if let Ok((source, _)) = decompile_with_plan(
-                        bytecode,
-                        &DecodePlan { prior: None, exact: Some(entry) },
-                    ) {
-                        return Ok(source);
-                    }
+    decompile_with_options(bytecode, &DecompileOptions::default())
+}
+
+/// [`decompile`] with an explicit database choice and v10+ mode.
+///
+/// The database's `lookup` returns `Hit` only after checking the chunk against
+/// the entry's fingerprint, so bytecode from any other build falls through to
+/// detection byte-for-byte as before - a database can only replace INFERENCE
+/// with MEASUREMENT, never override a chunk the entry does not fit.
+pub fn decompile_with_options(bytecode: &[u8], opts: &DecompileOptions<'_>) -> Result<String> {
+    decompile_routed(bytecode, opts).map(|(source, _)| source)
+}
+
+/// The Roblox client policy (accept the v10+ container, pass its shuffled
+/// opcodes through raw for the opmap) applies to this chunk only through the
+/// library's own gate: it is v10-v14 and the environment has not configured
+/// v10+ itself.
+fn v10plus_gated(bytecode: &[u8]) -> bool {
+    parser::v10plus::roblox_policy_for(bytecode).is_some()
+        && !parser::v10plus::environment_configures_v10plus()
+}
+
+fn with_roblox_policy<R>(f: impl FnOnce() -> R) -> R {
+    parser::v10plus::with_policy(parser::v10plus::V10PlusPolicy::ROBLOX_CLIENT, f)
+}
+
+fn hit_entry<'d>(
+    db: &'d parser::opmap_db::OpmapDb,
+    chunk: &parser::types::Chunk,
+) -> Result<&'d parser::opmap_db::DbEntry, String> {
+    let found = db.lookup(chunk);
+    match found {
+        parser::opmap_db::DbLookup::Hit { ref entry_id, .. } => {
+            db.get(entry_id).ok_or_else(|| found.describe())
+        }
+        other => Err(other.describe()),
+    }
+}
+
+/// The measured entry that verifies for a gated v10-v14 chunk read under the
+/// Roblox client policy (the caller's database first, then the bundled one),
+/// or the refusal saying why there is none.
+fn v10plus_measured_entry<'d>(
+    bytecode: &[u8],
+    dbs: DbChain<'d>,
+) -> Result<&'d parser::opmap_db::DbEntry> {
+    let chunk = with_roblox_policy(|| parser::parse(bytecode)).map_err(|e| {
+        v10plus_refusal(bytecode, &format!("it does not parse as Roblox client bytecode: {e:#}"))
+    })?;
+    let mut misses = Vec::new();
+    for (label, db) in [("caller's database", dbs.custom), ("bundled database", dbs.bundled)] {
+        if let Some(db) = db {
+            match hit_entry(db, &chunk) {
+                Ok(entry) => return Ok(entry),
+                Err(why) => misses.push(format!("{label}: {why}")),
+            }
+        }
+    }
+    let why = if misses.is_empty() {
+        "no opcode database is enabled".to_string()
+    } else {
+        format!("no measured opcode map verifies for it ({})", misses.join("; "))
+    };
+    Err(v10plus_refusal(bytecode, &why))
+}
+
+fn v10plus_refusal(bytecode: &[u8], why: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing Luau bytecode v{}: {why}. Without a measured map a v10+ chunk can only be \
+         decoded by opcode detection, which yields plausible-but-wrong code (stock luau-compile \
+         output built with call feedback, or a Roblox client build the database does not cover). \
+         To decode it anyway as Roblox client bytecode, as the luau-decompiler CLI does, use \
+         DecompileOptions {{ v10plus: V10PlusMode::DetectorFallback, .. }} (or export \
+         LUAU_ALLOW_V10PLUS=1 and LUAU_V10PLUS_RAW=1); to decode it exactly, supply that \
+         build's measured entry with OpmapDbChoice::Custom",
+        bytecode.first().copied().unwrap_or(0)
+    )
+}
+
+/// Does a caller-supplied entry verify for a gated chunk read under the Roblox
+/// client policy? Same checks as `--opmap-db-entry` (`lookup_by_id`).
+fn v10plus_entry_verifies(bytecode: &[u8], entry: &parser::opmap_db::DbEntry) -> bool {
+    let Ok(chunk) = with_roblox_policy(|| parser::parse(bytecode)) else {
+        return false;
+    };
+    let one = parser::opmap_db::OpmapDb { entries: vec![entry.clone()] };
+    one.lookup_by_id(&chunk, &entry.id).is_ok()
+}
+
+/// Which database in a [`DbChain`] supplied the entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbSource {
+    Custom,
+    Bundled,
+}
+
+/// The first entry in the chain that verifies for `bytecode` (parsed under
+/// whatever v10+ policy is in force): the caller's database, then the bundled
+/// one. `None` means the decode falls back to detection. Decompile and the
+/// `--opmap` listings both route through this, so a listing cannot show a map
+/// the decode did not pick.
+fn db_entry_for<'d>(
+    bytecode: &[u8],
+    dbs: DbChain<'d>,
+) -> Option<(&'d parser::opmap_db::DbEntry, DbSource)> {
+    let chunk = parser::parse(bytecode).ok()?;
+    if let Some(entry) = dbs.custom.and_then(|db| hit_entry(db, &chunk).ok()) {
+        return Some((entry, DbSource::Custom));
+    }
+    dbs.bundled
+        .and_then(|db| hit_entry(db, &chunk).ok())
+        .map(|entry| (entry, DbSource::Bundled))
+}
+
+/// The CLI's single-file decode (`decompile_with_store` with no store): the
+/// caller's database first, whose plan result is final as with `--opmap-db`;
+/// then the bundled one, whose plan failure falls through (as in the CLI's
+/// fallback through [`decompile`]); then detection.
+fn decompile_via_dbs(bytecode: &[u8], dbs: DbChain<'_>) -> Result<(String, Option<[u8; 256]>)> {
+    if let Some((entry, source)) = db_entry_for(bytecode, dbs) {
+        let plan = DecodePlan { prior: None, exact: Some(entry) };
+        match source {
+            DbSource::Custom => return decompile_with_plan_inner(bytecode, &plan),
+            // A plan failure is not fatal: fall through to detection rather
+            // than turn a decodable chunk into an error.
+            DbSource::Bundled => {
+                if let Ok(out) = decompile_with_plan_inner(bytecode, &plan) {
+                    return Ok(out);
                 }
             }
         }
     }
-    decompile_with_opmap(bytecode, None).map(|(source, _)| source)
+    decompile_with_plan_inner(bytecode, &DecodePlan::default())
+}
+
+/// The `--opmap` listing twin of [`decompile_via_dbs`]: through the entry the
+/// decode would use, else through the detector map it falls back to.
+///
+/// The one decode this cannot mirror without running it: a BUNDLED entry that
+/// verifies but whose decode then fails (a lifter error, or output over the
+/// size ceiling) makes the decompile retry by detection, while this lists the
+/// entry. The listing is still the map the decode tried first.
+fn disassemble_via_dbs(bytecode: &[u8], dbs: DbChain<'_>) -> Result<String> {
+    match db_entry_for(bytecode, dbs) {
+        Some((entry, _)) => disassemble_exact(bytecode, entry, true),
+        None => disassemble_with_opmap_inner(bytecode, None),
+    }
+}
+
+fn decompile_routed(
+    bytecode: &[u8],
+    opts: &DecompileOptions<'_>,
+) -> Result<(String, Option<[u8; 256]>)> {
+    let dbs = opts.opmap_db.chain();
+    if !v10plus_gated(bytecode) {
+        return decompile_via_dbs(bytecode, dbs);
+    }
+    match opts.v10plus {
+        V10PlusMode::Off => decompile_via_dbs(bytecode, dbs),
+        V10PlusMode::DetectorFallback => with_roblox_policy(|| decompile_via_dbs(bytecode, dbs)),
+        V10PlusMode::MeasuredOnly => {
+            let entry = v10plus_measured_entry(bytecode, dbs)?;
+            with_roblox_policy(|| {
+                decompile_with_plan_inner(bytecode, &DecodePlan { prior: None, exact: Some(entry) })
+            })
+        }
+    }
 }
 
 /// Decompile with optional cached opcode map. Returns (source, detected_opmap).
-/// If `cached_opmap` is provided and the bytecode uses shuffled opcodes, the cached
-/// map is tried first. If it produces fewer unknowns than fresh detection, it's used.
-/// The returned opmap is the HEURISTIC-only map (safe to cache, no speculative
-/// completion). The decompilation itself uses the full merged+completed map.
+///
+/// With `cached_opmap == None` this is [`decompile`] (bundled database, then
+/// detection; v10-v14 as described there), returning the detector's cacheable
+/// map when detection ran. With a prior, a v3-v9 chunk is detected with the
+/// prior folded in; the returned opmap is the HEURISTIC-only map (safe to
+/// cache, no speculative completion), while the decompilation itself uses the
+/// full merged+completed map. A v10-v14 chunk ignores the prior unless the
+/// environment configures v10+: it decodes only from a measured entry.
 pub fn decompile_with_opmap(
     bytecode: &[u8],
     cached_opmap: Option<&[u8; 256]>,
 ) -> Result<(String, Option<[u8; 256]>)> {
-    decompile_with_plan(
-        bytecode,
-        &DecodePlan {
-            prior: cached_opmap,
-            exact: None,
-        },
-    )
+    match cached_opmap {
+        Some(prior) if !v10plus_gated(bytecode) => decompile_with_plan_inner(
+            bytecode,
+            &DecodePlan { prior: Some(prior), exact: None },
+        ),
+        _ => decompile_routed(bytecode, &DecompileOptions::default()),
+    }
 }
 
 /// Decompile under an explicit [`DecodePlan`].
 ///
-/// With `plan.exact == None` this is byte-for-byte the behaviour
-/// [`decompile_with_opmap`] has always had. With an exact entry it takes a
-/// different path entirely: the entry's map is used verbatim, with no detection
-/// and no bijection completion, because completing a measured map would be
-/// filling in facts with guesses.
+/// With `plan.exact == None` this is byte-for-byte the detector path with the
+/// given prior (no database). With an exact entry it takes a different path
+/// entirely: the entry's map is used verbatim, with no detection and no
+/// bijection completion, because completing a measured map would be filling in
+/// facts with guesses.
+///
+/// A v10-v14 chunk is read as Roblox client bytecode when the supplied entry
+/// verifies against it (the `--opmap-db-entry` checks); otherwise the parser's
+/// environment gate decides, as before.
 pub fn decompile_with_plan(
+    bytecode: &[u8],
+    plan: &DecodePlan<'_>,
+) -> Result<(String, Option<[u8; 256]>)> {
+    if let Some(entry) = plan.exact {
+        if v10plus_gated(bytecode) && v10plus_entry_verifies(bytecode, entry) {
+            return with_roblox_policy(|| decompile_with_plan_inner(bytecode, plan));
+        }
+    }
+    decompile_with_plan_inner(bytecode, plan)
+}
+
+/// [`decompile_with_plan`] without the v10+ gate.
+fn decompile_with_plan_inner(
     bytecode: &[u8],
     plan: &DecodePlan<'_>,
 ) -> Result<(String, Option<[u8; 256]>)> {
@@ -1172,16 +1424,102 @@ pub fn bytecode_version(bytecode: &[u8]) -> Option<u8> {
     bytecode.first().copied().filter(|&v| v >= 3 && v <= 8)
 }
 
-/// High-level API: disassemble raw bytecode into readable text
+/// High-level API: disassemble raw bytecode into readable text.
+///
+/// v3-v9 prints the raw instruction stream. A v10-v14 chunk (with no v10+
+/// configuration in the environment) is printed through the bundled database's
+/// measured map, as `disassemble --opmap --opmap-db` does, because its raw
+/// stream is Roblox-shuffled: read without the map the AUX-carrying opcodes are
+/// misassigned and the listing eats AUX words as instructions. A v10-v14 chunk
+/// no entry verifies for is refused (see [`V10PlusMode::MeasuredOnly`]).
+/// [`disassemble_with_options`] takes a caller's database.
 pub fn disassemble(bytecode: &[u8], show_debug: bool) -> Result<String> {
-    let chunk = parser::parse(bytecode)?;
-    Ok(disasm::disassemble(&chunk, show_debug))
+    disassemble_with_options(bytecode, show_debug, &DecompileOptions::default())
 }
 
-/// Disassemble with opmap applied — applies the same shuffle detection/remap
-/// as decompile_with_opmap, then disassembles the remapped chunk. This is the
-/// diagnostic view of what the lifter actually processes.
+/// [`disassemble`] with an explicit database choice and v10+ mode.
+///
+/// A v3-v9 chunk (or any chunk when the environment configures v10+) is the
+/// raw instruction stream, whatever the options: this listing applies no map.
+/// A gated v10-v14 chunk is listed through the measured entry that
+/// [`decompile_with_options`] would decode it with (the caller's database
+/// first, then the bundled one). With no such entry it is refused under
+/// [`V10PlusMode::MeasuredOnly`], listed raw under the Roblox client policy
+/// with [`V10PlusMode::DetectorFallback`], and left to the parser's
+/// environment gate with [`V10PlusMode::Off`].
+pub fn disassemble_with_options(
+    bytecode: &[u8],
+    show_debug: bool,
+    opts: &DecompileOptions<'_>,
+) -> Result<String> {
+    let raw = || -> Result<String> {
+        let chunk = parser::parse(bytecode)?;
+        Ok(disasm::disassemble(&chunk, show_debug))
+    };
+    if !v10plus_gated(bytecode) {
+        return raw();
+    }
+    let dbs = opts.opmap_db.chain();
+    match opts.v10plus {
+        V10PlusMode::Off => raw(),
+        V10PlusMode::DetectorFallback => with_roblox_policy(|| match db_entry_for(bytecode, dbs) {
+            Some((entry, _)) => disassemble_exact(bytecode, entry, show_debug),
+            None => raw(),
+        }),
+        V10PlusMode::MeasuredOnly => {
+            let entry = v10plus_measured_entry(bytecode, dbs)?;
+            with_roblox_policy(|| disassemble_exact(bytecode, entry, show_debug))
+        }
+    }
+}
+
+/// Disassemble with opmap applied: the diagnostic view of what the lifter
+/// actually processes, listed through the map [`decompile_with_opmap`] uses
+/// for the same arguments.
+///
+/// With `cached_opmap == None` that is [`disassemble_with_opmap_options`] with
+/// the default options: through the measured entry the bundled database
+/// verifies for the chunk (v3-v9 included, e.g. `roblox_v9_live`), else
+/// through the detector map; a gated v10-v14 chunk no entry verifies for is
+/// refused, as [`decompile`] refuses it. With a prior, a v3-v9 chunk is
+/// detected with the prior folded in and no database, as
+/// [`decompile_with_opmap`] does; a gated v10-v14 chunk ignores the prior, as
+/// it does there too.
 pub fn disassemble_with_opmap(
+    bytecode: &[u8],
+    cached_opmap: Option<&[u8; 256]>,
+) -> Result<String> {
+    match cached_opmap {
+        Some(prior) if !v10plus_gated(bytecode) => {
+            disassemble_with_opmap_inner(bytecode, Some(prior))
+        }
+        _ => disassemble_with_opmap_options(bytecode, &DecompileOptions::default()),
+    }
+}
+
+/// The `--opmap` listing of `bytecode` through exactly the map
+/// [`decompile_with_options`] decodes it with under `opts`: the caller's
+/// database, then the bundled one, then detection, with the same v10+ gate.
+/// Where that decompile refuses the chunk, so does this.
+pub fn disassemble_with_opmap_options(
+    bytecode: &[u8],
+    opts: &DecompileOptions<'_>,
+) -> Result<String> {
+    let dbs = opts.opmap_db.chain();
+    if !v10plus_gated(bytecode) {
+        return disassemble_via_dbs(bytecode, dbs);
+    }
+    match opts.v10plus {
+        V10PlusMode::Off => disassemble_via_dbs(bytecode, dbs),
+        V10PlusMode::DetectorFallback => with_roblox_policy(|| disassemble_via_dbs(bytecode, dbs)),
+        V10PlusMode::MeasuredOnly => {
+            let entry = v10plus_measured_entry(bytecode, dbs)?;
+            with_roblox_policy(|| disassemble_exact(bytecode, entry, true))
+        }
+    }
+}
+
+fn disassemble_with_opmap_inner(
     bytecode: &[u8],
     cached_opmap: Option<&[u8; 256]>,
 ) -> Result<String> {
@@ -1254,14 +1592,34 @@ pub fn disassemble_with_opmap(
 /// exists -- the case where the disassembly is most likely to be trusted. It
 /// cost several investigations real time, one of which concluded a chunk was
 /// mis-decoded from a listing produced by a map the decompiler had not used.
+///
+/// With `plan.exact == None` this is the detector listing with the given prior
+/// and no database, the twin of [`decompile_with_plan`] (which consults no
+/// database either). A v10-v14 chunk is read as Roblox client bytecode when
+/// the supplied entry verifies against it, exactly as in
+/// [`decompile_with_plan`].
 pub fn disassemble_with_plan(bytecode: &[u8], plan: &DecodePlan<'_>) -> Result<String> {
     let Some(entry) = plan.exact else {
-        return disassemble_with_opmap(bytecode, plan.prior);
+        return disassemble_with_opmap_inner(bytecode, plan.prior);
     };
-    let mut chunk = parser::parse(bytecode)?;
-    if !parser::opmap::OpcodeMap::needs_remapping(&chunk) {
-        return disassemble_with_opmap(bytecode, plan.prior);
+    if v10plus_gated(bytecode) && v10plus_entry_verifies(bytecode, entry) {
+        return with_roblox_policy(|| disassemble_exact(bytecode, entry, true));
     }
+    disassemble_exact(bytecode, entry, true)
+}
+
+/// The listing of `bytecode` through a measured entry's map.
+///
+/// Applied whether or not the chunk looks shuffled, exactly as
+/// `decompile_with_plan_inner` applies an exact entry (it has no
+/// `needs_remapping` filter either): the listing must show the map the decode
+/// used.
+fn disassemble_exact(
+    bytecode: &[u8],
+    entry: &parser::opmap_db::DbEntry,
+    show_debug: bool,
+) -> Result<String> {
+    let mut chunk = parser::parse(bytecode)?;
 
     // Same ground-truth installation the decompile path performs, so anything
     // consulting the global sees the measured answer.
@@ -1290,12 +1648,21 @@ pub fn disassemble_with_plan(bytecode: &[u8], plan: &DecodePlan<'_>) -> Result<S
     header.push('\n');
 
     let (_unknowns, _, _) = exact.remap_chunk(&mut chunk);
-    Ok(format!("{}{}", header, disasm::disassemble(&chunk, true)))
+    Ok(format!("{}{}", header, disasm::disassemble(&chunk, show_debug)))
 }
 
-/// High-level API: parse and return structured info about the bytecode
+/// High-level API: parse and return structured info about the bytecode.
+///
+/// A v10-v14 chunk (with no v10+ configuration in the environment) is read as
+/// Roblox client bytecode when the bundled database verifies it, and refused
+/// otherwise, as in [`decompile`].
 pub fn info(bytecode: &[u8]) -> Result<BytecodeInfo> {
-    let chunk = parser::parse(bytecode)?;
+    let chunk = if v10plus_gated(bytecode) {
+        v10plus_measured_entry(bytecode, OpmapDbChoice::Bundled.chain())?;
+        with_roblox_policy(|| parser::parse(bytecode))?
+    } else {
+        parser::parse(bytecode)?
+    };
     Ok(BytecodeInfo {
         version: chunk.version,
         types_version: chunk.types_version,
@@ -1350,6 +1717,26 @@ pub struct ProtoInfo {
     pub line_defined: u32,
     pub has_debug_info: bool,
     pub has_line_info: bool,
+}
+
+#[cfg(test)]
+mod db_choice_tests {
+    use super::*;
+
+    /// `Custom` mirrors the CLI's `--opmap-db`: the caller's database first,
+    /// then the bundled one (the CLI reaches it through `decompile` on a miss).
+    #[test]
+    fn custom_database_falls_back_to_the_bundled_one() {
+        let custom = parser::opmap_db::OpmapDb::default();
+        let bundled = bundled_opmap_db().expect("bundled database parses");
+        let chain = OpmapDbChoice::Custom(&custom).chain();
+        assert!(chain.custom.is_some_and(|c| std::ptr::eq(c, &custom)));
+        assert!(chain.bundled.is_some_and(|b| std::ptr::eq(b, bundled)));
+        let chain = OpmapDbChoice::Bundled.chain();
+        assert!(chain.custom.is_none() && chain.bundled.is_some_and(|b| std::ptr::eq(b, bundled)));
+        let chain = OpmapDbChoice::Disabled.chain();
+        assert!(chain.custom.is_none() && chain.bundled.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1692,5 +2079,89 @@ mod db_decode_tests {
         assert!(out.contains("return #"), "canonical `#` regressed:\n{}", out);
         assert!(out.contains("return not "), "canonical `not` regressed:\n{}", out);
         assert!(out.contains("return -"), "canonical unary `-` regressed:\n{}", out);
+    }
+}
+
+/// The `--opmap` listings must go through the map the matching decompile uses.
+#[cfg(test)]
+mod listing_route_tests {
+    use crate::parser::opmap_db::{DbEntry, OpmapDb, Provenance, UnarySemantics};
+    use crate::parser::test_fixtures as fx;
+    use crate::{DecompileOptions, OpmapDbChoice};
+
+    fn entry(id: &str, perm: fn(u8) -> u8) -> DbEntry {
+        DbEntry {
+            id: id.to_string(),
+            bytecode_version: 6,
+            build_label: None,
+            provenance: Provenance {
+                method: "probe-align".to_string(),
+                producer: Some("test".to_string()),
+                probe_set_version: Some(1),
+                probe_programs: Some(19),
+                notes: None,
+            },
+            semantics: UnarySemantics::default(),
+            map: fx::exact_map(perm),
+        }
+    }
+
+    const DECODED_FROM_A: &str = "opmap source: database entry \"build_a\"";
+    const LISTED_FROM_A: &str = "measured map \"build_a\"";
+
+    #[test]
+    fn a_custom_database_hit_is_listed_through_the_entry_the_decode_used() {
+        let _lock = fx::ground_truth_lock();
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let db = OpmapDb { entries: vec![entry("build_a", fx::perm_a)] };
+        let opts = DecompileOptions { opmap_db: OpmapDbChoice::Custom(&db), ..Default::default() };
+        let src = crate::decompile_with_options(&shuffled, &opts).expect("decodes");
+        assert!(src.contains(DECODED_FROM_A), "decode did not use the entry:\n{src}");
+        let listing = crate::disassemble_with_opmap_options(&shuffled, &opts).expect("lists");
+        assert!(listing.contains(LISTED_FROM_A), "listing did not use the entry");
+    }
+
+    #[test]
+    fn a_database_miss_is_listed_through_detection_like_the_decode() {
+        let _lock = fx::ground_truth_lock();
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        // An entry for a different build: the lookup misses, the bundled
+        // database does not know this synthetic build either, so both the
+        // decode and the listing fall back to detection.
+        let db = OpmapDb { entries: vec![entry("build_b", fx::perm_b)] };
+        let opts = DecompileOptions { opmap_db: OpmapDbChoice::Custom(&db), ..Default::default() };
+        let src = crate::decompile_with_options(&shuffled, &opts).expect("decodes");
+        assert!(!src.contains("opmap source: database entry"));
+        let listing = crate::disassemble_with_opmap_options(&shuffled, &opts).expect("lists");
+        assert!(!listing.contains("measured map"));
+        assert!(listing.contains("remapped ("), "expected the detector listing");
+        assert_eq!(listing, crate::disassemble_with_plan(&shuffled, &crate::DecodePlan::default()).unwrap());
+    }
+
+    #[test]
+    fn disassemble_with_opmap_none_is_the_default_options_listing() {
+        let _lock = fx::ground_truth_lock();
+        for bytes in [fx::P03_UNARY, fx::M04_MIRROR_FLOW, fx::M02_MIRROR_BRANCH] {
+            let shuffled = fx::permuted_bytes(bytes, fx::perm_a);
+            for b in [bytes.to_vec(), shuffled] {
+                assert_eq!(
+                    crate::disassemble_with_opmap(&b, None).unwrap(),
+                    crate::disassemble_with_opmap_options(&b, &DecompileOptions::default()).unwrap()
+                );
+            }
+        }
+    }
+
+    /// `disassemble_with_plan` with no entry is the prior-only detector listing,
+    /// the twin of `decompile_with_plan` with no entry: no database at all.
+    #[test]
+    fn a_plan_without_an_entry_consults_no_database() {
+        let _lock = fx::ground_truth_lock();
+        let shuffled = fx::permuted_bytes(fx::M04_MIRROR_FLOW, fx::perm_a);
+        let plan = crate::DecodePlan::default();
+        assert_eq!(
+            crate::disassemble_with_plan(&shuffled, &plan).unwrap(),
+            crate::disassemble_with_opmap_inner(&shuffled, None).unwrap()
+        );
     }
 }
