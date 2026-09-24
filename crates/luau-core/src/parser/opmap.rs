@@ -2010,9 +2010,33 @@ fn detect_closure_capture(chunk: &Chunk, ctx: &mut DetectCtx) {
 }
 
 fn detect_dupclosure(chunk: &Chunk, ctx: &mut DetectCtx) {
+    // A byte that TERMINATES a proto cannot be DUPCLOSURE. The compiler ends
+    // every proto with RETURN (the premise `detect_return` rests on), and a
+    // DUPCLOSURE defines a register, so it is never the final word.
+    //
+    // Without this exclusion RETURN itself passes the test below: `RETURN 0 1`
+    // is ABC(0, 1, 0), whose D field reads as 1, so in any proto whose K[1]
+    // happens to be a Constant::Closure every RETURN "points at a closure".
+    // Two such hits reach the override bar, and `try_assign_override` evicts
+    // the RETURN that `detect_return` pinned from 12/12 proto tails.
+    //
+    // Measured on PetSim99 ProximityPrettifier (v12): 0x82 (RETURN) was
+    // re-assigned to DUPCLOSURE, frequency ranking then handed RETURN to 0x2B
+    // (the true JUMPIF), and the fingerprint's Tier-A RETURN reading
+    // contradicted the measured v12 entry. The DB refused the entry that walks
+    // the chunk cleanly and the file was decoded by detector guesswork.
+    let mut terminators: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for proto in &chunk.protos {
+        if let Some(&last) = proto.code.last() {
+            terminators.insert(insn_op(last));
+        }
+    }
     let mut candidates: HashMap<u8, usize> = HashMap::new();
     for proto in &chunk.protos {
         for &insn in &proto.code {
+            if terminators.contains(&insn_op(insn)) {
+                continue;
+            }
             let d = insn_d(insn);
             if d >= 0 {
                 if let Some(Constant::Closure(_)) = proto.constants.get(d as usize) {
@@ -15341,6 +15365,63 @@ mod tests {
             ctx.map[ret_byte as usize],
             LuauOpcode::Return as u8,
             "detect_return must pick byte that terminates all protos"
+        );
+    }
+
+    #[test]
+    fn detect_dupclosure_never_evicts_a_proto_terminator() {
+        // `RETURN 0 1` is ABC(0, 1, 0), so its D field reads as 1. In protos
+        // whose K[1] is a Constant::Closure, every RETURN "points at a closure"
+        // and used to out-vote the real DUPCLOSURE, evicting RETURN via
+        // try_assign_override (PetSim99 ProximityPrettifier, v12: 0x82 lost to
+        // DUPCLOSURE, the DB then refused the measured entry on a Tier-A
+        // RETURN conflict). A byte that terminates a proto is never DUPCLOSURE.
+        let ret_byte: u8 = 0x82;
+        let dup_byte: u8 = 0xE0;
+        let closure_k = vec![Constant::Nil, Constant::Closure(0)];
+        let mut chunk = chunk_from_code(
+            vec![
+                insn_ad(dup_byte, 0, 1),        // real DUPCLOSURE R0 K1
+                insn_abc(ret_byte, 0, 1, 0),    // early `return`
+                insn_abc(0xAA, 0, 0, 0),
+                insn_abc(ret_byte, 0, 1, 0),    // terminator
+            ],
+            4,
+        );
+        chunk.protos[0].constants = closure_k.clone();
+        for _ in 0..2 {
+            chunk.protos.push(Proto {
+                max_stack_size: 4,
+                num_params: 0,
+                num_upvalues: 0,
+                is_vararg: false,
+                flags: 0,
+                typeinfo: None,
+                code: vec![insn_abc(0xBB, 0, 0, 0), insn_abc(ret_byte, 0, 1, 0)],
+                constants: closure_k.clone(),
+                child_protos: Vec::new(),
+                line_defined: 0,
+                debug_name: None,
+                line_info: None,
+                debug_info: None,
+            });
+        }
+
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_return(&chunk, &mut ctx);
+        assert_eq!(ctx.map[ret_byte as usize], LuauOpcode::Return as u8);
+        detect_dupclosure(&chunk, &mut ctx);
+
+        assert_eq!(
+            ctx.map[ret_byte as usize],
+            LuauOpcode::Return as u8,
+            "DUPCLOSURE must not evict the byte that terminates every proto"
+        );
+        assert_eq!(
+            ctx.map[dup_byte as usize],
+            LuauOpcode::DupClosure as u8,
+            "the real DUPCLOSURE byte is still found"
         );
     }
 
