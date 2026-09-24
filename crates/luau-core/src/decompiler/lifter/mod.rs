@@ -9534,21 +9534,63 @@ pub(crate) fn mk_concat(left: Expr, right: Expr) -> Expr {
     }
 }
 
+thread_local! {
+    /// True while the chunk being lifted was decoded through the opcode
+    /// DETECTORS (a shuffled chunk with no measured database entry). False for
+    /// an exact decode: a measured `--opmap-db` entry, canonical upstream Luau,
+    /// or an unshuffled chunk. Set by `decompile_with_plan` via
+    /// [`InferredDecodeGuard`]; defaults to false (exact) so a direct lift
+    /// never guesses.
+    static INFERRED_OPMAP_DECODE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// RAII guard: marks the current thread's decode as detector-inferred (or
+/// not) and restores the previous value on drop.
+pub(crate) struct InferredDecodeGuard(bool);
+
+impl InferredDecodeGuard {
+    pub(crate) fn install(inferred: bool) -> Self {
+        InferredDecodeGuard(INFERRED_OPMAP_DECODE.with(|c| c.replace(inferred)))
+    }
+}
+
+impl Drop for InferredDecodeGuard {
+    fn drop(&mut self) {
+        INFERRED_OPMAP_DECODE.with(|c| c.set(self.0));
+    }
+}
+
+fn is_inferred_opmap_decode() -> bool {
+    INFERRED_OPMAP_DECODE.with(|c| c.get())
+}
+
 /// Phase B0.127: convert `Expr::String(s)` to `Expr::Name(s)` when `s` is a
-/// known stdlib / Roblox global name (per `is_stdlib_shadow_name`).
+/// known stdlib / Roblox global name (per `is_stdlib_shadow_name`) — but ONLY
+/// on a detector-inferred decode.
 ///
-/// In Luau bytecode, global names like `math`, `game`, `workspace`, `task`,
-/// etc. are always accessed via GETIMPORT, which produces `Expr::Name(s)`.
-/// The Luau compiler never emits LOADK to load these names as string literals.
-/// When an `Expr::String("math")` appears as an *assignment value* (right-hand
-/// side of SETTABLEKS, SETTABLEN, SETTABLE, SETGLOBAL, SETUPVAL), it is
-/// virtually always NAMECALL/AUX leakage or a misidentified opcode reading
-/// the constant table at the wrong index.
+/// The rule's original premise was that "the Luau compiler never emits LOADK
+/// to load these names as string literals", so an `Expr::String("math")` in an
+/// assignment value must be NAMECALL/AUX leakage or a misidentified opcode
+/// reading the constant table at the wrong index. That holds only when the
+/// opcode map itself is a guess. The premise is FALSE for real source: a
+/// string whose text happens to equal a global name is an ordinary LOADK, e.g.
+/// `return "error", msg, true` (a status tag) or `x = y or "error"`. On the
+/// measured v12 map (23 Sep 2026) the rule rewrote exactly those into the
+/// global function: `return error, "Red", true` where the bytecode is
+/// `LOADK R8 K34 ; "error"` + `RETURN R8..R10` (oracle 1b8591b7, Potassium
+/// agrees: `return "error", v35, v36`), and `Text6 = Text6 or error` for
+/// `... or "error"` (oracle 2b4fdb6e). A LOADK of a string is a string, so on
+/// an exact decode (measured DB entry, canonical Luau, unshuffled chunk) the
+/// value is returned untouched. The detector path keeps the old salvage,
+/// since there a string in this position genuinely can be a misread import.
 ///
 /// Applying this guard in call-argument positions would be wrong: `print("game")`
 /// is legitimate Luau. So this function is called ONLY in assignment-value
 /// contexts by the per-opcode handlers.
 pub(super) fn sanitize_leaked_global_string(val: Expr) -> Expr {
+    if !is_inferred_opmap_decode() {
+        return val;
+    }
     if let Expr::String(ref s) = val {
         if is_stdlib_shadow_name(s) {
             return Expr::Name(s.clone());

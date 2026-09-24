@@ -110,3 +110,5 @@ mod dropped_table_key_constant_tests;
 mod vararg_unpack_width_tests;
 #[cfg(test)]
 mod generic_for_short_circuit_generator_tests;
+#[cfg(test)]
+mod leaked_global_string_tests;
