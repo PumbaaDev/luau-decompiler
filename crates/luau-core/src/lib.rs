@@ -948,6 +948,14 @@ pub fn decompile_with_plan(
     decompile_with_plan_inner(bytecode, plan)
 }
 
+/// Environment switch that lets a caller take the output of a v10+ detector
+/// decode the library would otherwise refuse as untrustworthy.
+const ALLOW_UNTRUSTED_ENV: &str = "LUAU_ALLOW_UNTRUSTED_DECODE";
+
+fn allow_untrusted_decode() -> bool {
+    std::env::var_os(ALLOW_UNTRUSTED_ENV).is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 /// [`decompile_with_plan`] without the v10+ gate.
 fn decompile_with_plan_inner(
     bytecode: &[u8],
@@ -1142,6 +1150,25 @@ fn decompile_with_plan_inner(
         None
     };
 
+    // A v10+ chunk decoded by detectors alone (no measured entry) is the one case
+    // where a wrong map is routine: AUX-bearing streams desynchronise as soon as
+    // one AUX-carrying opcode is mis-assigned. Refuse rather than emit plausible
+    // but wrong code when the map left any byte this chunk uses unmapped.
+    let v10plus_inferred = plan.exact.is_none() && bytecode.first().is_some_and(|&v| v >= 10);
+    if v10plus_inferred {
+        if let Some((_, _, unresolved, _, _, cov)) = opmap_info.as_ref() {
+            if (*unresolved > 0 || cov.present_unmapped > 0) && !allow_untrusted_decode() {
+                anyhow::bail!(
+                    "refusing Luau bytecode v{}: no measured opcode map applies and the detectors \
+                     left {} opcode bytes this chunk uses unmapped ({} unresolved instructions), so \
+                     the decode would be wrong. Add a measured entry with `probe`, or set \
+                     {}=1 to emit the untrusted output anyway.",
+                    bytecode[0], cov.present_unmapped, unresolved, ALLOW_UNTRUSTED_ENV,
+                );
+            }
+        }
+    }
+
     let main_idx = chunk.main_proto as usize;
     if main_idx >= chunk.protos.len() {
         anyhow::bail!("invalid main_proto index {} (only {} protos)", main_idx, chunk.protos.len());
@@ -1287,6 +1314,16 @@ fn decompile_with_plan_inner(
                     entry.semantics.length.as_str(),
                 ));
             }
+        } else if let Some(cov) = opmap_coverage.filter(|_| v10plus_inferred) {
+            // v10+ inferred decode: provenance only. No percentage, because a
+            // share of "pinned" words was read as confidence while the map
+            // mis-assigned core opcodes (r=+0.26 against ground truth).
+            header.push_str(&format!(
+                "-- UNTRUSTED DECODE: v10+ opcode map inferred by detectors, not measured; \
+                 output may be wrong with no error. {}/{} used opcode bytes detector-assigned \
+                 (provenance, NOT correctness), {} invented by bijection completion, {} unmapped\n",
+                cov.present_confident, cov.present_bytes, cov.present_invented, cov.present_unmapped,
+            ));
         } else if let Some(cov) = opmap_coverage {
             header.push_str(&format!(
                 "-- opmap evidence: {}/{} opcode bytes used by this chunk were pinned by \

@@ -2981,6 +2981,21 @@ pub(super) fn lift_instruction_range(
                         })
                 };
 
+                // A populated `child_protos` (v10+ containers) is the authority on
+                // what this proto can instantiate. When D is outside it (NEWCLOSURE)
+                // or does not name a closure constant (DUPCLOSURE), the word is not
+                // a closure instruction - an opmap misreading - and the Roblox-era
+                // fallbacks above would lift an arbitrary proto in its place.
+                let proto_idx = if proto.child_protos.is_empty() {
+                    proto_idx
+                } else if op == LuauOpcode::NewClosure {
+                    proto_idx.filter(|_| d_unsigned < proto.child_protos.len())
+                } else {
+                    proto_idx.filter(|_| {
+                        matches!(proto.constants.get(d_unsigned), Some(Constant::Closure(_)))
+                    })
+                };
+
                 // Recursion guard: prevent decompiling a proto that's already on our stack
                 let child_idx_usize = proto_idx.map(|idx| idx as usize);
                 let is_recursive = child_idx_usize.map_or(false, |idx| ctx.proto_stack.contains(&idx));

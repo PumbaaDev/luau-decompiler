@@ -508,7 +508,13 @@ impl OpmapDb {
             // This only admits the entry as a CANDIDATE. Tier-A anchor
             // conflicts, the anchor-agreement floor and `walk_verify` all still
             // run below and reject a map that does not fit.
+            //
+            // The anchor tally runs BEFORE this skip so the "best anchor
+            // agreement" in the no-candidates message describes the real
+            // closest entry instead of reading 0 for every older-version one.
+            let (agree, _conflict) = fp.anchor_agreements(&e.map);
             if e.bytecode_version < chunk.version {
+                best_anchor_agree = best_anchor_agree.max(agree);
                 continue;
             }
             if fp.tier_a_conflicts(&e.map) > 0 {
@@ -520,7 +526,6 @@ impl OpmapDb {
             // reliable. Rejecting on those would reject the right answer.
             // Agreement is what carries information: two unrelated builds
             // colliding on one costs about 1 in 256.
-            let (agree, _conflict) = fp.anchor_agreements(&e.map);
             best_anchor_agree = best_anchor_agree.max(agree);
             if agree < DB_MIN_ANCHOR_AGREE {
                 continue;

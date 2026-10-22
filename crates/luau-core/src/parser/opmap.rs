@@ -1897,35 +1897,60 @@ fn detect_closure_capture(chunk: &Chunk, ctx: &mut DetectCtx) {
 
     for proto in &chunk.protos {
         if proto.child_protos.is_empty() { continue; }
-        for i in 0..proto.code.len() {
+        // Luau instantiates a proto's children in order, so closure instructions
+        // carry strictly increasing D (DUPCLOSURE children can leave gaps).
+        // Requiring D to be past the last claimed child, and stepping over the
+        // CAPTURE run each closure owns, stops a run of CAPTURE words
+        // ABC(type, id, 0) from voting as closures: each reads as `D = id`,
+        // which is in range of a populated `child_protos`.
+        let mut next_child = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
             let insn = proto.code[i];
             let op = insn_op(insn);
             let d = insn_d(insn) as i32;
-            if d >= 0 && (d as usize) < proto.child_protos.len() {
-                let expected_captures = chunk.protos
-                    .get(proto.child_protos[d as usize] as usize)
-                    .map(|p| p.num_upvalues as usize)
-                    .unwrap_or(0);
-                if expected_captures > 0 && i + expected_captures < proto.code.len() {
-                    let mut ok = true;
-                    let mut cap_op = None;
-                    for j in 1..=expected_captures {
-                        let ci = proto.code[i + j];
-                        let ca = insn_a(ci);
-                        let co = insn_op(ci);
-                        if ca > 2 { ok = false; break; }
-                        match cap_op {
-                            Some(prev) if prev != co => { ok = false; break; }
-                            None => cap_op = Some(co),
-                            _ => {}
-                        }
-                    }
-                    if ok {
-                        if let Some(cap) = cap_op {
-                            *closure_candidates.entry(op).or_insert(0) += 1;
-                            *capture_candidates.entry(cap).or_insert(0) += 1;
-                        }
-                    }
+            i += 1;
+            if d < 0 {
+                continue;
+            }
+            let d = d as usize;
+            if d < next_child || d >= proto.child_protos.len() {
+                continue;
+            }
+            let expected_captures = chunk.protos
+                .get(proto.child_protos[d] as usize)
+                .map(|p| p.num_upvalues as usize)
+                .unwrap_or(0);
+            let at = i - 1;
+            if expected_captures == 0 || at + expected_captures >= proto.code.len() {
+                continue;
+            }
+            let mut ok = true;
+            let mut cap_op = None;
+            for j in 1..=expected_captures {
+                let ci = proto.code[at + j];
+                // Identical capture words would capture the same slot twice.
+                if j > 1 && ci == proto.code[at + j - 1] {
+                    ok = false;
+                    break;
+                }
+                let co = insn_op(ci);
+                if insn_a(ci) > 2 || insn_c(ci) != 0 {
+                    ok = false;
+                    break;
+                }
+                match cap_op {
+                    Some(prev) if prev != co => { ok = false; break; }
+                    None => cap_op = Some(co),
+                    _ => {}
+                }
+            }
+            if ok {
+                if let Some(cap) = cap_op {
+                    *closure_candidates.entry(op).or_insert(0) += 1;
+                    *capture_candidates.entry(cap).or_insert(0) += 1;
+                    next_child = d + 1;
+                    i = at + expected_captures + 1;
                 }
             }
         }
@@ -9731,6 +9756,61 @@ mod tests {
     /// Pack an ABC-format instruction.
     fn insn_abc(op: u8, a: u8, b: u8, c: u8) -> u32 {
         (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
+    }
+
+    /// v14 populates `child_protos`, which switches on the first voting loop of
+    /// `detect_closure_capture`. A run of identical CAPTURE words ABC(type, id, 0)
+    /// reads as `D = id` to that loop, so the capture words themselves looked like
+    /// closure instructions pointing at a child with matching upvalue count, and
+    /// the CAPTURE byte was pinned as NEWCLOSURE (ShrineFusion: 0x12 NEWCLOSURE,
+    /// CAPTURE on 0x2A, 120 spurious NEWCLOSURE lines for 42 protos).
+    #[test]
+    fn detect_closure_capture_does_not_vote_capture_words_as_newclosure() {
+        const NEWCLOSURE_BYTE: u8 = 0x80;
+        const CAPTURE_BYTE: u8 = 0x2A;
+        let proto = |code: Vec<u32>, num_upvalues: u8, child_protos: Vec<u32>| Proto {
+            max_stack_size: 4,
+            num_params: 0,
+            num_upvalues,
+            is_vararg: false,
+            flags: 0,
+            typeinfo: None,
+            code,
+            constants: Vec::new(),
+            child_protos,
+            line_defined: 0,
+            debug_name: None,
+            line_info: None,
+            debug_info: None,
+        };
+        let cap = |id: u8| insn_abc(CAPTURE_BYTE, 0, id, 0);
+        // Child 1 captures 5 values, child 2 captures 2. The CAPTURE word reads as
+        // D=1, i.e. "child_protos[1]" (2 upvalues), and the words after it are
+        // small-A with C=0, so the old shape test accepted it more than once.
+        let parent_code = vec![
+            insn_ad(NEWCLOSURE_BYTE, 0, 0), cap(1), cap(2), cap(1), cap(2), cap(1),
+            insn_abc(0xCC, 0, 0, 0),
+        ];
+        let chunk = Chunk {
+            version: 14,
+            types_version: 0,
+            strings: Vec::new(),
+            protos: vec![
+                proto(parent_code, 0, vec![1, 2]),
+                proto(vec![insn_abc(0xCC, 0, 0, 0)], 5, Vec::new()),
+                proto(vec![insn_abc(0xCC, 0, 0, 0)], 2, Vec::new()),
+            ],
+            main_proto: 0,
+        };
+        let mut ctx = DetectCtx::new();
+        ctx.compute_frequencies(&chunk);
+        detect_closure_capture(&chunk, &mut ctx);
+        assert_ne!(
+            ctx.map[CAPTURE_BYTE as usize],
+            LuauOpcode::NewClosure as u8,
+            "the CAPTURE byte must not be pinned as NEWCLOSURE"
+        );
+        assert_eq!(ctx.map[CAPTURE_BYTE as usize], LuauOpcode::Capture as u8);
     }
 
     /// Build a generic-for loop bytecode using arbitrary shuffled opcode bytes.
