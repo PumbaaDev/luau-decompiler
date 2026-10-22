@@ -14,12 +14,34 @@ use std::collections::{HashMap, HashSet};
 thread_local! {
     /// Fresh names minted when an upvalue alias was retired. A local with one of
     /// these names that nothing reads is a discarded temporary, not a real value.
-    static RETIRED_FRESH: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Keyed by (proto identity, fresh name) and cleared at the start of every
+    /// decompile, so no result depends on files lifted earlier on this thread.
+    static RETIRED_FRESH: RefCell<HashMap<(usize, String), String>> = RefCell::new(HashMap::new());
+}
+
+/// Forget every retired name; called once per decompile.
+pub(super) fn clear_retired_fresh() {
+    RETIRED_FRESH.with(|map| map.borrow_mut().clear());
 }
 
 /// The upvalue alias name a retired temporary `name` was split off from.
+/// Looked up for the proto currently being post-processed.
 pub(super) fn retired_fresh_alias(name: &str) -> Option<String> {
-    RETIRED_FRESH.with(|map| map.borrow().get(name).cloned())
+    let proto = crate::decompiler::lifter::current_dce_proto_id();
+    RETIRED_FRESH.with(|map| map.borrow().get(&(proto, name.to_string())).cloned())
+}
+
+/// Every retired fresh name of the proto being post-processed, with the
+/// upvalue alias it was split off from.
+pub(super) fn retired_fresh_names() -> HashMap<String, String> {
+    let proto = crate::decompiler::lifter::current_dce_proto_id();
+    RETIRED_FRESH.with(|map| {
+        map.borrow()
+            .iter()
+            .filter(|((p, _), _)| *p == proto)
+            .map(|((_, fresh), alias)| (fresh.clone(), alias.clone()))
+            .collect()
+    })
 }
 
 use crate::ast::Expr;
@@ -226,8 +248,8 @@ impl LocalTracker {
     }
 
     /// Arm the retire for the write about to be lifted (see `alias_retire`).
-    pub(super) fn begin_alias_retire(&mut self, reg: usize, alias: String, fresh: String) {
-        RETIRED_FRESH.with(|map| map.borrow_mut().insert(fresh.clone(), alias.clone()));
+    pub(super) fn begin_alias_retire(&mut self, proto_key: usize, reg: usize, alias: String, fresh: String) {
+        RETIRED_FRESH.with(|map| map.borrow_mut().insert((proto_key, fresh.clone()), alias.clone()));
         self.alias_retire = Some((reg, alias, fresh));
     }
 

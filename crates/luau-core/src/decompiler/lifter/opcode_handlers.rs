@@ -1724,7 +1724,8 @@ pub(super) fn lift_instruction_range(
                     && !consumer_writes_param(code, pc, a, proto.num_params as usize);
                 if confined && !upval_stored_back(code, pc, a, upval) {
                     let fresh = ctx.name_distinct_from(proto, a as u8, pc, &alias);
-                    locals.begin_alias_retire(a, alias, fresh);
+                    let proto_key = proto as *const _ as usize;
+                    locals.begin_alias_retire(proto_key, a, alias, fresh);
                 }
             }
         }
