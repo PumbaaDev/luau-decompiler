@@ -128,6 +128,8 @@ struct Scan {
 /// Insert declarations for captured upvalues that nothing declares.
 /// Returns the names declared, for diagnostics.
 pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
+    localize_table_orphans(body);
+    drop_dead_table_seeds(body);
     let mut scan = Scan::default();
     scan_stats(body, &mut scan);
 
@@ -237,6 +239,263 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
         Stat::Local { names: free.clone(), values: Vec::new() },
     );
     free
+}
+
+// ── Table orphans: declare where the constructor runs ───────────────────
+
+/// Give an orphan table binding the scope of the statement that creates it.
+///
+/// A register bound to a fresh table (`NEWTABLE` / `DUPTABLE`) is written with
+/// `name = { ... }`. When the lifter believes the register is already declared
+/// but no `local` for it survives, the statement stays a bare assignment and
+/// the chunk-top hoist below turns it into ONE file-level variable shared by
+/// every call of the enclosing function:
+///
+/// ```luau
+/// local tbl7                      -- file level: shared across extend() calls
+/// local function extend(self, name)
+///     tbl7 = { __componentName = name }
+///     tbl7.__index = tbl7
+///     function tbl7.__ctor() ... end
+///     return tbl7
+/// end
+/// ```
+///
+/// (ReactBaseClasses `extend`: the bytecode builds a new class table per call.)
+///
+/// When the FIRST occurrence of an orphan name is a `name = <table>` statement
+/// and every other occurrence in the chunk lies in the same block after it,
+/// nothing before that statement can observe the name, so rewriting it to
+/// `local name = <table>` is exactly the original scope. Anything less certain
+/// (a use elsewhere, a first occurrence that is not a table constructor) is
+/// left to the chunk-top hoist, as before. Statements directly at chunk level
+/// are skipped: that is where the hoist already puts the declaration.
+fn localize_table_orphans(body: &mut Vec<Stat>) {
+    let mut scan = Scan::default();
+    scan_stats(body, &mut scan);
+    let orphans: Vec<String> = scan
+        .assigned
+        .iter()
+        .filter(|n| !scan.bound.contains(*n) && !is_known_global(n) && !n.is_empty())
+        .cloned()
+        .collect();
+    for name in orphans {
+        let total = count_name_stats(body, &name);
+        for stat in body.iter_mut() {
+            if localize_in_stat(stat, &name, total) {
+                break;
+            }
+        }
+    }
+}
+
+/// Every statement block that hangs directly off `stat`: branch and loop
+/// bodies, and the bodies of function expressions reachable without crossing
+/// another expression (`local function f`, `x = function`, `f(function)`).
+fn child_blocks(stat: &mut Stat) -> Vec<&mut Vec<Stat>> {
+    match stat {
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            let mut v: Vec<&mut Vec<Stat>> = vec![then_body];
+            v.extend(elseif_clauses.iter_mut().map(|(_, b)| b));
+            if let Some(b) = else_body {
+                v.push(b);
+            }
+            v
+        }
+        Stat::While { body, .. }
+        | Stat::Repeat { body, .. }
+        | Stat::NumericFor { body, .. }
+        | Stat::GenericFor { body, .. }
+        | Stat::DoBlock { body } => vec![body],
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => function_blocks(func),
+        Stat::Local { values, .. } | Stat::Assign { values, .. } | Stat::Return { values } => {
+            values.iter_mut().flat_map(function_blocks).collect()
+        }
+        Stat::ExprStat(e) => function_blocks(e),
+        Stat::Break | Stat::Continue | Stat::Comment(_) => Vec::new(),
+    }
+}
+
+/// A function expression, or a call whose arguments are function expressions
+/// (`signal:Connect(function() ... end)`).
+fn function_blocks(expr: &mut Expr) -> Vec<&mut Vec<Stat>> {
+    match expr {
+        Expr::Function { body, .. } => vec![body],
+        Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+            args.iter_mut().flat_map(function_blocks).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn localize_in_stat(stat: &mut Stat, name: &str, total: usize) -> bool {
+    child_blocks(stat).into_iter().any(|b| localize_in_block(b, name, total))
+}
+
+fn localize_in_block(block: &mut Vec<Stat>, name: &str, total: usize) -> bool {
+    for i in 0..block.len() {
+        if is_table_assign_to(&block[i], name)
+            && has_self_store(&block[i + 1..], name)
+            && count_name_stats(&block[i..], name) == total
+        {
+            if let Stat::Assign { values, .. } = &block[i] {
+                block[i] = Stat::Local { names: vec![name.to_string()], values: values.clone() };
+            }
+            return true;
+        }
+        if localize_in_stat(&mut block[i], name, total) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop a generated `local tblN = {}` seed that nothing can observe.
+///
+/// A branch-merge seed can declare the register before an `if`, and the arm
+/// that really builds the table then re-assigns it. If every later occurrence
+/// of the name sits in one nested block at or after a `tblN = <table>`
+/// statement, the seed value is never read: the assignment becomes the
+/// declaration and the seed goes. Only `tbl` names are touched, because those
+/// are the decompiler's own names for constructed tables.
+fn drop_dead_table_seeds(block: &mut Vec<Stat>) {
+    let mut i = 0;
+    while i < block.len() {
+        let name = match &block[i] {
+            Stat::Local { names, values }
+                if names.len() == 1
+                    && names[0].starts_with("tbl")
+                    && matches!(values.as_slice(), [Expr::Table { fields }] if fields.is_empty()) =>
+            {
+                Some(names[0].clone())
+            }
+            _ => None,
+        };
+        if let Some(name) = name {
+            let total = count_name_stats(&block[i + 1..], &name);
+            let moved = total > 0
+                && block[i + 1..]
+                    .iter_mut()
+                    .any(|s| localize_in_stat(s, &name, total));
+            if moved {
+                block.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    for stat in block.iter_mut() {
+        for child in child_blocks(stat) {
+            drop_dead_table_seeds(child);
+        }
+    }
+}
+
+/// Does a statement store the table into itself (`t.__index = t`)?
+///
+/// That store is what made the lifter bind the table (a parked constructor
+/// would have been cloned empty), so it marks the population this pass exists
+/// for. Tables that were already hoisted before that rule are left alone.
+fn has_self_store(stats: &[Stat], name: &str) -> bool {
+    stats.iter().any(|s| match s {
+        Stat::Assign { targets, values } => {
+            values.len() == 1
+                && matches!(&values[0], Expr::Name(n) if n == name)
+                && targets.iter().any(|t| match t {
+                    Expr::Field { object, .. } | Expr::Index { object, .. } => {
+                        matches!(object.as_ref(), Expr::Name(n) if n == name)
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    })
+}
+
+fn is_table_assign_to(stat: &Stat, name: &str) -> bool {
+    matches!(
+        stat,
+        Stat::Assign { targets, values }
+            if targets.len() == 1
+                && values.len() == 1
+                && matches!(&targets[0], Expr::Name(n) if n == name)
+                && matches!(&values[0], Expr::Table { .. })
+    )
+}
+
+/// Every occurrence of `name` as an identifier (reads and assignment targets),
+/// at any closure depth.
+fn count_name_stats(stats: &[Stat], name: &str) -> usize {
+    stats.iter().map(|s| count_name_stat(s, name)).sum()
+}
+
+fn count_name_stat(stat: &Stat, name: &str) -> usize {
+    match stat {
+        Stat::Local { values, .. } | Stat::Return { values } => {
+            values.iter().map(|v| count_name_expr(v, name)).sum()
+        }
+        Stat::Assign { targets, values } => {
+            targets.iter().map(|t| count_name_expr(t, name)).sum::<usize>()
+                + values.iter().map(|v| count_name_expr(v, name)).sum::<usize>()
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            count_name_expr(condition, name)
+                + count_name_stats(then_body, name)
+                + elseif_clauses
+                    .iter()
+                    .map(|(c, b)| count_name_expr(c, name) + count_name_stats(b, name))
+                    .sum::<usize>()
+                + else_body.as_ref().map_or(0, |b| count_name_stats(b, name))
+        }
+        Stat::While { condition, body } | Stat::Repeat { body, condition } => {
+            count_name_expr(condition, name) + count_name_stats(body, name)
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            count_name_expr(start, name)
+                + count_name_expr(stop, name)
+                + step.as_ref().map_or(0, |s| count_name_expr(s, name))
+                + count_name_stats(body, name)
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().map(|e| count_name_expr(e, name)).sum::<usize>()
+                + count_name_stats(body, name)
+        }
+        Stat::DoBlock { body } => count_name_stats(body, name),
+        Stat::ExprStat(e) => count_name_expr(e, name),
+        Stat::LocalFunction { func, .. } => count_name_expr(func, name),
+        Stat::MethodFunction { receiver, func, .. } => {
+            count_name_expr(receiver, name) + count_name_expr(func, name)
+        }
+        Stat::Break | Stat::Continue | Stat::Comment(_) => 0,
+    }
+}
+
+fn count_name_expr(expr: &Expr, name: &str) -> usize {
+    match expr {
+        Expr::Name(n) => usize::from(n == name),
+        Expr::Field { object, .. } => count_name_expr(object, name),
+        Expr::Index { object, key } => count_name_expr(object, name) + count_name_expr(key, name),
+        Expr::BinOp { left, right, .. } => count_name_expr(left, name) + count_name_expr(right, name),
+        Expr::UnOp { operand, .. } => count_name_expr(operand, name),
+        Expr::Call { func, args } => {
+            count_name_expr(func, name) + args.iter().map(|a| count_name_expr(a, name)).sum::<usize>()
+        }
+        Expr::MethodCall { object, args, .. } => {
+            count_name_expr(object, name) + args.iter().map(|a| count_name_expr(a, name)).sum::<usize>()
+        }
+        Expr::Function { body, .. } => count_name_stats(body, name),
+        Expr::Table { fields } => fields
+            .iter()
+            .map(|f| match f {
+                TableField::Sequential(v) | TableField::Named(_, v) => count_name_expr(v, name),
+                TableField::Indexed(k, v) => count_name_expr(k, name) + count_name_expr(v, name),
+            })
+            .sum(),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            count_name_expr(cond, name) + count_name_expr(then_expr, name) + count_name_expr(else_expr, name)
+        }
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Varargs | Expr::Vector(..) => 0,
+    }
 }
 
 // ── Scanning ────────────────────────────────────────────────────────────
@@ -574,6 +833,153 @@ mod tests {
         }];
         let declared = declare_free_vars(&mut body);
         assert!(declared.is_empty(), "declared a field-assign object: {:?}", declared);
+    }
+
+    // ── Table orphans keep the scope of the constructor ───────────────────
+
+    fn table() -> Expr {
+        Expr::Table { fields: vec![] }
+    }
+
+    fn self_index(n: &str) -> Stat {
+        Stat::Assign {
+            targets: vec![Expr::Field { object: Box::new(name(n)), field: "__index".into() }],
+            values: vec![name(n)],
+        }
+    }
+
+    /// ReactBaseClasses `extend`: the class table is built per call and used
+    /// only inside the function (and its closure). The declaration must sit in
+    /// the function, not at file level where one variable serves every call.
+    #[test]
+    fn table_orphan_is_declared_in_the_function_that_builds_it() {
+        let ctor = Expr::Function {
+            params: vec![],
+            is_vararg: false,
+            body: vec![Stat::Return { values: vec![name("tbl7")] }],
+        };
+        let mut body = vec![Stat::LocalFunction {
+            name: "extend".into(),
+            func: Expr::Function {
+                params: vec!["self".into()],
+                is_vararg: false,
+                body: vec![
+                    Stat::Assign { targets: vec![name("tbl7")], values: vec![table()] },
+                    self_index("tbl7"),
+                    Stat::Assign {
+                        targets: vec![Expr::Field { object: Box::new(name("tbl7")), field: "__ctor".into() }],
+                        values: vec![ctor],
+                    },
+                    Stat::Return { values: vec![name("tbl7")] },
+                ],
+            },
+        }];
+        let declared = declare_free_vars(&mut body);
+        assert!(declared.is_empty(), "hoisted to file level: {:?}", declared);
+        assert_eq!(body.len(), 1, "no chunk-top local");
+        let Stat::LocalFunction { func: Expr::Function { body: fb, .. }, .. } = &body[0] else {
+            panic!("shape");
+        };
+        assert!(matches!(&fb[0], Stat::Local { names, values }
+            if names == &vec!["tbl7".to_string()] && values.len() == 1));
+    }
+
+    /// A second function also uses the name: it is genuinely shared, so it
+    /// stays a chunk-top declaration.
+    #[test]
+    fn table_orphan_used_by_two_functions_stays_at_chunk_top() {
+        let mk = |n: &str| Stat::LocalFunction {
+            name: n.into(),
+            func: Expr::Function {
+                params: vec![],
+                is_vararg: false,
+                body: vec![
+                    Stat::Assign { targets: vec![name("tbl7")], values: vec![table()] },
+                    self_index("tbl7"),
+                ],
+            },
+        };
+        let mut body = vec![mk("a"), mk("b")];
+        let declared = declare_free_vars(&mut body);
+        assert_eq!(declared, vec!["tbl7".to_string()]);
+    }
+
+    /// Only self-referencing tables (the ones the lifter now binds) are
+    /// narrowed; an ordinary orphan table keeps its chunk-top hoist.
+    #[test]
+    fn table_orphan_without_self_store_keeps_chunk_top_hoist() {
+        let mut body = vec![Stat::LocalFunction {
+            name: "f".into(),
+            func: Expr::Function {
+                params: vec![],
+                is_vararg: false,
+                body: vec![
+                    Stat::Assign { targets: vec![name("tbl7")], values: vec![table()] },
+                    Stat::Return { values: vec![name("tbl7")] },
+                ],
+            },
+        }];
+        let declared = declare_free_vars(&mut body);
+        assert_eq!(declared, vec!["tbl7".to_string()]);
+    }
+
+    /// A read before the constructor means the name is live from outside:
+    /// do not narrow it.
+    #[test]
+    fn table_orphan_read_before_constructor_is_not_localized() {
+        let mut body = vec![Stat::LocalFunction {
+            name: "f".into(),
+            func: Expr::Function {
+                params: vec![],
+                is_vararg: false,
+                body: vec![
+                    Stat::ExprStat(Expr::Call { func: Box::new(name("use")), args: vec![name("tbl7")] }),
+                    Stat::Assign { targets: vec![name("tbl7")], values: vec![table()] },
+                ],
+            },
+        }];
+        let declared = declare_free_vars(&mut body);
+        assert_eq!(declared, vec!["tbl7".to_string()]);
+    }
+
+    /// DateTime (lune-util): a pre-branch `local tbl2 = {}` seed, then the
+    /// branch builds the table. The seed is unobservable and must go; the
+    /// branch assignment becomes the declaration.
+    #[test]
+    fn dead_table_seed_before_branch_is_dropped() {
+        let mut body = vec![
+            Stat::Local { names: vec!["tbl2".into()], values: vec![table()] },
+            Stat::If {
+                condition: name("flag"),
+                then_body: vec![
+                    Stat::Assign { targets: vec![name("tbl2")], values: vec![table()] },
+                    self_index("tbl2"),
+                ],
+                elseif_clauses: vec![],
+                else_body: None,
+            },
+        ];
+        declare_free_vars(&mut body);
+        assert_eq!(body.len(), 1, "seed not dropped");
+        let Stat::If { then_body, .. } = &body[0] else { panic!("shape") };
+        assert!(matches!(&then_body[0], Stat::Local { names, .. } if names[0] == "tbl2"));
+    }
+
+    /// A use after the branch can observe the seed: keep it.
+    #[test]
+    fn table_seed_read_after_branch_is_kept() {
+        let mut body = vec![
+            Stat::Local { names: vec!["tbl2".into()], values: vec![table()] },
+            Stat::If {
+                condition: name("flag"),
+                then_body: vec![Stat::Assign { targets: vec![name("tbl2")], values: vec![table()] }],
+                elseif_clauses: vec![],
+                else_body: None,
+            },
+            self_index("tbl2"),
+        ];
+        declare_free_vars(&mut body);
+        assert_eq!(body.len(), 3);
     }
 
     #[test]
