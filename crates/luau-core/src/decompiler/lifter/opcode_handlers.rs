@@ -1711,16 +1711,17 @@ pub(super) fn lift_instruction_range(
         // name as the write target (the output would assign to an upvalue the
         // bytecode never stores). Armed per instruction; see `alias_retire`.
         locals.clear_alias_retire();
-        if op != LuauOpcode::GetUpval && op_writes_a(op) {
+        if op != LuauOpcode::GetUpval && !matches!(op, LuauOpcode::LoadB) && op_writes_a(op) {
             if let Some((upval, alias, loaded_at)) = locals.alias_upval_of(a) {
                 // Retire only when the write cannot be observed past the join
                 // of the range being lifted: a fresh local declared inside an
                 // arm or a loop body is scoped to it, so a value the register
                 // carries OUT of the range (read after `end`) or INTO the next
                 // iteration (alias loaded before this loop body) would be lost.
-                let confined = (start == 0 || !reg_live_after(code, end, a))
+                let confined = (start == 0 || !reg_live_after(code, pc + if op.has_aux() { 2 } else { 1 }, a, start, end))
                     && (!in_loop || loaded_at >= start)
-                    && alias_reaches(code, loaded_at, pc);
+                    && alias_reaches(code, loaded_at, pc)
+                    && !consumer_writes_param(code, pc, a, proto.num_params as usize);
                 if confined && !upval_stored_back(code, pc, a, upval) {
                     let fresh = ctx.name_distinct_from(proto, a as u8, pc, &alias);
                     locals.begin_alias_retire(a, alias, fresh);
@@ -5856,58 +5857,80 @@ fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool 
 
 /// Is `reg` possibly read at or after `from` before something overwrites it?
 ///
-/// Linear scan, deliberately conservative: any mention of `reg` that is not a
-/// plain whole-register definition counts as a read (a CALL/RETURN window
+/// Walks the control-flow graph from `from` (both successors of every
+/// conditional branch), deliberately conservative: any mention of `reg` that is
+/// not a plain whole-register definition counts as a read (a CALL/RETURN window
 /// counts), so the answer errs towards "live". Used to keep a fresh local that
 /// would be scoped to an arm or loop body from replacing a value that is
 /// consumed after it.
-fn reg_live_after(code: &[u32], from: usize, reg: usize) -> bool {
-    let mut i = from;
-    while i < code.len() {
-        let insn = code[i];
-        let op = LuauOpcode::from_u8(insn_op(insn));
-        let step = if op.has_aux() { 2 } else { 1 };
-        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
-        let pure_def_by_a = matches!(
-            op,
-            LuauOpcode::LoadNil
-                | LuauOpcode::LoadB
-                | LuauOpcode::LoadN
-                | LuauOpcode::LoadK
-                | LuauOpcode::GetUpval
-                | LuauOpcode::GetGlobal
-                | LuauOpcode::GetImport
-                | LuauOpcode::NewClosure
-                | LuauOpcode::NewTable
-                | LuauOpcode::DupTable
-        );
-        if a == reg && pure_def_by_a {
-            return false;
-        }
-        if op_writes_a(op) && a == reg && b != reg && c != reg && op != LuauOpcode::Call {
-            return false;
-        }
-        match op {
-            LuauOpcode::Call => {
-                // Reads the function (A) and its arguments A+1..A+B-1; B == 0
-                // means every register above A up to the stack top.
-                if reg >= a && (b == 0 || reg < a + b) {
-                    return true;
+fn reg_live_after(code: &[u32], from: usize, reg: usize, start: usize, end: usize) -> bool {
+    let mut visited = vec![false; code.len()];
+    let mut work = vec![from];
+    while let Some(start) = work.pop() {
+        let mut i = start;
+        while i < code.len() && !visited[i] {
+            visited[i] = true;
+            let insn = code[i];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            let step = if op.has_aux() { 2 } else { 1 };
+            let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+            let pure_def_by_a = matches!(
+                op,
+                LuauOpcode::LoadNil
+                    | LuauOpcode::LoadB
+                    | LuauOpcode::LoadN
+                    | LuauOpcode::LoadK
+                    | LuauOpcode::GetUpval
+                    | LuauOpcode::GetGlobal
+                    | LuauOpcode::GetImport
+                    | LuauOpcode::NewClosure
+                    | LuauOpcode::NewTable
+                    | LuauOpcode::DupTable
+            );
+            if a == reg && pure_def_by_a {
+                break;
+            }
+            if op_writes_a(op) && a == reg && b != reg && c != reg && op != LuauOpcode::Call {
+                break;
+            }
+            let in_range = i >= start && i < end;
+            match op {
+                LuauOpcode::Call => {
+                    // Reads the function (A) and its arguments A+1..A+B-1; B == 0
+                    // means every register above A up to the stack top.
+                    if !in_range && reg >= a && (b == 0 || reg < a + b) {
+                        return true;
+                    }
+                }
+                LuauOpcode::Return => {
+                    // Returns A..A+B-2; B == 0 means up to the stack top.
+                    if !in_range && reg >= a && (b == 0 || (b >= 2 && reg < a + b - 1)) {
+                        return true;
+                    }
+                }
+                _ => {
+                    if !in_range && (a == reg || b == reg || c == reg) {
+                        return true;
+                    }
                 }
             }
-            LuauOpcode::Return => {
-                // Returns A..A+B-2; B == 0 means up to the stack top.
-                if reg >= a && (b == 0 || (b >= 2 && reg < a + b - 1)) {
-                    return true;
+            if op == LuauOpcode::Return {
+                break;
+            }
+            if is_control_flow_op(op) {
+                let target = match op {
+                    LuauOpcode::JumpX => i as i64 + insn_e(insn) as i64 + 1,
+                    _ => i as i64 + insn_d(insn) as i64 + 1,
+                };
+                if target >= 0 && (target as usize) < code.len() {
+                    work.push(target as usize);
+                }
+                if matches!(op, LuauOpcode::Jump | LuauOpcode::JumpBack | LuauOpcode::JumpX) {
+                    break;
                 }
             }
-            _ => {
-                if a == reg || b == reg || c == reg {
-                    return true;
-                }
-            }
+            i += step;
         }
-        i += step;
     }
     false
 }
@@ -5930,4 +5953,40 @@ fn alias_reaches(code: &[u32], loaded_at: usize, pc: usize) -> bool {
         i += if op.has_aux() { 2 } else { 1 };
     }
     true
+}
+
+/// True when the first instruction after `pc` that reads `reg` writes a
+/// PARAMETER register (other than `reg`). Branch-arm writes to parameters are
+/// a known-fragile lifter path (the consumer's write can be lost at the join),
+/// so a retired temporary feeding one would surface as a discarded arm local.
+fn consumer_writes_param(code: &[u32], pc: usize, reg: usize, num_params: usize) -> bool {
+    let first = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if first.has_aux() { 2 } else { 1 };
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        let c_is_reg = matches!(
+            op,
+            LuauOpcode::Add
+                | LuauOpcode::Sub
+                | LuauOpcode::Mul
+                | LuauOpcode::Div
+                | LuauOpcode::Mod
+                | LuauOpcode::Pow
+                | LuauOpcode::And
+                | LuauOpcode::Or
+                | LuauOpcode::GetTable
+                | LuauOpcode::Concat
+        );
+        let reads = op_writes_a(op) && (b == reg || (c_is_reg && c == reg));
+        if reads {
+            return a != reg && a < num_params;
+        }
+        if op_writes_a(op) && a == reg {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }

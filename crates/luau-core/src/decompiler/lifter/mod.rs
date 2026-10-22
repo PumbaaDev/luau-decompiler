@@ -6185,8 +6185,18 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
         };
 
         if should_remove {
-            stmts.remove(i);
-            // Don't increment i, check the same position again (it now has the next statement)
+            // A dead store whose RHS contains a CALL must keep the call: the
+            // result is unused but the side effect is real.
+            let kept: Vec<Stat> = match &stmts[i] {
+                Stat::Assign { values, .. } if values.iter().any(has_side_effects) => {
+                    values.iter().filter(|v| has_side_effects(v)).flat_map(extract_side_effect_stmts).collect()
+                }
+                _ => Vec::new(),
+            };
+            let kept_len = kept.len();
+            stmts.splice(i..=i, kept);
+            i += kept_len;
+            // Don't increment i past the next statement (it now sits at position i)
         } else {
             // Recursively process nested statements
             match &mut stmts[i] {
@@ -6414,7 +6424,16 @@ fn eliminate_dead_key_eq_value_locals(stmts: &mut Vec<Stat>) {
                 && values.len() == 1
                 && is_empty_function_literal(&values[0])
                 && no_downstream_write;
+            // A temporary minted by an upvalue-alias retire that nothing reads
+            // (its consumer was lost upstream) is a discarded pure value.
+            let qualifies_retired_temp = names.len() == 1
+                && values.len() == 1
+                && naming::retired_fresh_alias(&names[0])
+                    .is_some_and(|alias| is_alias_step(&values[0], &alias))
+                && !has_side_effects(&values[0])
+                && no_downstream_write;
             (qualifies_key_eq_value
+                || qualifies_retired_temp
                 || qualifies_pure_rhs
                 || qualifies_method_ref
                 || qualifies_empty_fn)
@@ -6559,6 +6578,19 @@ pub(super) fn is_artifact_method_call(expr: &Expr) -> bool {
         }
     }
     false
+}
+
+/// An arithmetic expression that reads the upvalue alias: the value an upvalue
+/// update (`counter + 1`, `pos + delta - last`) compiles to before its store.
+/// Selections, comparisons and `or` defaults are not this shape and are kept.
+fn is_alias_step(expr: &Expr, alias: &str) -> bool {
+    let arithmetic = |op: &BinOp| {
+        matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IDiv | BinOp::Mod | BinOp::Pow
+        )
+    };
+    matches!(expr, Expr::BinOp { op, .. } if arithmetic(op)) && expr_uses_name_deep(expr, alias)
 }
 
 fn has_side_effects(expr: &Expr) -> bool {
@@ -12148,3 +12180,37 @@ fn fold_expr(expr: &mut Expr) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dead_store_call_tests {
+    use super::*;
+
+    fn name(n: &str) -> Expr {
+        Expr::Name(n.to_string())
+    }
+
+    /// `x = f(x)` followed by `x = y` is a dead store, but the CALL in the
+    /// first RHS is a real side effect (TrainEventPresentation's
+    /// `IsActive("SoulsTradeInMachine")`) and must survive as a statement.
+    #[test]
+    fn dead_store_keeps_the_call_on_its_right_hand_side() {
+        let call: Expr = Expr::Call { func: Box::new(name("x")), args: vec![Expr::String("k".into())] };
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("x")], values: vec![call] },
+            Stat::Assign { targets: vec![name("x")], values: vec![name("y")] },
+        ];
+        eliminate_dead_stores(&mut stmts);
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(&stmts[0], Stat::ExprStat(Expr::Call { .. })));
+    }
+
+    #[test]
+    fn dead_store_of_a_pure_value_is_still_removed() {
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("x")], values: vec![name("a")] },
+            Stat::Assign { targets: vec![name("x")], values: vec![name("y")] },
+        ];
+        eliminate_dead_stores(&mut stmts);
+        assert_eq!(stmts.len(), 1);
+    }
+}

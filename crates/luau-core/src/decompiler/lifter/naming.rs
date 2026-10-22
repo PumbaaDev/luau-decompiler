@@ -8,7 +8,19 @@
 //! All items are `pub(super)` so the rest of the `lifter` module can use them,
 //! but nothing is exposed outside the module tree.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    /// Fresh names minted when an upvalue alias was retired. A local with one of
+    /// these names that nothing reads is a discarded temporary, not a real value.
+    static RETIRED_FRESH: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// The upvalue alias name a retired temporary `name` was split off from.
+pub(super) fn retired_fresh_alias(name: &str) -> Option<String> {
+    RETIRED_FRESH.with(|map| map.borrow().get(name).cloned())
+}
 
 use crate::ast::Expr;
 
@@ -215,6 +227,7 @@ impl LocalTracker {
 
     /// Arm the retire for the write about to be lifted (see `alias_retire`).
     pub(super) fn begin_alias_retire(&mut self, reg: usize, alias: String, fresh: String) {
+        RETIRED_FRESH.with(|map| map.borrow_mut().insert(fresh.clone(), alias.clone()));
         self.alias_retire = Some((reg, alias, fresh));
     }
 
