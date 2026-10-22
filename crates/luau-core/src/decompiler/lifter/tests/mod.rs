@@ -112,3 +112,5 @@ mod vararg_unpack_width_tests;
 mod generic_for_short_circuit_generator_tests;
 #[cfg(test)]
 mod leaked_global_string_tests;
+#[cfg(test)]
+mod detector_rule_gating_tests;

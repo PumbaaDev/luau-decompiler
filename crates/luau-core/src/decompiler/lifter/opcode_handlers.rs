@@ -42,6 +42,7 @@ use super::{
     resolve_global_name,
     // Small expression builders.
     is_roblox_method_lvalue_artifact,
+    is_inferred_opmap_decode,
     is_self_referential_field_assign,
     method_receiver_expr,
     mk_binop,
@@ -3847,7 +3848,9 @@ pub(super) fn lift_instruction_range(
                         | "FindFirstChildOfClass" | "FindFirstChildWhichIsA"
                         | "IsA" | "GetAttribute" | "SetAttribute"
                     ));
-                if is_string_arg_method {
+                // Detector-era salvage only: on an exact opmap LOADN is exact and
+                // the Number is the real argument (e.g. a WaitForChild timeout).
+                if is_string_arg_method && is_inferred_opmap_decode() {
                     for arg in args.iter_mut() {
                         if let Expr::Number(n) = arg {
                             let idx = *n as u32;
@@ -3918,7 +3921,9 @@ pub(super) fn lift_instruction_range(
                 // Fix: scan backwards through raw instructions to find one whose
                 // A field matches the argument register. Extract its D field as a
                 // constant index and resolve it to a String if possible.
-                if is_string_arg_method {
+                // Detector-era salvage only: on an exact opmap a Name argument is a
+                // live variable and the back-scan would swap it for a stale constant.
+                if is_string_arg_method && is_inferred_opmap_decode() {
                     for (i, arg) in args.iter_mut().enumerate() {
                         let is_name_arg = matches!(arg, Expr::Name(n)
                             if !n.is_empty() && !matches!(n.as_str(), "game" | "workspace" | "script"));

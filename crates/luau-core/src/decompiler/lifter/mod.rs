@@ -7158,7 +7158,9 @@ pub(super) fn is_roblox_method_lvalue_artifact(target: &Expr) -> bool {
         Expr::Field { field, .. } => field.as_str(),
         _ => return false,
     };
-    matches!(
+    // Detector-era rule: only on an inferred opmap. On an exact decode the
+    // SETTABLEKS is literally in the bytecode (a real method store).
+    (is_inferred_opmap_decode() && matches!(
         field_name,
         // Instance core API
         "FindFirstChild"
@@ -7196,7 +7198,7 @@ pub(super) fn is_roblox_method_lvalue_artifact(target: &Expr) -> bool {
             | "Invoke"
             | "InvokeServer"
             | "InvokeClient"
-    ) || is_stdlib_constructor_lvalue_artifact(target)
+    )) || is_stdlib_constructor_lvalue_artifact(target)
 }
 
 /// C10k: drop LHS of the form `<RobloxType>.<constructor>.<field>` — e.g.
@@ -9318,7 +9320,9 @@ pub(super) fn mk_binop(regs: &[RegVal], left: usize, right: usize, op: BinOp) ->
     // property names) are always leakage. Guard: if either operand is
     // Expr::String(s) where s is a valid identifier, replace it with the
     // register name fallback.
-    if matches!(op, BinOp::And | BinOp::Or) {
+    // Detector-era salvage only: on an exact opmap an identifier-shaped string
+    // operand of and/or (e.g. `x or "Default"`) is a real constant.
+    if is_inferred_opmap_decode() && matches!(op, BinOp::And | BinOp::Or) {
         let is_ident_string = |e: &Expr| -> bool {
             if let Expr::String(s) = e {
                 !s.is_empty()
@@ -9384,7 +9388,9 @@ pub(super) fn mk_binop_k(proto: &Proto, strings: &[String], regs: &[RegVal], lef
     }
     // B0.126: And/Or K-constant string leakage guard. Same logic as mk_binop:
     // identifier-shaped strings are NAMECALL leakage, not real operands.
-    if matches!(op, BinOp::And | BinOp::Or) {
+    // Detector-era salvage only: on an exact opmap an identifier-shaped string
+    // operand of and/or (e.g. `x or "Default"`) is a real constant.
+    if is_inferred_opmap_decode() && matches!(op, BinOp::And | BinOp::Or) {
         let is_ident_string = |e: &Expr| -> bool {
             if let Expr::String(s) = e {
                 !s.is_empty()
@@ -9560,7 +9566,7 @@ impl Drop for InferredDecodeGuard {
     }
 }
 
-fn is_inferred_opmap_decode() -> bool {
+pub(super) fn is_inferred_opmap_decode() -> bool {
     INFERRED_OPMAP_DECODE.with(|c| c.get())
 }
 
