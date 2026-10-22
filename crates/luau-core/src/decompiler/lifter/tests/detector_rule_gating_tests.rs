@@ -203,3 +203,27 @@ fn c10e_inferred_decode_keeps_legacy_method_store_drop() {
     let src = decompile_inferred(&settableks_method_name_chunk());
     assert!(!src.contains(".Destroy ="), "legacy drop lost:\n{src}");
 }
+
+// ------------------------------------------------- self-referential store
+
+/// oracle 7aa4449e: `SETTABLEKS R0."Name" R0` is a real `v.Name = v`. The
+/// NAMECALL-misread premise of the filter needs a guessed opmap.
+fn settableks_self_store_chunk() -> Chunk {
+    let code = vec![
+        insn_abc(OP_SETTABLEKS, 0, 0, 0), 0,   // R0.Name = R0 (aux K0)
+        insn_abc(OP_RETURN, 0, 1, 0),
+    ];
+    make_chunk(code, vec![s("Name")], 1)
+}
+
+#[test]
+fn self_ref_exact_decode_keeps_field_store_of_base() {
+    let src = decompile(&settableks_self_store_chunk());
+    assert!(src.contains(".Name = "), "real self store dropped:\n{src}");
+}
+
+#[test]
+fn self_ref_inferred_decode_keeps_legacy_drop() {
+    let src = decompile_inferred(&settableks_self_store_chunk());
+    assert!(!src.contains(".Name = "), "legacy drop lost:\n{src}");
+}

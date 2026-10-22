@@ -2407,8 +2407,18 @@ pub(super) fn lift_instruction_range(
                     // C10e: drop `x.MethodName = y` where MethodName is a
                     // known Roblox Instance method — always a decompiler
                     // artifact (you can't mutate inherited methods).
-                    if !is_self_referential_field_assign(&target, &val)
-                        && !is_roblox_method_lvalue_artifact(&target)
+                    // Self-referential filter: its premise (NAMECALL misread
+                    // as SETTABLEKS) needs a guessed opmap. On an exact decode
+                    // the store is in the bytecode, but a textual match with
+                    // A != B is still just two registers sharing one minted
+                    // name, so only the literal `R(B).k = R(B)` (A == B) is
+                    // exempt from the filter there.
+                    let is_closure_val = matches!(val, Expr::Function { .. });
+                    let is_self_ref = !is_closure_val
+                        && !(a == b && !is_inferred_opmap_decode())
+                        && is_self_referential_field_assign(&target, &val);
+                    if !is_self_ref
+                        && (is_closure_val || !is_roblox_method_lvalue_artifact(&target))
                     {
                         emit_assign(stmts, target, val);
                     }
