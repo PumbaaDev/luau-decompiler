@@ -6131,6 +6131,24 @@ fn simplify_stmts(stmts: &mut Vec<Stat>) {
     }
 }
 
+/// True when the call carried by `kept` (a bare-call statement recovered from
+/// the dead store at `skip`) already appears in another straight-line statement
+/// of the same block. The lifter often emitted that call once already (the
+/// overwriting store is frequently the same call), so keeping it again would run
+/// its side effect twice. The IR carries no pc, so identity is structural.
+fn call_already_emitted(stmts: &[Stat], skip: usize, kept: &Stat) -> bool {
+    let Stat::ExprStat(call) = kept else { return false };
+    let needle = format!("{:?}", call);
+    stmts.iter().enumerate().any(|(idx, st)| {
+        idx != skip
+            && matches!(
+                st,
+                Stat::Assign { .. } | Stat::Local { .. } | Stat::ExprStat(_) | Stat::Return { .. }
+            )
+            && format!("{:?}", st).contains(&needle)
+    })
+}
+
 // ---------------------------------------------------------------------------
 /// Also recursively processes nested statements in control flow.
 fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
@@ -6192,7 +6210,12 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
             // result is unused but the side effect is real.
             let kept: Vec<Stat> = match &stmts[i] {
                 Stat::Assign { values, .. } if values.iter().any(has_side_effects) => {
-                    values.iter().filter(|v| has_side_effects(v)).flat_map(extract_side_effect_stmts).collect()
+                    values
+                        .iter()
+                        .filter(|v| has_side_effects(v))
+                        .flat_map(extract_side_effect_stmts)
+                        .filter(|kept_stmt| !call_already_emitted(stmts, i, kept_stmt))
+                        .collect()
                 }
                 _ => Vec::new(),
             };
@@ -12219,6 +12242,34 @@ mod dead_store_call_tests {
         ];
         eliminate_dead_stores(&mut stmts);
         assert_eq!(stmts.len(), 2);
+        assert!(matches!(&stmts[0], Stat::ExprStat(Expr::Call { .. })));
+    }
+
+    /// The overwriting store already carries the same call (lifter emitted it
+    /// once): the dead store must not resurrect a second copy.
+    #[test]
+    fn dead_store_call_already_emitted_by_overwrite_is_not_duplicated() {
+        let call = || Expr::Call { func: Box::new(name("R2")), args: vec![Expr::String("GummyPower".into())] };
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("T")], values: vec![call()] },
+            Stat::Assign { targets: vec![name("T")], values: vec![call()] },
+        ];
+        eliminate_dead_stores(&mut stmts);
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Stat::Assign { .. }));
+    }
+
+    /// A genuinely different call in the dead store is still kept.
+    #[test]
+    fn dead_store_call_absent_elsewhere_is_kept_next_to_other_calls() {
+        let f = |a: &str| Expr::Call { func: Box::new(name("f")), args: vec![Expr::String(a.into())] };
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("x")], values: vec![f("a")] },
+            Stat::ExprStat(f("b")),
+            Stat::Assign { targets: vec![name("x")], values: vec![name("y")] },
+        ];
+        eliminate_dead_stores(&mut stmts);
+        assert_eq!(stmts.len(), 3);
         assert!(matches!(&stmts[0], Stat::ExprStat(Expr::Call { .. })));
     }
 
