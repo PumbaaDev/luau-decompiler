@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::ast::{Expr, Stat, TableField};
 
-use super::expr_references_name;
+use super::expr_uses_name_deep;
 
 /// Phase B0.47: Reconstruct `local M = { a = ..., b = ... }` table-constructor
 /// expressions from a `local M = {}` statement followed by a CONTIGUOUS run of
@@ -242,7 +242,13 @@ pub(super) fn field_assign_to_constructor_field(stmt: &Stat, target_name: &str) 
 
     // Circular-reference guard: if the RHS reads back from target_name,
     // it would observe the table mid-construction. Stop folding.
-    if expr_references_name(value, target_name) {
+    //
+    // The scan DESCENDS INTO CLOSURE BODIES: a closure that names the table
+    // (`__index = tbl`, `return tbl.new(..)`) reads it as an upvalue. Inside a
+    // constructor `local tbl = { f = function() .. tbl .. end }` the local is
+    // not yet in scope, so that name would resolve to a GLOBAL `tbl`
+    // (PetSimulator99 Items/Container: `return { new = .. __index = tbl .. }`).
+    if expr_uses_name_deep(value, target_name) {
         return None;
     }
 
@@ -323,7 +329,7 @@ pub(super) fn two_step_field_absorb(
     // Guard: F must not reference target_name (weird shadowing/circular
     // construction) — expression-level check mirrors the direct-assign
     // circular-reference guard in `field_assign_to_constructor_field`.
-    if expr_references_name(&f_value, target_name) {
+    if expr_uses_name_deep(&f_value, target_name) {
         return None;
     }
 

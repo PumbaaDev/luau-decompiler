@@ -285,11 +285,52 @@ fn is_unconditional_exit(op: LuauOpcode) -> bool {
 /// never assigned; `CogsPerRound`: `Op ..= ".."` after an `Add` arm read an
 /// `Op` that no arm wrote). Such an alias is refused.
 fn carries_value(code: &[u32], from: usize, to: usize, t: usize) -> bool {
+    carries_value_except(code, from, to, t, &[])
+}
+
+/// [`carries_value`] ignoring `pre_init` registers: ones that already hold a
+/// value from BEFORE the construct (see [`preinitialised`]). A write to such
+/// a register is a plain assignment to an existing variable, not the creation
+/// of a merge value, so the throwaway-local hazard above cannot arise.
+fn carries_value_except(code: &[u32], from: usize, to: usize, t: usize, pre_init: &[usize]) -> bool {
     const JOIN_WINDOW: usize = 64;
     let hi = to.min(code.len());
     super::collect_body_writes(code, from, hi)
         .into_iter()
+        .filter(|r| !pre_init.contains(r))
         .any(|r| reg_read_before_write(code, t, (t + JOIN_WINDOW).min(code.len()), r))
+}
+
+/// Registers whose LAST write before the range `[start, ..)` is a literal load
+/// (`LOADNIL`/`LOADB`/`LOADN`/`LOADK`) and that are not rewritten between
+/// `start` and the jump at `pc`. Such a register is a variable the range only
+/// updates conditionally (`local a, b = false, 0` then `if c then a = true end`);
+/// an `a and b` / if-else merge value is instead created by the code leading to
+/// the jump, never by a literal declaration. `PropsBillboardSlider` proto@190:
+/// `LOADB R2 / LOADN R3` at pc 14-15, then the X/Y/else arms (each ending in
+/// `JUMP -> 93`) assign R2/R3 under an inner `JUMPIFNOTLT -> 93`; that inner
+/// guard was dropped as a "value chain" and its body ran unconditionally.
+fn preinitialised(code: &[u32], start: usize, pc: usize) -> Vec<usize> {
+    let mut last_literal: std::collections::BTreeMap<usize, bool> = std::collections::BTreeMap::new();
+    let mut w = 0;
+    while w < start && w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = insn_size(op);
+        let literal = matches!(
+            op,
+            LuauOpcode::LoadNil | LuauOpcode::LoadB | LuauOpcode::LoadN | LuauOpcode::LoadK
+        );
+        for r in super::collect_body_writes(code, w, w + size) {
+            last_literal.insert(r, literal);
+        }
+        w += size;
+    }
+    let inside = super::collect_body_writes(code, start, pc);
+    last_literal
+        .into_iter()
+        .filter(|(r, literal)| *literal && !inside.contains(r))
+        .map(|(r, _)| r)
+        .collect()
 }
 
 /// S1 EXIT ALIAS. Is the out-of-range target `t` the place the range
@@ -342,7 +383,7 @@ pub(super) fn range_exit_alias(
             trace("ALIAS", pc, t, end, "refused:foreign_path");
             return None;
         }
-        if carries_value(code, jump_next, al, t) {
+        if carries_value_except(code, jump_next, al, t, &preinitialised(code, start, pc)) {
             trace("ALIAS", pc, t, end, "refused:value_chain");
             return None;
         }

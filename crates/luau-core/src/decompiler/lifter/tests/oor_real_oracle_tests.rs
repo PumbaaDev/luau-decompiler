@@ -107,3 +107,29 @@ fn loop_gap_join_does_not_write_an_orphan_name_that_becomes_a_global() {
         assert!(line != "Position = 0", "orphan write that becomes a global:\n{out}");
     }
 }
+
+const BILLBOARD_SLIDER: &[u8] = include_bytes!("fixtures/v14_props_billboard_slider.luac");
+const ITEMS_CONTAINER: &[u8] = include_bytes!("fixtures/v14_items_container.luac");
+
+#[test]
+fn literal_initialised_locals_do_not_make_an_arm_guard_a_value_chain() {
+    // Brookhaven PropsBillboardSlider: R2/R3 are declared by LOADB/LOADN before
+    // three arms that each end in `JUMP -> join`. The inner `JUMPIFNOTLT` guards
+    // target that join. They were refused as a "value chain" (R2/R3 are read at
+    // the join) and the guarded bodies then ran unconditionally.
+    let out = decompiled(BILLBOARD_SLIDER);
+    assert!(out.contains("if 0.05 < Enabled32 then"), "X-arm guard lost:\n{out}");
+    assert!(out.contains("if 0.05 < Enabled33 then"), "Y-arm guard lost:\n{out}");
+}
+
+#[test]
+fn self_referencing_closures_are_not_folded_into_the_module_constructor() {
+    // PetSimulator99 Items/Container: 33 closures capture the module table and
+    // `new` stores `__index = tbl`. Folding them into `return { ... }` left
+    // `tbl` undefined; the table must stay a named local.
+    let out = decompiled(ITEMS_CONTAINER);
+    assert!(out.contains("local tbl = {}"), "module table not kept:\n{out}");
+    assert!(out.contains("function tbl.new("), "constructor not a field function:\n{out}");
+    assert!(out.contains("return tbl"), "module does not return its table:\n{out}");
+    assert!(!out.contains("return {\n"), "closures folded into return {{}}:\n{out}");
+}
