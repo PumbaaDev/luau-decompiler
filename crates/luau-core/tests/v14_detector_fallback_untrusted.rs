@@ -30,6 +30,7 @@ fn unmeasured_v14_fallback_refuses_or_carries_untrusted_banner() {
         return;
     };
     let opts = DecompileOptions { v10plus: V10PlusMode::DetectorFallback, ..Default::default() };
+    let measured = DecompileOptions { v10plus: V10PlusMode::MeasuredOnly, ..Default::default() };
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).expect("read live dir").flatten() {
         let path = entry.path();
@@ -41,6 +42,11 @@ fn unmeasured_v14_fallback_refuses_or_carries_untrusted_banner() {
             continue;
         }
         checked += 1;
+        // A chunk the measured database verifies is decoded exactly, with no
+        // banner (ShrineFusionController since the roblox_v14_live entry).
+        if luau_core::decompile_with_options(&bc, &measured).is_ok() {
+            continue;
+        }
         match luau_core::decompile_with_options(&bc, &opts) {
             Err(e) => {
                 let msg = format!("{e:#}");
