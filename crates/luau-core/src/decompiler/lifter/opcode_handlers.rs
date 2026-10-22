@@ -2040,6 +2040,24 @@ pub(super) fn lift_instruction_range(
                 // ever does clobber a live module-table binding, the damage is
                 // a VISIBLE wrong name at the table's use sites — strictly
                 // better than an invisible stale expression at the call site.
+                // The register is about to be modified in place inside a
+                // conditional arm or loop body with no SETUPVAL: it is a
+                // private COPY of the upvalue, not an alias. Declare the copy
+                // here so the in-place write targets it, never the upvalue.
+                if copy_modified_in_arm_or_loop(code, pc, a, b) {
+                    // Reserve the copy's name so no later register is given it.
+                    let fresh = ctx.gen_scoped_name(&name);
+                    let proto_key = proto as *const _ as usize;
+                    locals.begin_alias_retire(proto_key, a, name.clone(), fresh.clone());
+                    let (_, copy_name) = locals.classify_write(a, &fresh);
+                    regs[a] = RegVal::Expr(Expr::Name(copy_name.clone()));
+                    stmts.push(Stat::Local {
+                        names: vec![copy_name],
+                        values: vec![Expr::Name(name.clone())],
+                    });
+                    pc += 1;
+                    continue;
+                }
                 regs[a] = RegVal::Expr(Expr::Name(name.clone()));
                 // The register is now an ALIAS of an existing binding (the
                 // upvalue), not a fresh slot. Without recording that, the
@@ -5893,6 +5911,155 @@ fn op_writes_a(op: LuauOpcode) -> bool {
             | LuauOpcode::NewTable
             | LuauOpcode::DupTable
     )
+}
+
+/// Does `op` (which writes A) also read A as an input operand? CALL reads its
+/// own function register; the loads and constructors never read A.
+fn write_reads_self(op: LuauOpcode, reg: usize, b: usize, c: usize) -> bool {
+    let c_is_reg = matches!(
+        op,
+        LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::And
+            | LuauOpcode::Or
+            | LuauOpcode::GetTable
+            | LuauOpcode::Concat
+    );
+    match op {
+        LuauOpcode::Call => true,
+        LuauOpcode::LoadNil
+        | LuauOpcode::LoadB
+        | LuauOpcode::LoadN
+        | LuauOpcode::LoadK
+        | LuauOpcode::GetGlobal
+        | LuauOpcode::GetImport
+        | LuauOpcode::NewClosure
+        | LuauOpcode::NewTable
+        | LuauOpcode::DupTable => false,
+        _ => b == reg || (c_is_reg && c == reg),
+    }
+}
+
+/// Arithmetic ops that compute `A = B op x` (compound-assignable on A == B).
+fn is_arith_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+    )
+}
+
+/// `GETUPVAL R U` at `pc`: is R a private ACCUMULATOR copy of the upvalue?
+///
+/// True when every later write to R in the proto is an in-place arithmetic
+/// step (`R = R op x`), the first of them sits inside a conditional arm or a
+/// loop that does not re-run the load, its result is read afterwards, and no
+/// SETUPVAL ever stores the copy back. Treating R as an alias would emit the
+/// step against the upvalue's name (`Cooldown /= speed`), a write the bytecode
+/// never performs. The straight-line case is already handled by the per-write
+/// retire; this covers the arm/loop-carried case it cannot, because a fresh
+/// local declared inside the arm would be scoped to it. Any other kind of write
+/// to R (a MOVE, a call result, a ternary arm) disqualifies it, so merges that
+/// the lifter already models keep their shape.
+fn copy_modified_in_arm_or_loop(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool {
+    if in_else_region_of_reg_write(code, pc, reg) {
+        return false;
+    }
+    let first = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if first.has_aux() { 2 } else { 1 };
+    // Furthest target of any conditional forward jump seen so far.
+    let mut skip_until: i64 = -1;
+    let mut first_step: Option<(usize, usize)> = None;
+    let mut conditional = false;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        let step = if op.has_aux() { 2 } else { 1 };
+        if op == LuauOpcode::SetUpval && b == upval {
+            return false;
+        }
+        if a == reg && (op == LuauOpcode::GetUpval || op_writes_a(op)) {
+            if !is_arith_op(op) || !write_reads_self(op, reg, b, c) {
+                return false;
+            }
+            if first_step.is_none() {
+                first_step = Some((i, step));
+                conditional = skip_until > i as i64 || loop_carries(code, pc, i);
+            }
+        }
+        if is_control_flow_op(op)
+            && !matches!(op, LuauOpcode::Jump | LuauOpcode::JumpBack | LuauOpcode::JumpX)
+        {
+            skip_until = skip_until.max(i as i64 + insn_d(insn) as i64 + 1);
+        }
+        i += step;
+    }
+    let Some((w, step)) = first_step else { return false };
+    conditional
+        && alias_reaches(code, pc, w)
+        && !upval_stored_back(code, w, reg, upval)
+        && reg_live_after(code, w + step, reg, 0, 0)
+}
+
+/// Is `pc` inside the skipped region of a forward unconditional JUMP that
+/// follows an earlier write of `reg`? That is the else arm of an if/else whose
+/// then arm also defines `reg`: the load is one side of a merge and its local
+/// would be scoped to the arm, so it must keep the merge machinery's handling.
+fn in_else_region_of_reg_write(code: &[u32], pc: usize, reg: usize) -> bool {
+    let mut first_write: Option<usize> = None;
+    let mut i = 0;
+    while i < pc && i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg && (op == LuauOpcode::GetUpval || op_writes_a(op)) {
+            first_write.get_or_insert(i);
+        }
+        let target = match op {
+            LuauOpcode::Jump => i as i64 + insn_d(insn) as i64 + 1,
+            LuauOpcode::JumpX => i as i64 + insn_e(insn) as i64 + 1,
+            _ => 0,
+        };
+        if target > pc as i64 && first_write.is_some_and(|w| w < i) {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Is there a backward jump after `w` that returns to a point after `load`
+/// (a loop that re-runs `w` without re-running the load)?
+fn loop_carries(code: &[u32], load: usize, w: usize) -> bool {
+    let mut i = w + 1;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let target = match op {
+            LuauOpcode::JumpBack | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop => i as i64 + insn_d(insn) as i64 + 1,
+            LuauOpcode::JumpX => i as i64 + insn_e(insn) as i64 + 1,
+            _ => i64::MAX,
+        };
+        if target > load as i64 && target <= w as i64 {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Is the value that the instruction at `pc` leaves in `reg` (an alias of

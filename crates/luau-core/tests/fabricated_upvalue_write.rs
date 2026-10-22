@@ -69,3 +69,36 @@ fn mul_into_upvalue_alias_register_is_not_stored_to_upvalue() {
     let Some(src) = decompile_prefix("194a6747") else { eprintln!("SKIP: oracle absent"); return };
     assert_absent(&src, "GetTileScale = ", "MUL into a GETUPVAL register");
 }
+
+fn bee_dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("LUAU_BEE_BC_DIR") {
+        return Some(PathBuf::from(p));
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest.join("../../target/full1143"),
+        PathBuf::from("C:/Users/jep/Downloads/luau-decompiler-v2/target/full1143"),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Collector touch script `touchStarted`: `GETUPVAL R4 U1` (the cooldown) is
+/// loaded each loop pass, then `DIV R4 R4 / R5` runs only inside an `if` arm and
+/// R4 is read after the join. No SETUPVAL for U1 exists, so the division acts on
+/// a private copy; it must not be emitted as `GetStat /= ...` on the upvalue.
+#[test]
+fn div_in_arm_on_upvalue_copy_is_not_a_compound_write_to_the_upvalue() {
+    let Some(dir) = bee_dir() else { eprintln!("SKIP: corpus absent"); return };
+    let Some(entry) = std::fs::read_dir(&dir).ok().and_then(|d| {
+        d.filter_map(|e| e.ok()).find(|e| {
+            e.file_name().to_string_lossy().ends_with("Collectors_Prototype_ClientScriptTouch.bin")
+        })
+    }) else {
+        eprintln!("SKIP: file absent");
+        return;
+    };
+    let bytes = std::fs::read(entry.path()).unwrap();
+    let Ok(src) = luau_core::decompile(&bytes) else { eprintln!("SKIP: refused"); return };
+    assert_absent(&src, "GetStat /=", "DIV in an arm on a GETUPVAL copy");
+    assert_absent(&src, "GetStat = ", "DIV in an arm on a GETUPVAL copy");
+}
