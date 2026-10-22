@@ -1623,10 +1623,6 @@ pub(super) fn lift_instruction_range(
 
     let code = &proto.code;
     let mut pc = start;
-    // Out-of-range forward jumps this range drops are recorded in a scope that
-    // nested lifts inherit and that is truncated back when this lift returns.
-    // See `oor_guard::on_foreign_path`.
-    let oor_scope = oor_guard::dropped_scope_len();
     // Track pending FastCall builtin ID so the next CALL can use it
     let mut pending_fastcall: Option<(u8, usize)> = None; // (builtin_id, target_reg)
     // A CALL with nresults==0 produces a VARIABLE number of results, but it is
@@ -1661,7 +1657,6 @@ pub(super) fn lift_instruction_range(
             note_stmts_pushed(stmts, delta);
         }
         if stmt_budget_tripped() {
-            oor_guard::dropped_scope_truncate(oor_scope);
             return;
         }
         last_len = stmts.len();
@@ -5866,7 +5861,6 @@ pub(super) fn lift_instruction_range(
     if delta > 0 {
         note_stmts_pushed(stmts, delta);
     }
-    oor_guard::dropped_scope_truncate(oor_scope);
 }
 
 

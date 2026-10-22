@@ -323,6 +323,7 @@ fn else_alias_refused_when_it_would_strand_an_and_link() {
 fn scope_hazard_counts_writes_after_scope_close() {
     use crate::ast::Stat;
     use crate::decompiler::lifter::scope_hazard_count;
+    use std::collections::HashSet;
     let n = |s: &str| Expr::Name(s.to_string());
     // if c then local x = 1 end ; x = 2   -> the write is a GLOBAL write
     let bad = vec![
@@ -334,7 +335,7 @@ fn scope_hazard_counts_writes_after_scope_close() {
         },
         Stat::Assign { targets: vec![n("x")], values: vec![Expr::Number(2.0)] },
     ];
-    assert_eq!(scope_hazard_count(&bad), 1);
+    assert_eq!(scope_hazard_count(&bad, &HashSet::new()), 1);
     // local x ; if c then x = 1 end ; return x   -> fine
     let good = vec![
         Stat::Local { names: vec!["x".into()], values: vec![] },
@@ -346,5 +347,43 @@ fn scope_hazard_counts_writes_after_scope_close() {
         },
         Stat::Return { values: vec![n("x")] },
     ];
-    assert_eq!(scope_hazard_count(&good), 0);
+    assert_eq!(scope_hazard_count(&good, &HashSet::new()), 0);
+}
+
+#[test]
+fn hazards_compare_per_class_and_count_distinct_reads() {
+    use crate::ast::Stat;
+    use crate::decompiler::lifter::{scope_hazards, Hazards};
+    use std::collections::HashSet;
+    let n = |s: &str| Expr::Name(s.to_string());
+    // Re-reading the same unbound name twice is ONE hazard, not two.
+    let out = vec![
+        Stat::Return { values: vec![n("v4")] },
+        Stat::Return { values: vec![n("v4")] },
+    ];
+    let (_, reads, uses) = scope_hazards(&out, &HashSet::new());
+    assert_eq!(uses, 2);
+    assert_eq!(reads.len(), 1);
+    // A bare vN that is the proto's own upvalue name is bound.
+    let ups: HashSet<String> = ["v4".to_string()].into_iter().collect();
+    let (_, reads, _) = scope_hazards(&out, &ups);
+    assert!(reads.is_empty());
+    // A gain in one class cannot hide a loss in another.
+    let on = Hazards { upvalue: 1, scope: 0, scope_uses: 0, orphan: 0 };
+    let off = Hazards { upvalue: 0, scope: 2, scope_uses: 2, orphan: 0 };
+    assert!(on.worse_than(off));
+    assert!(!off.worse_than(off));
+    // Scope and orphan hazards trade by their sum.
+    let on = Hazards { upvalue: 0, scope: 0, scope_uses: 0, orphan: 1 };
+    let off = Hazards { upvalue: 0, scope: 1, scope_uses: 1, orphan: 0 };
+    assert!(!on.worse_than(off));
+}
+
+#[test]
+fn name_dedup_alone_cannot_flip_an_on_lift_to_off() {
+    use crate::decompiler::lifter::Hazards;
+    // OFF looks cleaner only because its repeated reads were deduplicated.
+    let on = Hazards { upvalue: 0, scope: 0, scope_uses: 0, orphan: 331 };
+    let off = Hazards { upvalue: 0, scope: 138, scope_uses: 300, orphan: 192 };
+    assert!(!on.worse_than(off));
 }

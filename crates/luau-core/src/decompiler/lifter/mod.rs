@@ -1262,20 +1262,58 @@ fn collect_decl_names(stmts: &[Stat], d: &mut HashSet<String>) {
 /// (`2b4fdb6e updateMenuToItem`: an arm-merge rebind wrote `Text10 = ..` after
 /// `local Text10` went out of scope.) Nested function bodies are skipped;
 /// each child proto is checked by its own lift.
-fn scope_hazard_count(out: &[Stat]) -> usize {
+fn scope_hazard_count(out: &[Stat], upvals: &HashSet<String>) -> usize {
+    let (writes, reads, _) = scope_hazards(out, upvals);
+    writes.len() + reads.len()
+}
+
+/// The pre-dedup score: every unbound write AND every unbound read use counts,
+/// and no name is exempted as an upvalue. Used as a second opinion so the
+/// distinct-name score can only remove fallbacks the strict score also
+/// accepts (`RIVALS ReplicatedController`: deduping the OFF lift's repeated
+/// reads made a lossy OFF lift look cleaner than the faithful ON lift).
+fn scope_hazard_uses(out: &[Stat]) -> usize {
+    let (writes, _, read_uses) = scope_hazards(out, &HashSet::new());
+    writes.len() + read_uses
+}
+
+/// Unbound-name uses of a body: (names written while unbound, one per write; names read while unbound).
+fn scope_hazards(out: &[Stat], upvals: &HashSet<String>) -> (Vec<String>, HashSet<String>, usize) {
     struct W<'x> {
         decl: &'x HashSet<String>,
+        /// This proto's own upvalue names: a bare `vN` among them is bound
+        /// (to the enclosing chunk's local), not a lost register.
+        upvals: &'x HashSet<String>,
         scopes: Vec<HashSet<String>>,
-        n: usize,
+        /// Writes to an unbound name: every one is a possible clobber.
+        writes: Vec<String>,
+        /// Distinct names READ while unbound. A read of a name the body
+        /// already reads unbound elsewhere is not a new hazard: the binding
+        /// defect is the same one, so a faithfully lifted guard that tests it
+        /// must not count against the rewrite.
+        reads: HashSet<String>,
+        /// Every unbound read use (not deduplicated).
+        read_uses: usize,
     }
     impl W<'_> {
-        fn check(&mut self, name: &str) {
-            if self.decl.contains(name) && !self.scopes.iter().any(|s| s.contains(name)) {
-                self.n += 1;
-            } else if !self.decl.contains(name) && is_bare_register_name(name) {
+        fn is_unbound(&self, name: &str) -> bool {
+            if self.decl.contains(name) {
+                !self.scopes.iter().any(|s| s.contains(name))
+            } else {
                 // A generic `vN` that no scope of this body ever declares is a
                 // register read with no binding (`tbl4.Height = v2`): nil.
-                self.n += 1;
+                is_bare_register_name(name) && !self.upvals.contains(name)
+            }
+        }
+        fn check(&mut self, name: &str) {
+            if self.is_unbound(name) {
+                self.reads.insert(name.to_string());
+                self.read_uses += 1;
+            }
+        }
+        fn check_write(&mut self, name: &str) {
+            if self.is_unbound(name) {
+                self.writes.push(name.to_string());
             }
         }
         fn expr(&mut self, e: &Expr) {
@@ -1336,7 +1374,12 @@ fn scope_hazard_count(out: &[Stat]) -> usize {
                     }
                     Stat::Assign { targets, values } => {
                         values.iter().for_each(|v| self.expr(v));
-                        targets.iter().for_each(|t| self.expr(t));
+                        for t in targets {
+                            match t {
+                                Expr::Name(n) => self.check_write(n),
+                                other => self.expr(other),
+                            }
+                        }
                     }
                     Stat::If { condition, then_body, elseif_clauses, else_body } => {
                         self.expr(condition);
@@ -1387,9 +1430,9 @@ fn scope_hazard_count(out: &[Stat]) -> usize {
     }
     let mut decl = HashSet::new();
     collect_decl_names(out, &mut decl);
-    let mut w = W { decl: &decl, scopes: Vec::new(), n: 0 };
+    let mut w = W { decl: &decl, upvals, scopes: Vec::new(), writes: Vec::new(), reads: HashSet::new(), read_uses: 0 };
     w.block(out);
-    w.n
+    (w.writes, w.reads, w.read_uses)
 }
 
 /// Assignments in this body to a bare name that NOTHING in the body declares and
@@ -1438,9 +1481,47 @@ fn orphan_assign_count(ctx: &DecompileContext, proto: &Proto, proto_index: usize
     n
 }
 
-/// Hazard signals of a lifted proto body (not its children).
-fn lift_hazards(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> usize {
-    upclobber_count(ctx, proto, proto_index, out, false) + scope_hazard_count(out) + orphan_assign_count(ctx, proto, proto_index, out)
+/// Hazard signals of a lifted proto body (not its children), kept apart so a
+/// gain in one class cannot hide a loss in another: upvalue clobbers or lost
+/// upvalue writes, unbound-name uses, orphan writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Hazards {
+    upvalue: usize,
+    scope: usize,
+    /// Per-use (undeduplicated) scope score; see [`scope_hazard_uses`].
+    scope_uses: usize,
+    orphan: usize,
+}
+
+impl Hazards {
+    fn total(self) -> usize {
+        self.upvalue + self.scope + self.orphan
+    }
+
+    /// Is `self` worse than `other`? A lost upvalue write is never offset by a
+    /// gain elsewhere (it changes behaviour); scope and orphan hazards are
+    /// both name-binding noise and trade against each other by their sum.
+    /// The scope+orphan verdict needs BOTH the distinct-name score and the
+    /// per-use score to agree, so this can only keep ON where the old summed
+    /// score also would have, never turn an old ON into OFF by name dedup.
+    fn worse_than(self, other: Hazards) -> bool {
+        self.upvalue > other.upvalue
+            || (self.scope + self.orphan > other.scope + other.orphan
+                && self.scope_uses + self.orphan > other.scope_uses + other.orphan)
+    }
+}
+
+fn upvalue_names(ctx: &DecompileContext, proto: &Proto, proto_index: usize) -> HashSet<String> {
+    (0..proto.num_upvalues).map(|u| ctx.upval_name(proto, proto_index, u)).collect()
+}
+
+fn lift_hazards(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> Hazards {
+    Hazards {
+        upvalue: upclobber_count(ctx, proto, proto_index, out, false),
+        scope: scope_hazard_count(out, &upvalue_names(ctx, proto, proto_index)),
+        scope_uses: scope_hazard_uses(out),
+        orphan: orphan_assign_count(ctx, proto, proto_index, out),
+    }
 }
 
 /// HAZARD FALLBACK for the non-loop out-of-range rewrites (`oor_guard`).
@@ -1470,7 +1551,7 @@ fn lift_proto_with_oor_fallback(ctx: &mut DecompileContext, proto: &Proto, proto
         return out;
     }
     let h_on = lift_hazards(ctx, proto, proto_index, &out);
-    if h_on == 0 {
+    if h_on.total() == 0 {
         return out;
     }
     let ctx_on = std::mem::replace(ctx, snapshot);
@@ -1483,16 +1564,29 @@ fn lift_proto_with_oor_fallback(ctx: &mut DecompileContext, proto: &Proto, proto
     let out_off = oor_guard::with_disabled(proto, || lift_proto_inner_impl(ctx, proto, proto_index, depth));
     let h_off = lift_hazards(ctx, proto, proto_index, &out_off);
     if std::env::var("LUAU_OOR_FIX_TRACE").is_ok() {
+        let upvals = upvalue_names(ctx, proto, proto_index);
+        let (w_on, r_on, _) = scope_hazards(&out, &upvals);
+        let (w_off, r_off, _) = scope_hazards(&out_off, &upvals);
+        let mut new_reads: Vec<&String> = r_on.difference(&r_off).collect();
+        new_reads.sort();
         eprintln!(
-            "OORFIX\tFALLBACK\t{}@{}\tpc=0\ttarget=0\tend=0\thazards on={} off={} -> {}",
+            "OORFIX\tFALLBACKNAMES\t{}@{}\twrites_on={:?} writes_off={:?} new_reads={:?}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            w_on,
+            w_off,
+            new_reads
+        );
+        eprintln!(
+            "OORFIX\tFALLBACK\t{}@{}\tpc=0\ttarget=0\tend=0\thazards on={:?} off={:?} -> {}",
             proto.debug_name.as_deref().unwrap_or("?"),
             proto.line_defined,
             h_on,
             h_off,
-            if h_on > h_off { "OFF" } else { "ON" }
+            if h_on.worse_than(h_off) { "OFF" } else { "ON" }
         );
     }
-    if h_on > h_off {
+    if h_on.worse_than(h_off) {
         return out_off;
     }
     *ctx = ctx_on;

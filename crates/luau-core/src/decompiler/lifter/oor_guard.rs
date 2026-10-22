@@ -31,28 +31,18 @@ use super::{is_pure_expr, reg_read_before_write, sanitize_leaked_global_string, 
 
 thread_local! {
     /// Out-of-range forward jump targets that some ACTIVE `lift_instruction_range`
-    /// call discarded (or resumed past), keyed by proto identity. Nested lifts
-    /// see their ancestors' entries; each call truncates back to its own base
-    /// when it returns, so entries never outlive the range that dropped them.
+    /// call discarded (or resumed past), keyed by proto identity. A dropped jump
+    /// stays dropped for the rest of the proto's lift: the output that follows
+    /// it runs on that jump's path whichever sub-range emitted it (`fa3e7f27`
+    /// proto@532: the dropped first link lived in a nested lift that had
+    /// already returned when the second link was reached). Cleared per proto
+    /// by `fired_reset`.
     static OOR_DROPPED: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
 }
 
 fn proto_key(proto: &Proto) -> usize {
     proto as *const Proto as usize
 }
-
-/// Current depth of the dropped-jump scope; pass it to [`dropped_scope_truncate`]
-/// when the lift that took it returns.
-pub(super) fn dropped_scope_len() -> usize {
-    OOR_DROPPED.with(|d| d.borrow().len())
-}
-
-/// A dropped jump stays dropped for the rest of the proto's lift: the output
-/// that follows it runs on that jump's path whichever sub-range emitted it
-/// (`fa3e7f27` proto@532: the dropped first link lived in a nested lift that
-/// had already returned when the second link was reached). Entries are cleared
-/// per proto by [`fired_reset`].
-pub(super) fn dropped_scope_truncate(_n: usize) {}
 
 /// Record that the flat walk runs PAST a forward jump to `target` without
 /// modelling it: on that jump's path the bytecode never executes the code
