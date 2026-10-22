@@ -26,7 +26,8 @@ pub fn banner() -> String {
 
 /// Install a ground-truth opmap (canonical shuffled-byte → opcode table)
 /// obtained from an external source such as the an executor probe script. Ground
-/// truth is applied with top priority in every subsequent `detect` call.
+/// truth is applied with top priority in every subsequent `detect` call on the
+/// calling thread (it is thread-scoped, not process-wide).
 /// Pass `None` to clear any previously-installed ground truth.
 pub fn set_ground_truth_opmap(map: Option<[u8; 256]>) {
     parser::opmap::set_ground_truth(map);
@@ -40,15 +41,11 @@ pub fn get_ground_truth_opmap() -> Option<[u8; 256]> {
 /// Install a ground-truth map for a scope and put back whatever was there when
 /// the guard drops.
 ///
-/// The installed map lives in a process-global, which is fine for the intended
-/// use (a caller installs one map and decodes with it) but wrong for a caller
-/// that decodes chunks from several different builds in sequence: without a
-/// restore, the first install would leak into every later decode.
-///
-/// This does NOT make concurrent decodes of different builds safe. Two threads
-/// installing different maps still race, because the global is shared. A server
-/// decoding for multiple builds must serialise, or the map must be threaded
-/// through `detect_with_prior` as a parameter instead of read from a global.
+/// The installed map is scoped to the installing thread, which is the thread
+/// the whole decode runs on, so concurrent decodes of different builds on
+/// different threads cannot see each other's map. The guard restores whatever
+/// was installed before, so a caller decoding chunks from several builds in
+/// sequence does not leak the first install into later decodes.
 pub struct GroundTruthGuard(Option<[u8; 256]>);
 
 impl GroundTruthGuard {

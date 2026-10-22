@@ -7,33 +7,40 @@
 /// This module detects that permutation by analyzing bytecode patterns.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use super::types::*;
 use super::opcodes::LuauOpcode;
 
-/// Process-global ground-truth opcode mapping, supplied externally (e.g., by
+/// Thread-scoped ground-truth opcode mapping, supplied externally (e.g., by
 /// the server's `/api/opmap-probe` endpoint) and applied with top priority at
-/// the start of every detection run.
+/// the start of every detection run on the installing thread.
 ///
 /// Ground truth is a direct observation of the Roblox client's shuffle (via
 /// `lift_closure(loadstring(src))` round-trip), so it is strictly more
 /// authoritative than any heuristic detector or cached consensus. Entries
-/// here are LOCKED — validators must never unassign them, and per-script
+/// here are LOCKED: validators must never unassign them, and per-script
 /// detectors must never reassign their bytes.
-static GROUND_TRUTH: Mutex<Option<[u8; 256]>> = Mutex::new(None);
-
-/// Install ground-truth mappings for this process. Later calls fully replace
-/// any prior ground truth (so feeding a partially-populated table followed by
-/// a more complete one behaves as expected). Pass `None` to clear.
-pub fn set_ground_truth(map: Option<[u8; 256]>) {
-    let mut lock = GROUND_TRUTH.lock().unwrap_or_else(|p| p.into_inner());
-    *lock = map;
+///
+/// This is thread-local, not process-global, on purpose. A decode runs start
+/// to finish on one thread (the core spawns none), so install and read always
+/// happen on the same thread, and concurrent decodes of different builds (a
+/// server, or the parallel test harness) cannot read each other's map. A
+/// process-global here let one decode's installed map leak into an unrelated
+/// concurrent `detect`, which produced flaky wrong opcode assignments.
+thread_local! {
+    static GROUND_TRUTH: std::cell::Cell<Option<[u8; 256]>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Read the currently-installed ground truth, if any.
+/// Install ground-truth mappings for the CURRENT THREAD. Later calls fully
+/// replace any prior ground truth (so feeding a partially-populated table
+/// followed by a more complete one behaves as expected). Pass `None` to clear.
+pub fn set_ground_truth(map: Option<[u8; 256]>) {
+    GROUND_TRUTH.with(|g| g.set(map));
+}
+
+/// Read the ground truth installed on the current thread, if any.
 pub fn get_ground_truth() -> Option<[u8; 256]> {
-    let lock = GROUND_TRUTH.lock().unwrap_or_else(|p| p.into_inner());
-    *lock
+    GROUND_TRUTH.with(|g| g.get())
 }
 
 /// Merge a ground-truth map into a prior map. Ground-truth entries override

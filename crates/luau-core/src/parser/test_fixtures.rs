@@ -115,13 +115,11 @@ pub fn exact_map(perm: fn(u8) -> u8) -> [u8; 256] {
     m
 }
 
-/// Serialise the tests that install a process-global ground-truth map.
+/// Serialise the tests that install a ground-truth map.
 ///
-/// `GROUND_TRUTH` is process-wide, and the test harness runs tests in parallel,
-/// so two tests installing different maps would race and read each other's
-/// state. That is not a flaw in the tests: it is the same limitation
-/// `GroundTruthGuard` documents for real callers, surfacing exactly where you
-/// would expect it to.
+/// The map is thread-local, so tests no longer race on it; this lock is kept
+/// only so tests that install a map and then assert on process-wide
+/// expectations stay ordered with each other.
 pub fn ground_truth_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
