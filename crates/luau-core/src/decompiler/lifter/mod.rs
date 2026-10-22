@@ -5106,6 +5106,11 @@ pub(super) fn store_complex(
     // (only fires when the destination is already a named local AND the new
     // value reads from it) and safe (fold-only patterns like `R2 = R0 + 1`
     // are unaffected because `value` doesn't reference `R2`).
+    // An upvalue-alias register being given a value of its own (no SETUPVAL
+    // stores it back) must not reuse the carried upvalue name as the write
+    // target: see `LocalTracker::alias_retire`. The statement is still
+    // emitted (the value reads the alias, so it is not folded away).
+    let alias_retiring = locals.alias_retire_pending(reg);
     let is_self_mutation = match regs.get(reg) {
         Some(RegVal::Expr(Expr::Name(n))) | Some(RegVal::LoopVar(n)) => {
             expr_references_name(&value, n)
@@ -5184,6 +5189,7 @@ pub(super) fn store_complex(
         // exactly where the "local script = script.Parent" bug fires, and
         // we need the peek to catch it.
         let existing_name = match &regs[reg] {
+            _ if alias_retiring => None,
             RegVal::Expr(Expr::Name(n)) | RegVal::LoopVar(n) => Some(n.clone()),
             _ => None,
         };

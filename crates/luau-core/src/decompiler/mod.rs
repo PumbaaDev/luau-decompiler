@@ -54,6 +54,7 @@ pub enum RegisterHint {
 }
 
 /// Per-proto naming state, scoped so each proto gets its own clean namespace.
+#[derive(Clone)]
 struct ProtoNaming {
     /// Suffix counters per prefix to generate unique names within a proto
     prefix_counts: std::collections::HashMap<String, u32>,
@@ -458,6 +459,34 @@ impl<'a> DecompileContext<'a> {
         self.current_proto_index
             .and_then(|pi| self.proto_naming.get(&pi))
             .is_some_and(|naming| naming.pinned.contains(&(reg, pc)))
+    }
+
+    /// The name the write of `reg` at `pc` will get, made distinct from `alias`.
+    ///
+    /// Asks `reg_name` WITHOUT keeping its side effects (the per-prefix
+    /// counters and used-name set are restored), so that a probe on an
+    /// instruction that never reaches the namer cannot shift every later
+    /// suffix. When the derived name IS `alias` (a call result named after the
+    /// upvalue it was called through) a distinct name is minted and kept.
+    pub fn name_distinct_from(&mut self, proto: &Proto, reg: u8, pc: usize, alias: &str) -> String {
+        let pi = self.current_proto_index;
+        let saved_naming = pi.and_then(|pi| self.proto_naming.get(&pi).cloned());
+        let saved_used = self.used_names.clone();
+        let saved_counter = self.var_counter;
+        let cand = self.reg_name(proto, reg, pc);
+        if let (Some(pi), Some(n)) = (pi, saved_naming) {
+            self.proto_naming.insert(pi, n);
+        }
+        self.used_names = saved_used;
+        self.var_counter = saved_counter;
+        if cand != alias {
+            return cand;
+        }
+        let mut fresh = self.gen_scoped_name(alias);
+        while fresh == alias {
+            fresh = self.gen_scoped_name(alias);
+        }
+        fresh
     }
 
     /// Get a register name from debug info, or synthesize a meaningful one

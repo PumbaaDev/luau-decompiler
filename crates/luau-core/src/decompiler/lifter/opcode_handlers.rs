@@ -730,6 +730,12 @@ fn pinned_write_consumed(
     if !ctx.is_pinned_reg(a as u8, pc) {
         return false;
     }
+    // The pinned identity is an upvalue ALIAS and this write gives the register
+    // a value of its own that no SETUPVAL stores back: assigning to the pinned
+    // name would assign to the upvalue.
+    if locals.alias_retire_pending(a) {
+        return false;
+    }
     let bound = match regs.get(a) {
         Some(RegVal::Expr(Expr::Name(n))) if locals.current_name(a) == Some(n.as_str()) => {
             n.clone()
@@ -878,6 +884,12 @@ fn bind_arm_merge_seeds(
             _ => continue,
         };
         if is_generic_placeholder(&seed) {
+            continue;
+        }
+        // The seed is only the NAME of an upvalue this register was a read-only
+        // alias of, and the arm gave the register a value of its own with no
+        // SETUPVAL: writing it back to the seed would assign to the upvalue.
+        if locals.retired_alias_of(reg) == Some(seed.as_str()) {
             continue;
         }
         // Only a premateralized merge seed is pinned inside the construct span.
@@ -1694,6 +1706,28 @@ pub(super) fn lift_instruction_range(
         let e = insn_e(insn);
         let aux = if op.has_aux() && pc + 1 < code.len() { Some(code[pc + 1]) } else { None };
 
+        // An instruction that gives an UPVALUE-ALIAS register a value of its
+        // own, with no SETUPVAL storing it back, must not reuse the upvalue's
+        // name as the write target (the output would assign to an upvalue the
+        // bytecode never stores). Armed per instruction; see `alias_retire`.
+        locals.clear_alias_retire();
+        if op != LuauOpcode::GetUpval && op_writes_a(op) {
+            if let Some((upval, alias, loaded_at)) = locals.alias_upval_of(a) {
+                // Retire only when the write cannot be observed past the join
+                // of the range being lifted: a fresh local declared inside an
+                // arm or a loop body is scoped to it, so a value the register
+                // carries OUT of the range (read after `end`) or INTO the next
+                // iteration (alias loaded before this loop body) would be lost.
+                let confined = (start == 0 || !reg_live_after(code, end, a))
+                    && (!in_loop || loaded_at >= start)
+                    && alias_reaches(code, loaded_at, pc);
+                if confined && !upval_stored_back(code, pc, a, upval) {
+                    let fresh = ctx.name_distinct_from(proto, a as u8, pc, &alias);
+                    locals.begin_alias_retire(a, alias, fresh);
+                }
+            }
+        }
+
         // Ensure register vector is large enough for any operand we might access
         let max_reg = a.max(b).max(c) + 1;
         if max_reg > regs.len() {
@@ -1996,6 +2030,7 @@ pub(super) fn lift_instruction_range(
                 // deleted, silently dropping the upvalue write entirely.
                 locals.pre_declare(a);
                 locals.record_alias_name(a, &name);
+                locals.record_alias_upval(a, b, pc);
             }
             LuauOpcode::SetUpval => {
                 // Phase C2 pass #1 — SETUPVAL upval backscan.
@@ -5715,4 +5750,184 @@ pub(super) fn lift_instruction_range(
     if delta > 0 {
         note_stmts_pushed(stmts, delta);
     }
+}
+
+
+/// Does `op` write its destination register A? (Stores, jumps, returns and
+/// SETUPVAL do not; they only read A.)
+fn op_writes_a(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::LoadNil
+            | LuauOpcode::LoadB
+            | LuauOpcode::LoadN
+            | LuauOpcode::LoadK
+            | LuauOpcode::Move
+            | LuauOpcode::GetGlobal
+            | LuauOpcode::GetImport
+            | LuauOpcode::GetTable
+            | LuauOpcode::GetTableKS
+            | LuauOpcode::GetTableN
+            | LuauOpcode::NewClosure
+            | LuauOpcode::NameCall
+            | LuauOpcode::Call
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::And
+            | LuauOpcode::Or
+            | LuauOpcode::AndK
+            | LuauOpcode::OrK
+            | LuauOpcode::Concat
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+            | LuauOpcode::NewTable
+            | LuauOpcode::DupTable
+    )
+}
+
+/// Is the value that the instruction at `pc` leaves in `reg` (an alias of
+/// upvalue `upval`) later stored to that upvalue by a SETUPVAL, with only
+/// read-modify-write steps of `reg` in between?
+///
+/// `GETUPVAL R U; ADDK R R 1; SETUPVAL R U` is a counter update and keeps its
+/// `hits = hits + 1` shape. Any other write of `reg` first (or a RETURN) means
+/// the value is a scratch result: there is no store to the upvalue.
+fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool {
+    let first = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if first.has_aux() { 2 } else { 1 };
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        let step = if op.has_aux() { 2 } else { 1 };
+        if op == LuauOpcode::SetUpval && a == reg && b == upval {
+            return true;
+        }
+        if op == LuauOpcode::Return {
+            return false;
+        }
+        if a == reg && op_writes_a(op) {
+            let c_is_reg = matches!(
+                op,
+                LuauOpcode::Add
+                    | LuauOpcode::Sub
+                    | LuauOpcode::Mul
+                    | LuauOpcode::Div
+                    | LuauOpcode::Mod
+                    | LuauOpcode::Pow
+                    | LuauOpcode::And
+                    | LuauOpcode::Or
+                    | LuauOpcode::GetTable
+                    | LuauOpcode::Concat
+            );
+            let reads_self = match op {
+                LuauOpcode::Call => true,
+                LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::GetGlobal
+                | LuauOpcode::GetImport
+                | LuauOpcode::NewClosure
+                | LuauOpcode::NewTable
+                | LuauOpcode::DupTable => false,
+                _ => b == reg || (c_is_reg && c == reg),
+            };
+            if !reads_self {
+                return false;
+            }
+        }
+        i += step;
+    }
+    false
+}
+
+
+/// Is `reg` possibly read at or after `from` before something overwrites it?
+///
+/// Linear scan, deliberately conservative: any mention of `reg` that is not a
+/// plain whole-register definition counts as a read (a CALL/RETURN window
+/// counts), so the answer errs towards "live". Used to keep a fresh local that
+/// would be scoped to an arm or loop body from replacing a value that is
+/// consumed after it.
+fn reg_live_after(code: &[u32], from: usize, reg: usize) -> bool {
+    let mut i = from;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let step = if op.has_aux() { 2 } else { 1 };
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        let pure_def_by_a = matches!(
+            op,
+            LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::GetUpval
+                | LuauOpcode::GetGlobal
+                | LuauOpcode::GetImport
+                | LuauOpcode::NewClosure
+                | LuauOpcode::NewTable
+                | LuauOpcode::DupTable
+        );
+        if a == reg && pure_def_by_a {
+            return false;
+        }
+        if op_writes_a(op) && a == reg && b != reg && c != reg && op != LuauOpcode::Call {
+            return false;
+        }
+        match op {
+            LuauOpcode::Call => {
+                // Reads the function (A) and its arguments A+1..A+B-1; B == 0
+                // means every register above A up to the stack top.
+                if reg >= a && (b == 0 || reg < a + b) {
+                    return true;
+                }
+            }
+            LuauOpcode::Return => {
+                // Returns A..A+B-2; B == 0 means up to the stack top.
+                if reg >= a && (b == 0 || (b >= 2 && reg < a + b - 1)) {
+                    return true;
+                }
+            }
+            _ => {
+                if a == reg || b == reg || c == reg {
+                    return true;
+                }
+            }
+        }
+        i += step;
+    }
+    false
+}
+
+/// True when the GETUPVAL at `loaded_at` is on the straight-line path to `pc`:
+/// no forward unconditional JUMP between them skips over `pc`. A JUMP that
+/// does means `pc` sits in a sibling arm that the load never ran in.
+fn alias_reaches(code: &[u32], loaded_at: usize, pc: usize) -> bool {
+    let mut i = loaded_at;
+    while i < pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        let target = match op {
+            LuauOpcode::Jump => i as i64 + insn_d(code[i]) as i64 + 1,
+            LuauOpcode::JumpX => i as i64 + insn_e(code[i]) as i64 + 1,
+            _ => 0,
+        };
+        if target > pc as i64 {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    true
 }

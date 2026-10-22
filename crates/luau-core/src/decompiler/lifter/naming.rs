@@ -84,6 +84,19 @@ pub(in crate::decompiler) struct LocalTracker {
     /// own name) for an unrelated later CALL result collides with the real
     /// upvalue and makes dead-store elimination delete real statements (lv_0452).
     alias_regs: HashSet<usize>,
+    /// For each alias register, the upvalue index it was loaded from and the
+    /// pc of that GETUPVAL.
+    alias_upval: HashMap<usize, (usize, usize)>,
+    /// The destination register of the instruction being lifted, when it is an
+    /// ALIAS register being overwritten with a value of its own and no SETUPVAL
+    /// stores that value back: `(reg, alias_name, fresh_name)`. Set by the
+    /// dispatch loop before the handler runs and cleared before the next one,
+    /// so it can only ever affect the one write it was computed for.
+    alias_retire: Option<(usize, String, String)>,
+    /// Registers whose upvalue alias was retired by a write of their own, with
+    /// the alias name they carried. A branch-merge seed that is just that
+    /// alias name must not be assigned back (see `bind_arm_merge_seeds`).
+    retired_alias: HashMap<usize, String>,
 }
 
 impl LocalTracker {
@@ -92,7 +105,7 @@ impl LocalTracker {
         for i in 0..param_count {
             declared.insert(i);
         }
-        Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new() }
+        Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new(), alias_upval: HashMap::new(), alias_retire: None, retired_alias: HashMap::new() }
     }
 
     /// Returns true if this register needs a `local` declaration (first write).
@@ -184,6 +197,42 @@ impl LocalTracker {
         self.alias_regs.insert(reg);
     }
 
+    /// Remember which upvalue index the alias register `reg` was loaded from.
+    pub(super) fn record_alias_upval(&mut self, reg: usize, upval: usize, pc: usize) {
+        self.alias_upval.insert(reg, (upval, pc));
+    }
+
+    /// `(upvalue index, alias name, pc of the GETUPVAL)` if `reg` currently
+    /// holds a read-only alias of an upvalue.
+    pub(super) fn alias_upval_of(&self, reg: usize) -> Option<(usize, String, usize)> {
+        if !self.alias_regs.contains(&reg) {
+            return None;
+        }
+        let (idx, pc) = *self.alias_upval.get(&reg)?;
+        let name = self.current_names.get(&reg)?.clone();
+        Some((idx, name, pc))
+    }
+
+    /// Arm the retire for the write about to be lifted (see `alias_retire`).
+    pub(super) fn begin_alias_retire(&mut self, reg: usize, alias: String, fresh: String) {
+        self.alias_retire = Some((reg, alias, fresh));
+    }
+
+    /// The upvalue alias name `reg` carried before a write of its own retired it.
+    pub(super) fn retired_alias_of(&self, reg: usize) -> Option<&str> {
+        self.retired_alias.get(&reg).map(|s| s.as_str())
+    }
+
+    pub(super) fn clear_alias_retire(&mut self) {
+        self.alias_retire = None;
+    }
+
+    /// Is the write of `reg` that is being lifted one that must NOT reuse the
+    /// upvalue alias it currently carries?
+    pub(super) fn alias_retire_pending(&self, reg: usize) -> bool {
+        matches!(&self.alias_retire, Some((r, _, _)) if *r == reg)
+    }
+
     /// Phase B0.49 — decide how to emit a single-register write.
     ///
     /// Returns a `(WriteKind, name_to_use)` pair.  For `FirstDecl` and
@@ -203,6 +252,23 @@ impl LocalTracker {
         // re-declared.  Mirrors `needs_local`'s behavior.
         if reg < self.param_count {
             return (WriteKind::Reassign, new_name.to_string());
+        }
+        // A write of the register's OWN value into an upvalue alias that no
+        // SETUPVAL stores back: the register is a fresh local, never a
+        // reassignment of the upvalue. This must run BEFORE the same-name arm
+        // below, because a derived result name (`value(...)` -> `value`) or a
+        // generic one equals the alias name and would otherwise reassign it.
+        if let Some((r, alias, fresh)) = self.alias_retire.clone() {
+            if r == reg {
+                self.alias_retire = None;
+                self.alias_regs.remove(&reg);
+                self.alias_upval.remove(&reg);
+                self.retired_alias.insert(reg, alias.clone());
+                let name = if new_name == alias { fresh } else { new_name.to_string() };
+                self.declared.insert(reg);
+                self.current_names.insert(reg, name.clone());
+                return (WriteKind::Shadow, name);
+            }
         }
         if !self.declared.contains(&reg) {
             self.declared.insert(reg);
