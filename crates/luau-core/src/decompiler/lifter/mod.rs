@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use crate::parser::types::*;
 
 mod naming;
+mod retired_scope;
 use naming::{WriteKind, LocalTracker, is_semantic_local_name};
 pub(crate) use naming::RegVal;
 
@@ -1293,7 +1294,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             count_calls_stats(&stmts));
     }
     eliminate_dead_stores(&mut stmts);
-    redeclare_retired_out_of_scope(&mut stmts, &mut Vec::new(), &mut HashSet::new(), &naming::retired_fresh_names());
+    retired_scope::fix_retired_scopes(&mut stmts, &naming::retired_fresh_names());
     pass_probe(proto, "eliminate_dead_stores", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_stores calls={}",
@@ -6132,170 +6133,6 @@ fn simplify_stmts(stmts: &mut Vec<Stat>) {
 
 // ---------------------------------------------------------------------------
 /// Also recursively processes nested statements in control flow.
-/// A retired fresh name (see `naming::retired_fresh_alias`) is declared `local`
-/// where the retire happened, which may be an inner scope. Code outside that
-/// scope must not use the name:
-///  * a single `name = value` assignment becomes a declaration in the scope it
-///    sits in (a bare assignment would write a global), even before the name's
-///    first declaration: free-variable hoisting treats a name that is declared
-///    anywhere as declared everywhere;
-///  * a read of a name no enclosing scope declares falls back to the upvalue
-///    alias the register carried before the retire.
-/// `scopes` holds the names visible at this point, innermost last; `seen` every
-/// name this proto has declared so far (a retired name never declared here is an
-/// unrelated upvalue that happens to share its spelling and is left alone);
-/// `retired` maps each retired name of this proto to its alias.
-fn redeclare_retired_out_of_scope(
-    stmts: &mut Vec<Stat>,
-    scopes: &mut Vec<HashSet<String>>,
-    seen: &mut HashSet<String>,
-    retired: &HashMap<String, String>,
-) {
-    if retired.is_empty() {
-        return;
-    }
-    scopes.push(HashSet::new());
-    for stmt in stmts.iter_mut() {
-        let hidden: HashMap<String, String> = retired
-            .iter()
-            .filter(|(n, _)| seen.contains(*n) && !scopes.iter().any(|s| s.contains(*n)))
-            .map(|(n, a)| (n.clone(), a.clone()))
-            .collect();
-        if !hidden.is_empty() {
-            rename_stmt_reads_shallow(stmt, &hidden);
-        }
-        let redeclared = match stmt {
-            Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => match &targets[0] {
-                Expr::Name(n) if retired.contains_key(n) && !scopes.iter().any(|s| s.contains(n)) => {
-                    Some((n.clone(), values.remove(0)))
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some((name, value)) = redeclared {
-            *stmt = Stat::Local { names: vec![name], values: vec![value] };
-        }
-        match stmt {
-            Stat::Local { names, .. } => {
-                seen.extend(names.iter().cloned());
-                if let Some(top) = scopes.last_mut() {
-                    top.extend(names.iter().cloned());
-                }
-            }
-            Stat::LocalFunction { name, .. } => {
-                seen.insert(name.clone());
-                if let Some(top) = scopes.last_mut() {
-                    top.insert(name.clone());
-                }
-            }
-            Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                redeclare_retired_out_of_scope(then_body, scopes, seen, retired);
-                for (_, body) in elseif_clauses.iter_mut() {
-                    redeclare_retired_out_of_scope(body, scopes, seen, retired);
-                }
-                if let Some(body) = else_body {
-                    redeclare_retired_out_of_scope(body, scopes, seen, retired);
-                }
-            }
-            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
-                redeclare_retired_out_of_scope(body, scopes, seen, retired);
-            }
-            Stat::NumericFor { var, body, .. } => {
-                scopes.push(HashSet::from([var.clone()]));
-                redeclare_retired_out_of_scope(body, scopes, seen, retired);
-                scopes.pop();
-            }
-            Stat::GenericFor { vars, body, .. } => {
-                scopes.push(vars.iter().cloned().collect());
-                redeclare_retired_out_of_scope(body, scopes, seen, retired);
-                scopes.pop();
-            }
-            _ => {}
-        }
-    }
-    scopes.pop();
-}
-
-/// Rename reads in the expressions this statement itself evaluates (not its
-/// nested blocks, and not closure bodies, which are separate protos).
-fn rename_stmt_reads_shallow(stmt: &mut Stat, renames: &HashMap<String, String>) {
-    match stmt {
-        Stat::Local { values, .. } => values.iter_mut().for_each(|v| rename_reads_shallow(v, renames)),
-        Stat::Assign { targets, values } => {
-            for t in targets.iter_mut() {
-                if !matches!(t, Expr::Name(_)) {
-                    rename_reads_shallow(t, renames);
-                }
-            }
-            values.iter_mut().for_each(|v| rename_reads_shallow(v, renames));
-        }
-        Stat::ExprStat(e) => rename_reads_shallow(e, renames),
-        Stat::Return { values } => values.iter_mut().for_each(|v| rename_reads_shallow(v, renames)),
-        Stat::If { condition, elseif_clauses, .. } => {
-            rename_reads_shallow(condition, renames);
-            for (c, _) in elseif_clauses.iter_mut() {
-                rename_reads_shallow(c, renames);
-            }
-        }
-        Stat::While { condition, .. } | Stat::Repeat { condition, .. } => rename_reads_shallow(condition, renames),
-        Stat::NumericFor { start, stop, step, .. } => {
-            rename_reads_shallow(start, renames);
-            rename_reads_shallow(stop, renames);
-            if let Some(s) = step {
-                rename_reads_shallow(s, renames);
-            }
-        }
-        Stat::GenericFor { iterators, .. } => iterators.iter_mut().for_each(|e| rename_reads_shallow(e, renames)),
-        _ => {}
-    }
-}
-
-fn rename_reads_shallow(expr: &mut Expr, renames: &HashMap<String, String>) {
-    match expr {
-        Expr::Name(n) => {
-            if let Some(alias) = renames.get(n.as_str()) {
-                *n = alias.clone();
-            }
-        }
-        Expr::Field { object, .. } => rename_reads_shallow(object, renames),
-        Expr::Index { object, key } => {
-            rename_reads_shallow(object, renames);
-            rename_reads_shallow(key, renames);
-        }
-        Expr::BinOp { left, right, .. } => {
-            rename_reads_shallow(left, renames);
-            rename_reads_shallow(right, renames);
-        }
-        Expr::UnOp { operand, .. } => rename_reads_shallow(operand, renames),
-        Expr::Call { func, args } => {
-            rename_reads_shallow(func, renames);
-            args.iter_mut().for_each(|a| rename_reads_shallow(a, renames));
-        }
-        Expr::MethodCall { object, args, .. } => {
-            rename_reads_shallow(object, renames);
-            args.iter_mut().for_each(|a| rename_reads_shallow(a, renames));
-        }
-        Expr::Table { fields } => {
-            for f in fields.iter_mut() {
-                match f {
-                    TableField::Sequential(e) | TableField::Named(_, e) => rename_reads_shallow(e, renames),
-                    TableField::Indexed(k, v) => {
-                        rename_reads_shallow(k, renames);
-                        rename_reads_shallow(v, renames);
-                    }
-                }
-            }
-        }
-        Expr::Ternary { cond, then_expr, else_expr } => {
-            rename_reads_shallow(cond, renames);
-            rename_reads_shallow(then_expr, renames);
-            rename_reads_shallow(else_expr, renames);
-        }
-        _ => {}
-    }
-}
-
 fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
     let mut i = 0;
     while i < stmts.len() {
@@ -12393,71 +12230,5 @@ mod dead_store_call_tests {
         ];
         eliminate_dead_stores(&mut stmts);
         assert_eq!(stmts.len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod retired_scope_tests {
-    use super::*;
-
-    fn name(n: &str) -> Expr {
-        Expr::Name(n.to_string())
-    }
-
-    fn retire(proto_id: usize, fresh: &str, alias: &str) {
-        let mut locals = LocalTracker::new(0);
-        locals.begin_alias_retire(proto_id, 3, alias.to_string(), fresh.to_string());
-        set_dce_proto_id(proto_id);
-    }
-
-    /// `if c then local t = ... end; t = f()` writes a global: the second
-    /// statement must become its own declaration.
-    #[test]
-    fn bare_assignment_to_a_retired_name_outside_its_scope_is_redeclared() {
-        retire(0xA001, "v342", "v34");
-        let mut stmts = vec![
-            Stat::If {
-                condition: name("c"),
-                then_body: vec![Stat::Local { names: vec!["v342".into()], values: vec![name("a")] }],
-                elseif_clauses: vec![],
-                else_body: None,
-            },
-            Stat::Assign { targets: vec![name("v342")], values: vec![name("b")] },
-        ];
-        redeclare_retired_out_of_scope(&mut stmts, &mut Vec::new(), &mut HashSet::new(), &naming::retired_fresh_names());
-        assert!(matches!(&stmts[1], Stat::Local { names, .. } if names == &vec!["v342".to_string()]));
-    }
-
-    /// A read of the retired name where no declaration is visible falls back to
-    /// the upvalue alias, as the code did before the retire.
-    #[test]
-    fn read_of_an_out_of_scope_retired_name_falls_back_to_the_alias() {
-        retire(0xA002, "v4044", "v40");
-        let mut stmts = vec![
-            Stat::If {
-                condition: name("c"),
-                then_body: vec![Stat::Local { names: vec!["v4044".into()], values: vec![name("a")] }],
-                elseif_clauses: vec![],
-                else_body: None,
-            },
-            Stat::Local { names: vec!["x".into()], values: vec![Expr::Index { object: Box::new(name("v4044")), key: Box::new(name("k")) }] },
-        ];
-        redeclare_retired_out_of_scope(&mut stmts, &mut Vec::new(), &mut HashSet::new(), &naming::retired_fresh_names());
-        match &stmts[1] {
-            Stat::Local { values, .. } => assert!(matches!(&values[0], Expr::Index { object, .. } if matches!(&**object, Expr::Name(n) if n == "v40"))),
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    /// A name declared in an enclosing scope is untouched.
-    #[test]
-    fn retired_name_visible_in_scope_is_left_alone() {
-        retire(0xA003, "v9", "v1");
-        let mut stmts = vec![
-            Stat::Local { names: vec!["v9".into()], values: vec![name("a")] },
-            Stat::Assign { targets: vec![name("v9")], values: vec![name("b")] },
-        ];
-        redeclare_retired_out_of_scope(&mut stmts, &mut Vec::new(), &mut HashSet::new(), &naming::retired_fresh_names());
-        assert!(matches!(&stmts[1], Stat::Assign { .. }));
     }
 }
