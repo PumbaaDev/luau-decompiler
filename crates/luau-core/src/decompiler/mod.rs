@@ -217,6 +217,7 @@ impl ProtoNaming {
 }
 
 /// Context for decompilation, holds chunk-level state
+#[derive(Clone)]
 pub struct DecompileContext<'a> {
     pub chunk: &'a Chunk,
     pub var_counter: u32,

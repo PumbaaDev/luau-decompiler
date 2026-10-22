@@ -25,6 +25,7 @@ use crate::parser::types::{
     Constant, Proto,
 };
 
+use super::oor_guard;
 use super::{
     // Register-write primitives.
     emit_assign,
@@ -543,6 +544,7 @@ fn detect_else_skip(
     then_start: usize,
     target: usize,
     end: usize,
+    exit_ctx: Option<(&Proto, usize, bool)>,
 ) -> (usize, Option<(usize, usize)>) {
     if target <= then_start || target > code.len() {
         return (target, None);
@@ -559,6 +561,17 @@ fn detect_else_skip(
         _ => return (target, None),
     };
     let ok = jump_target > target && jump_target <= end;
+    // S1 (guard_to_shared_exit): an else-skip whose destination is where this
+    // range exits to is a jump to the range end; the else arm runs to `end`.
+    // See `oor_guard::else_skip_exit_alias`. Non-loop only (`exit_ctx`).
+    let exit_alias = !ok
+        && jump_target > target
+        && exit_ctx.map_or(false, |(proto, pc, in_loop)| {
+            oor_guard::else_skip_exit_alias(code, proto, pc, then_start, target, end, last_pc, jump_target, in_loop)
+        });
+    if exit_alias {
+        return (last_pc, Some((target, end)));
+    }
     if std::env::var("LUAU_ELSE_TRACE").is_ok() {
         eprintln!(
             "ELSE_SKIP then_start={} target={} end={} last_pc={} jump_target={} -> {}",
@@ -578,7 +591,7 @@ fn detect_else_skip(
 /// Used to tell a genuinely dead tail from one the walk merely stopped short
 /// of: an instruction something jumps TO is reachable regardless of the path
 /// that was just abandoned.
-fn pc_is_branch_target(code: &[u32], want: usize) -> bool {
+pub(super) fn pc_is_branch_target(code: &[u32], want: usize) -> bool {
     let mut pc = 0usize;
     while pc < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[pc]));
@@ -1610,6 +1623,10 @@ pub(super) fn lift_instruction_range(
 
     let code = &proto.code;
     let mut pc = start;
+    // Out-of-range forward jumps this range drops are recorded in a scope that
+    // nested lifts inherit and that is truncated back when this lift returns.
+    // See `oor_guard::on_foreign_path`.
+    let oor_scope = oor_guard::dropped_scope_len();
     // Track pending FastCall builtin ID so the next CALL can use it
     let mut pending_fastcall: Option<(u8, usize)> = None; // (builtin_id, target_reg)
     // A CALL with nresults==0 produces a VARIABLE number of results, but it is
@@ -1644,6 +1661,7 @@ pub(super) fn lift_instruction_range(
             note_stmts_pushed(stmts, delta);
         }
         if stmt_budget_tripped() {
+            oor_guard::dropped_scope_truncate(oor_scope);
             return;
         }
         last_len = stmts.len();
@@ -4492,6 +4510,12 @@ pub(super) fn lift_instruction_range(
                     //     calls gained in six, nothing lost anywhere
                     let next_pc = pc + if op.has_aux() { 2 } else { 1 };
                     if next_pc < end && pc_is_branch_target(code, next_pc) {
+                        // The path through this JUMP skips everything the walk
+                        // resumes into; no out-of-range guard there may fire
+                        // on it (`oor_guard::on_foreign_path`).
+                        if !in_loop {
+                            oor_guard::note_dropped(proto, target);
+                        }
                         pc = next_pc;
                         continue;
                     }
@@ -4570,6 +4594,11 @@ pub(super) fn lift_instruction_range(
                 }
                 let cond = reg_expr(regs, a);
                 let mut target = (pc as i32 + d as i32 + 1) as usize;
+                // S1 EXIT ALIAS (non-loop): a target past `end` that is where
+                // this range exits to is a jump to the range end.
+                if let Some(al) = oor_guard::range_exit_alias(code, proto, pc, start, end, target, in_loop) {
+                    target = al;
+                }
                 // The RAW jump target, before `extended_arm_end` may push it out
                 // to a later construct end. The type-guard fold only applies when
                 // this jump directly skips to the else; a jump that lands INSIDE
@@ -4621,7 +4650,14 @@ pub(super) fn lift_instruction_range(
                 // `a or b or c` / `a and b and c` merge their operands in one
                 // register. Rebuild the expression rather than lowering it to
                 // control flow, which loses every operand but the first.
-                if let Some(chain) = recognize_or_and_chain(code, pc) {
+                // A chain whose JOIN lies past this range and is a terminal
+                // RETURN block is left to the S2 terminal-return guard below,
+                // which emits the exact `if A then return A end`. See
+                // `oor_guard::chain_yields_to_terminal_return`.
+                let chain = recognize_or_and_chain(code, pc).filter(|c| {
+                    !oor_guard::chain_yields_to_terminal_return(ctx, proto, regs, c.end_pc, end, target, a, in_loop)
+                });
+                if let Some(chain) = chain {
                     // SPECULATIVE. The segment lifts below write into the SHARED
                     // register file, and when the chain is rejected (`ok = false`)
                     // control falls through to the inline-if path with those
@@ -4715,7 +4751,7 @@ pub(super) fn lift_instruction_range(
 
                     // If/else diamond: see the JumpXEqK* arm below.
                     let (then_end, else_range) =
-                        detect_else_skip(code, jump_next, target, end);
+                        detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
@@ -4915,9 +4951,35 @@ pub(super) fn lift_instruction_range(
                     // Forward jump beyond our range (or out of the loop)
                     if std::env::var("LUAU_OOR_TRACE").is_ok() {
                         eprintln!(
-                            "OOR pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
-                            pc, op, target, end, in_loop, ctx.current_loop_end
+                            "OOR proto={} pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            crate::decompiler::lifter::current_dce_proto(), pc, op, target, end, in_loop, ctx.current_loop_end
                         );
+                    }
+                    // S2 TERMINAL-RETURN GUARD (non-loop): a jump to a terminal
+                    // RETURN block is exactly `if <fire> then return .. end`.
+                    // See `oor_guard::terminal_return_at`.
+                    if !in_loop {
+                        if let Some(plan) = oor_guard::oor_terminal_return(ctx, proto, regs, pc, target, end, &[a], true) {
+                            let bound = oor_guard::plan_operand(&plan).map(|r| {
+                                let v = reg_expr(regs, r);
+                                emit_local_or_assign(ctx, proto, regs, locals, stmts, r, pc, v);
+                                reg_expr(regs, r)
+                            });
+                            let cond = reg_expr(regs, a);
+                            let fire = if op == LuauOpcode::JumpIf {
+                                cond
+                            } else {
+                                Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) }
+                            };
+                            if let Some(ret) = oor_guard::build_return(plan, bound.as_ref()) {
+                                stmts.push(Stat::If {
+                                    condition: fire,
+                                    then_body: vec![ret],
+                                    elseif_clauses: vec![],
+                                    else_body: None,
+                                });
+                            }
+                        }
                     }
                     if in_loop {
                         let condition = if op == LuauOpcode::JumpIf {
@@ -4981,7 +5043,11 @@ pub(super) fn lift_instruction_range(
                     other => other,
                 };
                 let condition = Expr::BinOp { left: Box::new(left.clone()), op: cmp, right: Box::new(right.clone()) };
-                let target = (pc as i32 + d as i32 + 1) as usize;
+                let mut target = (pc as i32 + d as i32 + 1) as usize;
+                // S1 EXIT ALIAS (non-loop): see the JumpIf arm.
+                if let Some(al) = oor_guard::range_exit_alias(code, proto, pc, start, end, target, in_loop) {
+                    target = al;
+                }
 
                 // `local x = a < b` compiles to a branch over a LOADB pair —
                 // store the comparison as a value, not as control flow.
@@ -5019,7 +5085,7 @@ pub(super) fn lift_instruction_range(
                     // the compiler's else-skip JUMP falls through to the
                     // out-of-range handler and becomes a spurious `break`.
                     let (then_end, else_range) =
-                        detect_else_skip(code, jump_next, target, end);
+                        detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
@@ -5109,9 +5175,22 @@ pub(super) fn lift_instruction_range(
                 } else {
                     if std::env::var("LUAU_OOR_TRACE").is_ok() {
                         eprintln!(
-                            "OOR-XEQK pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
-                            pc, op, target, end, in_loop, ctx.current_loop_end
+                            "OOR-XEQK proto={} pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            crate::decompiler::lifter::current_dce_proto(), pc, op, target, end, in_loop, ctx.current_loop_end
                         );
+                    }
+                    // S2 TERMINAL-RETURN GUARD (non-loop): see the JumpIf arm.
+                    if !in_loop {
+                        if let Some(plan) = oor_guard::oor_terminal_return(ctx, proto, regs, pc, target, end, &[a, aux_reg], false) {
+                            if let Some(ret) = oor_guard::build_return(plan, None) {
+                                stmts.push(Stat::If {
+                                    condition: condition.clone(),
+                                    then_body: vec![ret],
+                                    elseif_clauses: vec![],
+                                    else_body: None,
+                                });
+                            }
+                        }
                     }
                     if in_loop {
                         stmts.push(Stat::If {
@@ -5147,6 +5226,10 @@ pub(super) fn lift_instruction_range(
                 let neg_cmp = if negated { BinOp::Eq } else { BinOp::NotEq };
                 let condition = Expr::BinOp { left: Box::new(left.clone()), op: cmp, right: Box::new(right.clone()) };
                 let mut target = (pc as i32 + d as i32 + 1) as usize;
+                // S1 EXIT ALIAS (non-loop): see the JumpIf arm.
+                if let Some(al) = oor_guard::range_exit_alias(code, proto, pc, start, end, target, in_loop) {
+                    target = al;
+                }
                 // A branch inside this arm targeting past it is the construct's
                 // own continuation; cutting here strands it into a bare
                 // `continue`. See `extended_arm_end`.
@@ -5193,7 +5276,7 @@ pub(super) fn lift_instruction_range(
                     // handler and becomes a spurious `break` inside loops, and
                     // the else body is lifted as if it were unconditional.
                     let (then_end, else_range) =
-                        detect_else_skip(code, jump_next, target, end);
+                        detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
@@ -5284,9 +5367,22 @@ pub(super) fn lift_instruction_range(
                 } else {
                     if std::env::var("LUAU_OOR_TRACE").is_ok() {
                         eprintln!(
-                            "OOR-XEQK pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
-                            pc, op, target, end, in_loop, ctx.current_loop_end
+                            "OOR-XEQK proto={} pc={} op={:?} target={} end={} in_loop={} loop_end={:?}",
+                            crate::decompiler::lifter::current_dce_proto(), pc, op, target, end, in_loop, ctx.current_loop_end
                         );
+                    }
+                    // S2 TERMINAL-RETURN GUARD (non-loop): see the JumpIf arm.
+                    if !in_loop {
+                        if let Some(plan) = oor_guard::oor_terminal_return(ctx, proto, regs, pc, target, end, &[a], false) {
+                            if let Some(ret) = oor_guard::build_return(plan, None) {
+                                stmts.push(Stat::If {
+                                    condition: condition.clone(),
+                                    then_body: vec![ret],
+                                    elseif_clauses: vec![],
+                                    else_body: None,
+                                });
+                            }
+                        }
                     }
                     if in_loop {
                         stmts.push(Stat::If {
@@ -5752,6 +5848,7 @@ pub(super) fn lift_instruction_range(
     if delta > 0 {
         note_stmts_pushed(stmts, delta);
     }
+    oor_guard::dropped_scope_truncate(oor_scope);
 }
 
 

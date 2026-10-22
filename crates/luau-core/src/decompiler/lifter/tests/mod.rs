@@ -65,6 +65,10 @@ mod namecall_orphan_diagnosis_tests;
 mod namecall_arg_move_not_loadk_tests;
 mod type_guard_fold_tests;
 #[cfg(test)]
+mod oor_nonloop_tests;
+#[cfg(test)]
+mod oor_real_oracle_tests;
+#[cfg(test)]
 mod phase_c10q_kv_drop_any_name_tests;
 #[cfg(test)]
 mod phase_c10r_empty_fn_drop_tests;

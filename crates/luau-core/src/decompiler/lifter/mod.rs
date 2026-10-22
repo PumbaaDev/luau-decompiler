@@ -31,6 +31,7 @@ use post_passes::{
     inline_pure_literals,
 };
 
+mod oor_guard;
 mod opcode_handlers;
 use opcode_handlers::lift_instruction_range;
 
@@ -1002,7 +1003,7 @@ fn count_calls_expr(e: &Expr) -> usize {
 }
 
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
-    let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    let out = lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
     // Always recorded, not gated: this feeds a semantic check, not a trace.
     {
         // A CALL IN PROVABLY-DEAD CODE IS NOT A DROPPED CALL.
@@ -1074,6 +1075,9 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
         );
         crate::decompiler::call_recovery::record(proto_index, &who, bc, count_calls_stats(&out));
     }
+    if std::env::var("LUAU_UPCLOBBER_TRACE").is_ok() {
+        upclobber_report(ctx, proto, proto_index, &out);
+    }
     if std::env::var("LUAU_BODY_REPORT").is_ok() {
         // Also count CALL-family opcodes. A `dropped_call` claim - "a call whose
         // result is referenced but the call itself is missing" - is decidable by
@@ -1118,6 +1122,382 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
             count_calls_stats(&out)
         );
     }
+    out
+}
+
+/// Diagnostic (`LUAU_UPCLOBBER_TRACE`): an upvalue name assigned more often in
+/// the lifted body than the bytecode has `SETUPVAL`s for that slot is a write
+/// the lifter routed to the UPVALUE where the bytecode only writes a register
+/// (a pinned register holding an upvalue alias). Used to compare builds.
+fn upclobber_report(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) {
+    upclobber_count(ctx, proto, proto_index, out, true);
+}
+
+/// Excess assignments to upvalue names over the slot's `SETUPVAL` count (see
+/// [`upclobber_report`]).
+fn upclobber_count(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat], print: bool) -> usize {
+    fn walk(stmts: &[Stat], assigns: &mut HashMap<String, usize>, locals: &mut HashSet<String>) {
+        for st in stmts {
+            match st {
+                Stat::Local { names, .. } => locals.extend(names.iter().cloned()),
+                Stat::LocalFunction { name, .. } => {
+                    locals.insert(name.clone());
+                }
+                Stat::Assign { targets, .. } => {
+                    for t in targets {
+                        if let Expr::Name(n) = t {
+                            *assigns.entry(n.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                    walk(then_body, assigns, locals);
+                    for (_, b) in elseif_clauses {
+                        walk(b, assigns, locals);
+                    }
+                    if let Some(b) = else_body {
+                        walk(b, assigns, locals);
+                    }
+                }
+                Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                    walk(body, assigns, locals)
+                }
+                Stat::NumericFor { var, body, .. } => {
+                    locals.insert(var.clone());
+                    walk(body, assigns, locals)
+                }
+                Stat::GenericFor { vars, body, .. } => {
+                    locals.extend(vars.iter().cloned());
+                    walk(body, assigns, locals)
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut assigns = HashMap::new();
+    let mut locals = HashSet::new();
+    walk(out, &mut assigns, &mut locals);
+    let mut excess = 0usize;
+    for u in 0..proto.num_upvalues {
+        let name = ctx.upval_name(proto, proto_index, u);
+        if locals.contains(&name) {
+            continue;
+        }
+        let n_assign = assigns.get(&name).copied().unwrap_or(0);
+        let mut n_set = 0usize;
+        let mut i = 0usize;
+        while i < proto.code.len() {
+            let insn = proto.code[i];
+            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+            if op == LuauOpcode::SetUpval && insn_b(insn) as u8 == u {
+                n_set += 1;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        if n_assign < n_set && n_assign == 0 {
+            // A slot the bytecode writes but the body never assigns: the
+            // write was lost (`v43 = false` vanished, its reader then folded
+            // the register). Only the all-lost case counts; merged writes
+            // legitimately lower the count.
+            excess += 1;
+        }
+        if n_assign > n_set {
+            excess += n_assign - n_set;
+            if print {
+                eprintln!(
+                    "UPCLOBBER\t{}@{}\t{}\tassigns={}\tsetupvals={}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    name,
+                    n_assign,
+                    n_set
+                );
+            }
+        }
+    }
+    excess
+}
+
+/// `v<digits>`: the generic register placeholder (never a real identifier).
+fn is_bare_register_name(name: &str) -> bool {
+    name.strip_prefix('v')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Every name this body declares anywhere (locals, local functions, loop vars).
+fn collect_decl_names(stmts: &[Stat], d: &mut HashSet<String>) {
+    for st in stmts {
+        match st {
+            Stat::Local { names, .. } => d.extend(names.iter().cloned()),
+            Stat::LocalFunction { name, .. } => {
+                d.insert(name.clone());
+            }
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                collect_decl_names(then_body, d);
+                for (_, b) in elseif_clauses {
+                    collect_decl_names(b, d);
+                }
+                if let Some(b) = else_body {
+                    collect_decl_names(b, d);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                collect_decl_names(body, d)
+            }
+            Stat::NumericFor { var, body, .. } => {
+                d.insert(var.clone());
+                collect_decl_names(body, d)
+            }
+            Stat::GenericFor { vars, body, .. } => {
+                d.extend(vars.iter().cloned());
+                collect_decl_names(body, d)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reads or writes of a name that this body declares as a local, at a point
+/// where no enclosing scope declares it: the access silently becomes a GLOBAL.
+/// (`2b4fdb6e updateMenuToItem`: an arm-merge rebind wrote `Text10 = ..` after
+/// `local Text10` went out of scope.) Nested function bodies are skipped;
+/// each child proto is checked by its own lift.
+fn scope_hazard_count(out: &[Stat]) -> usize {
+    struct W<'x> {
+        decl: &'x HashSet<String>,
+        scopes: Vec<HashSet<String>>,
+        n: usize,
+    }
+    impl W<'_> {
+        fn check(&mut self, name: &str) {
+            if self.decl.contains(name) && !self.scopes.iter().any(|s| s.contains(name)) {
+                self.n += 1;
+            } else if !self.decl.contains(name) && is_bare_register_name(name) {
+                // A generic `vN` that no scope of this body ever declares is a
+                // register read with no binding (`tbl4.Height = v2`): nil.
+                self.n += 1;
+            }
+        }
+        fn expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Name(n) => self.check(n),
+                Expr::Field { object, .. } => self.expr(object),
+                Expr::Index { object, key } => {
+                    self.expr(object);
+                    self.expr(key)
+                }
+                Expr::BinOp { left, right, .. } => {
+                    self.expr(left);
+                    self.expr(right)
+                }
+                Expr::UnOp { operand, .. } => self.expr(operand),
+                Expr::Call { func, args } => {
+                    self.expr(func);
+                    args.iter().for_each(|a| self.expr(a))
+                }
+                Expr::MethodCall { object, args, .. } => {
+                    self.expr(object);
+                    args.iter().for_each(|a| self.expr(a))
+                }
+                Expr::Table { fields } => {
+                    for f in fields {
+                        match f {
+                            TableField::Sequential(v) | TableField::Named(_, v) => self.expr(v),
+                            TableField::Indexed(k, v) => {
+                                self.expr(k);
+                                self.expr(v)
+                            }
+                        }
+                    }
+                }
+                Expr::Ternary { cond, then_expr, else_expr } => {
+                    self.expr(cond);
+                    self.expr(then_expr);
+                    self.expr(else_expr)
+                }
+                _ => {}
+            }
+        }
+        fn block(&mut self, stmts: &[Stat]) {
+            self.scopes.push(HashSet::new());
+            self.stmts(stmts);
+            self.scopes.pop();
+        }
+        fn stmts(&mut self, stmts: &[Stat]) {
+            for st in stmts {
+                match st {
+                    Stat::Local { names, values } => {
+                        values.iter().for_each(|v| self.expr(v));
+                        let top = self.scopes.last_mut().unwrap();
+                        top.extend(names.iter().cloned());
+                    }
+                    Stat::LocalFunction { name, .. } => {
+                        self.scopes.last_mut().unwrap().insert(name.clone());
+                    }
+                    Stat::Assign { targets, values } => {
+                        values.iter().for_each(|v| self.expr(v));
+                        targets.iter().for_each(|t| self.expr(t));
+                    }
+                    Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                        self.expr(condition);
+                        self.block(then_body);
+                        for (c, b) in elseif_clauses {
+                            self.expr(c);
+                            self.block(b);
+                        }
+                        if let Some(b) = else_body {
+                            self.block(b);
+                        }
+                    }
+                    Stat::While { condition, body } => {
+                        self.expr(condition);
+                        self.block(body)
+                    }
+                    Stat::Repeat { body, condition } => {
+                        self.scopes.push(HashSet::new());
+                        self.stmts(body);
+                        self.expr(condition);
+                        self.scopes.pop();
+                    }
+                    Stat::NumericFor { var, start, stop, step, body } => {
+                        self.expr(start);
+                        self.expr(stop);
+                        if let Some(s) = step {
+                            self.expr(s);
+                        }
+                        let mut sc = HashSet::new();
+                        sc.insert(var.clone());
+                        self.scopes.push(sc);
+                        self.block(body);
+                        self.scopes.pop();
+                    }
+                    Stat::GenericFor { vars, iterators, body } => {
+                        iterators.iter().for_each(|i| self.expr(i));
+                        self.scopes.push(vars.iter().cloned().collect());
+                        self.block(body);
+                        self.scopes.pop();
+                    }
+                    Stat::Return { values } => values.iter().for_each(|v| self.expr(v)),
+                    Stat::DoBlock { body } => self.block(body),
+                    Stat::ExprStat(e) => self.expr(e),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut decl = HashSet::new();
+    collect_decl_names(out, &mut decl);
+    let mut w = W { decl: &decl, scopes: Vec::new(), n: 0 };
+    w.block(out);
+    w.n
+}
+
+/// Assignments in this body to a bare name that NOTHING in the body declares and
+/// that is not one of the proto's upvalue names: a register-named write the
+/// chunk-level `local` pass has to hoist, and which becomes a GLOBAL write when
+/// another scope of the chunk binds the same name (`CountdownTimer`: a rewrite
+/// wrote `Position = 0` in a closure while a sibling function declared
+/// `local Position`). Compared between the rewrite and rewrite-free lifts, so
+/// only an increase matters.
+fn orphan_assign_count(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> usize {
+    fn walk(stmts: &[Stat], decl: &HashSet<String>, upvals: &HashSet<String>, n: &mut usize) {
+        for st in stmts {
+            match st {
+                Stat::Assign { targets, .. } => {
+                    for t in targets {
+                        if let Expr::Name(name) = t {
+                            if !decl.contains(name) && !upvals.contains(name) {
+                                *n += 1;
+                            }
+                        }
+                    }
+                }
+                Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                    walk(then_body, decl, upvals, n);
+                    for (_, b) in elseif_clauses {
+                        walk(b, decl, upvals, n);
+                    }
+                    if let Some(b) = else_body {
+                        walk(b, decl, upvals, n);
+                    }
+                }
+                Stat::While { body, .. }
+                | Stat::Repeat { body, .. }
+                | Stat::DoBlock { body }
+                | Stat::NumericFor { body, .. }
+                | Stat::GenericFor { body, .. } => walk(body, decl, upvals, n),
+                _ => {}
+            }
+        }
+    }
+    let mut decl = HashSet::new();
+    collect_decl_names(out, &mut decl);
+    let upvals: HashSet<String> = (0..proto.num_upvalues).map(|u| ctx.upval_name(proto, proto_index, u)).collect();
+    let mut n = 0usize;
+    walk(out, &decl, &upvals, &mut n);
+    n
+}
+
+/// Hazard signals of a lifted proto body (not its children).
+fn lift_hazards(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> usize {
+    upclobber_count(ctx, proto, proto_index, out, false) + scope_hazard_count(out) + orphan_assign_count(ctx, proto, proto_index, out)
+}
+
+/// HAZARD FALLBACK for the non-loop out-of-range rewrites (`oor_guard`).
+///
+/// Each rewrite is exact on its own, but the inline if it creates runs the
+/// shared merge machinery (premateralized seeds, pinned registers, arm-merge
+/// rebinds), which has known failure modes on some register shapes: a pinned
+/// register holding an upvalue ALIAS reassigns the upvalue (`b88d6cad
+/// OnTouchChanged`: `tbl3 = self.Position - v442`), and an arm-merge rebind can
+/// write a local after its scope closed (`2b4fdb6e`: `Text10 = Discount4`
+/// became a global write). When a proto in which a rewrite fired shows MORE of
+/// those hazard signals than the same proto lifted without the rewrites, the
+/// rewrite-free lift is kept: a guard is never bought with a new clobber.
+/// Kill-switch for the fallback itself: `LUAU_NO_OOR_FALLBACK`.
+fn lift_proto_with_oor_fallback(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    if std::env::var("LUAU_NO_OOR_FALLBACK").is_ok() || !oor_guard::proto_has_candidates(proto) {
+        return lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    }
+    let snapshot = ctx.clone();
+    let budget = (
+        STMTS_EMITTED.with(|c| c.get()),
+        STMT_BUDGET_TRIPPED.with(|c| c.get()),
+    );
+    oor_guard::fired_reset(proto);
+    let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    if oor_guard::fired_count(proto) == 0 {
+        return out;
+    }
+    let h_on = lift_hazards(ctx, proto, proto_index, &out);
+    if h_on == 0 {
+        return out;
+    }
+    let ctx_on = std::mem::replace(ctx, snapshot);
+    let budget_on = (
+        STMTS_EMITTED.with(|c| c.get()),
+        STMT_BUDGET_TRIPPED.with(|c| c.get()),
+    );
+    STMTS_EMITTED.with(|c| c.set(budget.0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(budget.1));
+    let out_off = oor_guard::with_disabled(proto, || lift_proto_inner_impl(ctx, proto, proto_index, depth));
+    let h_off = lift_hazards(ctx, proto, proto_index, &out_off);
+    if std::env::var("LUAU_OOR_FIX_TRACE").is_ok() {
+        eprintln!(
+            "OORFIX\tFALLBACK\t{}@{}\tpc=0\ttarget=0\tend=0\thazards on={} off={} -> {}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            h_on,
+            h_off,
+            if h_on > h_off { "OFF" } else { "ON" }
+        );
+    }
+    if h_on > h_off {
+        return out_off;
+    }
+    *ctx = ctx_on;
+    STMTS_EMITTED.with(|c| c.set(budget_on.0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(budget_on.1));
     out
 }
 
@@ -1833,6 +2213,38 @@ fn lift_branch_region(
                 );
                 return;
             }
+        }
+    }
+    // LOOP BODY SPLIT AT AN EARLY-EXIT GAP. A loop body's block list holds only
+    // the natural loop; a `return` guard inside it (`if not c then return end`)
+    // is an EXIT block, so the list has a pc gap there and the body falls into
+    // runs. Lifted run by run, the guard's conditional jump targets the first
+    // pc after the gap - past its run's `end` - and is discarded (or becomes a
+    // `continue`) while the `return` is emitted after the loop. When every gap
+    // is a RETURN-terminated block, lift the whole span as one range instead:
+    // the jump target is then in range and the guard becomes an inline `if`.
+    // Kill-switch: `LUAU_NO_LOOP_GAP_JOIN`.
+    if in_loop
+        && runs.len() > 1
+        && std::env::var("LUAU_NO_LOOP_GAP_JOIN").is_err()
+        && oor_guard::gap_join_allowed(proto)
+        && runs.windows(2).all(|w| {
+            let gap_start = ranges[w[0].1].1;
+            let gap_end = ranges[w[1].0].0;
+            gap_start < gap_end
+                && crate::analysis::structuring::arm_terminates(&proto.code, gap_start, gap_end)
+                // A jump INTO the gap (the `a or b` chain whose first link
+                // targets the RETURN) is not a plain guard: the flat walk
+                // drops the body after it (`b928db02` Run()).
+                && !opcode_handlers::pc_is_branch_target(&proto.code, gap_start)
+        })
+    {
+        let span_lo = ranges[runs[0].0].0;
+        let span_hi = ranges[runs[runs.len() - 1].1].1;
+        if !crate::analysis::structuring::range_contains_nested_for(&proto.code, span_lo, span_hi) {
+            oor_guard::note_gap_join(proto);
+            lift_instruction_range(ctx, proto, proto_index, depth, span_lo, span_hi, regs, locals, out, in_loop);
+            return;
         }
     }
     for &(lo, hi) in &runs {
