@@ -270,7 +270,7 @@ fn infer_main_proto_upval_names(proto: &Proto, strings: &[String]) -> Vec<String
                 }
             }
             LuauOpcode::SetGlobal => {
-                // SETGLOBAL A D [AUX]: writes R(A) into global K[D].
+                // SETGLOBAL A C [AUX]: writes R(A) into global K[AUX] (see resolve_global_name).
                 // If R(A) was loaded from GETUPVAL with no intervening overwrite,
                 // the upval's "natural" name is the global being assigned to.
                 if a < reg_count {
@@ -612,7 +612,7 @@ fn infer_upval_names_from_setupval(
             }
 
             LuauOpcode::GetGlobal => {
-                // GETGLOBAL A D [AUX]: K[D] is the global name, AUX is hash/index
+                // GETGLOBAL A C [AUX]: K[AUX] is the global name; C is a hash slot
                 let aux_word = code.get(pc + 1).copied();
                 let name = resolve_global_name(proto, strings, d, aux_word);
                 if a < reg_count {
@@ -9866,18 +9866,42 @@ fn resolve_aux_string_at(proto: &Proto, strings: &[String], idx: u32) -> Option<
     None
 }
 
-/// Resolve a global name for GETGLOBAL/SETGLOBAL using both the D field
-/// (constant index K[D]) and the AUX word (which may be a hash or index).
+/// Resolve a global name for GETGLOBAL/SETGLOBAL.
 ///
-/// In the Luau VM, GETGLOBAL is `A D [AUX]` where:
-///   - K[D] is the String constant holding the global's name
-///   - AUX is typically a hash of that string (used for fast table lookup)
+/// CANONICAL ENCODING (Luau `Bytecode.h`, `lvmexecute.cpp` LOP_GETGLOBAL /
+/// LOP_SETGLOBAL): `A, C = predicted hash slot, AUX = constant index`. The VM
+/// reads the name as `VM_KV(aux)`. B is always 0 and C is `luaS_hash(name) &
+/// 0xFF`, so the "D field" (bits 16-31) is `C << 8`: a hash byte, NEVER a
+/// constant index.
 ///
-/// However, in Roblox's shuffled bytecode, AUX sometimes doubles as a
-/// constant index. We try K[D] first (the canonical source), then fall back
-/// to AUX-based resolution, then finally to known-globals inference.
+/// EVIDENCE: across every measured corpus (v9 union1324, the 777-pair v12
+/// oracle, 11 live v12 games) K[AUX] is a String constant for 14,491 of
+/// 14,491 GETGLOBAL/SETGLOBAL instructions and B is always 0; C equals
+/// `hash(K[AUX]) & 0xFF` for all 182 checked oracle names. The old order
+/// (K[D], strings[D], K[D-1], strings[D-1], K[D+1] before AUX) named the
+/// WRONG global whenever one of those tiers happened to hit:
+///   - C=0 → D=0 → K[0]: Animate `SETGLOBAL onSwimming` (word 0x00002318,
+///     AUX=148) emitted `script = onSwimming`;
+///   - C=5 → D=1280 → K[1280] in a 2,338-constant proto: StickerTypes
+///     `GETGLOBAL tostring` (0x05000d35, AUX=2322) emitted
+///     `("+0.5% Pollen")(v.ID)`;
+///   - C=1 → D=256 → chunk.strings[256]: RootCamera `IsAToolEquipped`
+///     written as `MenuOpened`.
+///
+/// So K[AUX] is consulted FIRST and, when it is a String, it is the answer.
+/// The legacy D / multi-tier AUX chain below is kept only as a fallback for
+/// streams where K[AUX] is not a String (never on measured-map input: only
+/// hand-built or detector-misaligned streams, e.g. a GETGLOBAL encoded with
+/// no AUX word so the next instruction is read as AUX).
 pub(super) fn resolve_global_name(proto: &Proto, strings: &[String], d: i16, aux: Option<u32>) -> Option<String> {
-    // Primary: K[D] — the D field is a signed 16-bit constant index
+    // Canonical: K[AUX], exactly as the VM reads it.
+    if let Some(ax) = aux {
+        if let Some(s) = resolve_aux_string_canonical(proto, ax) {
+            return Some(s);
+        }
+    }
+
+    // Legacy fallback (non-canonical streams only): the D tiers.
     let d_unsigned = d as u16 as usize;
     if let Some(k) = proto.constants.get(d_unsigned) {
         if let Some(s) = const_to_string(k, strings, &proto.constants) {

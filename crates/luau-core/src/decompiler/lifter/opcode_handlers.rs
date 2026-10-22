@@ -1913,8 +1913,9 @@ pub(super) fn lift_instruction_range(
             }
 
             LuauOpcode::GetGlobal => {
-                // GETGLOBAL A D [AUX]: K[D] is the global name, AUX is a hash/index.
-                // Try K[D] first (canonical), then AUX multi-fallback.
+                // GETGLOBAL A C [AUX]: K[AUX] is the global name (VM_KV(aux));
+                // C is a hash slot, so D = C<<8 is NOT an index. See
+                // resolve_global_name for the rule and its evidence.
                 // When all resolution fails, the instruction is likely a misaligned
                 // data word — absorb silently instead of emitting garbage.
                 if let Some(name) = resolve_global_name(proto, &ctx.chunk.strings, d, aux) {

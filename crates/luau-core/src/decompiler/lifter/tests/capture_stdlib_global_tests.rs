@@ -142,7 +142,9 @@ fn val_captures_of_two_sibling_stdlib_globals_both_resolve() {
         insn_ad(OP_GETGLOBAL, 0, 0),
         0u32, // AUX
         insn_ad(OP_GETGLOBAL, 1, 1),
-        0u32, // AUX
+        // AUX = K index of the name (canonical Luau: the VM reads VM_KV(aux);
+        // D is a hash slot, not an index). AUX=0 here named K0 "print".
+        1u32,
         insn_ad(OP_NEWCLOSURE, 2, 0),
         insn_abc(OP_CAPTURE, 0, 0, 0), // val R0 ("print")
         insn_ad(OP_NEWCLOSURE, 3, 1),
