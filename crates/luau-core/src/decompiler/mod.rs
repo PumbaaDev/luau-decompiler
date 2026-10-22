@@ -98,6 +98,9 @@ struct ProtoNaming {
     /// a loop-carried binding whose writes must be emitted" from "this register
     /// happens to have a name".
     pinned: std::collections::HashSet<(u8, usize)>,
+    /// Globals this proto (or any closure nested in it) reads or writes. A
+    /// local with one of these names would capture the access.
+    global_reads: std::collections::HashSet<String>,
 }
 
 /// Phase B0.51C — compact key encoding a stable-identity hint.  Used by
@@ -138,34 +141,46 @@ impl ProtoNaming {
             hints: std::collections::HashMap::new(),
             reserved: std::collections::HashSet::new(),
             pinned: std::collections::HashSet::new(),
+            global_reads: std::collections::HashSet::new(),
         }
+    }
+
+    /// True when a local called `name` would shadow a global that is still
+    /// reachable here.
+    fn shadows_global(&self, name: &str) -> bool {
+        is_well_known_global(name) || self.global_reads.contains(name)
     }
 
     /// Generate a unique name with the given prefix within this proto.
     /// First use of a prefix gets the plain name (e.g., "result"),
     /// subsequent uses get suffixed (e.g., "result2", "result3").
     fn unique_name(&mut self, prefix: &str, used_names: &std::collections::HashSet<String>) -> String {
-        let count = self.prefix_counts.entry(prefix.to_string()).or_insert(0);
-        *count += 1;
-        let name = if *count == 1 {
-            prefix.to_string()
-        } else {
-            format!("{}{}", prefix, count)
-        };
-        // If it collides with a global reserved name, keep bumping until the
-        // name is actually free. A single bump could still hand back a
-        // colliding name (`result2` taken → returns `result3`, but `result3`
-        // may be taken too).
-        if used_names.contains(&name) || self.reserved.contains(&name) {
-            loop {
-                *count += 1;
-                let alt = format!("{}{}", prefix, count);
-                if !used_names.contains(&alt) && !self.reserved.contains(&alt) {
-                    return alt;
-                }
+        // A prefix that is itself a reachable global never gets the bare name:
+        // it starts at `Prefix_2` so the global stays visible.
+        let shadowing = self.shadows_global(prefix);
+        let mut count = *self.prefix_counts.get(prefix).unwrap_or(&0);
+        loop {
+            count += 1;
+            if shadowing && count == 1 {
+                count = 2;
+            }
+            let candidate = if shadowing {
+                format!("{}_{}", prefix, count)
+            } else if count == 1 {
+                prefix.to_string()
+            } else {
+                format!("{}{}", prefix, count)
+            };
+            // Keep bumping until the name is free: not used elsewhere, not an
+            // inherited upvalue, and not a global (`Color` + 3 is `Color3`).
+            if !used_names.contains(&candidate)
+                && !self.reserved.contains(&candidate)
+                && !self.shadows_global(&candidate)
+            {
+                self.prefix_counts.insert(prefix.to_string(), count);
+                return candidate;
             }
         }
-        name
     }
 
     /// Phase B0.51C — generate a stable-identity name within this proto that
@@ -332,6 +347,14 @@ impl<'a> DecompileContext<'a> {
             .cloned()
             .collect();
         self.proto_naming.insert(proto_index, naming);
+    }
+
+    /// Record the globals a proto (and its nested closures) read, so no local
+    /// in it is given one of those names.
+    pub fn reserve_global_reads(&mut self, proto_index: usize, reads: std::collections::HashSet<String>) {
+        if let Some(naming) = self.proto_naming.get_mut(&proto_index) {
+            naming.global_reads = reads;
+        }
     }
 
     /// Let every function in this proto claim its own name before lifting.
@@ -1084,6 +1107,22 @@ pub fn is_stdlib_shadow_name(s: &str) -> bool {
         | "tick" | "time" | "os" | "math" | "string" | "table"
         | "coroutine" | "debug" | "bit32" | "buffer" | "utf8"
         | "task" | "game" | "workspace" | "script")
+}
+
+/// Globals a local must not be named after: the stdlib set plus the Roblox
+/// datatype constructors and misc globals that `is_stdlib_shadow_name` omits.
+pub fn is_well_known_global(s: &str) -> bool {
+    is_stdlib_shadow_name(s)
+        || matches!(s,
+            "Color3" | "Vector3" | "Vector2" | "CFrame" | "Instance" | "UDim"
+            | "UDim2" | "Enum" | "Random" | "Rect" | "Ray" | "Region3"
+            | "BrickColor" | "TweenInfo" | "NumberRange" | "NumberSequence"
+            | "NumberSequenceKeypoint" | "ColorSequence" | "ColorSequenceKeypoint"
+            | "Vector3int16" | "Vector2int16" | "Region3int16" | "Axes" | "Faces"
+            | "PhysicalProperties" | "DateTime" | "Font" | "OverlapParams"
+            | "RaycastParams" | "CatalogSearchParams" | "SharedTable"
+            | "PathWaypoint" | "DockWidgetPluginGuiInfo" | "Content"
+            | "getfenv" | "setfenv" | "_G" | "_VERSION")
 }
 
 /// Check if a string is a valid Luau identifier (starts with letter/underscore,
@@ -5171,5 +5210,63 @@ mod b067_tests {
             }
             other => panic!("expected UnOp::Not wrapping Nil, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod global_shadow_naming_tests {
+    //! A local must never take the name of a global the code can still read:
+    //! `local Color3 = Color3.fromRGB(..)` makes every later `Color3.new` in
+    //! the scope index the local instead of the library.
+    use crate::decompiler::DecompileContext;
+    use crate::parser::types::Chunk;
+
+    fn empty_chunk() -> Chunk {
+        Chunk { version: 6, types_version: 0, strings: Vec::new(), protos: Vec::new(), main_proto: 0 }
+    }
+
+    fn ctx_for(chunk: &Chunk) -> DecompileContext<'_> {
+        let mut ctx = DecompileContext::new(chunk);
+        ctx.init_proto_naming(0, std::collections::HashMap::new(), &[]);
+        ctx.current_proto_index = Some(0);
+        ctx
+    }
+
+    #[test]
+    fn well_known_roblox_global_is_suffixed_not_reused() {
+        let chunk = empty_chunk();
+        let mut ctx = ctx_for(&chunk);
+        assert_eq!(ctx.gen_scoped_name("Color3"), "Color3_2");
+        assert_eq!(ctx.gen_scoped_name("Color3"), "Color3_3");
+        assert_eq!(ctx.gen_scoped_name("CFrame"), "CFrame_2");
+    }
+
+    #[test]
+    fn ordinary_names_keep_the_plain_first_use() {
+        let chunk = empty_chunk();
+        let mut ctx = ctx_for(&chunk);
+        assert_eq!(ctx.gen_scoped_name("result"), "result");
+        assert_eq!(ctx.gen_scoped_name("result"), "result2");
+        assert_eq!(ctx.gen_scoped_name("Players"), "Players");
+    }
+
+    #[test]
+    fn counter_suffix_never_spells_a_global() {
+        let chunk = empty_chunk();
+        let mut ctx = ctx_for(&chunk);
+        assert_eq!(ctx.gen_scoped_name("Color"), "Color");
+        assert_eq!(ctx.gen_scoped_name("Color"), "Color2");
+        // "Color" + 3 is the Roblox global `Color3`; skip it.
+        assert_eq!(ctx.gen_scoped_name("Color"), "Color4");
+    }
+
+    #[test]
+    fn game_defined_global_read_by_the_proto_is_suffixed() {
+        let chunk = empty_chunk();
+        let mut ctx = ctx_for(&chunk);
+        let reads: std::collections::HashSet<String> = ["Utils".to_string()].into_iter().collect();
+        ctx.reserve_global_reads(0, reads);
+        assert_eq!(ctx.gen_scoped_name("Utils"), "Utils_2");
+        assert_eq!(ctx.gen_scoped_name("Other"), "Other");
     }
 }

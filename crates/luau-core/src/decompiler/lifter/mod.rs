@@ -537,6 +537,78 @@ fn is_sane_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Names of the globals `proto` and every closure nested in it only READ
+/// (GETIMPORT root, GETGLOBAL). A local given one of these names would capture
+/// the read. A global the tree also WRITES is left out: the decompiler renders
+/// such a definition as a local of that name, and renaming it would only split
+/// a function from the name its callers use.
+pub(super) fn collect_global_reads(
+    proto: &Proto,
+    strings: &[String],
+    protos: &[Proto],
+) -> std::collections::HashSet<String> {
+    let mut reads = std::collections::HashSet::new();
+    let mut writes = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_global_reads_into(proto, strings, protos, &mut reads, &mut writes, &mut seen, 0);
+    reads.retain(|n| !writes.contains(n));
+    reads
+}
+
+fn collect_global_reads_into(
+    proto: &Proto,
+    strings: &[String],
+    protos: &[Proto],
+    out: &mut std::collections::HashSet<String>,
+    writes: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<u32>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 64;
+    let code = &proto.code;
+    let mut pc = 0;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let aux = code.get(pc + 1).copied();
+        match op {
+            LuauOpcode::GetImport => {
+                let import_val = aux.unwrap_or_else(|| match proto.constants.get(insn_d(insn) as u16 as usize) {
+                    Some(Constant::Import(v)) => *v,
+                    _ => 0,
+                });
+                if import_val != 0 {
+                    if let Some(&root) = decode_import(import_val).first() {
+                        let name = match proto.constants.get(root as usize) {
+                            Some(Constant::String(s)) => Some(s.clone()),
+                            _ => strings.get(root as usize).cloned(),
+                        };
+                        out.extend(name);
+                    }
+                }
+            }
+            LuauOpcode::GetGlobal => {
+                out.extend(resolve_global_name(proto, strings, insn_d(insn), aux));
+            }
+            LuauOpcode::SetGlobal => {
+                writes.extend(resolve_global_name(proto, strings, insn_d(insn), aux));
+            }
+            _ => {}
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    for &child in &proto.child_protos {
+        if let Some(c) = protos.get(child as usize) {
+            if seen.insert(child) {
+                collect_global_reads_into(c, strings, protos, out, writes, seen, depth + 1);
+            }
+        }
+    }
+}
+
 /// Infer upvalue names from SETUPVAL instructions by tracing what value is
 /// being stored.  When `SETUPVAL upval[B] = R(A)` and R(A) was loaded by a
 /// preceding instruction that gives it a meaningful name (GETIMPORT, GETGLOBAL,
@@ -1145,6 +1217,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
         hints,
         upval_names_clone.as_deref().unwrap_or(&[]),
     );
+    ctx.reserve_global_reads(proto_index, collect_global_reads(proto, &ctx.chunk.strings, &ctx.chunk.protos));
     let prev_proto = ctx.current_proto_index;
     ctx.current_proto_index = Some(proto_index);
     // Let each function claim its own recorded name before any temporary
