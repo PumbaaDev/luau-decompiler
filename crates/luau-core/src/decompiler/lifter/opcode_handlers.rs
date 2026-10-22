@@ -1036,7 +1036,7 @@ const TABLE_USE_SCAN_LIMIT: usize = 1024;
 /// Returns false for straight-line constructors read at most once, so
 /// one-shot literals like `print(#{1, 2, 3})` and `table.concat({}, ",")`
 /// still inline exactly as before.
-fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
+pub(in crate::decompiler::lifter) fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
     if pc >= code.len() {
         return false;
     }
@@ -1074,6 +1074,18 @@ fn table_needs_binding(code: &[u32], pc: usize, a: usize) -> bool {
                     | LuauOpcode::Length
                     | LuauOpcode::Move
             ) && ib == a;
+            // A store with A == B == a is the self reference `t.__index = t`.
+            // Folding it into the pending constructor snapshots an EMPTY clone
+            // of the literal (`__index = {}`), so that shape always needs a
+            // binding.
+            if matches!(
+                op,
+                LuauOpcode::SetTableKS | LuauOpcode::SetTableN | LuauOpcode::SetTable
+            ) && ia == a
+                && ib == a
+            {
+                return true;
+            }
             if reads_table {
                 reads += 1;
                 if reads >= 2 {

@@ -120,3 +120,5 @@ mod leaked_global_string_tests;
 mod detector_rule_gating_tests;
 #[cfg(test)]
 mod global_name_aux_tests;
+#[cfg(test)]
+mod table_escape_binding_tests;
