@@ -2600,7 +2600,13 @@ pub(super) fn lift_instruction_range(
                 // conditional arm or loop body with no SETUPVAL: it is a
                 // private COPY of the upvalue, not an alias. Declare the copy
                 // here so the in-place write targets it, never the upvalue.
-                if copy_modified_in_arm_or_loop(code, pc, a, b) {
+                // Likewise when the upvalue is overwritten (SETUPVAL from
+                // another register) while this register still holds the old
+                // value and is read afterwards: it is a snapshot.
+                if copy_modified_in_arm_or_loop(code, pc, a, b)
+                    || (std::env::var("LUAU_NO_UPVAL_SNAPSHOT").is_err()
+                        && copy_read_after_setupval(code, pc, a, b))
+                {
                     // Reserve the copy's name so no later register is given it.
                     let fresh = ctx.gen_scoped_name(&name);
                     let proto_key = proto as *const _ as usize;
@@ -6620,6 +6626,46 @@ fn copy_modified_in_arm_or_loop(code: &[u32], pc: usize, reg: usize, upval: usiz
         && alias_reaches(code, pc, w)
         && !upval_stored_back(code, w, reg, upval)
         && reg_live_after(code, w + step, reg, 0, 0)
+}
+
+/// After `GETUPVAL R(reg) U(upval)` at `pc`, does a `SETUPVAL` of the same
+/// slot from ANOTHER register run while `reg` still holds the loaded value,
+/// with `reg` read after that store? Then `reg` is a SNAPSHOT of the old
+/// value, not an alias: printed under the upvalue's name, every read after the
+/// store would see the NEW value (StealAnEgg MutationConsumableFeedback
+/// openScene pc 0-5: `GETUPVAL R4 U0; LOADNIL R5; SETUPVAL R5 U0; GETTABLEKS
+/// R5 R4."Trove"` lifted as `v29 = nil; v29.Trove`, which indexes nil).
+///
+/// The scan is linear and stops at a loop edge, a RETURN, or a rewrite of
+/// `reg`; its only effect is declaring `local copy = up`, which is exactly
+/// what the register holds, so a conservative miss keeps the old output.
+fn copy_read_after_setupval(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool {
+    if in_else_region_of_reg_write(code, pc, reg) {
+        return false;
+    }
+    let mut i = pc + 1;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let (a, b) = (insn_a(insn) as usize, insn_b(insn) as usize);
+        if matches!(
+            op,
+            LuauOpcode::Return
+                | LuauOpcode::JumpBack
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGLoop
+        ) {
+            return false;
+        }
+        if op == LuauOpcode::SetUpval && b == upval {
+            return a != reg && reg_live_after(code, i + 1, reg, 0, 0);
+        }
+        if a == reg && (op == LuauOpcode::GetUpval || op_writes_a(op)) {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Is `pc` inside the skipped region of a forward unconditional JUMP that

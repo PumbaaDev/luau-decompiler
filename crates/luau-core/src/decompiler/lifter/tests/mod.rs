@@ -124,3 +124,4 @@ mod global_name_aux_tests;
 mod table_escape_binding_tests;
 #[cfg(test)]
 mod or_guard_body_tests;
+mod upval_snapshot_tests;
