@@ -1125,6 +1125,69 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
     out
 }
 
+/// Assignments per plain name in `out` (nested function bodies excluded) and
+/// the names `out` declares as locals.
+fn name_assign_counts(out: &[Stat]) -> (HashMap<String, usize>, HashSet<String>) {
+    let mut assigns = HashMap::new();
+    let mut locals = HashSet::new();
+    walk_name_assigns(out, &mut assigns, &mut locals);
+    (assigns, locals)
+}
+
+fn walk_name_assigns(stmts: &[Stat], assigns: &mut HashMap<String, usize>, locals: &mut HashSet<String>) {
+    for st in stmts {
+        match st {
+            Stat::Local { names, .. } => locals.extend(names.iter().cloned()),
+            Stat::LocalFunction { name, .. } => {
+                locals.insert(name.clone());
+            }
+            Stat::Assign { targets, .. } => {
+                for t in targets {
+                    if let Expr::Name(n) = t {
+                        *assigns.entry(n.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                walk_name_assigns(then_body, assigns, locals);
+                for (_, b) in elseif_clauses {
+                    walk_name_assigns(b, assigns, locals);
+                }
+                if let Some(b) = else_body {
+                    walk_name_assigns(b, assigns, locals);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                walk_name_assigns(body, assigns, locals)
+            }
+            Stat::NumericFor { var, body, .. } => {
+                locals.insert(var.clone());
+                walk_name_assigns(body, assigns, locals)
+            }
+            Stat::GenericFor { vars, body, .. } => {
+                locals.extend(vars.iter().cloned());
+                walk_name_assigns(body, assigns, locals)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `SETUPVAL`s in `proto` that write upvalue slot `u`.
+fn setupval_count(proto: &Proto, u: u8) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < proto.code.len() {
+        let insn = proto.code[i];
+        let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
+        if op == LuauOpcode::SetUpval && insn_b(insn) as u8 == u {
+            n += 1;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    n
+}
+
 /// Diagnostic (`LUAU_UPCLOBBER_TRACE`): an upvalue name assigned more often in
 /// the lifted body than the bytecode has `SETUPVAL`s for that slot is a write
 /// the lifter routed to the UPVALUE where the bytecode only writes a register
@@ -1136,47 +1199,7 @@ fn upclobber_report(ctx: &DecompileContext, proto: &Proto, proto_index: usize, o
 /// Excess assignments to upvalue names over the slot's `SETUPVAL` count (see
 /// [`upclobber_report`]).
 fn upclobber_count(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat], print: bool) -> usize {
-    fn walk(stmts: &[Stat], assigns: &mut HashMap<String, usize>, locals: &mut HashSet<String>) {
-        for st in stmts {
-            match st {
-                Stat::Local { names, .. } => locals.extend(names.iter().cloned()),
-                Stat::LocalFunction { name, .. } => {
-                    locals.insert(name.clone());
-                }
-                Stat::Assign { targets, .. } => {
-                    for t in targets {
-                        if let Expr::Name(n) = t {
-                            *assigns.entry(n.clone()).or_insert(0) += 1;
-                        }
-                    }
-                }
-                Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                    walk(then_body, assigns, locals);
-                    for (_, b) in elseif_clauses {
-                        walk(b, assigns, locals);
-                    }
-                    if let Some(b) = else_body {
-                        walk(b, assigns, locals);
-                    }
-                }
-                Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
-                    walk(body, assigns, locals)
-                }
-                Stat::NumericFor { var, body, .. } => {
-                    locals.insert(var.clone());
-                    walk(body, assigns, locals)
-                }
-                Stat::GenericFor { vars, body, .. } => {
-                    locals.extend(vars.iter().cloned());
-                    walk(body, assigns, locals)
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut assigns = HashMap::new();
-    let mut locals = HashSet::new();
-    walk(out, &mut assigns, &mut locals);
+    let (assigns, locals) = name_assign_counts(out);
     let mut excess = 0usize;
     for u in 0..proto.num_upvalues {
         let name = ctx.upval_name(proto, proto_index, u);
@@ -1184,16 +1207,7 @@ fn upclobber_count(ctx: &DecompileContext, proto: &Proto, proto_index: usize, ou
             continue;
         }
         let n_assign = assigns.get(&name).copied().unwrap_or(0);
-        let mut n_set = 0usize;
-        let mut i = 0usize;
-        while i < proto.code.len() {
-            let insn = proto.code[i];
-            let op = LuauOpcode::from_u8((insn & 0xFF) as u8);
-            if op == LuauOpcode::SetUpval && insn_b(insn) as u8 == u {
-                n_set += 1;
-            }
-            i += if op.has_aux() { 2 } else { 1 };
-        }
+        let n_set = setupval_count(proto, u);
         if n_assign < n_set && n_assign == 0 {
             // A slot the bytecode writes but the body never assigns: the
             // write was lost (`v43 = false` vanished, its reader then folded
@@ -1513,6 +1527,26 @@ impl Hazards {
 
 fn upvalue_names(ctx: &DecompileContext, proto: &Proto, proto_index: usize) -> HashSet<String> {
     (0..proto.num_upvalues).map(|u| ctx.upval_name(proto, proto_index, u)).collect()
+}
+
+/// Upvalue names whose every `x = e` in `out` can be a real store: the proto
+/// has a SETUPVAL for the slot and `out` assigns the name no more often than
+/// that. The caller and sibling closures observe those stores. More assigns
+/// than SETUPVALs means some are registers the namer gave the upvalue's name
+/// (Slayers2 Invite `v15 = task.spawn` over a GETIMPORT register; see
+/// [`upclobber_count`]), and a read-only upvalue (AdoptMe
+/// DisplayStandUseHelper `v62 = v62.wings_offset`, GETUPVAL R4 U3) has no
+/// store at all; both are left to the ordinary temp handling.
+fn stored_upvalue_names(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> HashSet<String> {
+    let (assigns, locals) = name_assign_counts(out);
+    (0..proto.num_upvalues)
+        .filter_map(|u| {
+            let name = ctx.upval_name(proto, proto_index, u);
+            let n_set = setupval_count(proto, u);
+            let n_assign = assigns.get(&name).copied().unwrap_or(0);
+            (n_set > 0 && n_assign <= n_set && !locals.contains(&name)).then_some(name)
+        })
+        .collect()
 }
 
 fn lift_hazards(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: &[Stat]) -> Hazards {
@@ -1931,7 +1965,8 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // Inline single-use call/method temps into their use sites:
     // `call7 = chain:Build()` + `call8 = Y:Add(call7)` → `call8 = Y:Add(chain:Build())`
     let arity_pinned = ctx.arity_pinned_temps.clone();
-    post_passes::inline_single_use_temps_pinned(&mut stmts, &arity_pinned);
+    let upvals = stored_upvalue_names(ctx, proto, proto_index, &stmts);
+    post_passes::inline_single_use_temps_pinned(&mut stmts, &arity_pinned, &upvals);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_post_passes calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,

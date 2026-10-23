@@ -763,11 +763,16 @@ fn stmt_uses_name_as_sole_call_arg(stmt: &Stat, name: &str) -> bool {
     }
 }
 
+/// True when one of `stmts` is a `local` declaring `name` at this level.
+fn name_declared_in(stmts: &[Stat], name: &str) -> bool {
+    stmts.iter().any(|s| matches!(s, Stat::Local { names, .. } if names.iter().any(|n| n == name)))
+}
+
 /// Convenience entry point with no arity-pinned temps. Used by the unit tests,
 /// which build ASTs directly and therefore have no bytecode-level arity info.
 #[cfg(test)]
 pub(super) fn inline_single_use_temps(stmts: &mut Vec<Stat>) {
-    inline_single_use_temps_pinned(stmts, &std::collections::HashSet::new());
+    inline_single_use_temps_pinned(stmts, &std::collections::HashSet::new(), &std::collections::HashSet::new());
 }
 
 /// As [`inline_single_use_temps`], but refuses to inline a temp listed in
@@ -775,22 +780,23 @@ pub(super) fn inline_single_use_temps(stmts: &mut Vec<Stat>) {
 pub(super) fn inline_single_use_temps_pinned(
     stmts: &mut Vec<Stat>,
     arity_pinned: &std::collections::HashSet<String>,
+    upvalues: &std::collections::HashSet<String>,
 ) {
     // Recurse into nested blocks first
     for stmt in stmts.iter_mut() {
         match stmt {
             Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                inline_single_use_temps_pinned(then_body, arity_pinned);
+                inline_single_use_temps_pinned(then_body, arity_pinned, upvalues);
                 for (_, body) in elseif_clauses {
-                    inline_single_use_temps_pinned(body, arity_pinned);
+                    inline_single_use_temps_pinned(body, arity_pinned, upvalues);
                 }
-                if let Some(eb) = else_body { inline_single_use_temps_pinned(eb, arity_pinned); }
+                if let Some(eb) = else_body { inline_single_use_temps_pinned(eb, arity_pinned, upvalues); }
             }
-            Stat::While { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
-            Stat::Repeat { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
-            Stat::NumericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
-            Stat::GenericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned),
-            Stat::DoBlock { body } => inline_single_use_temps_pinned(body, arity_pinned),
+            Stat::While { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
+            Stat::Repeat { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
+            Stat::NumericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
+            Stat::GenericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
+            Stat::DoBlock { body } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
             _ => {}
         }
     }
@@ -827,6 +833,23 @@ pub(super) fn inline_single_use_temps_pinned(
                 }
                 Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
                     match (&targets[0], &values[0]) {
+                        // `x = e` to one of this function's UPVALUES (that this
+                        // block does not re-declare) is a SETUPVAL: the caller
+                        // and every other closure sharing it see the write. The
+                        // read count below only sees this block, so a write
+                        // read once here looked single-use and was deleted: RIVALS Animate lost
+                        // `v12 = v11` (SETUPVAL) from `if ... then v12 = v11;
+                        // blend2D(Vector2.yAxis, v12) end`.
+                        (Expr::Name(n), _)
+                            if upvalues.contains(n)
+                                && !name_declared_in(&stmts[..i], n)
+                                && std::env::var("LUAU_NO_INLINE_ASSIGN_GUARD").is_err() =>
+                        {
+                            if std::env::var("LUAU_INLINE_GUARD_TRACE").is_ok() {
+                                eprintln!("INLINEGUARD\t{}", n);
+                            }
+                            i += 1; continue;
+                        }
                         (Expr::Name(n), v) => match v {
                             Expr::Function { body, .. } => {
                                 if body.len() > 20 || !is_generated_fn_name(n) {
