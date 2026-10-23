@@ -133,3 +133,41 @@ fn self_referencing_closures_are_not_folded_into_the_module_constructor() {
     assert!(out.contains("return tbl"), "module does not return its table:\n{out}");
     assert!(!out.contains("return {\n"), "closures folded into return {{}}:\n{out}");
 }
+#[test]
+fn else_arm_or_chain_keeps_its_second_link() {
+    // Brookhaven PropsBillboardSlider proto@190, the last arm:
+    //     59: JUMPIFLT    0.05 < |X| -> 70      first link: fire -> body
+    //     61..67: |Y| = math.abs(pos.Y)
+    //     68: JUMPIFNOTLT 0.05 >= |Y| -> 93     second link: skip the body
+    //     70..92: if |X| > |Y| then .. else .. end; R2 = true
+    // i.e. `if 0.05 < |X| or 0.05 < |Y| then .. end`. The first link was lifted
+    // as an inline `if` whose then-arm [61, 70) held the second link, whose
+    // target 93 lies past that arm, so it was dropped: the arm became
+    // `if 0.05 >= |X| then <|Y| computed and discarded> end` and the body ran
+    // unconditionally (Thumbstick1 always true, the slider always moved).
+    let out = decompiled(BILLBOARD_SLIDER);
+    assert!(
+        out.contains(" or 0.05 < math.abs("),
+        "second `or` link lost:\n{out}"
+    );
+    assert!(!out.contains("if 0.05 >= Y then"), "first link lifted as a bare guard:\n{out}");
+}
+
+const CAMERA_SCRIPT: &[u8] = include_bytes!("fixtures/v9_camera_script_or_and_else.luac");
+
+#[test]
+fn or_chain_whose_body_ands_into_the_else_arm_is_not_folded() {
+    // v9 lv_0907 CameraScript OnCameraMovementModeChange:
+    //     84: JUMPIFEQ    cameraType == Custom -> 88    first link: fire -> body
+    //     86..87: JUMPIF  U6 -> 119                     second link: skip the body
+    //     92: JUMPIFNOTEQ arg1 ~= Classic.Name -> 119   in the body: AND into the else arm
+    //    118: JUMP -> 131                               else-skip; 119.. is the else arm
+    // i.e. `if (Custom or not U6) and arg1 == Classic.Name then .. else ..`.
+    // Folded as `if Custom or not U6 then <body> else ..` the pc 92 test has no
+    // place to go and vanished: any Custom camera took the Classic branch.
+    let out = decompiled(CAMERA_SCRIPT);
+    assert!(
+        out.contains("if arg1 == Enum.ComputerCameraMovementMode.Classic.Name then"),
+        "the arg1 == Classic.Name conjunct was lost:\n{out}"
+    );
+}
