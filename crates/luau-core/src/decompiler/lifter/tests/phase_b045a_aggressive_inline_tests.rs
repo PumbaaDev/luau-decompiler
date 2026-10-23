@@ -453,3 +453,56 @@ fn b045a_impure_field_blocked_by_intervening_call() {
     assert_eq!(stmts.len(), 2,
         "pure Field is inlined across mutate(); got {:?}", stmts);
 }
+
+/// `v12 = v11; blend2D(Vector2.yAxis, v12)` where `v12` is an UPVALUE of the
+/// function (SETUPVAL). The block reads `v12` once, but the write is seen by
+/// the caller and every closure sharing the upvalue, so it must survive
+/// (RIVALS Animate updateVelocity pc 162-169 lost `v12 = v11`).
+#[test]
+fn upvalue_write_read_once_is_not_inlined_away() {
+    let mut stmts = vec![
+        assign_name("v12", name("v11")),
+        Stat::ExprStat(call(name("blend2D"), vec![field(name("Vector2"), "yAxis"), name("v12")])),
+    ];
+    let upvals: std::collections::HashSet<String> = ["v12".to_string()].into_iter().collect();
+    super::super::post_passes::inline_single_use_temps_pinned(
+        &mut stmts,
+        &std::collections::HashSet::new(),
+        &upvals,
+    );
+    assert_eq!(stmts.len(), 2, "upvalue write was removed: {:?}", stmts);
+    assert!(matches!(&stmts[0], Stat::Assign { targets, .. } if matches!(&targets[0], Expr::Name(n) if n == "v12")));
+}
+
+/// The same shape on a name that is not an upvalue still inlines.
+#[test]
+fn non_upvalue_assign_temp_still_inlines() {
+    let mut stmts = vec![
+        assign_name("t", name("v11")),
+        Stat::ExprStat(call(name("blend2D"), vec![name("t")])),
+    ];
+    let upvals: std::collections::HashSet<String> = ["v12".to_string()].into_iter().collect();
+    super::super::post_passes::inline_single_use_temps_pinned(
+        &mut stmts,
+        &std::collections::HashSet::new(),
+        &upvals,
+    );
+    assert_eq!(stmts.len(), 1, "{:?}", stmts);
+}
+
+/// Hoisting a bare `local x` out of a loop body rewrites it to an assignment;
+/// it must become `x = nil` (the per-iteration reset), never an Assign with no
+/// values, which printed as the unparseable `x = ` (HouseCooldownUI `token2 = `).
+#[test]
+fn hoisted_bare_local_becomes_nil_assignment() {
+    let mut body = vec![Stat::Local { names: vec!["token2".to_string()], values: vec![] }];
+    let set: std::collections::HashSet<String> = ["token2".to_string()].into_iter().collect();
+    super::super::rewrite_locals_to_assigns(&mut body, &set);
+    match &body[0] {
+        Stat::Assign { targets, values } => {
+            assert!(matches!(&targets[0], Expr::Name(n) if n == "token2"));
+            assert!(matches!(values.as_slice(), [Expr::Nil]), "{:?}", values);
+        }
+        other => panic!("expected an assignment, got {:?}", other),
+    }
+}

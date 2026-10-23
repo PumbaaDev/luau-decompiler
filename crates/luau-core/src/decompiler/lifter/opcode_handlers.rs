@@ -539,6 +539,543 @@ fn extended_arm_end(code: &[u32], arm_start: usize, target: usize, end: usize) -
     out
 }
 
+/// Is `op` one of the twelve CONDITIONAL jumps?
+fn is_cond_jump_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    )
+}
+
+/// May the instruction at `pc` appear in the operand computation of an `or`
+/// link? Value setup only (the guard-span set plus arithmetic); a store or any
+/// control flow of its own means the segment is not a condition operand.
+fn is_or_link_operand_op(code: &[u32], pc: usize, op: LuauOpcode) -> bool {
+    if op == LuauOpcode::LoadB && insn_c(code[pc]) != 0 {
+        return false; // LOADB with a skip is control flow
+    }
+    is_guard_span_op(op)
+        || matches!(
+            op,
+            LuauOpcode::Add
+                | LuauOpcode::Sub
+                | LuauOpcode::Mul
+                | LuauOpcode::Div
+                | LuauOpcode::Mod
+                | LuauOpcode::Pow
+                | LuauOpcode::AddK
+                | LuauOpcode::SubK
+                | LuauOpcode::MulK
+                | LuauOpcode::DivK
+                | LuauOpcode::ModK
+                | LuauOpcode::PowK
+                | LuauOpcode::SubRK
+                | LuauOpcode::DivRK
+                | LuauOpcode::IDiv
+                | LuauOpcode::IDivK
+                | LuauOpcode::Concat
+        )
+}
+
+/// The bytecode shape of `if A or B [or C ..] then <body> end` behind a
+/// conditional jump whose FIRE path goes to `target` (the body).
+///
+/// `[jump_next, target)` is what an inline `if` would lift as the then-arm.
+/// It is an `or` link instead when it holds nothing but operand computation
+/// and conditional jumps: every jump but the last fires to `target` (more `or`
+/// terms) and the LAST one, which falls through into `target`, fires PAST it
+/// to `exit` (the body's skip). Returns the segments `(start, jump_pc)` in
+/// order, and `exit`.
+///
+/// Lifted as an inline `if`, the last link's `exit` lies past the arm
+/// `[jump_next, target)`, so `lift_instruction_range` drops it as out of range
+/// and the body runs on every path where the first link does not fire
+/// (`PropsBillboardSlider` proto@190 pc 59/68: `if 0.05 < |X| or 0.05 < |Y|`
+/// became `if 0.05 >= |X| then <|Y| discarded> end` and an unconditional body).
+///
+/// Refused unless `exit <= end` (the skip stays in this range), no pc of the
+/// segment is reached by any other jump (it is entered only by falling out of
+/// the first link), and no register the segment writes is read at the body or
+/// at the exit before being rewritten (that would be a value `or`).
+fn or_link_shape(
+    code: &[u32],
+    jump_next: usize,
+    target: usize,
+    end: usize,
+) -> Option<(Vec<(usize, usize)>, usize)> {
+    if target <= jump_next || target > end || target >= code.len() {
+        return None;
+    }
+    let mut segs = Vec::new();
+    let mut seg_start = jump_next;
+    let mut exit = None;
+    let mut w = jump_next;
+    while w < target && w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        if pc_is_branch_target(code, w) {
+            return None;
+        }
+        if is_cond_jump_op(op) {
+            let t = (w as i64 + insn_d(code[w]) as i64 + 1) as usize;
+            if w + size == target {
+                if t <= target || t > end {
+                    return None;
+                }
+                exit = Some(t);
+            } else if t != target {
+                return None;
+            }
+            segs.push((seg_start, w));
+            seg_start = w + size;
+        } else if !is_or_link_operand_op(code, w, op) {
+            return None;
+        }
+        w += size;
+    }
+    if w != target {
+        return None;
+    }
+    let exit = exit?;
+    // Followed along every control-flow path, counting every operand as a
+    // read. `reg_read_before_write` never counts a conditional jump's A, which
+    // let `local s = a == b and a or a:Clone()` through (v9
+    // LocalPoppablePlants pc 174-181: R14 read by the exit's JUMPIFEQ), and a
+    // straight-line scan let `local x = c and a + b or a` through (TopbarPlus
+    // `Overflow` updateBoundary pc 157-161: R18 rewritten at pc 183 on the
+    // fall-through, but read at pc 200 on the path that skips it).
+    let carries = range_writes_regs(code, jump_next, target)
+        .into_iter()
+        .any(|r| reg_maybe_live(code, target, r) || reg_maybe_live(code, exit, r));
+    if carries {
+        return None;
+    }
+    Some((segs, exit))
+}
+
+/// May `reg` be read at or after `start` before every path rewrites it?
+/// A bounded search over the control-flow graph (all jump kinds, LOADB skips,
+/// loop edges) counting any operand that names `reg` as a read
+/// ([`insn_reads_reg`], whose opcode list bounds what counts as a read).
+/// Running out of budget answers true.
+fn reg_maybe_live(code: &[u32], start: usize, reg: usize) -> bool {
+    const BUDGET: usize = 4096;
+    let n = code.len();
+    let mut seen = vec![false; n];
+    let mut work = vec![start];
+    let mut steps = 0usize;
+    while let Some(pc) = work.pop() {
+        if pc >= n || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        steps += 1;
+        if steps > BUDGET {
+            return true;
+        }
+        if insn_reads_reg(code, pc, reg) {
+            return true;
+        }
+        if insn_writes_regs(code, pc).contains(&reg) {
+            continue;
+        }
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let next = pc + if op.has_aux() { 2 } else { 1 };
+        let jump = |d: i64| (pc as i64 + d + 1).max(0) as usize;
+        match op {
+            LuauOpcode::Return => {}
+            LuauOpcode::Jump | LuauOpcode::JumpBack => work.push(jump(insn_d(insn) as i64)),
+            LuauOpcode::JumpX => work.push(jump(insn_e(insn) as i64)),
+            LuauOpcode::LoadB if insn_c(insn) != 0 => work.push(pc + 1 + insn_c(insn) as usize),
+            _ if is_cond_jump_op(op)
+                || matches!(
+                    op,
+                    LuauOpcode::ForNPrep
+                        | LuauOpcode::ForNLoop
+                        | LuauOpcode::ForGPrep
+                        | LuauOpcode::ForGPrepINext
+                        | LuauOpcode::ForGPrepNext
+                        | LuauOpcode::ForGLoop
+                ) =>
+            {
+                work.push(jump(insn_d(insn) as i64));
+                work.push(next);
+            }
+            _ => work.push(next),
+        }
+    }
+    false
+}
+
+/// Registers the instruction at `pc` writes, per [`super::collect_body_writes`]
+/// minus the FASTCALL family: their A is a builtin id, not a register (the
+/// builtin's result lands in the CALL that follows). Counting it as a write
+/// made `math.abs`'s id 2 look like a write of R2 (PropsBillboardSlider).
+fn insn_writes_regs(code: &[u32], pc: usize) -> Vec<usize> {
+    let op = LuauOpcode::from_u8(insn_op(code[pc]));
+    if matches!(
+        op,
+        LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3
+    ) {
+        return Vec::new();
+    }
+    super::collect_body_writes(code, pc, pc + 1)
+}
+
+/// Registers written anywhere in `[start, end)` (see [`insn_writes_regs`]).
+fn range_writes_regs(code: &[u32], start: usize, end: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        for r in insn_writes_regs(code, pc) {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    out
+}
+
+/// Registers a conditional jump at `jpc` reads.
+fn cond_jump_reads(code: &[u32], jpc: usize) -> Vec<usize> {
+    let insn = code[jpc];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let mut read = vec![insn_a(insn) as usize];
+    if matches!(
+        op,
+        LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+    ) {
+        read.push((code.get(jpc + 1).copied().unwrap_or(0) & 0xFF) as usize);
+    }
+    read
+}
+
+/// Is `reg` read anywhere in `[body, upto]` (straight line) at or before the
+/// write at `upto`? The write instruction's own operands count.
+fn body_reads_before_write(code: &[u32], body: usize, upto: usize, reg: usize) -> bool {
+    let mut pc = body;
+    while pc <= upto && pc < code.len() {
+        if insn_reads_reg(code, pc, reg) {
+            return true;
+        }
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Does the body `[body, exit)` write a register that holds a bound name and
+/// may be read after the construct (on any path from `exit`), where the write
+/// cannot be carried out under that name? Returns the pc of that write.
+///
+/// Unpinned, neither way the inline `if` carries the write out is sound: a
+/// literal load parks the literal and the join restores the pre-branch file,
+/// so the store vanishes (v12 oracle `655ee3a6` proto@296: `if not D or
+/// type(D) ~= "string" then D = "error" end` lost `"error"`), and other writes
+/// are left to the arm merge seeding. Pinned, the write keeps its name unless
+/// the body also READS the entry value (an accumulator, `R1 = R1 .. x`): the
+/// two-arm merge seed assumes the arms never observe it and declares a FRESH
+/// local without the old value (BloxFruits `TextUtil` sanitizeStringForSave:
+/// the accumulator `len` became `local sel1` and every non-empty string
+/// concatenated nil). The old flat lift is wrong too, but it keeps the
+/// variable; such a chain is left to it.
+fn bound_join_write(
+    ctx: &DecompileContext,
+    code: &[u32],
+    regs: &[RegVal],
+    body: usize,
+    exit: usize,
+) -> Option<usize> {
+    let n = code.len();
+    let mut w = body;
+    while w < exit && w < n {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        for r in insn_writes_regs(code, w) {
+            if matches!(regs.get(r), Some(RegVal::Expr(Expr::Name(_))))
+                && (!ctx.is_pinned_reg(r as u8, w) || body_reads_before_write(code, body, w, r))
+                && reg_maybe_live(code, exit, r)
+            {
+                return Some(w);
+            }
+        }
+        w += size;
+    }
+    None
+}
+
+/// Does the body `[body, exit)` copy (`MOVE x, r`) a register `r` that holds
+/// a parked, unnamed expression at the branch and is rewritten after the copy?
+/// Returns the pc of that MOVE.
+///
+/// The arm pre-materialisation names such a stale parked register as a local
+/// and pins it across the body, so the MOVE aliases the copy to that local and
+/// the later rewrite of `r` clobbers it (v9 `Morpher` makeInvisible pc 32-54:
+/// `self.className` parked in R2 by the chain before, body `MOVE R1 R2` then
+/// `LOADK R2`; the folded lift lost the `.Name` and `.Value` stores). The
+/// hazard is in the generic arm lift, not in the `or` fold, so such a chain is
+/// left to the old path rather than traded for a different wrong output.
+fn parked_alias_hazard(code: &[u32], regs: &[RegVal], body: usize, exit: usize) -> Option<usize> {
+    let n = code.len();
+    let mut w = body;
+    while w < exit && w < n {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        if op == LuauOpcode::Move {
+            let r = insn_b(code[w]) as usize;
+            let parked = matches!(regs.get(r), Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_)));
+            if parked && range_writes_regs(code, w + size, exit).contains(&r) {
+                return Some(w);
+            }
+        }
+        w += size;
+    }
+    None
+}
+
+/// Is `pc` the AUX word of an instruction, walking from `start`?
+fn aux_word_at(code: &[u32], start: usize, pc: usize) -> bool {
+    let mut w = start;
+    while w < pc && w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    w != pc
+}
+
+/// Does a CONDITIONAL jump in the body `[body, exit)` land past `exit`?
+/// Returns its pc.
+///
+/// Then `exit` is not the join of an `if` statement but one arm of a value
+/// expression: `(A or B) and x or ""` compiles to the same links, a body that
+/// computes `x` and `JUMPIF`s over the `""` load at `exit` (RIVALS `Utility`
+/// TimeFormat2 pc 116-126). Lifted as `if A or B then <x> end` the `""` arm
+/// and the join are lost (the function's return collapsed to `return ""`).
+///
+/// A jump landing exactly ON `exit` is refused too when the body ends in an
+/// else-skip (`exit` starts an `else` arm): it is an `and` into that arm,
+/// `if (A or B) and C then <body> else <exit..>`, which a nested
+/// `if C then .. end` inside the body cannot express (v9 `lv_0907`
+/// CameraScript OnCameraMovementModeChange pc 84-118: the
+/// `arg1 == Classic.Name` test at pc 92 vanished).
+fn body_value_branch(code: &[u32], body: usize, exit: usize) -> Option<usize> {
+    let n = code.len();
+    let has_else = exit > body && exit <= n && {
+        let last = exit - 1;
+        let op = LuauOpcode::from_u8(insn_op(code[last]));
+        let t = last as i64 + insn_d(code[last]) as i64 + 1;
+        // A one-word JUMP is the only way an arm's last word can be an
+        // else-skip; an AUX word at `exit - 1` decodes as garbage here, so it
+        // must also not be the second word of an AUX-carrying instruction.
+        op == LuauOpcode::Jump && t > exit as i64 && !aux_word_at(code, body, last)
+    };
+    let mut w = body;
+    while w < exit && w < n {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        if is_cond_jump_op(op) {
+            let t = w as i64 + insn_d(code[w]) as i64 + 1;
+            if t > exit as i64 || (has_else && t == exit as i64) {
+                return Some(w);
+            }
+        }
+        w += size;
+    }
+    None
+}
+
+/// Does the body `[body, exit)` MOVE a table it built (NEWTABLE / DUPTABLE)
+/// into a register whose merge [`table_move_blocked`] keeps parked? Returns
+/// the pc of that MOVE.
+///
+/// That park exists for OR-guarded arms lifted the old, flat way, where a
+/// later phi path recovers the guard; it does not run once the `or` is folded,
+/// so the table would be lost outright (BloxFruits `ImageUtil` getAssetSprite
+/// pc 222-233: `if k2 == a or k2 == b then sel = {k, v2}` became an empty arm
+/// and a `sel` declared but never assigned). Such a chain is left to the old
+/// path.
+fn blocked_table_move(code: &[u32], body: usize, exit: usize) -> Option<usize> {
+    let n = code.len();
+    let mut last_table_write: Vec<usize> = Vec::new();
+    let mut w = body;
+    while w < exit && w < n {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        let a = insn_a(code[w]) as usize;
+        if op == LuauOpcode::Move {
+            let b = insn_b(code[w]) as usize;
+            if last_table_write.contains(&b) && table_move_blocked(code, w, a) {
+                return Some(w);
+            }
+        }
+        let writes = insn_writes_regs(code, w);
+        last_table_write.retain(|r| !writes.contains(r));
+        if matches!(op, LuauOpcode::NewTable | LuauOpcode::DupTable) {
+            last_table_write.push(a);
+        }
+        w += size;
+    }
+    None
+}
+
+/// Fold the remaining links of `if A or B .. then` into one condition.
+///
+/// `first_fire` is the condition under which the jump at the head of the
+/// chain FIRES (jumps to the body at `target`). On a match of
+/// [`or_link_shape`] each segment's operand computation is lifted and its jump
+/// turned into a term: a link that fires to the body contributes its fire
+/// condition, the last link (which skips the body) its fall-through
+/// condition. Returns the condition under which the body runs and the exit
+/// pc; the caller then lifts the body `[target, exit)` exactly like an
+/// ordinary inline `if`.
+///
+/// A segment must lift to no statement, or to one `local n = v` where `n` is
+/// what its link tests (it is folded back into the term, keeping the operand
+/// short-circuited). Anything else returns None with the register file and
+/// the local tracker restored, and the caller lifts the old way. On success
+/// both are restored too: the operands exist only on the paths that reached
+/// their link, so nothing after the construct may read them.
+#[allow(clippy::too_many_arguments)]
+fn fold_or_link_condition(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    in_loop: bool,
+    first_fire: &Expr,
+    jump_next: usize,
+    target: usize,
+    end: usize,
+) -> Option<(Expr, usize)> {
+    if std::env::var("LUAU_NO_OR_LINK").is_ok() {
+        return None;
+    }
+    let code = &proto.code;
+    let (segs, exit) = or_link_shape(code, jump_next, target, end)?;
+    if ctx.current_loop_end.map_or(false, |le| exit >= le) {
+        return None;
+    }
+    let trace = std::env::var("LUAU_OR_LINK_TRACE").is_ok();
+    if let Some(w) = bound_join_write(ctx, code, regs, target, exit) {
+        if trace {
+            eprintln!(
+                "ORLINK\t{}\trefused\tbody={}\texit={}\tbound_join_write_pc={}",
+                super::current_dce_proto(), target, exit, w
+            );
+        }
+        return None;
+    }
+    if let Some(w) = body_value_branch(code, target, exit) {
+        if trace {
+            eprintln!(
+                "ORLINK	{}	refused	body={}	exit={}	value_branch_pc={}",
+                super::current_dce_proto(), target, exit, w
+            );
+        }
+        return None;
+    }
+    if let Some(w) = blocked_table_move(code, target, exit) {
+        if trace {
+            eprintln!(
+                "ORLINK	{}	refused	body={}	exit={}	blocked_table_move_pc={}",
+                super::current_dce_proto(), target, exit, w
+            );
+        }
+        return None;
+    }
+    if let Some(w) = parked_alias_hazard(code, regs, target, exit) {
+        if trace {
+            eprintln!(
+                "ORLINK	{}	refused	body={}	exit={}	parked_alias_move_pc={}",
+                super::current_dce_proto(), target, exit, w
+            );
+        }
+        return None;
+    }
+    // The segment lifts are speculative: their operands are folded into the
+    // condition, and nothing they named or pinned may leak into the body lift.
+    let ctx_pre = ctx.clone();
+    let regs_pre = regs.clone();
+    let locals_pre = locals.clone();
+    let mut cond = first_fire.clone();
+    let last = segs.len() - 1;
+    for (i, &(s, jpc)) in segs.iter().enumerate() {
+        let mut seg = Vec::new();
+        lift_instruction_range(ctx, proto, proto_index, depth + 1, s, jpc, regs, locals, &mut seg, in_loop);
+        let fall = super::extract_branch_condition(ctx, proto, jpc, regs);
+        let mut term = if i == last { fall } else { super::negate_condition(&fall) };
+        let ok = match seg.as_slice() {
+            [] => true,
+            [Stat::Local { names, values }] if names.len() == 1 && values.len() == 1 => {
+                let name = &names[0];
+                let holds = cond_jump_reads(code, jpc)
+                    .iter()
+                    .filter(|&&r| matches!(regs.get(r), Some(RegVal::Expr(Expr::Name(n))) if n == name))
+                    .count();
+                if holds == 1 && !expr_references_name(&values[0], name) {
+                    super::replace_name_in_expr(&mut term, name, &values[0]);
+                    !expr_references_name(&term, name)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !ok {
+            *ctx = ctx_pre;
+            *regs = regs_pre;
+            *locals = locals_pre;
+            if trace {
+                eprintln!(
+                    "ORLINK\t{}\trefused\tbody={}\texit={}\tseg={}..{}",
+                    super::current_dce_proto(), target, exit, s, jpc
+                );
+            }
+            return None;
+        }
+        cond = Expr::BinOp {
+            left: Box::new(cond),
+            op: BinOp::Or,
+            right: Box::new(simplify_expr(&term)),
+        };
+    }
+    *ctx = ctx_pre;
+    *regs = regs_pre;
+    *locals = locals_pre;
+    if trace {
+        eprintln!(
+            "ORLINK\t{}\tfold\tbody={}\texit={}\tlinks={}",
+            super::current_dce_proto(), target, exit, segs.len()
+        );
+    }
+    Some((cond, exit))
+}
+
 fn detect_else_skip(
     code: &[u32],
     then_start: usize,
@@ -4794,7 +5331,23 @@ pub(super) fn lift_instruction_range(
                         Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) } // JumpIf: skip when true
                     };
                     let base_condition = condition.clone();
-                    let jump_next = pc + 1 + if op.has_aux() { 1 } else { 0 };
+                    let mut jump_next = pc + 1 + if op.has_aux() { 1 } else { 0 };
+
+                    // `if A or B then`: this jump fires INTO the body and the
+                    // "arm" before `target` is B's link. See `or_link_shape`.
+                    // Only for the raw target: an `extended_arm_end` target is
+                    // a different construct.
+                    if target == raw_target {
+                        let fire = super::negate_condition(&condition);
+                        if let Some((or_cond, exit)) = fold_or_link_condition(
+                            ctx, proto, proto_index, depth, regs, locals, in_loop,
+                            &fire, jump_next, target, end,
+                        ) {
+                            condition = or_cond;
+                            jump_next = target;
+                            target = exit;
+                        }
+                    }
 
                     // If/else diamond: see the JumpXEqK* arm below.
                     let (then_end, else_range) =
@@ -5125,8 +5678,19 @@ pub(super) fn lift_instruction_range(
                 if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
                     // Isolate register state so then-body doesn't corrupt fall-through.
-                    let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
-                    let jump_next = pc + 2; // comparison jumps have AUX word
+                    let mut guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
+                    let mut jump_next = pc + 2; // comparison jumps have AUX word
+
+                    // `if A or B then`: this jump fires INTO the body and the
+                    // "arm" before `target` is B's link. See `or_link_shape`.
+                    if let Some((or_cond, exit)) = fold_or_link_condition(
+                        ctx, proto, proto_index, depth, regs, locals, in_loop,
+                        &condition, jump_next, target, end,
+                    ) {
+                        guard_cond = or_cond;
+                        jump_next = target;
+                        target = exit;
+                    }
 
                     // If/else diamond: see the JumpXEqK* arm below. Without this
                     // the compiler's else-skip JUMP falls through to the
@@ -5277,6 +5841,7 @@ pub(super) fn lift_instruction_range(
                 if let Some(al) = oor_guard::range_exit_alias(code, proto, pc, start, end, target, in_loop) {
                     target = al;
                 }
+                let raw_target = target;
                 // A branch inside this arm targeting past it is the construct's
                 // own continuation; cutting here strands it into a bare
                 // `continue`. See `extended_arm_end`.
@@ -5313,8 +5878,21 @@ pub(super) fn lift_instruction_range(
                 let exits_loop = ctx.current_loop_end.map_or(false, |le| target >= le);
                 if target > pc && target <= end && !exits_loop {
                     // Forward jump within range → inline if-then block
-                    let guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
-                    let jump_next = pc + 2; // these have AUX word
+                    let mut guard_cond = Expr::BinOp { left: Box::new(left), op: neg_cmp, right: Box::new(right) };
+                    let mut jump_next = pc + 2; // these have AUX word
+
+                    // `if A or B then`: see `or_link_shape`. Only for the raw
+                    // target (not one `extended_arm_end` moved).
+                    if target == raw_target {
+                        if let Some((or_cond, exit)) = fold_or_link_condition(
+                            ctx, proto, proto_index, depth, regs, locals, in_loop,
+                            &condition, jump_next, target, end,
+                        ) {
+                            guard_cond = or_cond;
+                            jump_next = target;
+                            target = exit;
+                        }
+                    }
 
                     // If/else diamond: when the then-range's LAST instruction is
                     // an unconditional forward JUMP past `target`, that jump is
