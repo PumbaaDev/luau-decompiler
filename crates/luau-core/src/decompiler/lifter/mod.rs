@@ -6129,6 +6129,10 @@ fn rewrite_locals_to_assigns(body: &mut Vec<Stat>, rewrite_set: &HashSet<String>
                 std::mem::replace(stat, Stat::Comment(String::new()))
             {
                 let targets: Vec<Expr> = names.into_iter().map(Expr::Name).collect();
+                // A bare `local x` re-binds `x` to nil on every iteration;
+                // keep that as `x = nil`. An empty value list printed as the
+                // dangling, unparseable `x = ` (HouseCooldownUI `token2 = `).
+                let values = if values.is_empty() { vec![Expr::Nil] } else { values };
                 *stat = Stat::Assign { targets, values };
             }
         }

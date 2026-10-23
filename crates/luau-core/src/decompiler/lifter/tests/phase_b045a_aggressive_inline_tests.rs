@@ -490,3 +490,19 @@ fn non_upvalue_assign_temp_still_inlines() {
     assert_eq!(stmts.len(), 1, "{:?}", stmts);
 }
 
+/// Hoisting a bare `local x` out of a loop body rewrites it to an assignment;
+/// it must become `x = nil` (the per-iteration reset), never an Assign with no
+/// values, which printed as the unparseable `x = ` (HouseCooldownUI `token2 = `).
+#[test]
+fn hoisted_bare_local_becomes_nil_assignment() {
+    let mut body = vec![Stat::Local { names: vec!["token2".to_string()], values: vec![] }];
+    let set: std::collections::HashSet<String> = ["token2".to_string()].into_iter().collect();
+    super::super::rewrite_locals_to_assigns(&mut body, &set);
+    match &body[0] {
+        Stat::Assign { targets, values } => {
+            assert!(matches!(&targets[0], Expr::Name(n) if n == "token2"));
+            assert!(matches!(values.as_slice(), [Expr::Nil]), "{:?}", values);
+        }
+        other => panic!("expected an assignment, got {:?}", other),
+    }
+}
