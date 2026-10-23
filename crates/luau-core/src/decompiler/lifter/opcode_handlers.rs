@@ -1743,7 +1743,19 @@ pub(super) fn lift_instruction_range(
                 // arm or a loop body is scoped to it, so a value the register
                 // carries OUT of the range (read after `end`) or INTO the next
                 // iteration (alias loaded before this loop body) would be lost.
-                let confined = (start == 0 || !reg_live_after(code, pc + if op.has_aux() { 2 } else { 1 }, a, start, end))
+                // A conditional branch that ENDS the range (a guard link's
+                // test) consumes the new value as the `if` condition, at the
+                // level where the fresh local is declared, so its read is not
+                // an escape; reads in either successor still are.
+                let live_end = match code.get(end).map(|&w| LuauOpcode::from_u8(insn_op(w))) {
+                    Some(bop) if start != 0 && end > pc && is_control_flow_op(bop)
+                        && !matches!(bop, LuauOpcode::Jump | LuauOpcode::JumpBack | LuauOpcode::JumpX) =>
+                    {
+                        end + if bop.has_aux() { 2 } else { 1 }
+                    }
+                    _ => end,
+                };
+                let confined = (start == 0 || !reg_live_after(code, pc + if op.has_aux() { 2 } else { 1 }, a, start, live_end))
                     && (!in_loop || loaded_at >= start)
                     && alias_reaches(code, loaded_at, pc)
                     && !consumer_writes_param(code, pc, a, proto.num_params as usize);

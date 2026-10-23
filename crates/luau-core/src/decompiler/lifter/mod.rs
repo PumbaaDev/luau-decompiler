@@ -2532,6 +2532,9 @@ fn lift_structured_run(
                 Region::GuardedTailIf { guards, merge, .. } => {
                     ("GuardedTailIf", guards.first().map(|g| g.0).unwrap_or(0), *merge, None)
                 }
+                Region::OrGuardIf { links, cont, .. } => {
+                    ("OrGuardIf", links.first().map(|l| l.0).unwrap_or(0), *cont, None)
+                }
             };
             eprintln!(
                 "RUNREG	{}@{}	run={}..{}	{}{}	{}..{}	nested={}",
@@ -2577,6 +2580,7 @@ fn lift_structured_run(
                 Region::InlineLoopInLoop { .. } => ("InlineLoopInLoop", 0, 0),
                 Region::InlineIfThenInLoop { .. } => ("InlineIfThenInLoop", 0, 0),
                 Region::GuardedTailIf { merge, .. } => ("GuardedTailIf", 0, *merge),
+                Region::OrGuardIf { cont, .. } => ("OrGuardIf", 0, *cont),
             };
             eprintln!(
                 "RUNREG	{}	run={}..{}	{}	{}..{}",
@@ -2721,6 +2725,7 @@ fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
         | Region::WhileTrue { .. }
         | Region::WhileDo { .. }
         | Region::GuardedTailIf { .. }
+        | Region::OrGuardIf { .. }
         | Region::RepeatUntil { .. } => false,
     }
 }
@@ -3339,6 +3344,125 @@ fn lift_guarded_tail_if(
     }
 }
 
+/// Lift `Region::OrGuardIf` as `if c0 or c1 or ... then <body> end`.
+///
+/// The entry link's preamble is ordinary code (it may call) and is lifted as
+/// statements. Every later link was gated pure (value parks only), so its
+/// preamble normally lifts to no statement at all and the parked values flow
+/// into that link's operand of the `or`, which Lua evaluates only when every
+/// earlier operand was false: exactly when the bytecode reaches the link.
+///
+/// When a later link's preamble DOES produce statements (the lifter chose to
+/// materialise a local), those statements cannot be folded into an `or`
+/// operand. The chain is then split there: the links so far become
+/// `if acc then <body> end`, the preamble is emitted after it (reached only
+/// when every earlier link fell through, because the body returns on every
+/// path), and a new group starts. Each group lifts its own copy of the body.
+///
+/// The continuation sees the register file as the last link left it, which is
+/// the only edge into the continuation.
+#[allow(clippy::too_many_arguments)]
+fn lift_or_guard_if(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    links: &[(usize, bool)],
+    body: &[usize],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+) {
+    let mut body_sorted = body.to_vec();
+    body_sorted.sort_unstable();
+    let mut condition: Option<Expr> = None;
+    for (i, &(link, body_is_taken)) in links.iter().enumerate() {
+        let Some(block) = cfg.blocks.get(&link) else { continue };
+        let branch_pc = block_branch_pc(block);
+        let mut preamble = Vec::new();
+        lift_instruction_range(
+            ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, &mut preamble,
+            false,
+        );
+        if !preamble.is_empty() {
+            if i > 0 && std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
+                eprintln!(
+                    "ORGUARD-SPLIT proto={}@{} link={} stmts={}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    link,
+                    preamble.len()
+                );
+            }
+            if let Some(acc) = condition.take() {
+                push_or_guard_group(
+                    ctx, proto, proto_index, cfg, depth, acc, &body_sorted, regs, locals, stmts,
+                );
+            }
+            stmts.extend(preamble);
+        }
+        let fall_cond = extract_branch_condition(ctx, proto, branch_pc, regs);
+        // `extract_branch_condition` is the FALL-THROUGH condition; the body
+        // is reached on the taken edge when `body_is_taken`.
+        let this = if body_is_taken { negate_condition(&fall_cond) } else { fall_cond };
+        condition = Some(match condition {
+            None => this,
+            Some(acc) => Expr::BinOp { left: Box::new(acc), op: BinOp::Or, right: Box::new(this) },
+        });
+    }
+    match condition {
+        Some(acc) => push_or_guard_group(
+            ctx, proto, proto_index, cfg, depth, acc, &body_sorted, regs, locals, stmts,
+        ),
+        // Detection requires two conditional links; never drop the body.
+        None => lift_or_guard_body(ctx, proto, proto_index, cfg, depth, &body_sorted, regs, locals, stmts),
+    }
+}
+
+/// Emit `if condition then <body> end`, leaving `regs` and `locals` as they
+/// were before the body: the body returns on every path, so nothing after the
+/// `if` sees its values, and every local it declares goes out of scope at its
+/// `end`. Without the `locals` restore a second copy of the body (or the
+/// continuation) would assign those names as GLOBALS (`tbl = {...}`).
+#[allow(clippy::too_many_arguments)]
+fn push_or_guard_group(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    condition: Expr,
+    body_sorted: &[usize],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+) {
+    let regs_before = regs.clone();
+    let locals_before = locals.clone();
+    let mut then_stmts = Vec::new();
+    lift_or_guard_body(ctx, proto, proto_index, cfg, depth, body_sorted, regs, locals, &mut then_stmts);
+    *regs = regs_before;
+    *locals = locals_before;
+    stmts.push(Stat::If { condition, then_body: then_stmts, elseif_clauses: vec![], else_body: None });
+}
+
+/// Lift the guarded body blocks as a branch arm.
+#[allow(clippy::too_many_arguments)]
+fn lift_or_guard_body(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    cfg: &ControlFlowGraph,
+    depth: usize,
+    body_sorted: &[usize],
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    out: &mut Vec<Stat>,
+) {
+    lift_branch_region(ctx, proto, proto_index, cfg, depth, body_sorted, regs, locals, out, false);
+}
+
 /// Lift a single region into statements
 fn lift_region(
     ctx: &mut DecompileContext,
@@ -3366,6 +3490,10 @@ fn lift_region(
             lift_guarded_tail_if(
                 ctx, proto, proto_index, cfg, depth, guards, tail, *merge, regs, locals, stmts,
             );
+        }
+
+        Region::OrGuardIf { links, body, .. } => {
+            lift_or_guard_if(ctx, proto, proto_index, cfg, depth, links, body, regs, locals, stmts);
         }
 
         Region::IfThenElse {
