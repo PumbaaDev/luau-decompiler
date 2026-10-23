@@ -288,13 +288,18 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
                         // can't use `return cond and a or b` (semantically
                         // wrong) or `return if c then a else b` (unparseable).
                         // Expand to if-statement form instead.
+                        //
+                        // Each arm is emitted as a `return` STATEMENT, not an
+                        // expression, so a ternary nested in an arm gets the
+                        // same expansion. As an expression it rendered
+                        // `return #f == 0 and nil or g(f)`, which returns g(f)
+                        // when #f == 0 (AdoptMe alert_lure_ready
+                        // find_furniture_function, RIVALS LootLibrary).
                         out.push_str(&format!("if {} then\n", emit_expr(cond, depth)));
-                        indent(out, depth + 1);
-                        out.push_str(&format!("return {}\n", emit_expr(then_expr, depth + 1)));
+                        emit_stat(out, &Stat::Return { values: vec![(**then_expr).clone()] }, depth + 1);
                         indent(out, depth);
                         out.push_str("else\n");
-                        indent(out, depth + 1);
-                        out.push_str(&format!("return {}\n", emit_expr(else_expr, depth + 1)));
+                        emit_stat(out, &Stat::Return { values: vec![(**else_expr).clone()] }, depth + 1);
                         indent(out, depth);
                         out.push_str("end\n");
                         return;
@@ -1766,6 +1771,31 @@ mod tests {
         let mut out = String::new();
         emit_block(&mut out, &stmts, 0);
         assert_eq!(out, "if cond then\n    return x\nelse\n    return y\nend\n");
+    }
+
+    #[test]
+    fn return_ternary_nested_non_truthy_arm_expands_too() {
+        // `if f then (if empty then return nil end; return g) else return nil end`
+        // folded to nested ternaries must not emit `empty and nil or g`,
+        // which returns g when `empty` holds.
+        let inner = Expr::Ternary {
+            cond: Box::new(name("empty")),
+            then_expr: Box::new(Expr::Nil),
+            else_expr: Box::new(name("g")),
+        };
+        let stmts = vec![Stat::Return {
+            values: vec![Expr::Ternary {
+                cond: Box::new(name("f")),
+                then_expr: Box::new(inner),
+                else_expr: Box::new(Expr::Nil),
+            }],
+        }];
+        let mut out = String::new();
+        emit_block(&mut out, &stmts, 0);
+        assert_eq!(
+            out,
+            "if f then\n    if empty then\n        return nil\n    else\n        return g\n    end\nelse\n    return nil\nend\n"
+        );
     }
 
     #[test]

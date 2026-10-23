@@ -185,6 +185,28 @@ pub enum Region {
         /// member here — it keeps its own region and is lifted exactly once.
         merge: usize,
     },
+
+    /// `if a or b ... then <body> end` where `<body>` ends in RETURN, sits in
+    /// PC order BEFORE the continuation, and is reached ONLY from the chain.
+    ///
+    /// The shapes `find_or_chain_return_guard` cannot take: a link whose test
+    /// needs `#x` (`if not mods or #mods <= 0 then return true end`), or a body
+    /// that is more than one block (`if not ready or not id then apply(nil)
+    /// return end`, where `apply` was inlined with its own early return). The
+    /// plain if/else fallback reports the body as the MERGE of the first link,
+    /// so the body is emitted after the continuation's own trailing `return`
+    /// and dropped as dead, and the second link's jump to the continuation is
+    /// out of range and dropped too: the guard vanishes.
+    OrGuardIf {
+        /// Chain links in evaluation order. The bool is `true` when the edge
+        /// to the body is the link's branch (taken) edge.
+        links: Vec<(usize, bool)>,
+        /// The guarded body blocks, ascending. Closed and acyclic: every exit
+        /// stays inside the set or returns.
+        body: Vec<usize>,
+        /// The continuation the last link falls to. NOT a member.
+        cont: usize,
+    },
 }
 
 /// Analyze CFG and produce ordered regions
@@ -539,6 +561,24 @@ pub fn structure_control_flow(
                 // `cont` is intentionally left unhandled — the continuation is a
                 // sibling region, lifted on its own.
                 let _ = cont;
+                continue;
+            }
+        }
+
+        // OR-CHAIN GUARD WITH A COMPUTED LINK OR A MULTI-BLOCK BODY. Runs only
+        // when `find_or_chain_return_guard` declined, so every shape it takes
+        // is untouched. See `Region::OrGuardIf`.
+        if block.successors.len() == 2 {
+            if let Some((links, body, cont)) =
+                find_or_guard_body(cfg, code, block_id, &handled, &loop_headers_all)
+            {
+                for &(l, _) in &links {
+                    handled.insert(l);
+                }
+                for &b in &body {
+                    handled.insert(b);
+                }
+                regions.push(Region::OrGuardIf { links, body, cont });
                 continue;
             }
         }
@@ -1086,7 +1126,7 @@ fn is_pure_preamble_chain_link(
     block.successors.len() == 2
         && block.predecessors.len() == 1
         && block.predecessors[0] == prev_link
-        && is_pure_guard_block(code, block)
+        && is_pure_or_link_block(code, block)
 }
 
 /// Recognise an `if a or b or c then return end` chain rooted at `entry`.
@@ -1211,6 +1251,197 @@ fn find_or_chain_return_guard(
         return None;
     }
     Some((chain, terminal, cur))
+}
+
+/// A non-entry OR-guard link: a pure guard block (`is_pure_guard_block`) whose
+/// preamble may also take a length (`#x`). LENGTH only parks a value like the
+/// table reads already whitelisted; the link is folded into the `or` condition,
+/// which evaluates it exactly when every earlier link fell through, as the
+/// bytecode does.
+fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
+    let Some(branch_pc) = block.branch_pc else { return false };
+    if branch_pc >= code.len() {
+        return false;
+    }
+    let mut i = block.start;
+    while i < branch_pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if !(is_pure_guard_setup_op(op) || op == LuauOpcode::Length) {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    is_conditional_branch_op(LuauOpcode::from_u8(insn_op(code[branch_pc])))
+}
+
+/// Upper bounds that keep `find_or_guard_body` a local pattern, not a search.
+const OR_GUARD_MAX_LINKS: usize = 8;
+const OR_GUARD_MAX_BODY_BLOCKS: usize = 16;
+
+/// Match `Region::OrGuardIf` at `entry`: returns `(links, body, cont)`.
+///
+/// Gate, all required:
+/// * `entry` is straight-line (at most one predecessor; a join tests a value
+///   the register file may not carry, see `find_or_chain_return_guard`);
+/// * every later link is a pure (`is_pure_or_link_block`) conditional whose
+///   ONLY predecessor is the previous link, and one of its successors is the
+///   shared body head `T`; at least two links;
+/// * every edge into `T` comes from a link;
+/// * the body (everything reachable from `T`) is closed, acyclic, unclaimed,
+///   entered only through `T`, and every exit returns;
+/// * the body lies BEFORE the continuation in PC order (stranded). A body
+///   after the continuation is the natural tail the if/else fallback already
+///   nests correctly.
+fn find_or_guard_body(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    handled: &BTreeSet<usize>,
+    loop_headers: &BTreeSet<usize>,
+) -> Option<(Vec<(usize, bool)>, Vec<usize>, usize)> {
+    let eb = cfg.blocks.get(&entry)?;
+    if eb.successors.len() != 2
+        || eb.predecessors.len() > 1
+        || handled.contains(&entry)
+        || loop_headers.contains(&entry)
+    {
+        return None;
+    }
+    for &head in &[eb.successors[1], eb.successors[0]] {
+        if let Some(found) = or_guard_with_head(cfg, code, entry, head, handled, loop_headers) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// `find_or_guard_body` for one choice of body head.
+fn or_guard_with_head(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    head: usize,
+    handled: &BTreeSet<usize>,
+    loop_headers: &BTreeSet<usize>,
+) -> Option<(Vec<(usize, bool)>, Vec<usize>, usize)> {
+    let eb = cfg.blocks.get(&entry)?;
+    let other = |succ: &[usize]| if succ[0] == head { succ[1] } else { succ[0] };
+    let mut links = vec![(entry, eb.successors[1] == head)];
+    let mut cur = other(&eb.successors);
+    loop {
+        let prev = links.last()?.0;
+        let Some(cb) = cfg.blocks.get(&cur) else { break };
+        let is_link = links.len() < OR_GUARD_MAX_LINKS
+            && cb.successors.len() == 2
+            && cb.successors.contains(&head)
+            && cb.successors[0] != cb.successors[1]
+            && cb.predecessors.len() == 1
+            && cb.predecessors[0] == prev
+            && !handled.contains(&cur)
+            && !loop_headers.contains(&cur)
+            && is_pure_guard_block(code, cb);
+        if !is_link {
+            break;
+        }
+        links.push((cur, cb.successors[1] == head));
+        cur = other(&cb.successors);
+    }
+    let cont = cur;
+    let link_ids: BTreeSet<usize> = links.iter().map(|l| l.0).collect();
+    if links.len() < 2 || cont <= head || link_ids.contains(&cont) {
+        return None;
+    }
+    let hb = cfg.blocks.get(&head)?;
+    if hb.predecessors.is_empty() || !hb.predecessors.iter().all(|p| link_ids.contains(p)) {
+        return None;
+    }
+    let body = closed_return_body(cfg, code, head, cont, &link_ids, handled, loop_headers)?;
+    if std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
+        let conds = body
+            .iter()
+            .filter(|b| cfg.blocks.get(b).map_or(false, |x| x.successors.len() == 2))
+            .count();
+        eprintln!(
+            "ORGUARD entry={} links={:?} body={:?} conds={} cont={}",
+            entry, links, body, conds, cont
+        );
+    }
+    Some((links, body, cont))
+}
+
+/// Everything reachable from `head`, if it is a closed, forward-only,
+/// unclaimed region entered only through `head` whose every exit returns.
+fn closed_return_body(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    head: usize,
+    cont: usize,
+    link_ids: &BTreeSet<usize>,
+    handled: &BTreeSet<usize>,
+    loop_headers: &BTreeSet<usize>,
+) -> Option<Vec<usize>> {
+    let mut body: BTreeSet<usize> = BTreeSet::new();
+    let mut work = vec![head];
+    while let Some(b) = work.pop() {
+        if !body.insert(b) {
+            continue;
+        }
+        if body.len() > OR_GUARD_MAX_BODY_BLOCKS
+            || b == cont
+            || link_ids.contains(&b)
+            || handled.contains(&b)
+            || loop_headers.contains(&b)
+        {
+            return None;
+        }
+        let blk = cfg.blocks.get(&b)?;
+        if blk.successors.is_empty() {
+            if !block_ends_in_return(code, blk) {
+                return None;
+            }
+            continue;
+        }
+        if blk.successors.iter().any(|&s| s <= b) {
+            return None; // a backward edge: not a forward-only body
+        }
+        work.extend(blk.successors.iter().copied());
+    }
+    let entered_only_at_head = body.iter().filter(|&&b| b != head).all(|b| {
+        cfg.blocks
+            .get(b)
+            .map_or(false, |blk| blk.predecessors.iter().all(|p| body.contains(p)))
+    });
+    if !entered_only_at_head {
+        return None;
+    }
+    // An inner `if a or b then X elseif c then ...`: a block X entered ONLY
+    // by conditional branches, one of which also leads to a conditional block
+    // reached from nowhere else (the `elseif` test). The arm lifter cannot
+    // rebuild that chain inside a body and drops the later `elseif` arms
+    // (Brookhaven GiftSelectRecipient promptGift loses its IN_PROGRESS /
+    // OWNED messages), so such a body is left to the general structurer.
+    let is_cond = |id: &usize| cfg.blocks.get(id).map_or(false, |b| b.successors.len() == 2);
+    let has_inner_short_circuit = body.iter().filter(|&&b| b != head).any(|&x| {
+        let Some(xb) = cfg.blocks.get(&x) else { return false };
+        xb.predecessors.len() >= 2
+            && xb.predecessors.iter().all(is_cond)
+            && xb.predecessors.iter().any(|p| {
+                cfg.blocks.get(p).map_or(false, |pb| {
+                    pb.successors.iter().filter(|&&y| y != x).any(|y| {
+                        body.contains(y)
+                            && is_cond(y)
+                            && cfg.blocks.get(y).map_or(false, |yb| yb.predecessors == vec![*p])
+                    })
+                })
+            })
+    });
+    if has_inner_short_circuit {
+        if std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
+            eprintln!("ORGUARD-DECLINE inner_short_circuit head={}", head);
+        }
+        return None;
+    }
+    Some(body.into_iter().collect())
 }
 
 /// Check if a detected natural loop is a REAL loop by verifying that the

@@ -122,3 +122,5 @@ mod detector_rule_gating_tests;
 mod global_name_aux_tests;
 #[cfg(test)]
 mod table_escape_binding_tests;
+#[cfg(test)]
+mod or_guard_body_tests;
