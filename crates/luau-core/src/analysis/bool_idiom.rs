@@ -33,7 +33,7 @@ pub struct BoolIdiom {
 }
 
 /// Is `op` a conditional jump whose target is encoded in the D field?
-fn is_conditional_jump(op: LuauOpcode) -> bool {
+pub(crate) fn is_conditional_jump(op: LuauOpcode) -> bool {
     matches!(
         op,
         LuauOpcode::JumpIf

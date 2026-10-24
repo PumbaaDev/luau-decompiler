@@ -89,3 +89,47 @@ fn get_if_can_use_decodes_once_and_keeps_the_whole_or_chain() {
     assert_eq!(body.matches("decodeModificationData(arg2)").count(), 1, "decode duplicated:\n{body}");
     assert_eq!(body.matches("getIfUnlocked(").count(), 1, "chain wrong:\n{body}");
 }
+
+// Refinement regressions (adversarial review of 9e827fd).
+
+const SWAP_UI: &[u8] = include_bytes!("fixtures/andchain_callfb_dqr_character_swap_ui.luac");
+const AURA: &[u8] = include_bytes!("fixtures/andchain_callfb_bloxfruits_aura_visuals.luac");
+const HYDRANT: &[u8] = include_bytes!("fixtures/andchain_callfb_adoptme_fire_hydrant.luac");
+const CATALOG_HEADER: &[u8] = include_bytes!("fixtures/andchain_callfb_adoptme_catalog_header.luac");
+
+/// `Parent:FindFirstChild(Name.."3d") or (Name == "label" and ...) or nil`: an
+/// operand with a branch of its own must not fold (the `Name == "label"` guard
+/// and the `labelShadow` lookup were dropped or duplicated).
+#[test]
+fn branching_or_operand_keeps_its_name_guard() {
+    let out = crate::decompile(SWAP_UI).expect("fixture decompiles");
+    assert!(!out.contains("child4 or self.Parent:FindFirstChild(\"labelShadow\")"), "guard dropped:\n{out}");
+    assert!(!out.contains("labelShadow4 == \"label\""), "invented global compare:\n{out}");
+    assert!(out.contains("self.Name == \"label\""), "guard lost:\n{out}");
+}
+
+/// A fold whose simplification would discard the operand's call is refused.
+#[test]
+fn chain_fold_does_not_discard_a_call() {
+    let out = crate::decompile(AURA).expect("fixture decompiles");
+    assert!(out.contains("if Callback or BusoColor3 then"), "BusoColor3 operand lost:\n{out}");
+}
+
+/// A rejected speculative chain lift must not leave its locals declared: the
+/// real lift then emitted bare assignments and a module-level `local` hoist.
+#[test]
+fn rejected_chain_does_not_hoist_function_locals() {
+    let out = crate::decompile(HYDRANT).expect("fixture decompiles");
+    assert!(!out.contains("local fn, modifiers, sit_anim_name"), "hoisted:\n{out}");
+    assert!(out.contains("local modifiers = arg2.modifiers"), "declaration lost:\n{out}");
+}
+
+/// Reads parked before a calling chain operand keep their place: the Frame
+/// props table (with `self.layout_order`) is named before the child calls.
+#[test]
+fn pending_reads_are_named_before_a_calling_chain() {
+    let out = crate::decompile(CATALOG_HEADER).expect("fixture decompiles");
+    assert!(out.contains("local createElement = value4.createElement"), "createElement moved:\n{out}");
+    assert!(out.contains("local tbl4 = {"), "props table not named:\n{out}");
+    assert!(out.contains("return createElement(\"Frame\", tbl4, tbl2)"), "props inlined late:\n{out}");
+}

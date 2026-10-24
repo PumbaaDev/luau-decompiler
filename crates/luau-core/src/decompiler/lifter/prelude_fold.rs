@@ -46,6 +46,19 @@ fn effects_of(e: &Expr) -> Effects {
     fx
 }
 
+/// Does evaluating `e` read a table field or call something? Such a value
+/// parked lazily in a register must keep its place relative to later calls.
+pub(super) fn reads_or_calls(e: &Expr) -> bool {
+    let fx = effects_of(e);
+    fx.call || fx.read
+}
+
+/// Number of calls and method calls in `e` (closure bodies not counted).
+pub(super) fn call_count(e: &Expr) -> usize {
+    let own = usize::from(matches!(e, Expr::Call { .. } | Expr::MethodCall { .. }));
+    own + children(e).into_iter().map(call_count).sum::<usize>()
+}
+
 /// The direct sub-expressions of `e`, in evaluation order.
 fn children(e: &Expr) -> Vec<&Expr> {
     match e {

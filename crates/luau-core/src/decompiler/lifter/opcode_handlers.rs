@@ -4966,6 +4966,14 @@ pub(super) fn lift_instruction_range(
                                 values: vec![call_expr],
                             });
                         } else {
+                            // All targets are already declared: assign to the names they
+                            // are BOUND to, not to a fresh hint that was never declared
+                            // (`success, err = pcall(..)` with `success` undeclared).
+                            for (i, n) in names.iter_mut().enumerate() {
+                                if let Some(bound) = locals.current_name(a + i) {
+                                    *n = bound.to_string();
+                                }
+                            }
                             let targets: Vec<Expr> = names.iter().map(|n| Expr::Name(n.clone())).collect();
                             stmts.push(Stat::Assign {
                                 targets,
@@ -5451,6 +5459,12 @@ pub(super) fn lift_instruction_range(
                     // Snapshot and restore on the reject path only; the accept
                     // path deliberately keeps its writes.
                     let chain_snapshot = regs.clone();
+                    // The segment lifts also DECLARE locals; a rejected chain that only
+                    // became visible through the CALLFB/prelude work must not leave them
+                    // behind, or the real lift assigns to names that are never declared
+                    // (AdoptMe FireHydrantPerformance `step`). Chains the old recogniser
+                    // already speculated on keep the old behaviour.
+                    let locals_snapshot = locals.clone();
                     let mut acc = reg_expr(regs, chain.dest);
                     let mut ok = true;
                     let mut seg_folded: Vec<bool> = Vec::new();
@@ -5479,6 +5493,14 @@ pub(super) fn lift_instruction_range(
                             // A prelude of single-use temps (`local T = F.x;
                             // local R = T:Get()`): inline them back when that
                             // cannot reorder calls. Otherwise reject the chain.
+                            // A segment with a branch of its own is not a prelude: the
+                            // branch's far arm lies outside the lifted range and is
+                            // silently dropped (DungeonQuestReborn characterSwapUI
+                            // `or (Name == "label" and ...)`).
+                            _ if segment_has_branch(code, seg_start, seg_end) => {
+                                ok = false;
+                                break;
+                            }
                             _ => match super::prelude_fold::fold_prelude_temps(
                                 &seg_stmts,
                                 reg_expr(regs, chain.dest),
@@ -5507,11 +5529,88 @@ pub(super) fn lift_instruction_range(
                     {
                         ok = false;
                     }
+                    // Same shape when the bytecode DOES write the upvalue back
+                    // (`if not v then v = f() end`): the chain would be stored under a
+                    // fresh name that is never declared (`Move2 = v6 or ...`).
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && locals_snapshot.alias_upval_of(chain.dest).is_some()
+                    {
+                        ok = false;
+                    }
+                    // Simplification must not discard an operand's call
+                    // (`nil and x:GetAttribute(..)` -> `nil`): a newly visible chain
+                    // that would lose a call keeps the old shape (BloxFruits
+                    // AuraVisuals `enable`).
+                    let simplified = simplify_expr(&acc);
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && super::prelude_fold::call_count(&simplified)
+                            < super::prelude_fold::call_count(&acc)
+                    {
+                        ok = false;
+                    }
+                    // Folding a calling operand into an expression removes the branch
+                    // that used to force earlier lazily-parked reads into locals; they
+                    // would then be inlined past the call (AdoptMe StorageCatalogHeader:
+                    // `value4.createElement` and `self.layout_order` read after five
+                    // calls). Keep the branch (old shape) in that case.
+                    let crossing = if ok && chain_is_newly_visible(code, &chain, &seg_folded) {
+                        pending_reads_crossing_call(code, &chain_snapshot, &chain)
+                    } else {
+                        Vec::new()
+                    };
+                    if !crossing.is_empty() {
+                        ok = false;
+                    }
                     if ok {
-                        let acc = simplify_expr(&acc);
+                        let acc = simplified;
+                        let stmts_before = stmts.len();
                         store_complex(ctx, proto, regs, locals, stmts, chain.dest, pc, acc);
-                        pc = chain.end_pc;
-                        continue;
+                        // A newly visible chain must not be stored as a bare assignment to
+                        // a name that was never declared: it would be hoisted to module
+                        // scope later (BloxFruits CannonController `Cannon`).
+                        let undeclared_write = chain_is_newly_visible(code, &chain, &seg_folded)
+                            && stmts[stmts_before..].iter().any(|st| matches!(
+                                st,
+                                Stat::Assign { targets, .. }
+                                    if matches!(targets.as_slice(), [Expr::Name(n)]
+                                        if !locals_snapshot.is_bound_name(n))
+                            ));
+                        if undeclared_write {
+                            stmts.truncate(stmts_before);
+                            *locals = locals_snapshot.clone();
+                            ok = false;
+                        } else {
+                            // The branch this chain replaced always named its result. A
+                            // result parked lazily in the register would be re-evaluated
+                            // (reads, even calls) at every later use, so name it here;
+                            // single-use names are inlined back by the later passes.
+                            if chain_is_newly_visible(code, &chain, &seg_folded)
+                                && stmts.len() == stmts_before
+                            {
+                                if let Some(RegVal::Expr(value)) = regs.get(chain.dest).cloned() {
+                                    if super::prelude_fold::reads_or_calls(&value) {
+                                        let fresh = ctx.reg_name(proto, chain.dest as u8, pc);
+                                        let (kind, name) = locals.classify_write(chain.dest, &fresh);
+                                        // Only a genuine new declaration; a reassignment
+                                        // keeps the parked value (old behaviour).
+                                        if kind != WriteKind::Reassign {
+                                            stmts.push(Stat::Local {
+                                                names: vec![name.clone()],
+                                                values: vec![value],
+                                            });
+                                            regs[chain.dest] = RegVal::Expr(Expr::Name(name));
+                                        }
+                                    }
+                                }
+                            }
+                            if seg_folded.iter().any(|&f| f)
+                                && chain_is_newly_visible(code, &chain, &seg_folded)
+                            {
+                                locals.forget_declared_since(&locals_snapshot, chain.dest);
+                            }
+                            pc = chain.end_pc;
+                            continue;
+                        }
                     }
                     // Rejected: undo the speculation.
                     //
@@ -5528,6 +5627,36 @@ pub(super) fn lift_instruction_range(
                     //     17-line table constructor.
                     regs.clear();
                     regs.extend_from_slice(&chain_snapshot);
+                    // (`ends_in_nop`: the old recogniser never saw such a chain, so it
+                    // never speculated on it either.)
+                    if chain.segments.iter().any(|&(s, e)| ends_in_nop(code, s, e)) {
+                        *locals = locals_snapshot;
+                    }
+                    // The branch region used to name live pending tables before it
+                    // split; the flat path does not, so a table holding a field read
+                    // would be built after the calls that follow it. Name it here.
+                    for r in crossing {
+                        let RegVal::Expr(value @ Expr::Table { .. }) = regs[r].clone() else {
+                            continue;
+                        };
+                        let fresh = ctx.reg_name(proto, r as u8, pc);
+                        let (kind, name) = locals.classify_write(r, &fresh);
+                        match kind {
+                            WriteKind::FirstDecl | WriteKind::Shadow => {
+                                stmts.push(Stat::Local {
+                                    names: vec![name.clone()],
+                                    values: vec![value],
+                                });
+                            }
+                            WriteKind::Reassign => {
+                                stmts.push(Stat::Assign {
+                                    targets: vec![Expr::Name(name.clone())],
+                                    values: vec![value],
+                                });
+                            }
+                        }
+                        regs[r] = RegVal::Expr(Expr::Name(name));
+                    }
                 }
 
                 // A jump that reaches the END of the enclosing loop leaves it,
@@ -6978,6 +7107,54 @@ fn loop_carries(code: &[u32], load: usize, w: usize) -> bool {
 fn chain_is_newly_visible(code: &[u32], chain: &OrAndChain, seg_folded: &[bool]) -> bool {
     !seg_folded.is_empty()
         || chain.segments.iter().any(|&(start, end)| ends_in_nop(code, start, end))
+}
+
+/// Registers other than the chain's `dest` that hold a parked read or call which
+/// code after the chain still uses, when a chain operand makes a call.
+fn pending_reads_crossing_call(code: &[u32], before: &[RegVal], chain: &OrAndChain) -> Vec<usize> {
+    let calls = chain.segments.iter().any(|&(s, e)| {
+        let mut w = s;
+        while w < e.min(code.len()) {
+            let op = LuauOpcode::from_u8(insn_op(code[w]));
+            if matches!(op, LuauOpcode::Call) {
+                return true;
+            }
+            w += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    });
+    if !calls {
+        return Vec::new();
+    }
+    let written: Vec<usize> = chain
+        .segments
+        .iter()
+        .flat_map(|&(s, e)| super::collect_body_writes(code, s, e))
+        .collect();
+    before
+        .iter()
+        .enumerate()
+        .filter(|&(r, v)| {
+            r != chain.dest
+                && !written.contains(&r)
+                && matches!(v, RegVal::Expr(e) if super::prelude_fold::reads_or_calls(e))
+                && super::reg_used_in_range(code, chain.end_pc, code.len(), r)
+        })
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// Does `[start, end)` hold a conditional jump (AUX-aligned scan)?
+fn segment_has_branch(code: &[u32], start: usize, end: usize) -> bool {
+    let mut w = start;
+    while w < end.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if crate::analysis::bool_idiom::is_conditional_jump(op) {
+            return true;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Is the last instruction (AUX-aligned) of `[start, end)` a NOP?

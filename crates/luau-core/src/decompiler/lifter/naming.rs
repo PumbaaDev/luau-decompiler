@@ -142,6 +142,25 @@ impl LocalTracker {
         Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new(), alias_upval: HashMap::new(), alias_retire: None, retired_alias: HashMap::new() }
     }
 
+    /// Forget the declarations `self` gained since `before` was cloned, except for
+    /// `keep`. Used when speculative lifts declared temps whose `local` statements
+    /// were folded away, so a later write to the register declares it afresh.
+    pub(super) fn forget_declared_since(&mut self, before: &LocalTracker, keep: usize) {
+        let leaked: Vec<usize> = self
+            .declared
+            .iter()
+            .copied()
+            .filter(|r| *r != keep && !before.declared.contains(r))
+            .collect();
+        for r in leaked {
+            self.declared.remove(&r);
+            match before.current_names.get(&r) {
+                Some(n) => { self.current_names.insert(r, n.clone()); }
+                None => { self.current_names.remove(&r); }
+            }
+        }
+    }
+
     /// Returns true if this register needs a `local` declaration (first write).
     pub(super) fn needs_local(&mut self, reg: usize) -> bool {
         if reg < self.param_count {
