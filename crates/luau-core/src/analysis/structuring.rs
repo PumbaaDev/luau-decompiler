@@ -1672,7 +1672,8 @@ pub(crate) fn structure_numeric_for_body(
                             code, cfg, then_blocks.iter().chain(else_blocks.iter()));
                         let overwrites = arm_overwrites_prefix_value(
                             code, cfg, cond_id, pc, merge, &then_blocks, &else_blocks);
-                        let cut = if nested || overwrites { pc }
+                        let cut = if (nested || overwrites)
+                            && !prefix_has_callfb_chain(code, cfg, cond_id, pc) { pc }
                             else { cond_prefix_cut(code, cfg, cond_id, pc) };
                         if linear_start < cut { regions.push(Region::Linear { start: linear_start, end: cut }); }
                         regions.push(Region::IfThenElse { cond_pc: cond_id,
@@ -2278,6 +2279,35 @@ fn last_real_pc(code: &[u32], block: &BasicBlock) -> usize {
         }
     }
     last_pc
+}
+
+/// True when the condition block's prefix (`block.start..pc`) holds an
+/// `a and f()` chain recognised only because its last operand is a CALLFB pair.
+/// The CFG keeps such a chain whole, so the prefix can run far back (getIfCanUse,
+/// GiveItem). The old double-lift split would emit that prefix, calls and all,
+/// twice; there the prefix must be lifted once, whatever the arms look like.
+fn prefix_has_callfb_chain(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    cond_id: usize,
+    pc: usize,
+) -> bool {
+    let start = match cfg.blocks.get(&cond_id) {
+        Some(b) => b.start.min(pc),
+        None => return false,
+    };
+    let mut w = start;
+    while w < pc.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+            && crate::analysis::bool_idiom::recognize_or_and_chain(code, w)
+                .is_some_and(|c| c.has_callfb_operand)
+        {
+            return true;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Where the `Linear` region before a conditional-wrapping-a-loop must stop.

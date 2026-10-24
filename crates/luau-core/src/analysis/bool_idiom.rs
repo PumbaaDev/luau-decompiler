@@ -143,6 +143,11 @@ pub struct OrAndChain {
     /// Instruction ranges, one per operand after the first. The first operand
     /// is whatever `dest` already holds at the chain's first jump.
     pub segments: Vec<(usize, usize)>,
+    /// `true` when an operand ends in a CALLFB pair (CALL + NOP). Keeping such
+    /// a chain whole in the CFG can merge a long prefix into the following
+    /// condition block; `cond_prefix_cut` uses this to avoid lifting that
+    /// prefix (and its calls) twice.
+    pub has_callfb_operand: bool,
 }
 
 /// Try to recognise `a or b or c` / `a and b and c` merged in one register:
@@ -296,12 +301,59 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
     if callfb_operand && span_has_external_entry(code, pc, join) {
         return None;
     }
+    // Inside a loop, keeping the chain whole merges the loop's prefix into its
+    // header block: the structurer then rotates the `while`, duplicating the
+    // prefix (RideAPet Weather's egg-polling loop). Leave those to control flow.
+    if callfb_operand && span_is_inside_loop(code, pc, join) {
+        return None;
+    }
     Some(OrAndChain {
         dest,
         end_pc: join,
         is_or: op == LuauOpcode::JumpIf,
         segments,
+        has_callfb_operand: callfb_operand,
     })
+}
+
+/// Is `[start, end)` in the HEADER prefix of a loop? True when a backward jump
+/// at or after `end` lands at or before `start` AND nothing between that loop
+/// head and `start` branches, so the chain's block would swallow the whole
+/// prefix. A chain after the loop's own condition (a `while c do` body) is a
+/// plain statement and stays recognised.
+fn span_is_inside_loop(code: &[u32], start: usize, end: usize) -> bool {
+    let is_jump = |op: LuauOpcode| {
+        is_conditional_jump(op)
+            || matches!(
+                op,
+                LuauOpcode::Jump | LuauOpcode::JumpBack | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+            )
+    };
+    let mut head: Option<usize> = None;
+    let mut w = end.min(code.len());
+    while w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if is_jump(op) {
+            let target = w as i64 + insn_d(code[w]) as i64 + 1;
+            if target >= 0 && target <= start as i64 {
+                let t = target as usize;
+                head = Some(head.map_or(t, |h| h.min(t)));
+            }
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    let Some(head) = head else {
+        return false;
+    };
+    let mut w = head;
+    while w < start {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if is_jump(op) {
+            return false;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    true
 }
 
 /// Does any instruction *outside* `[start, end)` jump to a pc strictly inside
@@ -484,6 +536,22 @@ mod tests {
         assert_eq!(chain.dest, 3);
         assert!(!chain.is_or);
         assert_eq!(chain.segments, vec![(1, 5)]);
+    }
+
+    /// The same chain inside a loop (a JUMPBACK after the join targets a pc at
+    /// or before the chain) is left to control flow: keeping it whole made the
+    /// structurer rotate the `while` and duplicate the loop prefix.
+    #[test]
+    fn callfb_chain_inside_a_loop_is_not_a_chain() {
+        let code = vec![
+            ad(LuauOpcode::JumpIfNot, 3, 4),
+            abc(LuauOpcode::Move, 3, 2, 0),
+            abc(LuauOpcode::LoadK, 4, 0, 0),
+            abc(LuauOpcode::Call, 3, 2, 2),
+            abc(LuauOpcode::Nop, 0, 0, 0),
+            ad(LuauOpcode::JumpBack, 0, -6),
+        ];
+        assert_eq!(recognize_or_and_chain(&code, 0), None);
     }
 
     /// `if v and v ~= x then v.Cancel() end`: the body's CALLFB pair has zero

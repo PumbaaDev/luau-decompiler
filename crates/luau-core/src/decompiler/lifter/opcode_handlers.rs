@@ -2020,7 +2020,7 @@ fn move_in_or_guarded_arm(code: &[u32], move_pc: usize) -> bool {
 /// operands genuinely name registers; anything unlisted counts as no read,
 /// which only WIDENS the window `table_move_blocked` inspects (the safe
 /// direction).
-fn insn_reads_reg(code: &[u32], pc: usize, reg: usize) -> bool {
+pub(super) fn insn_reads_reg(code: &[u32], pc: usize, reg: usize) -> bool {
     let insn = code[pc];
     let op = LuauOpcode::from_u8(insn_op(insn));
     let a = insn_a(insn) as usize;
