@@ -9187,10 +9187,30 @@ fn premateralize_branch_escapes_spans(
             // something trips the one-write rule, which is why the ordinary
             // `x = f(...)` two-arm selection was never reachable by it. The
             // gate trace reads `arm_writes=4` for a plain two-arm diamond.
-            let bound_seed = matches!(
+            // STALE-EXPR twin: the pre-branch value is a dead, non-inlinable
+            // expression (a table already consumed by earlier stores, a call
+            // result). Both arms write the register and neither reads it first,
+            // so the merge read cannot observe the stale value: same soundness
+            // argument as the Unknown seed. Inlinable parked values stay on the
+            // parked-pure path below.
+            let stale_expr = matches!(
+                regs.get(reg),
+                Some(RegVal::Expr(e)) if !matches!(e, Expr::Name(_)) && !expr_is_inlinable(e)
+            ) && !arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg))
+                // Straight-line arms only: pinning one name over a nested and/or
+                // chain dropped a guard (StealAnEgg AssetToolRig: `tool and
+                // result24` became `if tool`).
+                && !arm_ranges
+                    .iter()
+                    .filter(|(s, e)| e > s)
+                    .any(|&(s, e)| range_has_cond_jump(&proto.code, s, e));
+            let bound_seed = (matches!(
                 regs.get(reg),
                 Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
-            )
+            ) || stale_expr)
                 && locals.is_non_param(reg)
                 && !then_ranges.is_empty()
                 && !else_ranges.is_empty()
@@ -9204,7 +9224,7 @@ fn premateralize_branch_escapes_spans(
                 // failure). A name already live in this proto cannot be used
                 // either - shadowing a name some other register still reads
                 // would silently retarget that reader.
-                if opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
+                if stale_expr || opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
                     name = format!("sel{}", reg);
                 }
                 // A register whose live value is `Unknown` at the branch is a
@@ -9223,7 +9243,7 @@ fn premateralize_branch_escapes_spans(
                 // redefinition, so the dead pre-branch value is never observed and
                 // a fresh declaration is bit-exact. A fresh name (never the stale
                 // one) keeps clear of the 476_BadgeMenu name-reuse hazard.
-                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown));
+                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown)) || stale_expr;
                 let (kind, final_name) = if reg_is_dead {
                     (WriteKind::Shadow, locals.reseed_shadow(reg, &name))
                 } else {
@@ -9552,6 +9572,19 @@ fn count_reg_writes(code: &[u32], start: usize, end: usize, reg: usize) -> usize
         pc += if op.has_aux() { 2 } else { 1 };
     }
     n
+}
+
+/// Does `[start, end)` contain any conditional jump?
+fn range_has_cond_jump(code: &[u32], start: usize, end: usize) -> bool {
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if crate::analysis::bool_idiom::is_conditional_jump(op) {
+            return true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 fn ranges_write_reg(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool {
