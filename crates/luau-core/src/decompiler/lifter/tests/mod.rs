@@ -70,6 +70,8 @@ mod oor_nonloop_tests;
 #[cfg(test)]
 mod oor_real_oracle_tests;
 #[cfg(test)]
+mod andchain_callfb_tests;
+#[cfg(test)]
 mod phase_c10q_kv_drop_any_name_tests;
 #[cfg(test)]
 mod phase_c10r_empty_fn_drop_tests;

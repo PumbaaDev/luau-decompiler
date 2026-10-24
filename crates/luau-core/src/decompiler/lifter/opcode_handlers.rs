@@ -16,7 +16,7 @@
 //! `pub(super)` visibility from `naming.rs`; we pull them in via
 //! `super::{RegVal, LocalTracker, WriteKind}`.
 
-use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain};
+use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain, OrAndChain};
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
 use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext, EmittedLoop};
 use crate::parser::opcodes::{builtin_name, LuauOpcode};
@@ -2020,7 +2020,7 @@ fn move_in_or_guarded_arm(code: &[u32], move_pc: usize) -> bool {
 /// operands genuinely name registers; anything unlisted counts as no read,
 /// which only WIDENS the window `table_move_blocked` inspects (the safe
 /// direction).
-fn insn_reads_reg(code: &[u32], pc: usize, reg: usize) -> bool {
+pub(super) fn insn_reads_reg(code: &[u32], pc: usize, reg: usize) -> bool {
     let insn = code[pc];
     let op = LuauOpcode::from_u8(insn_op(insn));
     let a = insn_a(insn) as usize;
@@ -5451,8 +5451,15 @@ pub(super) fn lift_instruction_range(
                     // Snapshot and restore on the reject path only; the accept
                     // path deliberately keeps its writes.
                     let chain_snapshot = regs.clone();
+                    // The segment lifts also DECLARE locals; a rejected chain that only
+                    // became visible through the CALLFB/prelude work must not leave them
+                    // behind, or the real lift assigns to names that are never declared
+                    // (AdoptMe FireHydrantPerformance `step`). Chains the old recogniser
+                    // already speculated on keep the old behaviour.
+                    let locals_snapshot = locals.clone();
                     let mut acc = reg_expr(regs, chain.dest);
                     let mut ok = true;
+                    let mut seg_folded: Vec<bool> = Vec::new();
                     for &(seg_start, seg_end) in &chain.segments {
                         let mut seg_stmts = Vec::new();
                         lift_instruction_range(
@@ -5475,8 +5482,27 @@ pub(super) fn lift_instruction_range(
                                 }
                                 _ => { ok = false; break; }
                             },
-                            // Anything else has side effects we cannot inline.
-                            _ => { ok = false; break; }
+                            // A prelude of single-use temps (`local T = F.x;
+                            // local R = T:Get()`): inline them back when that
+                            // cannot reorder calls. Otherwise reject the chain.
+                            // A segment with a branch of its own is not a prelude: the
+                            // branch's far arm lies outside the lifted range and is
+                            // silently dropped (DungeonQuestReborn characterSwapUI
+                            // `or (Name == "label" and ...)`).
+                            _ if segment_has_branch(code, seg_start, seg_end) => {
+                                ok = false;
+                                break;
+                            }
+                            _ => match super::prelude_fold::fold_prelude_temps(
+                                &seg_stmts,
+                                reg_expr(regs, chain.dest),
+                            ) {
+                                Some(e) => {
+                                    seg_folded.push(true);
+                                    e
+                                }
+                                None => { ok = false; break; }
+                            },
                         };
                         acc = Expr::BinOp {
                             left: Box::new(acc),
@@ -5484,11 +5510,121 @@ pub(super) fn lift_instruction_range(
                             right: Box::new(operand),
                         };
                     }
+                    // A chain that only became visible through Fix A (CALLFB NOP) or Fix B
+                    // (prelude fold) must not store into an UPVALUE ALIAS the bytecode
+                    // never writes back: the last operand parks the upvalue's name in
+                    // `dest`, and `store_complex` would reuse it as the write target
+                    // (`Workspace = self.Parent or ... or Workspace`). Keep the old
+                    // behaviour (reject) rather than fabricate an upvalue write.
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && alias_would_be_written(code, locals, chain.dest)
+                    {
+                        ok = false;
+                    }
+                    // Same shape when the bytecode DOES write the upvalue back
+                    // (`if not v then v = f() end`): the chain would be stored under a
+                    // fresh name that is never declared (`Move2 = v6 or ...`).
+                    // A chain that only became foldable through the prelude work must be
+                    // the sole way into its own span: an outside jump landing inside is
+                    // the `x and f() or g()` ternary, whose first operand is not the
+                    // register's value (AdoptMe profileViewSaveServer).
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && crate::analysis::bool_idiom::span_has_external_entry(code, pc, chain.end_pc)
+                    {
+                        ok = false;
+                    }
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && locals_snapshot.alias_upval_of(chain.dest).is_some()
+                    {
+                        ok = false;
+                    }
+                    // Simplification must not discard an operand's call
+                    // (`nil and x:GetAttribute(..)` -> `nil`): a newly visible chain
+                    // that would lose a call keeps the old shape (BloxFruits
+                    // AuraVisuals `enable`).
+                    let simplified = simplify_expr(&acc);
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && super::prelude_fold::call_count(&simplified)
+                            < super::prelude_fold::call_count(&acc)
+                    {
+                        ok = false;
+                    }
+                    // Folding a calling operand into an expression removes the branch
+                    // that used to force earlier lazily-parked reads into locals; they
+                    // would then be inlined past the call (AdoptMe StorageCatalogHeader:
+                    // `value4.createElement` and `self.layout_order` read after five
+                    // calls). Keep the branch (old shape) in that case.
+                    let crossing = if ok && chain_is_newly_visible(code, &chain, &seg_folded) {
+                        pending_reads_crossing_call(code, &chain_snapshot, &chain)
+                    } else {
+                        Vec::new()
+                    };
+                    if !crossing.is_empty() {
+                        ok = false;
+                    }
                     if ok {
-                        let acc = simplify_expr(&acc);
+                        let acc = simplified;
+                        let stmts_before = stmts.len();
                         store_complex(ctx, proto, regs, locals, stmts, chain.dest, pc, acc);
-                        pc = chain.end_pc;
-                        continue;
+                        // The same span lifted twice in one run declares the result twice
+                        // (BloxFruits QuestPro, RideAPet PetRenderer): drop an exact repeat
+                        // of the statements just before.
+                        if chain_is_newly_visible(code, &chain, &seg_folded) {
+                            let added = stmts.len() - stmts_before;
+                            if added > 0
+                                && stmts_before >= added
+                                && format!("{:?}", &stmts[stmts_before - added..stmts_before])
+                                    == format!("{:?}", &stmts[stmts_before..])
+                            {
+                                stmts.truncate(stmts_before);
+                            }
+                        }
+                        // A newly visible chain must not be stored as a bare assignment to
+                        // a name that was never declared: it would be hoisted to module
+                        // scope later (BloxFruits CannonController `Cannon`).
+                        let undeclared_write = chain_is_newly_visible(code, &chain, &seg_folded)
+                            && stmts[stmts_before..].iter().any(|st| matches!(
+                                st,
+                                Stat::Assign { targets, .. }
+                                    if matches!(targets.as_slice(), [Expr::Name(n)]
+                                        if !locals_snapshot.is_bound_name(n))
+                            ));
+                        if undeclared_write {
+                            stmts.truncate(stmts_before);
+                            *locals = locals_snapshot.clone();
+                            ok = false;
+                        } else {
+                            // The branch this chain replaced always named its result. A
+                            // result parked lazily in the register would be re-evaluated
+                            // (reads, even calls) at every later use, so name it here;
+                            // single-use names are inlined back by the later passes.
+                            if chain_is_newly_visible(code, &chain, &seg_folded)
+                                && stmts.len() == stmts_before
+                            {
+                                if let Some(RegVal::Expr(value)) = regs.get(chain.dest).cloned() {
+                                    if super::prelude_fold::reads_or_calls(&value) {
+                                        let fresh = ctx.reg_name(proto, chain.dest as u8, pc);
+                                        let (kind, name) = locals.classify_write(chain.dest, &fresh);
+                                        // Only a genuine new declaration; a reassignment
+                                        // keeps the parked value (old behaviour).
+                                        if kind != WriteKind::Reassign {
+                                            stmts.push(Stat::Local {
+                                                names: vec![name.clone()],
+                                                values: vec![value],
+                                            });
+                                            regs[chain.dest] = RegVal::Expr(Expr::Name(name));
+                                        }
+                                    }
+                                }
+                            }
+                            if seg_folded.iter().any(|&f| f)
+                                && chain_is_newly_visible(code, &chain, &seg_folded)
+                            {
+                                locals.forget_declared_since(&locals_snapshot, chain.dest);
+                            }
+                            pc = chain.end_pc;
+                            continue;
+                        }
                     }
                     // Rejected: undo the speculation.
                     //
@@ -5505,6 +5641,36 @@ pub(super) fn lift_instruction_range(
                     //     17-line table constructor.
                     regs.clear();
                     regs.extend_from_slice(&chain_snapshot);
+                    // (`ends_in_nop`: the old recogniser never saw such a chain, so it
+                    // never speculated on it either.)
+                    if chain.segments.iter().any(|&(s, e)| ends_in_nop(code, s, e)) {
+                        *locals = locals_snapshot;
+                    }
+                    // The branch region used to name live pending tables before it
+                    // split; the flat path does not, so a table holding a field read
+                    // would be built after the calls that follow it. Name it here.
+                    for r in crossing {
+                        let RegVal::Expr(value @ Expr::Table { .. }) = regs[r].clone() else {
+                            continue;
+                        };
+                        let fresh = ctx.reg_name(proto, r as u8, pc);
+                        let (kind, name) = locals.classify_write(r, &fresh);
+                        match kind {
+                            WriteKind::FirstDecl | WriteKind::Shadow => {
+                                stmts.push(Stat::Local {
+                                    names: vec![name.clone()],
+                                    values: vec![value],
+                                });
+                            }
+                            WriteKind::Reassign => {
+                                stmts.push(Stat::Assign {
+                                    targets: vec![Expr::Name(name.clone())],
+                                    values: vec![value],
+                                });
+                            }
+                        }
+                        regs[r] = RegVal::Expr(Expr::Name(name));
+                    }
                 }
 
                 // A jump that reaches the END of the enclosing loop leaves it,
@@ -6949,6 +7115,94 @@ fn loop_carries(code: &[u32], load: usize, w: usize) -> bool {
 /// `GETUPVAL R U; ADDK R R 1; SETUPVAL R U` is a counter update and keeps its
 /// `hits = hits + 1` shape. Any other write of `reg` first (or a RETURN) means
 /// the value is a scratch result: there is no store to the upvalue.
+/// Was this chain admitted only by the CALLFB-NOP rule or the prelude fold?
+/// (Those are the shapes the old code rejected; everything else keeps its
+/// pre-existing handling untouched.)
+fn chain_is_newly_visible(code: &[u32], chain: &OrAndChain, seg_folded: &[bool]) -> bool {
+    !seg_folded.is_empty()
+        || chain.segments.iter().any(|&(start, end)| ends_in_nop(code, start, end))
+}
+
+/// Registers other than the chain's `dest` that hold a parked read or call which
+/// code after the chain still uses, when a chain operand makes a call.
+fn pending_reads_crossing_call(code: &[u32], before: &[RegVal], chain: &OrAndChain) -> Vec<usize> {
+    let calls = chain.segments.iter().any(|&(s, e)| {
+        let mut w = s;
+        while w < e.min(code.len()) {
+            let op = LuauOpcode::from_u8(insn_op(code[w]));
+            if matches!(op, LuauOpcode::Call) {
+                return true;
+            }
+            w += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    });
+    if !calls {
+        return Vec::new();
+    }
+    let written: Vec<usize> = chain
+        .segments
+        .iter()
+        .flat_map(|&(s, e)| super::collect_body_writes(code, s, e))
+        .collect();
+    before
+        .iter()
+        .enumerate()
+        .filter(|&(r, v)| {
+            r != chain.dest
+                && !written.contains(&r)
+                && matches!(v, RegVal::Expr(e) if super::prelude_fold::reads_or_calls(e))
+                && super::reg_used_in_range(code, chain.end_pc, code.len(), r)
+        })
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// Does `[start, end)` hold a conditional jump that leaves it (AUX-aligned scan)?
+fn segment_has_branch(code: &[u32], start: usize, end: usize) -> bool {
+    let mut w = start;
+    while w < end.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if crate::analysis::bool_idiom::is_conditional_jump(op)
+            && w as i64 + insn_d(code[w]) as i64 + 1 > end as i64
+        {
+            return true;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Is the last instruction (AUX-aligned) of `[start, end)` a NOP?
+fn ends_in_nop(code: &[u32], start: usize, end: usize) -> bool {
+    let mut last = None;
+    let mut w = start;
+    while w < end.min(code.len()) {
+        last = Some(w);
+        w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() { 2 } else { 1 };
+    }
+    last.is_some_and(|w| LuauOpcode::from_u8(insn_op(code[w])) == LuauOpcode::Nop)
+}
+
+/// Does `dest` still carry a read-only alias of an upvalue that no SETUPVAL in
+/// this proto ever writes? Storing the chain into it would assign to that
+/// upvalue by name.
+fn alias_would_be_written(code: &[u32], locals: &LocalTracker, dest: usize) -> bool {
+    let Some((upval, _alias, _loaded_at)) = locals.alias_upval_of(dest) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::SetUpval && insn_b(insn) as usize == upval {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
 fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool {
     let first = LuauOpcode::from_u8(insn_op(code[pc]));
     let mut i = pc + if first.has_aux() { 2 } else { 1 };

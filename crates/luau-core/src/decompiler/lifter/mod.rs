@@ -32,6 +32,7 @@ use post_passes::{
 };
 
 mod oor_guard;
+mod prelude_fold;
 mod opcode_handlers;
 use opcode_handlers::lift_instruction_range;
 
@@ -2760,8 +2761,14 @@ fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
             within(*cond_pc)
                 && body.iter().all(|r| region_pc_extent_within(r, start, end))
         }
-        Region::IfThenElse { .. }
-        | Region::WhileTrue { .. }
+        // The loop-wrapping `if` the structurer emits since the single-lift prefix
+        // work (`cond_prefix_cut`): its blocks are arm blocks, named by start pc.
+        Region::IfThenElse { cond_pc, then_region, else_region, merge_pc } => {
+            within(*cond_pc)
+                && then_region.iter().chain(else_region.iter()).all(|&b| within(b))
+                && merge_pc.map_or(true, |m| m <= end)
+        }
+        Region::WhileTrue { .. }
         | Region::WhileDo { .. }
         | Region::GuardedTailIf { .. }
         | Region::OrGuardIf { .. }
@@ -3159,8 +3166,12 @@ fn lift_value_join(
     );
     let paths = match paths {
         Some(p) if p.len() >= 2 => {
+            // Two paths through one arm hoist the same temp twice; keep the first.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for st in hoisted_temps.drain(..) {
-                stmts.push(st);
+                if seen.insert(format!("{st:?}")) {
+                    stmts.push(st);
+                }
             }
             p
         }
@@ -5802,6 +5813,50 @@ pub(super) fn emit_local_or_assign(
 /// later inlining. For expressions with side effects or unbounded size (calls,
 /// method calls, functions, deeply nested ops), emits a local declaration to
 /// prevent the expression from being duplicated at every use site.
+/// A field read parked in a register is re-evaluated wherever the register is
+/// read. When a `SETTABLEKS` to the same key runs before that first read
+/// (`local prev = c.Archivable; c.Archivable = true; ...; c.Archivable = prev`),
+/// inlining it reads the NEW value and the restore degenerates into a dropped
+/// self-assignment. Such a read must be emitted where it happens.
+fn field_read_clobbered_before_use(
+    ctx: &DecompileContext,
+    proto: &Proto,
+    pc: usize,
+    reg: usize,
+    value: &Expr,
+) -> bool {
+    let Expr::Field { field, .. } = value else {
+        return false;
+    };
+    let code = &proto.code;
+    let mut i = pc + 1;
+    // The producing GETTABLEKS carries an AUX word.
+    if code.get(pc).is_some_and(|&w| LuauOpcode::from_u8(insn_op(w)).has_aux()) {
+        i += 1;
+    }
+    let mut clobbered = false;
+    while i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        // First consumer of the register sees the clobbered value iff a
+        // same-key store ran before it.
+        if opcode_handlers::insn_reads_reg(code, i, reg) {
+            return clobbered;
+        }
+        if op == LuauOpcode::SetTableKS {
+            if let Some(&aux) = code.get(i + 1) {
+                if get_table_string_from_aux(proto, &ctx.chunk.strings, aux) == *field {
+                    clobbered = true;
+                }
+            }
+        }
+        if op == LuauOpcode::Return {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 pub(super) fn store_complex(
     ctx: &mut DecompileContext,
     proto: &Proto,
@@ -5853,7 +5908,10 @@ pub(super) fn store_complex(
     let is_pinned_loop_carried = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
         && ctx.is_pinned_reg(reg as u8, pc);
 
-    if !is_self_mutation && !is_pinned_loop_carried && expr_is_inlinable(&value) {
+    let clobbered_before_use = field_read_clobbered_before_use(ctx, proto, pc, reg, &value);
+    if !is_self_mutation && !is_pinned_loop_carried && !clobbered_before_use
+        && expr_is_inlinable(&value)
+    {
         regs[reg] = RegVal::Expr(value);
     } else {
         // B0.127b: sanitize stdlib-name strings when emitting as a statement.

@@ -1150,6 +1150,22 @@ fn find_or_chain_return_guard(
     entry: usize,
     handled: &BTreeSet<usize>,
 ) -> Option<(Vec<usize>, usize, usize)> {
+    // A chain that needs a pure-preamble link must own the terminal. When another
+    // edge (the ladder's last fall-through) also reaches it, retry with bare links
+    // only: that is the chain an entry reached by several edges has always got, and
+    // the rest of the ladder then starts its own chain (StealAnEgg
+    // FullscreenPresentation `Open`).
+    or_chain_return_guard_with(cfg, code, entry, handled, true)
+        .or_else(|| or_chain_return_guard_with(cfg, code, entry, handled, false))
+}
+
+fn or_chain_return_guard_with(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    handled: &BTreeSet<usize>,
+    allow_pure_links: bool,
+) -> Option<(Vec<usize>, usize, usize)> {
     if handled.contains(&entry) {
         return None;
     }
@@ -1190,7 +1206,8 @@ fn find_or_chain_return_guard(
             // the guard would become an unconditional `notice(..); return` that
             // kills the whole function. Bare-link chains keep their original
             // (unrestricted) acceptance, so nothing that matched before changes.
-            if eb.predecessors.len() > 1
+            if !allow_pure_links
+                || eb.predecessors.len() > 1
                 || !is_pure_preamble_chain_link(cfg, code, cur, *chain.last()?)
             {
                 break;
@@ -1672,7 +1689,8 @@ pub(crate) fn structure_numeric_for_body(
                             code, cfg, then_blocks.iter().chain(else_blocks.iter()));
                         let overwrites = arm_overwrites_prefix_value(
                             code, cfg, cond_id, pc, merge, &then_blocks, &else_blocks);
-                        let cut = if nested || overwrites { pc }
+                        let cut = if (nested || overwrites)
+                            && !prefix_has_callfb_chain(code, cfg, cond_id, pc) { pc }
                             else { cond_prefix_cut(code, cfg, cond_id, pc) };
                         if linear_start < cut { regions.push(Region::Linear { start: linear_start, end: cut }); }
                         regions.push(Region::IfThenElse { cond_pc: cond_id,
@@ -2278,6 +2296,35 @@ fn last_real_pc(code: &[u32], block: &BasicBlock) -> usize {
         }
     }
     last_pc
+}
+
+/// True when the condition block's prefix (`block.start..pc`) holds an
+/// `a and f()` chain recognised only because its last operand is a CALLFB pair.
+/// The CFG keeps such a chain whole, so the prefix can run far back (getIfCanUse,
+/// GiveItem). The old double-lift split would emit that prefix, calls and all,
+/// twice; there the prefix must be lifted once, whatever the arms look like.
+fn prefix_has_callfb_chain(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    cond_id: usize,
+    pc: usize,
+) -> bool {
+    let start = match cfg.blocks.get(&cond_id) {
+        Some(b) => b.start.min(pc),
+        None => return false,
+    };
+    let mut w = start;
+    while w < pc.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+            && crate::analysis::bool_idiom::recognize_or_and_chain(code, w)
+                .is_some_and(|c| c.has_callfb_operand)
+        {
+            return true;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Where the `Linear` region before a conditional-wrapping-a-loop must stop.
