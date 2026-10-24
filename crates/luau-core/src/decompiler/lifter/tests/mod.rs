@@ -86,6 +86,7 @@ mod getupval_retarget_tests;
 #[cfg(test)]
 mod branch_arm_for_recovery_tests;
 mod branch_merge_reg_tests;
+mod default_load_merge_tests;
 #[cfg(test)]
 mod ref_capture_write_pin_tests;
 #[cfg(test)]

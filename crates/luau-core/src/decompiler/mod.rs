@@ -298,6 +298,9 @@ pub struct DecompileContext<'a> {
     /// to the latch of the innermost emitted loop is a `continue` even when
     /// bytecode-level inner loops sit between.
     pub emitted_latches: Vec<EmittedLoop>,
+    /// `(proto_index, pc)` of each LOADNIL default already folded into a
+    /// `c and X or nil` declaration by the if-lift; the LOADNIL must not re-park nil.
+    pub default_merged_loads: std::collections::HashSet<(usize, usize)>,
 }
 
 /// A loop the lifter is currently emitting, as seen by `continue` minting.
@@ -334,6 +337,7 @@ impl<'a> DecompileContext<'a> {
             current_loop_end: None,
             current_loop_body: None,
             emitted_latches: Vec::new(),
+            default_merged_loads: std::collections::HashSet::new(),
         }
     }
 

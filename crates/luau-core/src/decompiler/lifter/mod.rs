@@ -4015,6 +4015,51 @@ fn lift_region(
                 }
             }
 
+            // Default-load merge: `local h = c and X or nil` compiles to
+            // `JUMPIFNOT c -> L; <X into Rh>; JUMPIF Rh -> L+1; L: LOADNIL Rh`.
+            // The arm's own jump lands AFTER the LOADNIL, so the join holds the
+            // arm value or nil. The arm's `local h = X` is scoped to the `if`
+            // and the LOADNIL would then park a constant nil in the register,
+            // folding every later guard on `h` to a constant. Rebuild the
+            // selection as ONE declaration whose scope reaches the join.
+            let mut default_merge_local: Option<Stat> = None;
+            if else_body.is_none() {
+                if let Some(mpc) = merge_pc {
+                    if let Some(r) = default_load_merge_reg(&proto.code, *cond_pc, *mpc)
+                        .filter(|&r| !copied_into_conditionally_rewritten_reg(&proto.code, *mpc, r))
+                    {
+                        if let [Stat::Local { names, values }] = then_stmts.as_slice() {
+                            let arm_binds_reg = matches!(
+                                regs_after_then.get(r),
+                                Some(RegVal::Expr(Expr::Name(n))) if names.len() == 1 && *n == names[0]
+                            );
+                            if arm_binds_reg && values.len() == 1 {
+                                let guarded = Expr::BinOp {
+                                    left: Box::new(Expr::BinOp {
+                                        left: Box::new(condition.clone()),
+                                        op: BinOp::And,
+                                        right: Box::new(values[0].clone()),
+                                    }),
+                                    op: BinOp::Or,
+                                    right: Box::new(Expr::Nil),
+                                };
+                                default_merge_local = Some(Stat::Local {
+                                    names: names.clone(),
+                                    values: vec![guarded],
+                                });
+                                if r < regs.len() {
+                                    regs[r] = RegVal::Expr(Expr::Name(names[0].clone()));
+                                }
+                                ctx.default_merged_loads.insert((proto_index, *mpc));
+                            }
+                        }
+                    }
+                }
+            }
+            if default_merge_local.is_some() {
+                then_stmts.clear();
+            }
+
             // B0.57: hoist `Stat::Local` declarations out of branch bodies
             // when the register escapes (i.e. post-merge `regs` still holds
             // an `Expr::Name(n)` matching the declared local). Without this,
@@ -4038,8 +4083,9 @@ fn lift_region(
             // that the hoist just lifted out of a branch.
             stmts.extend(hoisted_phis);
 
-            // If condition is always true (unknown branch opcode), inline the body directly
-            if matches!(&condition, Expr::Bool(true)) {
+            if let Some(decl) = default_merge_local {
+                stmts.push(decl);
+            } else if matches!(&condition, Expr::Bool(true)) {
                 stmts.extend(then_stmts);
                 if let Some(else_stmts) = else_body {
                     stmts.extend(else_stmts);
@@ -7419,6 +7465,80 @@ fn has_side_effects(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Is register `r` COPIED (`MOVE X r`) after `from_pc` into a register `X` that is
+/// then rewritten inside a forward-jumped region? A MOVE of a bound name is
+/// lifted as a plain alias, so such a conditional rewrite of `X` splits from the
+/// copied variable and the join keeps `r`'s name instead of `X`'s new value.
+/// (A `CAPTURE ref X` closure sharing `X`, or an `X = X and f(X)` chain, are the
+/// measured cases.) The constant-nil fold used to hide that weakness, so
+/// declining the default-load rewrite keeps the old behaviour for the shape.
+fn copied_into_conditionally_rewritten_reg(code: &[u32], from_pc: usize, r: usize) -> bool {
+    let is_forward_jump = |insn: u32| {
+        matches!(
+            LuauOpcode::from_u8(insn_op(insn)),
+            LuauOpcode::Jump
+                | LuauOpcode::JumpIf
+                | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpIfEq
+                | LuauOpcode::JumpIfNotEq
+                | LuauOpcode::JumpIfLE
+                | LuauOpcode::JumpIfNotLE
+                | LuauOpcode::JumpIfLT
+                | LuauOpcode::JumpIfNotLT
+                | LuauOpcode::JumpXEqKNil
+                | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN
+                | LuauOpcode::JumpXEqKS
+        ) && insn_d(insn) > 0
+    };
+    let mut pc = from_pc;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::Move && insn_b(insn) as usize == r && insn_a(insn) as usize != r {
+            let dest = insn_a(insn) as usize;
+            let mut jumps_end: usize = 0;
+            let mut q = pc + 1;
+            while q < code.len() {
+                let qi = code[q];
+                let qop = LuauOpcode::from_u8(insn_op(qi));
+                if q < jumps_end && collect_body_writes(code, q, q + 1).contains(&dest) {
+                    return true;
+                }
+                if is_forward_jump(qi) {
+                    jumps_end = jumps_end.max((q as i64 + 1 + insn_d(qi) as i64) as usize);
+                }
+                q += if qop.has_aux() { 2 } else { 1 };
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// `LOADNIL Rr` at `merge_pc` that an arm of the `if` at `cond_pc` jumps OVER
+/// with `JUMPIF Rr -> merge_pc + 1` (the `c and X or nil` shape). Returns `r`.
+fn default_load_merge_reg(code: &[u32], cond_pc: usize, merge_pc: usize) -> Option<usize> {
+    let insn = *code.get(merge_pc)?;
+    if LuauOpcode::from_u8(insn_op(insn)) != LuauOpcode::LoadNil {
+        return None;
+    }
+    let r = insn_a(insn) as usize;
+    let mut pc = cond_pc + 1;
+    while pc < merge_pc {
+        let i = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(i));
+        let jumps_over = op == LuauOpcode::JumpIf
+            && insn_a(i) as usize == r
+            && pc as i64 + 1 + insn_d(i) as i64 == merge_pc as i64 + 1;
+        if jumps_over {
+            return Some(r);
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    None
 }
 
 /// Returns true if an if-statement is entirely empty (all branches have no
