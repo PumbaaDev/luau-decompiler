@@ -133,3 +133,5 @@ mod upval_snapshot_tests;
 #[cfg(test)]
 mod tail_recompute_redeclared_local_tests;
 mod return_wide_list_tests;
+#[cfg(test)]
+mod loop_exit_read_carried_tests;

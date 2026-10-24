@@ -768,6 +768,45 @@ fn name_declared_in(stmts: &[Stat], name: &str) -> bool {
     stmts.iter().any(|s| matches!(s, Stat::Local { names, .. } if names.iter().any(|n| n == name)))
 }
 
+/// True when `next` is `if <cond reading name> then ... break end`: the loop's
+/// exit test on the value just written.
+fn is_exit_test_of(next: Option<&Stat>, name: &str) -> bool {
+    match next {
+        Some(Stat::If { condition, then_body, .. }) => {
+            expr_references_name(condition, name)
+                && matches!(then_body.last(), Some(Stat::Break))
+        }
+        _ => false,
+    }
+}
+
+/// Does the code that runs after a nested block (`after`, in execution order)
+/// read `name` before a straight-line statement overwrites or re-declares it?
+fn read_after_block(after: &[&Stat], name: &str) -> bool {
+    for s in after {
+        match s {
+            Stat::Assign { targets, values }
+                if targets.len() == 1
+                    && matches!(&targets[0], Expr::Name(n) if n == name)
+                    && !values.iter().any(|v| expr_references_name(v, name)) =>
+            {
+                return false;
+            }
+            Stat::Local { names, values }
+                if names.iter().any(|n| n == name)
+                    && !values.iter().any(|v| expr_references_name(v, name)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        if stmt_reads_name_deep(s, name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Convenience entry point with no arity-pinned temps. Used by the unit tests,
 /// which build ASTs directly and therefore have no bytecode-level arity info.
 #[cfg(test)]
@@ -782,7 +821,7 @@ pub(super) fn inline_single_use_temps_pinned(
     arity_pinned: &std::collections::HashSet<String>,
     upvalues: &std::collections::HashSet<String>,
 ) {
-    inline_single_use_temps_scoped(stmts, arity_pinned, upvalues, &[]);
+    inline_single_use_temps_scoped(stmts, arity_pinned, upvalues, &[], &[], false);
 }
 
 /// `tail_reads` are expressions evaluated AFTER the last statement of `stmts`
@@ -796,24 +835,33 @@ fn inline_single_use_temps_scoped(
     arity_pinned: &std::collections::HashSet<String>,
     upvalues: &std::collections::HashSet<String>,
     tail_reads: &[Expr],
+    after: &[&Stat],
+    in_loop: bool,
 ) {
-    // Recurse into nested blocks first
-    for stmt in stmts.iter_mut() {
+    // Recurse into nested blocks first. `after` is every statement that runs
+    // once the nested block is left (the later siblings here, then the
+    // parent's own `after`): a write to an OUTER variable that is read there
+    // is not single-use, whatever the nested block alone shows.
+    for k in 0..stmts.len() {
+        let (head, rest) = stmts.split_at_mut(k + 1);
+        let stmt = &mut head[k];
+        let nested_after: Vec<&Stat> = rest.iter().chain(after.iter().copied()).collect();
+        let nested_after = nested_after.as_slice();
         match stmt {
             Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                inline_single_use_temps_scoped(then_body, arity_pinned, upvalues, tail_reads);
+                inline_single_use_temps_scoped(then_body, arity_pinned, upvalues, tail_reads, nested_after, in_loop);
                 for (_, body) in elseif_clauses {
-                    inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads);
+                    inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads, nested_after, in_loop);
                 }
-                if let Some(eb) = else_body { inline_single_use_temps_scoped(eb, arity_pinned, upvalues, tail_reads); }
+                if let Some(eb) = else_body { inline_single_use_temps_scoped(eb, arity_pinned, upvalues, tail_reads, nested_after, in_loop); }
             }
-            Stat::While { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
+            Stat::While { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads, nested_after, true),
             Stat::Repeat { body, condition } => {
-                inline_single_use_temps_scoped(body, arity_pinned, upvalues, std::slice::from_ref(condition))
+                inline_single_use_temps_scoped(body, arity_pinned, upvalues, std::slice::from_ref(condition), nested_after, true)
             }
-            Stat::NumericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
-            Stat::GenericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
-            Stat::DoBlock { body } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
+            Stat::NumericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads, nested_after, true),
+            Stat::GenericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads, nested_after, true),
+            Stat::DoBlock { body } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads, nested_after, in_loop),
             _ => {}
         }
     }
@@ -865,6 +913,20 @@ fn inline_single_use_temps_scoped(
                             if std::env::var("LUAU_INLINE_GUARD_TRACE").is_ok() {
                                 eprintln!("INLINEGUARD\t{}", n);
                             }
+                            i += 1; continue;
+                        }
+                        // `x = e` inside a nested block to a variable declared
+                        // OUTSIDE it and read after the block is a write the
+                        // later code observes (`friends = X:Get(id)` in a
+                        // `while`, `cb(friends or {})` after it). The per-block
+                        // read count cannot see that read.
+                        (Expr::Name(n), v)
+                            if !name_declared_in(&stmts[..i], n)
+                                && in_loop
+                                && super::expr_contains_call(v)
+                                && is_exit_test_of(stmts.get(i + 1), n)
+                                && read_after_block(after, n) =>
+                        {
                             i += 1; continue;
                         }
                         (Expr::Name(n), v) => match v {
