@@ -16,7 +16,7 @@
 //! `pub(super)` visibility from `naming.rs`; we pull them in via
 //! `super::{RegVal, LocalTracker, WriteKind}`.
 
-use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain};
+use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain, OrAndChain};
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
 use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext, EmittedLoop};
 use crate::parser::opcodes::{builtin_name, LuauOpcode};
@@ -5453,6 +5453,7 @@ pub(super) fn lift_instruction_range(
                     let chain_snapshot = regs.clone();
                     let mut acc = reg_expr(regs, chain.dest);
                     let mut ok = true;
+                    let mut seg_folded: Vec<bool> = Vec::new();
                     for &(seg_start, seg_end) in &chain.segments {
                         let mut seg_stmts = Vec::new();
                         lift_instruction_range(
@@ -5475,14 +5476,36 @@ pub(super) fn lift_instruction_range(
                                 }
                                 _ => { ok = false; break; }
                             },
-                            // Anything else has side effects we cannot inline.
-                            _ => { ok = false; break; }
+                            // A prelude of single-use temps (`local T = F.x;
+                            // local R = T:Get()`): inline them back when that
+                            // cannot reorder calls. Otherwise reject the chain.
+                            _ => match super::prelude_fold::fold_prelude_temps(
+                                &seg_stmts,
+                                reg_expr(regs, chain.dest),
+                            ) {
+                                Some(e) => {
+                                    seg_folded.push(true);
+                                    e
+                                }
+                                None => { ok = false; break; }
+                            },
                         };
                         acc = Expr::BinOp {
                             left: Box::new(acc),
                             op: if chain.is_or { BinOp::Or } else { BinOp::And },
                             right: Box::new(operand),
                         };
+                    }
+                    // A chain that only became visible through Fix A (CALLFB NOP) or Fix B
+                    // (prelude fold) must not store into an UPVALUE ALIAS the bytecode
+                    // never writes back: the last operand parks the upvalue's name in
+                    // `dest`, and `store_complex` would reuse it as the write target
+                    // (`Workspace = self.Parent or ... or Workspace`). Keep the old
+                    // behaviour (reject) rather than fabricate an upvalue write.
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && alias_would_be_written(code, locals, chain.dest)
+                    {
+                        ok = false;
                     }
                     if ok {
                         let acc = simplify_expr(&acc);
@@ -6949,6 +6972,44 @@ fn loop_carries(code: &[u32], load: usize, w: usize) -> bool {
 /// `GETUPVAL R U; ADDK R R 1; SETUPVAL R U` is a counter update and keeps its
 /// `hits = hits + 1` shape. Any other write of `reg` first (or a RETURN) means
 /// the value is a scratch result: there is no store to the upvalue.
+/// Was this chain admitted only by the CALLFB-NOP rule or the prelude fold?
+/// (Those are the shapes the old code rejected; everything else keeps its
+/// pre-existing handling untouched.)
+fn chain_is_newly_visible(code: &[u32], chain: &OrAndChain, seg_folded: &[bool]) -> bool {
+    !seg_folded.is_empty()
+        || chain.segments.iter().any(|&(start, end)| ends_in_nop(code, start, end))
+}
+
+/// Is the last instruction (AUX-aligned) of `[start, end)` a NOP?
+fn ends_in_nop(code: &[u32], start: usize, end: usize) -> bool {
+    let mut last = None;
+    let mut w = start;
+    while w < end.min(code.len()) {
+        last = Some(w);
+        w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() { 2 } else { 1 };
+    }
+    last.is_some_and(|w| LuauOpcode::from_u8(insn_op(code[w])) == LuauOpcode::Nop)
+}
+
+/// Does `dest` still carry a read-only alias of an upvalue that no SETUPVAL in
+/// this proto ever writes? Storing the chain into it would assign to that
+/// upvalue by name.
+fn alias_would_be_written(code: &[u32], locals: &LocalTracker, dest: usize) -> bool {
+    let Some((upval, _alias, _loaded_at)) = locals.alias_upval_of(dest) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::SetUpval && insn_b(insn) as usize == upval {
+            return false;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
 fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool {
     let first = LuauOpcode::from_u8(insn_op(code[pc]));
     let mut i = pc + if first.has_aux() { 2 } else { 1 };

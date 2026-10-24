@@ -32,6 +32,7 @@ use post_passes::{
 };
 
 mod oor_guard;
+mod prelude_fold;
 mod opcode_handlers;
 use opcode_handlers::lift_instruction_range;
 

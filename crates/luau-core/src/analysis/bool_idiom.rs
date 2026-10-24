@@ -176,6 +176,11 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
     }
 
     let mut segments: Vec<(usize, usize)> = Vec::new();
+    // Set when an operand ends in the CALL + NOP pair of a CALLFB, and when any
+    // operand contains a conditional jump of its own. The two together are not a
+    // straight-line `a and f()` chain (see the check after the loop).
+    let mut callfb_operand = false;
+    let mut operand_has_branch = false;
     let mut jump_pc = pc;
     loop {
         let seg_start = jump_pc + 1;
@@ -192,6 +197,9 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
             {
                 next_jump = Some(i);
                 break;
+            }
+            if is_conditional_jump(cur_op) {
+                operand_has_branch = true;
             }
             // An operand of a short-circuit expression is straight-line value
             // code. A back-edge, loop header or return inside the span means
@@ -230,7 +238,11 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
         let mut writer_pc: Option<usize> = None;
         let mut w = seg_start;
         while w < seg_end {
-            writer_pc = Some(w);
+            // remap_chunk demotes a CALLFB's feedback AUX word to a standalone NOP.
+            // It is not an operand writer; the CALL before it is.
+            if LuauOpcode::from_u8(insn_op(code[w])) != LuauOpcode::Nop {
+                writer_pc = Some(w);
+            }
             w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() {
                 2
             } else {
@@ -239,6 +251,23 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
         }
         let writer_pc = writer_pc?;
         let writer = code[writer_pc];
+        // The word after the writer's own AUX (an AUX of 0 decodes as NOP).
+        let after_writer = writer_pc
+            + if LuauOpcode::from_u8(insn_op(writer)).has_aux() { 2 } else { 1 };
+        let followed_by_nop = after_writer < seg_end
+            && LuauOpcode::from_u8(insn_op(code[after_writer])) == LuauOpcode::Nop;
+        callfb_operand |= followed_by_nop;
+        // A CALL with zero results (C == 1) leaves no value in `dest`: it is the
+        // last statement of an ordinary `if` body that happens to reuse the
+        // tested register (`if v and v ~= x then v.Cancel() end`), not an
+        // operand. Only judged for the CALLFB pair, where the NOP made it newly
+        // visible.
+        if followed_by_nop
+            && LuauOpcode::from_u8(insn_op(writer)) == LuauOpcode::Call
+            && insn_c(writer) == 1
+        {
+            return None;
+        }
         if !writes_reg_a(LuauOpcode::from_u8(insn_op(writer)))
             || insn_a(writer) as usize != dest
         {
@@ -252,6 +281,19 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
     }
 
     if segments.is_empty() {
+        return None;
+    }
+    // A CALLFB operand became visible only by skipping its NOP. When the span
+    // also contains a comparison or test jump of its own, it is an `if` ladder
+    // (`a and 1 < a and b and f()` lowered with inner branches), not a flat
+    // chain: folding it drops the inner conditions. Leave those to control flow.
+    if callfb_operand && operand_has_branch {
+        return None;
+    }
+    // Likewise when an earlier branch lands INSIDE the span: that is the
+    // `typeof(x) == "T" and a + b or T.new(..)` ternary, whose guard jumps into
+    // the middle of what looks like a chain.
+    if callfb_operand && span_has_external_entry(code, pc, join) {
         return None;
     }
     Some(OrAndChain {
@@ -422,6 +464,79 @@ mod tests {
         assert_eq!(chain.dest, 3);
         assert!(chain.is_or);
         assert_eq!(chain.segments.len(), 2);
+    }
+
+    /// `a and f()` where the right operand ends in `CALL` + the NOP that
+    /// `remap_chunk` leaves in place of a CALLFB feedback word. The NOP is not
+    /// an operand writer; the CALL before it is, so the chain must be seen.
+    #[test]
+    fn chain_whose_last_operand_is_a_callfb_pair_is_recognised() {
+        // 0: JUMPIFNOT R3 -> 5 ; 1: MOVE ; 2: LOADK ; 3: CALL R3 ; 4: NOP ; 5: RETURN
+        let code = vec![
+            ad(LuauOpcode::JumpIfNot, 3, 4),
+            abc(LuauOpcode::Move, 3, 2, 0),
+            abc(LuauOpcode::LoadK, 4, 0, 0),
+            abc(LuauOpcode::Call, 3, 2, 2),
+            abc(LuauOpcode::Nop, 0, 0, 0),
+            abc(LuauOpcode::Return, 3, 2, 0),
+        ];
+        let chain = recognize_or_and_chain(&code, 0).expect("and-chain with CALLFB operand");
+        assert_eq!(chain.dest, 3);
+        assert!(!chain.is_or);
+        assert_eq!(chain.segments, vec![(1, 5)]);
+    }
+
+    /// `if v and v ~= x then v.Cancel() end`: the body's CALLFB pair has zero
+    /// results, so it writes no value into the tested register. Not a chain.
+    #[test]
+    fn discarded_callfb_call_is_not_an_operand() {
+        let code = vec![
+            ad(LuauOpcode::JumpIfNot, 3, 4),
+            abc(LuauOpcode::Move, 3, 2, 0),
+            abc(LuauOpcode::LoadK, 4, 0, 0),
+            abc(LuauOpcode::Call, 3, 2, 1),
+            abc(LuauOpcode::Nop, 0, 0, 0),
+            abc(LuauOpcode::Return, 3, 2, 0),
+        ];
+        assert_eq!(recognize_or_and_chain(&code, 0), None);
+    }
+
+    /// A CALLFB operand in a span that also holds a comparison jump is an `if`
+    /// ladder, not a flat chain; folding it would drop the comparison.
+    #[test]
+    fn callfb_operand_with_inner_comparison_is_not_a_chain() {
+        // 0: JUMPIFNOT R3 -> 7 ; 1: LOADN R4 ; 2: JUMPIFNOTLT R4 R3 -> 7 (+aux 3)
+        // 4: LOADK ; 5: CALL R3 ; 6: NOP ; 7: RETURN
+        let code = vec![
+            ad(LuauOpcode::JumpIfNot, 3, 6),
+            abc(LuauOpcode::LoadN, 4, 1, 0),
+            ad(LuauOpcode::JumpIfNotLT, 4, 4),
+            3,
+            abc(LuauOpcode::LoadK, 4, 0, 0),
+            abc(LuauOpcode::Call, 3, 2, 2),
+            abc(LuauOpcode::Nop, 0, 0, 0),
+            abc(LuauOpcode::Return, 3, 2, 0),
+        ];
+        assert_eq!(recognize_or_and_chain(&code, 0), None);
+    }
+
+    /// An earlier guard that jumps into the middle of the span means the span is
+    /// a ternary arm, not a flat chain, even when its last operand is a CALLFB.
+    #[test]
+    fn callfb_operand_with_a_branch_into_the_span_is_not_a_chain() {
+        // 0: JUMPIFNOT R9 -> 3 (lands on the 2nd operand) ; 1: MOVE R3 ;
+        // 2: JUMPIF R3 -> 7 ; 3: LOADK ; 4: LOADK ; 5: CALL R3 ; 6: NOP ; 7: RETURN
+        let code = vec![
+            ad(LuauOpcode::JumpIfNot, 9, 2),
+            abc(LuauOpcode::Move, 3, 2, 0),
+            ad(LuauOpcode::JumpIf, 3, 4),
+            abc(LuauOpcode::LoadK, 4, 0, 0),
+            abc(LuauOpcode::LoadK, 5, 0, 0),
+            abc(LuauOpcode::Call, 3, 2, 2),
+            abc(LuauOpcode::Nop, 0, 0, 0),
+            abc(LuauOpcode::Return, 3, 2, 0),
+        ];
+        assert_eq!(recognize_or_and_chain(&code, 2), None);
     }
 
     /// The inner `or` of `t and t.n or -1`: a one-instruction operand that does
