@@ -1531,6 +1531,54 @@ fn is_real_loop(
     false
 }
 
+/// Longest loop (in instructions) Shape C0 claims. Every ordinary loop measured on
+/// the 25k-file gate is under 330; the only ones past 3,000 are the dispatch loops
+/// of obfuscated bytecode VMs (hundreds of arms), where claiming the loop at its
+/// header makes the arms' pending-register state leak across joins and surfaces a
+/// `declared_never_assigned` that the old double-lift hid. Those keep the old path.
+const MAX_C0_LOOP_SPAN: usize = 2000;
+
+/// The last JUMPBACK in `(pc, end)` whose target is exactly `pc`, if any.
+fn back_edge_latch_to(code: &[u32], pc: usize, end: usize) -> Option<usize> {
+    let end = end.min(code.len());
+    let mut w = pc + 1;
+    let mut found = None;
+    while w < end {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::JumpBack) && w as i64 + insn_d(code[w]) as i64 + 1 == pc as i64 {
+            found = Some(w);
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    found
+}
+
+/// Does `[start, end)` hold a complete numeric or generic for prep->loop pair?
+/// (`range_contains_nested_for` also answers true for a bare back edge.)
+fn range_has_for_pair(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let d = insn_d(code[pc]) as i64;
+        let (target, loop_ops): (i64, &[LuauOpcode]) = match op {
+            LuauOpcode::ForNPrep => (pc as i64 + d, &[LuauOpcode::ForNLoop]),
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                (pc as i64 + d + 1, &[LuauOpcode::ForGLoop, LuauOpcode::Deprecated61])
+            }
+            _ => (-1, &[]),
+        };
+        if target > pc as i64 && (target as usize) < end {
+            let top = LuauOpcode::from_u8(insn_op(code[target as usize]));
+            if loop_ops.contains(&top) {
+                return true;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Phase B0.4 + B0.5: build the nested region tree for a numeric-for body range.
 ///
 /// Scans `[body_start, body_end)` linearly, producing:
@@ -1640,6 +1688,51 @@ pub(crate) fn structure_numeric_for_body(
                     linear_start = pc;
                     continue;
                 }
+            }
+        }
+
+        // ── Shape C0: a `while true` loop whose header is reached BEFORE a
+        //    nested for-loop that sits directly in its body ─────────────────
+        //
+        // Shape C below keys off the JUMPBACK latch (or a header guard), so for
+        // `while true do for .. end; if done then break end; step() end` the
+        // scan met the nested for first, consumed it as a GenericFor region,
+        // and only then reached the latch: the loop's header was already behind
+        // `linear_start`, so the whole body (for included) was lifted a second
+        // time as flat code (loop variable never bound). Claim the loop here,
+        // at its header, as a condition-free loop: its body is structured
+        // recursively and the for is found there. A header that is itself the
+        // guard (`while c do`) is left to Shape C.
+        let c0_latch = if std::env::var("LUAU_NO_NFG_C").is_ok() {
+            None
+        } else {
+            back_edge_latch_to(code, pc, body_end)
+        };
+        if let Some(latch_pc) = c0_latch {
+            let guard_at_header = forward_conditional_jump(op, pc, insn)
+                .map(|(next_pc, t)| t > next_pc && t == latch_pc + 1)
+                .unwrap_or(false);
+            if !guard_at_header
+                && latch_pc - pc <= MAX_C0_LOOP_SPAN
+                && range_has_for_pair(code, pc, latch_pc)
+            {
+                if std::env::var("LUAU_NFG_TRACE").is_ok() {
+                    eprintln!("NFG_C0 header={} latch={} span={}", pc, latch_pc, latch_pc - pc);
+                }
+                if linear_start < pc {
+                    regions.push(Region::Linear { start: linear_start, end: pc });
+                }
+                let nested_body = structure_numeric_for_body(code, pc, latch_pc, cfg, loop_headers);
+                regions.push(Region::InlineLoopInLoop {
+                    header_start: pc,
+                    cond_pc: None,
+                    body_start: pc,
+                    latch_pc,
+                    body: nested_body,
+                });
+                pc = latch_pc + 1;
+                linear_start = pc;
+                continue;
             }
         }
 

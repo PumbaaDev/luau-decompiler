@@ -2334,11 +2334,12 @@ fn lift_branch_region(
                 let gap_start = ranges[w[0].1].1; // end pc of the earlier run
                 let gap_end = ranges[w[1].0].0; // start pc of the later run
                 gap_start < gap_end
-                    && crate::analysis::structuring::arm_terminates(
+                    && (crate::analysis::structuring::arm_terminates(
                         &proto.code,
                         gap_start,
                         gap_end,
-                    )
+                    ) || (is_lone_forward_jump(&proto.code, gap_start, gap_end)
+                        && std::env::var("LUAU_NO_NFG_B").is_err()))
             });
             if gaps_are_early_exit {
                 lift_structured_run(
@@ -2482,6 +2483,52 @@ fn lift_branch_region(
             lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
         }
     }
+}
+
+/// Is `[start, end)` exactly one forward `JUMP`? Inside a nested for-loop that
+/// block is the `break` (or `continue` joiner) the arm's block list leaves out.
+fn is_lone_forward_jump(code: &[u32], start: usize, end: usize) -> bool {
+    end == start + 1
+        && end <= code.len()
+        && matches!(LuauOpcode::from_u8((code[start] & 0xFF) as u8), LuauOpcode::Jump)
+        && ((code[start] as i32) >> 16) >= 0
+}
+
+/// For a `while true` body (sorted block ranges, the last being the loop's
+/// latch), the pc span `[first start, latch start)` to structure as one run when
+/// a nested for-loop straddles pc gaps in the block list: no single contiguous
+/// run holds the complete prep->loop pair, the whole span does, and every hole
+/// inside it (including the one before the latch) is a RETURN-terminated block.
+fn nested_for_gap_span(
+    code: &[u32],
+    ranges: &[(usize, usize)],
+    runs: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    if ranges.len() < 2 || runs.len() < 2 {
+        return None;
+    }
+    let last = ranges.len() - 1;
+    let span_lo = ranges[0].0;
+    let span_hi = ranges[last].0;
+    if span_lo >= span_hi
+        || !crate::analysis::structuring::range_contains_nested_for(code, span_lo, span_hi)
+    {
+        return None;
+    }
+    let whole_in_one_run = runs.iter().any(|&(lo, hi)| {
+        let end = if hi == last { ranges[hi].0 } else { ranges[hi].1 };
+        ranges[lo].0 < end
+            && crate::analysis::structuring::range_contains_nested_for(code, ranges[lo].0, end)
+    });
+    if whole_in_one_run {
+        return None;
+    }
+    let holes_are_returns = ranges.windows(2).all(|w| {
+        w[0].1 == w[1].0
+            || (w[0].1 < w[1].0
+                && crate::analysis::structuring::arm_terminates(code, w[0].1, w[1].0))
+    });
+    holes_are_returns.then_some((span_lo, span_hi))
 }
 
 /// Split sorted block ranges into maximal runs of PC-adjacent ranges.
@@ -4232,7 +4279,28 @@ fn lift_region(
                 trailing_recompute: false,
             });
             let last_idx = ranges.len().saturating_sub(1);
-            for &(lo, hi) in &split_contiguous_runs(&ranges) {
+            let runs = split_contiguous_runs(&ranges);
+            // A generic-for whose FORGPREP and FORGLOOP sit in different runs
+            // (the body list has pc gaps at RETURN-terminated guard blocks) is
+            // invisible to the per-run check below. When every hole between the
+            // body blocks, up to the latch, is a RETURN-terminated early exit,
+            // the hole lies inside this loop's own pc extent and claims nothing
+            // a sibling region owns: structure the whole span once.
+            let gap_bridge = if std::env::var("LUAU_NO_NFG_A").is_ok() {
+                None
+            } else {
+                nested_for_gap_span(&proto.code, &ranges, &runs)
+            };
+            if let Some((span_lo, span_hi)) = gap_bridge {
+                liftpath(proto, "while_true_gap_bridge", span_lo, span_hi);
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, span_lo, span_hi, regs, locals,
+                    &mut body_stmts, true,
+                );
+                let (s, e) = ranges[last_idx];
+                lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+            } else {
+            for &(lo, hi) in &runs {
                 let run_has_latch = hi == last_idx && ranges.len() > 1;
                 let run_start = ranges[lo].0;
                 let span_end = if run_has_latch { ranges[hi].0 } else { ranges[hi].1 };
@@ -4252,6 +4320,7 @@ fn lift_region(
                         lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                     }
                 }
+            }
             }
             ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
