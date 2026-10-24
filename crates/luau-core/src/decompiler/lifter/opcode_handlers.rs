@@ -1146,6 +1146,59 @@ pub(super) fn pc_is_branch_target(code: &[u32], want: usize) -> bool {
     false
 }
 
+/// Does control resuming at `resume_pc` leave the loop?
+///
+/// A `while true` loop is lifted block by block, and a block the structurer
+/// left out of the loop body (a loop-exit `return`) is lifted AFTER the loop.
+/// When a guard `if c then continue end` is followed by such a block, control
+/// reaching it exits the loop, and the loop body must end in a `break` there
+/// rather than run on into its latch. Refuses unless every body block at or
+/// past `resume_pc` is a bare back edge, so no real body code can be shadowed
+/// by the `break`.
+pub(super) fn fallthrough_leaves_loop(
+    body: Option<&[(usize, usize)]>,
+    code: &[u32],
+    resume_pc: usize,
+) -> bool {
+    let Some(body) = body else { return false };
+    if body.iter().any(|&(s, e)| s <= resume_pc && resume_pc < e) {
+        return false;
+    }
+    body.iter().filter(|&&(s, _)| s >= resume_pc).all(|&(s, e)| {
+        e == s + 1
+            && s < code.len()
+            && matches!(
+                LuauOpcode::from_u8(insn_op(code[s])),
+                LuauOpcode::JumpBack | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+            )
+    })
+}
+
+/// Emit the out-of-range in-loop guard `if <condition> then continue|break end`.
+/// A `continue` whose fall-through leaves the loop is followed by a `break`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_oor_loop_guard(
+    stmts: &mut Vec<Stat>,
+    condition: Expr,
+    code: &[u32],
+    next_pc: usize,
+    end: usize,
+    target: usize,
+    loop_end: Option<usize>,
+    loop_body: Option<&[(usize, usize)]>,
+) {
+    let is_continue = forward_target_is_continue(code, target, loop_end);
+    stmts.push(Stat::If {
+        condition,
+        then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
+        elseif_clauses: vec![],
+        else_body: None,
+    });
+    if is_continue && next_pc == end && fallthrough_leaves_loop(loop_body, code, next_pc) {
+        stmts.push(Stat::Break);
+    }
+}
+
 /// In-loop out-of-range conditional at `cond_pc`'s successor `jump_pc`: when the
 /// conditional skips exactly one instruction (`target == jump_pc + 1`) and that
 /// instruction is a forward `JUMP`, the shape is `if <not taken> then
@@ -1167,7 +1220,25 @@ pub(super) fn lone_exit_jump_after(
     if jt <= target {
         return None;
     }
-    Some(loop_end.map_or(false, |le| jt < le))
+    // `loop_end` is not one convention: a numeric for sets none, a generic for
+    // sets one past FORGLOOP, a structured while sets the latch pc itself. So a
+    // jump whose target IS a back-edge instruction (FORNLOOP, FORGLOOP,
+    // JUMPBACK) is the loop's own latch and reads as `continue` whatever
+    // `loop_end` says, provided it is not past the construct's end.
+    Some(forward_target_is_continue(code, jt, loop_end))
+}
+
+/// Does a forward jump to `jt` inside a loop read as `continue`? True when the
+/// target is a back-edge instruction (the loop's own latch) not past the
+/// construct's end, or simply lies before `loop_end`.
+pub(super) fn forward_target_is_continue(code: &[u32], jt: usize, loop_end: Option<usize>) -> bool {
+    let targets_latch = jt < code.len()
+        && matches!(
+            LuauOpcode::from_u8(insn_op(code[jt])),
+            LuauOpcode::ForNLoop | LuauOpcode::ForGLoop | LuauOpcode::JumpBack
+        )
+        && loop_end.map_or(true, |le| jt <= le);
+    targets_latch || loop_end.map_or(false, |le| jt < le)
 }
 
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
@@ -5099,7 +5170,7 @@ pub(super) fn lift_instruction_range(
                     if in_loop && !oor_guard::take_consumed_jump(proto, pc) {
                         // A forward jump that stays INSIDE the loop skips the
                         // rest of the iteration; it is `continue`, not `break`.
-                        if ctx.current_loop_end.map_or(false, |le| target < le) {
+                        if forward_target_is_continue(code, target, ctx.classify_loop_end()) {
                             stmts.push(Stat::Continue);
                         } else {
                             stmts.push(Stat::Break);
@@ -5618,7 +5689,7 @@ pub(super) fn lift_instruction_range(
                             Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) }
                         };
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + 1, target, ctx.current_loop_end,
+                            code, pc + 1, target, ctx.classify_loop_end(),
                         ) {
                             stmts.push(Stat::If {
                                 condition: super::negate_condition(&condition),
@@ -5627,19 +5698,16 @@ pub(super) fn lift_instruction_range(
                                 else_body: None,
                             });
                             oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
                             pc = target;
                             continue;
                         }
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + 1, end, target,
+                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                        );
                     }
                     // In non-loop context, out-of-range forward jumps are skipped
                 } else {
@@ -5848,7 +5916,7 @@ pub(super) fn lift_instruction_range(
                     }
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.classify_loop_end(),
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -5860,19 +5928,16 @@ pub(super) fn lift_instruction_range(
                                 else_body: None,
                             });
                             oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
                             pc = target;
                             continue;
                         }
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
+                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                        );
                     }
                 }
             }
@@ -6070,7 +6135,7 @@ pub(super) fn lift_instruction_range(
                     }
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.classify_loop_end(),
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -6082,19 +6147,16 @@ pub(super) fn lift_instruction_range(
                                 else_body: None,
                             });
                             oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
                             pc = target;
                             continue;
                         }
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
+                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                        );
                     }
                 }
             }

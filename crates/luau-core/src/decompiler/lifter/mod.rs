@@ -1003,7 +1003,17 @@ fn count_calls_expr(e: &Expr) -> usize {
 }
 
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    // A closure body is not inside the enclosing function's loop, but
+    // `current_loop_end` (a pc in the PARENT's code) leaks into it, and other
+    // logic (`exits_loop`, the or-link bail) relies on that leak, so it is not
+    // cleared. It is only marked foreign so `continue`/`break` classification
+    // ignores it (RigDriver: a numeric for at pc 128..144 saw `Some(40)`, so
+    // its jump to its own FORNLOOP read as `break`).
+    let outer_foreign = std::mem::replace(&mut ctx.loop_end_foreign, ctx.current_loop_end.is_some());
+    let outer_loop_body = ctx.current_loop_body.take();
     let out = lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
+    ctx.loop_end_foreign = outer_foreign;
+    ctx.current_loop_body = outer_loop_body;
     // Always recorded, not gated: this feeds a semantic check, not a trace.
     {
         // A CALL IN PROVABLY-DEAD CODE IS NOT A DROPPED CALL.
@@ -4114,6 +4124,8 @@ fn lift_region(
                 .filter(|id| id != header)
                 .collect();
             let prev_loop_end = ctx.current_loop_end;
+            let prev_loop_body = ctx.current_loop_body.take();
+            let prev_foreign = std::mem::replace(&mut ctx.loop_end_foreign, false);
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4122,6 +4134,8 @@ fn lift_region(
             // Remove trailing JUMPBACK if present
             remove_trailing_jump(&mut body_stmts);
             ctx.current_loop_end = prev_loop_end;
+            ctx.current_loop_body = prev_loop_body;
+            ctx.loop_end_foreign = prev_foreign;
 
             // Re-lift the header's pre-branch instructions at the end of the
             // loop body. In the original bytecode, JUMPBACK returns control to
@@ -4202,6 +4216,8 @@ fn lift_region(
             // an inner loop of the span, double-lifting the tail and swallowing
             // the loop exit. The latch is lifted per-block after the span, just
             // as it always was.
+            let prev_loop_body = ctx.current_loop_body.replace(ranges.clone());
+            let prev_foreign = std::mem::replace(&mut ctx.loop_end_foreign, false);
             let last_idx = ranges.len().saturating_sub(1);
             for &(lo, hi) in &split_contiguous_runs(&ranges) {
                 let run_has_latch = hi == last_idx && ranges.len() > 1;
@@ -4225,6 +4241,8 @@ fn lift_region(
                 }
             }
             ctx.current_loop_end = prev_loop_end;
+            ctx.current_loop_body = prev_loop_body;
+            ctx.loop_end_foreign = prev_foreign;
             remove_trailing_jump(&mut body_stmts);
 
             // Hoist locals first declared inside the loop body
@@ -4279,6 +4297,8 @@ fn lift_region(
             // which is not part of the body span — without this the jump reads
             // as "leaves the range" and is emitted as `break`.
             let prev_loop_end = ctx.current_loop_end;
+            let prev_loop_body = ctx.current_loop_body.take();
+            let prev_foreign = std::mem::replace(&mut ctx.loop_end_foreign, false);
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4290,6 +4310,8 @@ fn lift_region(
                 }
             }
             ctx.current_loop_end = prev_loop_end;
+            ctx.current_loop_body = prev_loop_body;
+            ctx.loop_end_foreign = prev_foreign;
 
             // Lift the condition block's pre-branch instructions so that
             // registers used in the condition are populated. For example,
@@ -4404,6 +4426,14 @@ fn lift_region(
             // Region::NumericFor children we delegate to `lift_region`,
             // which re-enters this same arm and establishes its own body
             // scope (including its own in_loop semantics).
+            //
+            // A numeric for deliberately leaves `current_loop_end` alone (usually
+            // none): setting it would change `exits_loop` and the or-link bail
+            // for every conditional in the body. A jump TO the FORNLOOP is still
+            // read as `continue` by `forward_target_is_continue`'s latch rule.
+            // Only the block-by-block `while true` body list is cleared, so an
+            // enclosing loop's ranges are not applied to this body.
+            let prev_loop_body = ctx.current_loop_body.take();
             if nested_body.is_empty() {
                 lift_instruction_range(
                     ctx, proto, proto_index, depth,
@@ -4429,6 +4459,7 @@ fn lift_region(
                     }
                 }
             }
+            ctx.current_loop_body = prev_loop_body;
             // Remove the FORNLOOP at the end
             remove_trailing_jump(&mut body_stmts);
 
@@ -4641,6 +4672,8 @@ fn lift_region(
             // under the existing `target < le` test, and only a jump past the
             // whole construct reads as break.
             let prev_loop_end = ctx.current_loop_end;
+            let prev_loop_body = ctx.current_loop_body.take();
+            let prev_foreign = std::mem::replace(&mut ctx.loop_end_foreign, false);
             {
                 let lop = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
                 ctx.current_loop_end =
@@ -4683,6 +4716,8 @@ fn lift_region(
                 }
             }
             ctx.current_loop_end = prev_loop_end;
+            ctx.current_loop_body = prev_loop_body;
+            ctx.loop_end_foreign = prev_foreign;
             remove_trailing_jump(&mut body_stmts);
 
             // Phase C4: lifter corruption guard — reject GenericFor whose
@@ -4861,6 +4896,8 @@ fn lift_region(
             // (c) `break`/`continue` inside the body must resolve against THIS
             //     loop, not the enclosing for.
             let prev_loop_end = ctx.current_loop_end;
+            let prev_loop_body = ctx.current_loop_body.take();
+            let prev_foreign = std::mem::replace(&mut ctx.loop_end_foreign, false);
             ctx.current_loop_end = Some(*latch_pc);
             for sub_region in body {
                 match sub_region {
@@ -4881,6 +4918,8 @@ fn lift_region(
             }
             remove_trailing_jump(&mut body_stmts);
             ctx.current_loop_end = prev_loop_end;
+            ctx.current_loop_body = prev_loop_body;
+            ctx.loop_end_foreign = prev_foreign;
 
             // (d) Re-lift the header at the bottom so the condition is
             //     recomputed every iteration.
