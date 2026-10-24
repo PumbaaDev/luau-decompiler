@@ -18,7 +18,7 @@
 
 use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain};
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
-use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext};
+use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext, EmittedLoop};
 use crate::parser::opcodes::{builtin_name, LuauOpcode};
 use crate::parser::types::{
     decode_import, insn_a, insn_b, insn_c, insn_d, insn_e, insn_op,
@@ -1144,6 +1144,189 @@ pub(super) fn pc_is_branch_target(code: &[u32], want: usize) -> bool {
         pc += if op.has_aux() { 2 } else { 1 };
     }
     false
+}
+
+/// Does control resuming at `resume_pc` leave the loop?
+///
+/// A `while true` loop is lifted block by block, and a block the structurer
+/// left out of the loop body (a loop-exit `return`) is lifted AFTER the loop.
+/// When a guard `if c then continue end` is followed by such a block, control
+/// reaching it exits the loop, and the loop body must end in a `break` there
+/// rather than run on into its latch. Refuses unless every body block at or
+/// past `resume_pc` is a bare back edge, so no real body code can be shadowed
+/// by the `break`.
+pub(super) fn fallthrough_leaves_loop(
+    body: Option<&[(usize, usize)]>,
+    code: &[u32],
+    resume_pc: usize,
+) -> bool {
+    let Some(body) = body else { return false };
+    if body.iter().any(|&(s, e)| s <= resume_pc && resume_pc < e) {
+        return false;
+    }
+    body.iter().filter(|&&(s, _)| s >= resume_pc).all(|&(s, e)| {
+        e == s + 1
+            && s < code.len()
+            && matches!(
+                LuauOpcode::from_u8(insn_op(code[s])),
+                LuauOpcode::JumpBack | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+            )
+    })
+}
+
+/// Emit the out-of-range in-loop guard `if <condition> then continue|break end`.
+/// A `continue` whose fall-through leaves the loop is followed by a `break`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_oor_loop_guard(
+    stmts: &mut Vec<Stat>,
+    condition: Expr,
+    code: &[u32],
+    next_pc: usize,
+    end: usize,
+    target: usize,
+    loop_end: Option<usize>,
+    loop_body: Option<&[(usize, usize)]>,
+    emitted: Option<EmittedLoop>,
+) {
+    let is_continue =
+        forward_target_is_continue(code, next_pc.saturating_sub(1), target, loop_end, emitted);
+    stmts.push(Stat::If {
+        condition,
+        then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
+        elseif_clauses: vec![],
+        else_body: None,
+    });
+    if is_continue && next_pc == end && fallthrough_leaves_loop(loop_body, code, next_pc) {
+        stmts.push(Stat::Break);
+    }
+}
+
+/// In-loop out-of-range conditional at `cond_pc`'s successor `jump_pc`: when the
+/// conditional skips exactly one instruction (`target == jump_pc + 1`) and that
+/// instruction is a forward `JUMP`, the shape is `if <not taken> then
+/// continue|break end`. Returns `Some(is_continue)`.
+pub(super) fn lone_exit_jump_after(
+    code: &[u32],
+    jump_pc: usize,
+    target: usize,
+    loop_end: Option<usize>,
+    emitted: Option<EmittedLoop>,
+) -> Option<bool> {
+    if jump_pc >= code.len() || target != jump_pc + 1 {
+        return None;
+    }
+    let jt = match LuauOpcode::from_u8(insn_op(code[jump_pc])) {
+        LuauOpcode::Jump => (jump_pc as i64 + insn_d(code[jump_pc]) as i64 + 1) as usize,
+        LuauOpcode::JumpX => (jump_pc as i64 + insn_e(code[jump_pc]) as i64 + 1) as usize,
+        _ => return None,
+    };
+    if jt <= target {
+        return None;
+    }
+    // Only the INNERMOST enclosing loop's own latch is a `continue`. A target
+    // past that latch (even an outer loop's latch, which is where an inner
+    // loop's exit lands when it is the last statement of the outer body) is a
+    // `break`. A mid-body forward skip is neither: leave it alone.
+    // A jump to the latch of the innermost EMITTED loop is a `continue` even
+    // when collapsed raw loops sit between (they are not in the output).
+    // A loop that prints its condition recompute as trailing body statements
+    // must not gain a `continue` from the latch rule: the jump would skip the
+    // recompute. Such a loop keeps the pre-latch-fix reading (`jt < loop_end`).
+    let keeps_recompute = emitted.map_or(false, |e| e.trailing_recompute);
+    let before_latch_rule = loop_end.map_or(false, |le| jt < le);
+    if is_emitted_latch(code, jump_pc, jt, emitted.and_then(|e| e.latch)) {
+        return Some(if keeps_recompute { before_latch_rule } else { true });
+    }
+    match own_latch(code, jump_pc) {
+        Some(latch) if jt == latch => Some(if keeps_recompute { before_latch_rule } else { true }),
+        Some(latch) if jt < latch => None,
+        Some(_) => Some(false),
+        None => {
+            if loop_end.map_or(false, |le| jt < le) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+    }
+}
+
+/// Does `[start, end)` hold a call? A loop header that recomputes its condition
+/// through a call (`Ended()`, `task.wait()`, `IsFocused()`) prints that call as
+/// a trailing body statement; pure loads fold into the condition expression and
+/// leave nothing for a `continue` to skip.
+pub(super) fn range_has_call(code: &[u32], start: usize, end: usize) -> bool {
+    let mut pc = start;
+    while pc < end.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) {
+            return true;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
+fn is_back_edge_op(op: LuauOpcode) -> bool {
+    matches!(op, LuauOpcode::ForNLoop | LuauOpcode::ForGLoop | LuauOpcode::JumpBack)
+}
+
+/// The pc of the back-edge instruction (FORNLOOP, FORGLOOP or JUMPBACK) of the
+/// innermost loop that encloses `pc`: the first back-edge after `pc` whose
+/// target (the loop head) is at or before `pc`. For FORGLOOP this is the pc of
+/// the op itself, not its aux word.
+pub(super) fn own_latch(code: &[u32], pc: usize) -> Option<usize> {
+    if pc >= code.len() {
+        return None;
+    }
+    // Walk instruction by instruction: an AUX word can carry any low byte, so
+    // reading it as an opcode would invent a back edge.
+    let mut l = pc + 1 + LuauOpcode::from_u8(insn_op(code[pc])).has_aux() as usize;
+    while l < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[l]));
+        if is_back_edge_op(op) {
+            let head = l as i64 + insn_d(code[l]) as i64 + 1;
+            if head <= pc as i64 {
+                return Some(l);
+            }
+        }
+        l += 1 + op.has_aux() as usize;
+    }
+    None
+}
+
+/// Is `jt` the back-edge op of the innermost EMITTED loop (`emitted`) and does
+/// that loop enclose a jump at `pc`? The raw loops between `pc` and it were
+/// collapsed or peeled, so such a jump is a `continue` of the emitted loop.
+pub(super) fn is_emitted_latch(code: &[u32], pc: usize, jt: usize, emitted: Option<usize>) -> bool {
+    emitted == Some(jt)
+        && jt > pc
+        && jt < code.len()
+        && is_back_edge_op(LuauOpcode::from_u8(insn_op(code[jt])))
+        && jt as i64 + insn_d(code[jt]) as i64 + 1 <= pc as i64
+}
+
+/// Does a forward jump from `pc` to `jt` inside a loop read as `continue`?
+/// True when `jt` is the latch of the innermost enclosing loop. A back-edge
+/// target that is NOT that latch (an outer loop's) is a `break`. Otherwise the
+/// older `jt < loop_end` reading applies.
+pub(super) fn forward_target_is_continue(
+    code: &[u32],
+    pc: usize,
+    jt: usize,
+    loop_end: Option<usize>,
+    emitted: Option<EmittedLoop>,
+) -> bool {
+    let keeps_recompute = emitted.map_or(false, |e| e.trailing_recompute);
+    if own_latch(code, pc) == Some(jt)
+        || is_emitted_latch(code, pc, jt, emitted.and_then(|e| e.latch))
+    {
+        return !keeps_recompute || loop_end.map_or(false, |le| jt < le);
+    }
+    if jt < code.len() && is_back_edge_op(LuauOpcode::from_u8(insn_op(code[jt]))) {
+        return false;
+    }
+    loop_end.map_or(false, |le| jt < le)
 }
 
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
@@ -5072,10 +5255,13 @@ pub(super) fn lift_instruction_range(
                     continue;
                 } else if target > pc {
                     // Forward jump out of range
-                    if in_loop {
+                    if in_loop && !oor_guard::take_consumed_jump(proto, pc) {
                         // A forward jump that stays INSIDE the loop skips the
                         // rest of the iteration; it is `continue`, not `break`.
-                        if ctx.current_loop_end.map_or(false, |le| target < le) {
+                        if forward_target_is_continue(
+                            code, pc, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied(),
+                        ) {
                             stmts.push(Stat::Continue);
                         } else {
                             stmts.push(Stat::Break);
@@ -5593,16 +5779,28 @@ pub(super) fn lift_instruction_range(
                         } else {
                             Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) }
                         };
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        if let Some(is_continue) = lone_exit_jump_after(
+                            code, pc + 1, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied(),
+                        ) {
+                            stmts.push(Stat::If {
+                                condition: super::negate_condition(&condition),
+                                then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
+                                elseif_clauses: vec![],
+                                else_body: None,
+                            });
+                            oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
+                            pc = target;
+                            continue;
+                        }
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + 1, end, target,
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied(),
+                        );
                     }
                     // In non-loop context, out-of-range forward jumps are skipped
                 } else {
@@ -5810,16 +6008,31 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                     if in_loop {
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        if let Some(is_continue) = lone_exit_jump_after(
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied(),
+                        ) {
+                            // `if <fall-through> then continue|break end`: the
+                            // conditional skips a lone `JUMP` to the loop latch
+                            // or exit, so the guard is the negated condition.
+                            stmts.push(Stat::If {
+                                condition: super::negate_condition(&condition),
+                                then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
+                                elseif_clauses: vec![],
+                                else_body: None,
+                            });
+                            oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
+                            pc = target;
+                            continue;
+                        }
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied(),
+                        );
                     }
                 }
             }
@@ -6016,16 +6229,31 @@ pub(super) fn lift_instruction_range(
                         }
                     }
                     if in_loop {
-                        stmts.push(Stat::If {
-                            condition,
-                            then_body: vec![if ctx.current_loop_end.map_or(false, |le| target < le) {
-                                Stat::Continue
-                            } else {
-                                Stat::Break
-                            }],
-                            elseif_clauses: vec![],
-                            else_body: None,
-                        });
+                        if let Some(is_continue) = lone_exit_jump_after(
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied(),
+                        ) {
+                            // `if <fall-through> then continue|break end`: the
+                            // conditional skips a lone `JUMP` to the loop latch
+                            // or exit, so the guard is the negated condition.
+                            stmts.push(Stat::If {
+                                condition: super::negate_condition(&condition),
+                                then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
+                                elseif_clauses: vec![],
+                                else_body: None,
+                            });
+                            oor_guard::note_consumed_jump(proto, target - 1);
+                            if is_continue && fallthrough_leaves_loop(ctx.current_loop_body.as_deref(), code, target) {
+                                stmts.push(Stat::Break);
+                            }
+                            pc = target;
+                            continue;
+                        }
+                        push_oor_loop_guard(
+                            stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied(),
+                        );
                     }
                 }
             }

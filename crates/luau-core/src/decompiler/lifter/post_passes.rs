@@ -782,21 +782,38 @@ pub(super) fn inline_single_use_temps_pinned(
     arity_pinned: &std::collections::HashSet<String>,
     upvalues: &std::collections::HashSet<String>,
 ) {
+    inline_single_use_temps_scoped(stmts, arity_pinned, upvalues, &[]);
+}
+
+/// `tail_reads` are expressions evaluated AFTER the last statement of `stmts`
+/// by the enclosing construct: the `until` condition of a `repeat` reads the
+/// body's locals and every name the body assigns. They are invisible to the
+/// per-block read count, so without them a body-level `v = e` read once in the
+/// body and once in `until v ...` looked single-use and was deleted, leaving
+/// the condition to read the stale pre-loop value of `v`.
+fn inline_single_use_temps_scoped(
+    stmts: &mut Vec<Stat>,
+    arity_pinned: &std::collections::HashSet<String>,
+    upvalues: &std::collections::HashSet<String>,
+    tail_reads: &[Expr],
+) {
     // Recurse into nested blocks first
     for stmt in stmts.iter_mut() {
         match stmt {
             Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                inline_single_use_temps_pinned(then_body, arity_pinned, upvalues);
+                inline_single_use_temps_scoped(then_body, arity_pinned, upvalues, tail_reads);
                 for (_, body) in elseif_clauses {
-                    inline_single_use_temps_pinned(body, arity_pinned, upvalues);
+                    inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads);
                 }
-                if let Some(eb) = else_body { inline_single_use_temps_pinned(eb, arity_pinned, upvalues); }
+                if let Some(eb) = else_body { inline_single_use_temps_scoped(eb, arity_pinned, upvalues, tail_reads); }
             }
-            Stat::While { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
-            Stat::Repeat { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
-            Stat::NumericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
-            Stat::GenericFor { body, .. } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
-            Stat::DoBlock { body } => inline_single_use_temps_pinned(body, arity_pinned, upvalues),
+            Stat::While { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
+            Stat::Repeat { body, condition } => {
+                inline_single_use_temps_scoped(body, arity_pinned, upvalues, std::slice::from_ref(condition))
+            }
+            Stat::NumericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
+            Stat::GenericFor { body, .. } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
+            Stat::DoBlock { body } => inline_single_use_temps_scoped(body, arity_pinned, upvalues, tail_reads),
             _ => {}
         }
     }
@@ -898,6 +915,13 @@ pub(super) fn inline_single_use_temps_pinned(
             if def_name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
                 // Capitalized name suggests a module/class import; keep as-is
                 // to match Konstant's style of declaring requires at the top.
+                i += 1;
+                continue;
+            }
+
+            // A name the enclosing construct reads after this block (the
+            // `until` condition) is not single-use whatever the block says.
+            if tail_reads.iter().any(|e| expr_references_name(e, &def_name)) {
                 i += 1;
                 continue;
             }

@@ -65,6 +65,7 @@ mod namecall_orphan_diagnosis_tests;
 mod namecall_arg_move_not_loadk_tests;
 mod type_guard_fold_tests;
 #[cfg(test)]
+mod loop_skip_jump_guard_tests;
 mod oor_nonloop_tests;
 #[cfg(test)]
 mod oor_real_oracle_tests;

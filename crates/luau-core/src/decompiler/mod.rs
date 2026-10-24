@@ -287,6 +287,33 @@ pub struct DecompileContext<'a> {
     /// `repeat ... until c` targets the until-test — still inside the loop —
     /// so a target below this bound is an intra-iteration jump, not an exit.
     pub current_loop_end: Option<usize>,
+    /// `(start, end)` pc ranges of the basic blocks of the innermost enclosing
+    /// `while true` loop, when it is lifted block by block. A code range that
+    /// starts outside every one of them is lifted AFTER the loop, so reaching
+    /// it by fall-through leaves the loop.
+    pub current_loop_body: Option<Vec<(usize, usize)>>,
+    /// Raw back-edge pc of each loop EMITTED around the code being lifted,
+    /// innermost last (`None` for a kind whose latch is not a back-edge op).
+    /// Raw loops that were collapsed or peeled never appear here, so a jump
+    /// to the latch of the innermost emitted loop is a `continue` even when
+    /// bytecode-level inner loops sit between.
+    pub emitted_latches: Vec<EmittedLoop>,
+}
+
+/// A loop the lifter is currently emitting, as seen by `continue` minting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmittedLoop {
+    /// Raw back-edge pc (FORNLOOP, FORGLOOP, JUMPBACK), when the kind has one.
+    pub latch: Option<usize>,
+    /// The condition recompute is printed as trailing body statements, which a
+    /// `continue` would skip.
+    pub trailing_recompute: bool,
+}
+
+impl EmittedLoop {
+    pub fn with_latch(latch: Option<usize>) -> Self {
+        Self { latch, ..Self::default() }
+    }
 }
 
 impl<'a> DecompileContext<'a> {
@@ -305,6 +332,8 @@ impl<'a> DecompileContext<'a> {
             unary: crate::parser::opmap_db::UnarySemantics::default(),
             arity_pinned_temps: std::collections::HashSet::new(),
             current_loop_end: None,
+            current_loop_body: None,
+            emitted_latches: Vec::new(),
         }
     }
 
