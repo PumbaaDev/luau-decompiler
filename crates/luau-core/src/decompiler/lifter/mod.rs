@@ -2688,10 +2688,28 @@ fn lift_structured_regions(
                 }
                 let from = (*start).max(consumed_to);
                 let ext = linear_escape_else_target(&proto.code, from, *end, run_end);
+                // An extended span is lifted FLAT, and the flat walker drops
+                // FORPREP/FORLOOP. Hand it the for-regions the structurer
+                // already found inside the span so it lifts them as loops.
+                let prev_for_regions = std::mem::take(&mut ctx.flat_for_regions);
+                if let Some(m) = ext {
+                    ctx.flat_for_regions = regions
+                        .iter()
+                        .filter(|r| match r {
+                            Region::NumericFor { prep_pc, loop_pc, .. }
+                            | Region::GenericFor { prep_pc, loop_pc, .. } => {
+                                *prep_pc >= from && *loop_pc < m
+                            }
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect();
+                }
                 lift_instruction_range(
                     ctx, proto, proto_index, depth, from, ext.unwrap_or(*end), regs, locals, out,
                     in_loop,
                 );
+                ctx.flat_for_regions = prev_for_regions;
                 if let Some(m) = ext {
                     consumed_to = m;
                 }

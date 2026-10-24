@@ -298,6 +298,12 @@ pub struct DecompileContext<'a> {
     /// to the latch of the innermost emitted loop is a `continue` even when
     /// bytecode-level inner loops sit between.
     pub emitted_latches: Vec<EmittedLoop>,
+    /// Structured `NumericFor`/`GenericFor` regions that lie inside a span the
+    /// lifter is about to lift FLAT (an extended Linear in
+    /// `lift_structured_regions`). The flat walker has no region structure of
+    /// its own, so without these it drops FORNPREP/FORGPREP/FORGLOOP and the
+    /// loop vanishes. Empty outside such a span.
+    pub flat_for_regions: Vec<crate::analysis::structuring::Region>,
 }
 
 /// A loop the lifter is currently emitting, as seen by `continue` minting.
@@ -334,6 +340,7 @@ impl<'a> DecompileContext<'a> {
             current_loop_end: None,
             current_loop_body: None,
             emitted_latches: Vec::new(),
+            flat_for_regions: Vec::new(),
         }
     }
 

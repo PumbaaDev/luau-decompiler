@@ -6424,6 +6424,32 @@ pub(super) fn lift_instruction_range(
                 }
             }
 
+            // A structured for-region handed in for this flat span is lifted
+            // as a loop and its whole extent skipped.
+            LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+            | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+                if flat_for_region_at(ctx, pc, end).is_some() =>
+            {
+                let Some(region) = flat_for_region_at(ctx, pc, end) else { break };
+                let loop_pc = match &region {
+                    super::Region::NumericFor { loop_pc, .. }
+                    | super::Region::GenericFor { loop_pc, .. } => *loop_pc,
+                    _ => break,
+                };
+                let loop_op = LuauOpcode::from_u8(insn_op(code[loop_pc]));
+                let next_pc = loop_pc + if loop_op.has_aux() { 2 } else { 1 };
+                let cfg = crate::analysis::cfg::ControlFlowGraph::build(proto);
+                // The region lift owns the loop context; the flat span's
+                // regions must not leak into the loop body's own flat lifts.
+                let saved = std::mem::take(&mut ctx.flat_for_regions);
+                super::lift_region(
+                    ctx, proto, proto_index, &cfg, &region, regs, locals, depth + 1, stmts,
+                );
+                ctx.flat_for_regions = saved;
+                pc = next_pc;
+                continue;
+            }
+
             // For-loop ops are handled at the region level
             LuauOpcode::ForNPrep | LuauOpcode::ForNLoop
             | LuauOpcode::ForGPrep | LuauOpcode::ForGLoop
@@ -7388,4 +7414,22 @@ fn consumer_writes_param(code: &[u32], pc: usize, reg: usize, num_params: usize)
         i += if op.has_aux() { 2 } else { 1 };
     }
     false
+}
+
+/// The structured for-region whose prep sits at `pc` and whose back edge lies
+/// inside the flat span ending at `end`, if the caller registered one.
+fn flat_for_region_at(
+    ctx: &DecompileContext,
+    pc: usize,
+    end: usize,
+) -> Option<crate::analysis::structuring::Region> {
+    use crate::analysis::structuring::Region;
+    ctx.flat_for_regions
+        .iter()
+        .find(|r| match r {
+            Region::NumericFor { prep_pc, loop_pc, .. }
+            | Region::GenericFor { prep_pc, loop_pc, .. } => *prep_pc == pc && *loop_pc < end,
+            _ => false,
+        })
+        .cloned()
 }
