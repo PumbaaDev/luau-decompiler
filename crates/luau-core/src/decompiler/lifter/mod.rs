@@ -9147,7 +9147,7 @@ fn premateralize_branch_escapes_spans(
 /// rotation 101 could not tell why this returned true for `284_GuiTile`'s
 /// scratch slot and three of that session's four predicate attempts failed for
 /// want of exactly this print.
-fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+pub(crate) fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
     if end <= start || end > code.len() {
         return false;
     }
@@ -9289,7 +9289,7 @@ fn ranges_write_reg(code: &[u32], ranges: &[(usize, usize)], reg: usize) -> bool
 /// explicitly classified stops the scan with `false` — an unrecognised
 /// opcode suppresses the seed, never invents one, so the failure mode is
 /// "defect stays flagged", not "bare declaration nothing assigns".
-fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+pub(crate) fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
     use LuauOpcode as Op;
     let mut i = start;
     let end = end.min(code.len());
@@ -9489,7 +9489,7 @@ fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, reg: usize)
     false
 }
 
-fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec<usize> {
+pub(crate) fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec<usize> {
     use std::collections::BTreeSet;
     let mut out: BTreeSet<usize> = BTreeSet::new();
     let mut pc = start;
