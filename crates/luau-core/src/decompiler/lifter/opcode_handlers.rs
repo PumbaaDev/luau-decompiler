@@ -1186,8 +1186,10 @@ pub(super) fn push_oor_loop_guard(
     target: usize,
     loop_end: Option<usize>,
     loop_body: Option<&[(usize, usize)]>,
+    emitted: Option<usize>,
 ) {
-    let is_continue = forward_target_is_continue(code, next_pc.saturating_sub(1), target, loop_end);
+    let is_continue =
+        forward_target_is_continue(code, next_pc.saturating_sub(1), target, loop_end, emitted);
     stmts.push(Stat::If {
         condition,
         then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
@@ -1208,6 +1210,7 @@ pub(super) fn lone_exit_jump_after(
     jump_pc: usize,
     target: usize,
     loop_end: Option<usize>,
+    emitted: Option<usize>,
 ) -> Option<bool> {
     if jump_pc >= code.len() || target != jump_pc + 1 {
         return None;
@@ -1224,6 +1227,11 @@ pub(super) fn lone_exit_jump_after(
     // past that latch (even an outer loop's latch, which is where an inner
     // loop's exit lands when it is the last statement of the outer body) is a
     // `break`. A mid-body forward skip is neither: leave it alone.
+    // A jump to the latch of the innermost EMITTED loop is a `continue` even
+    // when collapsed raw loops sit between (they are not in the output).
+    if is_emitted_latch(code, jump_pc, jt, emitted) {
+        return Some(true);
+    }
     match own_latch(code, jump_pc) {
         Some(latch) if jt == latch => Some(true),
         Some(latch) if jt < latch => None,
@@ -1266,6 +1274,17 @@ pub(super) fn own_latch(code: &[u32], pc: usize) -> Option<usize> {
     None
 }
 
+/// Is `jt` the back-edge op of the innermost EMITTED loop (`emitted`) and does
+/// that loop enclose a jump at `pc`? The raw loops between `pc` and it were
+/// collapsed or peeled, so such a jump is a `continue` of the emitted loop.
+pub(super) fn is_emitted_latch(code: &[u32], pc: usize, jt: usize, emitted: Option<usize>) -> bool {
+    emitted == Some(jt)
+        && jt > pc
+        && jt < code.len()
+        && is_back_edge_op(LuauOpcode::from_u8(insn_op(code[jt])))
+        && jt as i64 + insn_d(code[jt]) as i64 + 1 <= pc as i64
+}
+
 /// Does a forward jump from `pc` to `jt` inside a loop read as `continue`?
 /// True when `jt` is the latch of the innermost enclosing loop. A back-edge
 /// target that is NOT that latch (an outer loop's) is a `break`. Otherwise the
@@ -1275,9 +1294,9 @@ pub(super) fn forward_target_is_continue(
     pc: usize,
     jt: usize,
     loop_end: Option<usize>,
+    emitted: Option<usize>,
 ) -> bool {
-    let own = own_latch(code, pc);
-    if own == Some(jt) {
+    if own_latch(code, pc) == Some(jt) || is_emitted_latch(code, pc, jt, emitted) {
         return true;
     }
     if jt < code.len() && is_back_edge_op(LuauOpcode::from_u8(insn_op(code[jt]))) {
@@ -5215,7 +5234,10 @@ pub(super) fn lift_instruction_range(
                     if in_loop && !oor_guard::take_consumed_jump(proto, pc) {
                         // A forward jump that stays INSIDE the loop skips the
                         // rest of the iteration; it is `continue`, not `break`.
-                        if forward_target_is_continue(code, pc, target, ctx.current_loop_end) {
+                        if forward_target_is_continue(
+                            code, pc, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied().flatten(),
+                        ) {
                             stmts.push(Stat::Continue);
                         } else {
                             stmts.push(Stat::Break);
@@ -5735,6 +5757,7 @@ pub(super) fn lift_instruction_range(
                         };
                         if let Some(is_continue) = lone_exit_jump_after(
                             code, pc + 1, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied().flatten(),
                         ) {
                             stmts.push(Stat::If {
                                 condition: super::negate_condition(&condition),
@@ -5752,6 +5775,7 @@ pub(super) fn lift_instruction_range(
                         push_oor_loop_guard(
                             stmts, condition, code, pc + 1, end, target,
                             ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied().flatten(),
                         );
                     }
                     // In non-loop context, out-of-range forward jumps are skipped
@@ -5962,6 +5986,7 @@ pub(super) fn lift_instruction_range(
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
                             code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied().flatten(),
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -5982,6 +6007,7 @@ pub(super) fn lift_instruction_range(
                         push_oor_loop_guard(
                             stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
                             ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied().flatten(),
                         );
                     }
                 }
@@ -6181,6 +6207,7 @@ pub(super) fn lift_instruction_range(
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
                             code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
+                            ctx.emitted_latches.last().copied().flatten(),
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -6201,6 +6228,7 @@ pub(super) fn lift_instruction_range(
                         push_oor_loop_guard(
                             stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
                             ctx.current_loop_end, ctx.current_loop_body.as_deref(),
+                            ctx.emitted_latches.last().copied().flatten(),
                         );
                     }
                 }

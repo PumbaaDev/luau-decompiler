@@ -40,7 +40,7 @@ fn jump_to_the_own_latch_is_continue_whatever_loop_end_says() {
         // A numeric for sets no loop end; a while sets the latch pc; a generic
         // for sets one past it.
         for le in [None, Some(4), Some(5)] {
-            assert_eq!(lone_exit_jump_after(&code, 1, 2, le), Some(true), "op {op} le {le:?}");
+            assert_eq!(lone_exit_jump_after(&code, 1, 2, le, None), Some(true), "op {op} le {le:?}");
         }
     }
 }
@@ -50,7 +50,7 @@ fn jump_past_the_latch_is_break() {
     // pc1: JUMP -> 5, the instruction after the FORNLOOP at pc4.
     let code = [0u32, jump(3), 0, 0, edge(OP_FORNLOOP, -5), 0];
     for le in [None, Some(4), Some(5)] {
-        assert_eq!(lone_exit_jump_after(&code, 1, 2, le), Some(false));
+        assert_eq!(lone_exit_jump_after(&code, 1, 2, le, None), Some(false));
     }
 }
 
@@ -59,7 +59,7 @@ fn mid_body_forward_skip_is_not_a_latch_jump() {
     // pc1: JUMP -> 3 lands mid-body, before the latch at pc4: neither
     // continue nor break, so the lone path must not fire.
     let code = [0u32, jump(1), 0, 0, edge(OP_FORNLOOP, -5), 0];
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5)), None);
+    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5), None), None);
 }
 
 // Nested loops: the inner exit is the outer latch. pc0 outer head, pc1 inner
@@ -71,25 +71,25 @@ fn inner_loop_exit_that_equals_the_outer_latch_is_break() {
 
     let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -7), 0];
     // From inside the inner body, the inner latch is a continue...
-    assert!(forward_target_is_continue(&code, 3, 5, None));
+    assert!(forward_target_is_continue(&code, 3, 5, None, None));
     // ...but the outer latch (past the inner loop) is a break.
-    assert!(!forward_target_is_continue(&code, 3, 6, None));
-    assert!(!forward_target_is_continue(&code, 3, 6, Some(8)));
-    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8)), Some(false));
+    assert!(!forward_target_is_continue(&code, 3, 6, None, None));
+    assert!(!forward_target_is_continue(&code, 3, 6, Some(8), None));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), None), Some(false));
     // From the outer body only (pc 0), the outer latch is a continue.
-    assert!(forward_target_is_continue(&code, 0, 6, None));
+    assert!(forward_target_is_continue(&code, 0, 6, None, None));
 }
 
 #[test]
 fn skipping_more_than_the_lone_jump_is_not_recognised() {
     let code = [0u32, jump(3), 0, 0, 0, 0];
-    assert_eq!(lone_exit_jump_after(&code, 1, 3, Some(6)), None);
+    assert_eq!(lone_exit_jump_after(&code, 1, 3, Some(6), None), None);
 }
 
 #[test]
 fn backward_jump_is_not_recognised() {
     let code = [0u32, 0, jump(-3), 0];
-    assert_eq!(lone_exit_jump_after(&code, 2, 3, Some(6)), None);
+    assert_eq!(lone_exit_jump_after(&code, 2, 3, Some(6), None), None);
 }
 
 #[test]
@@ -202,8 +202,46 @@ fn numeric_for_plain_jump_to_fornloop_is_continue() {
 
     // pc0..3 body (head pc0), pc4 FORNLOOP, pc5 after, pc6 more.
     let code = [0u32, 0, 0, 0, edge(OP_FORNLOOP, -5), 0, 0];
-    assert!(forward_target_is_continue(&code, 2, 4, None));
-    assert!(!forward_target_is_continue(&code, 2, 5, None));
-    assert!(!forward_target_is_continue(&code, 2, 6, None));
-    assert!(!forward_target_is_continue(&code, 2, 3, None));
+    assert!(forward_target_is_continue(&code, 2, 4, None, None));
+    assert!(!forward_target_is_continue(&code, 2, 5, None, None));
+    assert!(!forward_target_is_continue(&code, 2, 6, None, None));
+    assert!(!forward_target_is_continue(&code, 2, 3, None, None));
+}
+
+// Two collapsed raw loops under one emitted `while` (PetSimulator99 GIF2 pc45:
+// JUMP to the OUTER raw for's FORNLOOP, which exits the inner for = break). Only
+// the emitted loop's own back edge (pc7) is a continue.
+#[test]
+fn jump_to_a_collapsed_outer_loops_latch_stays_break_under_an_emitted_loop() {
+    use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
+
+    // pc0 head, pc1 inner head, pc3 JUMP -> 6, pc5 inner FORNLOOP (head 1),
+    // pc6 outer-raw FORNLOOP (head 0), pc7 emitted JUMPBACK (head 0).
+    let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -6),
+        edge(OP_JUMPBACK, -8), 0];
+    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(7)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(9), Some(7)), Some(false));
+    assert!(forward_target_is_continue(&code, 3, 7, None, Some(7)));
+}
+
+// Collapsed inner loop: raw bytecode has an inner loop (latch pc5, head pc1)
+// inside the outer one (latch pc6), but the emitted output has no inner loop.
+// The innermost EMITTED loop is the outer one, so a jump to pc6 is a continue
+// (RigDriver n2 pc29, ContentCatalog lS pc77). With the inner loop emitted
+// (emitted latch = pc5) the same jump is a break.
+#[test]
+fn jump_to_outer_latch_is_continue_when_the_inner_loop_was_collapsed() {
+    use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
+
+    let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -7), 0];
+    assert!(forward_target_is_continue(&code, 3, 6, None, Some(6)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), Some(6)), Some(true));
+    // The collapsed inner loop's own latch (pc5) stays a continue (RigDriver n2
+    // pc18 -> inner FORNLOOP).
+    assert!(forward_target_is_continue(&code, 3, 5, None, Some(6)));
+    // Inner loop emitted: break, as before.
+    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(5)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), Some(5)), Some(false));
+    // An emitted latch that does not enclose the jump is ignored.
+    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(7)));
 }

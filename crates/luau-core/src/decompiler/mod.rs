@@ -292,6 +292,12 @@ pub struct DecompileContext<'a> {
     /// starts outside every one of them is lifted AFTER the loop, so reaching
     /// it by fall-through leaves the loop.
     pub current_loop_body: Option<Vec<(usize, usize)>>,
+    /// Raw back-edge pc of each loop EMITTED around the code being lifted,
+    /// innermost last (`None` for a kind whose latch is not a back-edge op).
+    /// Raw loops that were collapsed or peeled never appear here, so a jump
+    /// to the latch of the innermost emitted loop is a `continue` even when
+    /// bytecode-level inner loops sit between.
+    pub emitted_latches: Vec<Option<usize>>,
 }
 
 impl<'a> DecompileContext<'a> {
@@ -311,6 +317,7 @@ impl<'a> DecompileContext<'a> {
             arity_pinned_temps: std::collections::HashSet::new(),
             current_loop_end: None,
             current_loop_body: None,
+            emitted_latches: Vec::new(),
         }
     }
 

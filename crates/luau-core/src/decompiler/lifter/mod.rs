@@ -1004,7 +1004,9 @@ fn count_calls_expr(e: &Expr) -> usize {
 
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let outer_loop_body = ctx.current_loop_body.take();
+    let outer_latches = std::mem::take(&mut ctx.emitted_latches);
     let out = lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
+    ctx.emitted_latches = outer_latches;
     ctx.current_loop_body = outer_loop_body;
     // Always recorded, not gated: this feeds a semantic check, not a trace.
     {
@@ -4117,6 +4119,8 @@ fn lift_region(
                 .collect();
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
+            let while_latch = cfg.blocks.get(header).and_then(|b| opcode_handlers::own_latch(&proto.code, b.start));
+            ctx.emitted_latches.push(while_latch);
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4124,6 +4128,7 @@ fn lift_region(
             lift_branch_region(ctx, proto, proto_index, cfg, depth, &body_only, regs, locals, &mut body_stmts, true);
             // Remove trailing JUMPBACK if present
             remove_trailing_jump(&mut body_stmts);
+            ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
             ctx.current_loop_body = prev_loop_body;
 
@@ -4207,6 +4212,8 @@ fn lift_region(
             // the loop exit. The latch is lifted per-block after the span, just
             // as it always was.
             let prev_loop_body = ctx.current_loop_body.replace(ranges.clone());
+            let true_latch = ranges.iter().map(|r| r.0).min().and_then(|st| opcode_handlers::own_latch(&proto.code, st));
+            ctx.emitted_latches.push(true_latch);
             let last_idx = ranges.len().saturating_sub(1);
             for &(lo, hi) in &split_contiguous_runs(&ranges) {
                 let run_has_latch = hi == last_idx && ranges.len() > 1;
@@ -4229,6 +4236,7 @@ fn lift_region(
                     }
                 }
             }
+            ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
             ctx.current_loop_body = prev_loop_body;
             remove_trailing_jump(&mut body_stmts);
@@ -4286,6 +4294,7 @@ fn lift_region(
             // as "leaves the range" and is emitted as `break`.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
+            ctx.emitted_latches.push(None);
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4296,6 +4305,7 @@ fn lift_region(
                     lift_instruction_range(ctx, proto, proto_index, depth, b.start, b.end, regs, locals, &mut body_stmts, true);
                 }
             }
+            ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
             ctx.current_loop_body = prev_loop_body;
 
@@ -4320,7 +4330,7 @@ fn lift_region(
             });
         }
 
-        Region::NumericFor { prep_pc, loop_pc: _, body_start, body_end, body: nested_body } => {
+        Region::NumericFor { prep_pc, loop_pc, body_start, body_end, body: nested_body } => {
             let code = &proto.code;
             let a = insn_a(code[*prep_pc]) as usize;
 
@@ -4420,6 +4430,7 @@ fn lift_region(
             // Only the block-by-block `while true` body list is cleared, so an
             // enclosing loop's ranges are not applied to this body.
             let prev_loop_body = ctx.current_loop_body.take();
+            ctx.emitted_latches.push(Some(*loop_pc));
             if nested_body.is_empty() {
                 lift_instruction_range(
                     ctx, proto, proto_index, depth,
@@ -4445,6 +4456,7 @@ fn lift_region(
                     }
                 }
             }
+            ctx.emitted_latches.pop();
             ctx.current_loop_body = prev_loop_body;
             // Remove the FORNLOOP at the end
             remove_trailing_jump(&mut body_stmts);
@@ -4659,6 +4671,7 @@ fn lift_region(
             // whole construct reads as break.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
+            ctx.emitted_latches.push(Some(*loop_pc));
             {
                 let lop = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
                 ctx.current_loop_end =
@@ -4700,6 +4713,7 @@ fn lift_region(
                     }
                 }
             }
+            ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
             ctx.current_loop_body = prev_loop_body;
             remove_trailing_jump(&mut body_stmts);
@@ -4881,6 +4895,7 @@ fn lift_region(
             //     loop, not the enclosing for.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
+            ctx.emitted_latches.push(Some(*latch_pc));
             ctx.current_loop_end = Some(*latch_pc);
             for sub_region in body {
                 match sub_region {
@@ -4900,6 +4915,7 @@ fn lift_region(
                 }
             }
             remove_trailing_jump(&mut body_stmts);
+            ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
             ctx.current_loop_body = prev_loop_body;
 
