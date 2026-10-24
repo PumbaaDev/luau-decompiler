@@ -1330,7 +1330,7 @@ pub(super) fn forward_target_is_continue(
 }
 
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
-fn is_control_flow_op(op: LuauOpcode) -> bool {
+pub(super) fn is_control_flow_op(op: LuauOpcode) -> bool {
     matches!(
         op,
         LuauOpcode::Jump

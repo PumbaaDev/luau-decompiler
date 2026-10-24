@@ -132,6 +132,17 @@ fn anti_afk_idle_guard_jumping_to_the_latch_is_a_continue() {
     assert!(!out.contains("if v7 then\n                    continue"), "{out}");
 }
 
+// `if not v7 then <set + FireServer> end` in the AntiAFK poll loop compiles to a
+// conditional that skips a lone mid-body `JUMP`. Reading every forward target
+// inside the loop as `continue` emitted `if not v7 then continue end; continue`
+// and dead-code elimination then cut the rest of the body (5 calls lost).
+#[test]
+fn anti_afk_mid_body_forward_skip_keeps_the_rest_of_the_loop_body() {
+    let out = crate::decompile(ANTI_AFK).expect("fixture decompiles");
+    assert!(!out.contains("fewer call(s)"), "calls lost after a mid-body skip:\n{out}");
+    assert!(!out.contains("if not v7 then\n                    continue"), "{out}");
+}
+
 // A body-level `v = e` read once in the body and once in `until v ...` must
 // survive: the loop condition's read is invisible to the per-block count, and
 // deleting the assignment left `until` reading the stale `local v = nil`

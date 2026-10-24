@@ -2484,6 +2484,138 @@ fn lift_branch_region(
     }
 }
 
+/// Last instruction pc of `[start, end)`, stepping over AUX words.
+fn last_insn_pc(code: &[u32], start: usize, end: usize) -> Option<usize> {
+    let mut pc = start;
+    let mut last = None;
+    while pc < end.min(code.len()) {
+        last = Some(pc);
+        pc += 1 + LuauOpcode::from_u8(crate::parser::types::insn_op(code[pc])).has_aux() as usize;
+    }
+    last
+}
+
+/// Index in `ranges[from..=hi]` of the block that starts at `pc`, excluding the
+/// loop latch (the last range).
+fn mid_body_block_at(ranges: &[(usize, usize)], from: usize, hi: usize, pc: usize) -> Option<usize> {
+    let latch_idx = ranges.len().saturating_sub(1);
+    (from..=hi).find(|&k| ranges[k].0 == pc && k < latch_idx)
+}
+
+/// A `while true` body block whose last instruction is a conditional jump that
+/// skips forward to a LATER block of the same contiguous run, short of the loop
+/// latch, is an inline `if` over `[block, target)`. Lifting the block alone makes
+/// the target out of range, which prints `if <taken> then continue end` and drops
+/// the skipped code. Returns the index of the block starting at the target, past
+/// an else-skip: when the last instruction before the target is a forward `JUMP`
+/// to another mid-body block, the construct runs through that block.
+fn mid_body_branch_end_block(
+    code: &[u32],
+    ranges: &[(usize, usize)],
+    idx: usize,
+    hi: usize,
+) -> Option<usize> {
+    use crate::parser::types::insn_d;
+    let (s, e) = ranges[idx];
+    let lp = last_insn_pc(code, s, e)?;
+    let op = LuauOpcode::from_u8(crate::parser::types::insn_op(code[lp]));
+    let conditional = matches!(
+        op,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    );
+    if !conditional {
+        return None;
+    }
+    let target = lp as i64 + insn_d(code[lp]) as i64 + 1;
+    if target <= e as i64 {
+        return None;
+    }
+    let mut k = mid_body_block_at(ranges, idx + 1, hi, target as usize)?;
+    // The back edge itself: a latch block may hold real code before it.
+    let (ls, le) = ranges[ranges.len() - 1];
+    let latch_start = last_insn_pc(code, ls, le)?;
+    // The arm before the target either ends in a JUMP to another mid-body block
+    // (the `if not c then <else> end` alias, accepted only when that JUMP is the
+    // arm's sole instruction) or runs on / leaves the iteration (a plain `if`).
+    // A longer arm with a mid-body JUMP is a two-armed merge, left to the
+    // per-block lift.
+    let (ps, pe) = ranges[k - 1];
+    let arm_last = last_insn_pc(code, ps, pe).filter(|&p| p >= e)?;
+    let arm_op = LuauOpcode::from_u8(crate::parser::types::insn_op(code[arm_last]));
+    let arm_target = match arm_op {
+        LuauOpcode::Jump => Some(arm_last as i64 + insn_d(code[arm_last]) as i64 + 1),
+        _ => None,
+    };
+    let mut skip_pc = None;
+    if let Some(t2) = arm_target.filter(|&t2| t2 > ranges[k].0 as i64 && t2 < latch_start as i64) {
+        // Lone mid-body JUMP: the else arm runs from the target to `t2`.
+        if arm_last != e {
+            return None;
+        }
+        let k2 = mid_body_block_at(ranges, k + 1, hi, t2 as usize)?;
+        skip_pc = Some(arm_last);
+        k = k2;
+    }
+    let end_pc = ranges[k].0;
+    // An arm that jumps to a mid-body pc past the construct (a shared tail, an
+    // `a or b` join) is not a diamond; leave it to the per-block lift.
+    if branch_escapes_mid_body(code, e, end_pc, skip_pc, latch_start) {
+        return None;
+    }
+    // The skipped region must make a call: this exists to recover calls the
+    // `continue` reading dropped. A call-free region (the arithmetic arms of an
+    // obfuscated dispatch loop) gains nothing and only exposes structuring
+    // defects the dropped code used to hide.
+    if !opcode_handlers::range_has_call(code, e, end_pc) {
+        return None;
+    }
+    Some(k)
+}
+
+/// Does any branch in `[from, to)` (but `skip_pc`) go backward (an inner loop)
+/// or land past `to` and short of the loop latch at `latch_start`? Landing at or
+/// after the latch is a `continue` or a loop exit and is fine.
+fn branch_escapes_mid_body(
+    code: &[u32],
+    from: usize,
+    to: usize,
+    skip_pc: Option<usize>,
+    latch_start: usize,
+) -> bool {
+    use crate::parser::types::{insn_d, insn_e, insn_op};
+    let mut pc = from;
+    while pc < to.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if Some(pc) != skip_pc && opcode_handlers::is_control_flow_op(op) && op != LuauOpcode::Return {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            // A backward edge is an inner loop; it is structured on its own and
+            // a linear lift of the span would flatten or repeat it.
+            if t <= pc as i64 {
+                return true;
+            }
+            if t > to as i64 && t < latch_start as i64 {
+                return true;
+            }
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
 /// Split sorted block ranges into maximal runs of PC-adjacent ranges.
 ///
 /// Returns inclusive index pairs `(lo, hi)` into `ranges`; each run's PC span
@@ -4248,8 +4380,32 @@ fn lift_region(
                         lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                     }
                 } else {
-                    for &(s, e) in &ranges[lo..=hi] {
-                        lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                    let mut i = lo;
+                    while i <= hi {
+                        let (s, e) = ranges[i];
+                        // A block-ending conditional that skips forward to a
+                        // MID-BODY block is an inline `if`, not a `continue`:
+                        // lift through its target so the walker sees it in range.
+                        match mid_body_branch_end_block(&proto.code, &ranges, i, hi) {
+                            Some(k) => {
+                                if std::env::var("LUAU_MIDBODY_TRACE").is_ok() {
+                                    eprintln!(
+                                        "MIDBODY	{}@{}	blocks={}	span={}..{}",
+                                        proto.debug_name.as_deref().unwrap_or("?"),
+                                        proto.line_defined,
+                                        ranges.len(),
+                                        s,
+                                        ranges[k].0
+                                    );
+                                }
+                                lift_instruction_range(ctx, proto, proto_index, depth, s, ranges[k].0, regs, locals, &mut body_stmts, true);
+                                i = k;
+                            }
+                            None => {
+                                lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+                                i += 1;
+                            }
+                        }
                     }
                 }
             }
