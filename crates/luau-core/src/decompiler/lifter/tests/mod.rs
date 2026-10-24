@@ -94,6 +94,7 @@ mod capture_param_global_upval_tests;
 mod capture_stdlib_global_tests;
 #[cfg(test)]
 mod branch_seed_shape_tests;
+mod branch_stale_table_seed_tests;
 #[cfg(test)]
 mod pinned_arm_write_tests;
 #[cfg(test)]
