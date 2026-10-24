@@ -8920,11 +8920,6 @@ fn premateralize_branch_escapes_spans(
                 // would silently retarget that reader.
                 if opcode_handlers::is_generic_placeholder(&name) || locals.is_bound_name(&name) {
                     name = format!("sel{}", reg);
-                    let mut n = 2;
-                    while locals.is_bound_name(&name) {
-                        name = format!("sel{}_{}", reg, n);
-                        n += 1;
-                    }
                 }
                 // A register whose live value is `Unknown` at the branch is a
                 // REUSED slot: its prior lifetime was already clobbered, so the
