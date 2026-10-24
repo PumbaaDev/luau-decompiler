@@ -128,3 +128,5 @@ mod table_escape_binding_tests;
 #[cfg(test)]
 mod or_guard_body_tests;
 mod upval_snapshot_tests;
+#[cfg(test)]
+mod loop_exit_read_carried_tests;
