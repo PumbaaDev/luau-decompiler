@@ -2456,6 +2456,7 @@ pub(super) fn lift_instruction_range(
         // name as the write target (the output would assign to an upvalue the
         // bytecode never stores). Armed per instruction; see `alias_retire`.
         locals.clear_alias_retire();
+        locals.arm_tail_pin(pc);
         if op != LuauOpcode::GetUpval && !matches!(op, LuauOpcode::LoadB) && op_writes_a(op) {
             if let Some((upval, alias, loaded_at)) = locals.alias_upval_of(a) {
                 // Retire only when the write cannot be observed past the join

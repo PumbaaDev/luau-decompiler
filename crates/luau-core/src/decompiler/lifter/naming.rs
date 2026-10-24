@@ -131,6 +131,14 @@ pub(in crate::decompiler) struct LocalTracker {
     /// the alias name they carried. A branch-merge seed that is just that
     /// alias name must not be assigned back (see `bind_arm_merge_seeds`).
     retired_alias: HashMap<usize, String>,
+    /// Loop-tail re-lift only: `pc -> (reg, name)` for the header CALL whose
+    /// result is the loop condition. The pre-loop lift bound `reg` to `name`;
+    /// the body then reused the register, so at the tail the recorded name is
+    /// stale and the write would classify as a Shadow (`local name = call()`
+    /// inside the body, which the outer `while name` test never sees).
+    tail_pins: HashMap<usize, (usize, String)>,
+    /// The pin armed for the instruction currently being lifted.
+    armed_tail_pin: Option<(usize, String)>,
 }
 
 impl LocalTracker {
@@ -139,7 +147,7 @@ impl LocalTracker {
         for i in 0..param_count {
             declared.insert(i);
         }
-        Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new(), alias_upval: HashMap::new(), alias_retire: None, retired_alias: HashMap::new() }
+        Self { declared, param_count, current_names: HashMap::new(), alias_regs: HashSet::new(), alias_upval: HashMap::new(), alias_retire: None, retired_alias: HashMap::new(), tail_pins: HashMap::new(), armed_tail_pin: None }
     }
 
     /// Forget the declarations `self` gained since `before` was cloned, except for
@@ -277,6 +285,27 @@ impl LocalTracker {
         self.retired_alias.get(&reg).map(|s| s.as_str())
     }
 
+    /// Install the loop-tail pins (see `tail_pins`). Replaces any previous set.
+    pub(super) fn set_tail_pins(&mut self, pins: HashMap<usize, (usize, String)>) {
+        self.tail_pins = pins;
+        self.armed_tail_pin = None;
+    }
+
+    /// Drop the loop-tail pins once the tail re-lift is done.
+    pub(super) fn clear_tail_pins(&mut self) {
+        self.tail_pins.clear();
+        self.armed_tail_pin = None;
+    }
+
+    /// Arm (or clear) the pin for the instruction at `pc`. Cheap no-op when no
+    /// pins are installed.
+    pub(super) fn arm_tail_pin(&mut self, pc: usize) {
+        if self.tail_pins.is_empty() && self.armed_tail_pin.is_none() {
+            return;
+        }
+        self.armed_tail_pin = self.tail_pins.get(&pc).cloned();
+    }
+
     pub(super) fn clear_alias_retire(&mut self) {
         self.alias_retire = None;
     }
@@ -322,6 +351,16 @@ impl LocalTracker {
                 self.declared.insert(reg);
                 self.current_names.insert(reg, name.clone());
                 return (WriteKind::Shadow, name);
+            }
+        }
+        // Loop-tail re-lift of the header CALL: it re-assigns the condition
+        // local the pre-loop lift declared.
+        if let Some((r, name)) = self.armed_tail_pin.clone() {
+            if r == reg {
+                self.declared.insert(reg);
+                self.alias_regs.remove(&reg);
+                self.current_names.insert(reg, name.clone());
+                return (WriteKind::Reassign, name);
             }
         }
         if !self.declared.contains(&reg) {

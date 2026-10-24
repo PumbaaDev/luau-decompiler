@@ -4113,6 +4113,7 @@ fn lift_region(
             }
 
             let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
+            let tail_pins = header_call_tail_pins(proto, block.start, branch_pc, regs, locals, &condition);
 
             let snap = locals.snapshot();
             let mut sorted_body = body_blocks.clone();
@@ -4152,7 +4153,9 @@ fn lift_region(
             // to re-evaluate the condition. We place them at the bottom of the
             // body so the condition is re-computed each time around.
             if block.start < branch_pc {
+                locals.set_tail_pins(tail_pins);
                 lift_instruction_range(ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, &mut body_stmts, true);
+                locals.clear_tail_pins();
             }
 
             // Hoist locals first declared inside the loop body
@@ -6254,6 +6257,44 @@ pub(super) fn expr_references_name(expr: &Expr, name: &str) -> bool {
         | Expr::Function { .. } => false,
     }
 }
+/// The header CALL of a `while` whose result IS the loop condition's local.
+///
+/// Returns `pc -> (reg, name)` for the last CALL in `[start, branch_pc)` that
+/// writes a register the pre-loop lift bound to a local `name` that the
+/// condition reads and that no later header instruction overwrites. The tail
+/// re-lift must re-assign that local rather than shadow it (see
+/// `LocalTracker::tail_pins`).
+fn header_call_tail_pins(
+    proto: &Proto,
+    start: usize,
+    branch_pc: usize,
+    regs: &[RegVal],
+    locals: &LocalTracker,
+    condition: &Expr,
+) -> HashMap<usize, (usize, String)> {
+    let mut pins = HashMap::new();
+    let mut last_call: Option<usize> = None;
+    let mut pc = start;
+    while pc < branch_pc && pc < proto.code.len() {
+        let insn = proto.code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if matches!(op, LuauOpcode::Call | LuauOpcode::CallFb) && insn_c(insn) >= 2 {
+            last_call = Some(pc);
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    let Some(call_pc) = last_call else { return pins };
+    let reg = insn_a(proto.code[call_pc]) as usize;
+    if collect_body_writes(&proto.code, call_pc + 1, branch_pc).contains(&reg) {
+        return pins;
+    }
+    let Some(RegVal::Expr(Expr::Name(name))) = regs.get(reg) else { return pins };
+    if locals.current_name(reg) == Some(name.as_str()) && expr_references_name(condition, name) {
+        pins.insert(call_pc, (reg, name.clone()));
+    }
+    pins
+}
+
 /// After lifting a loop body, hoist any `local` declarations that were first
 /// introduced inside the loop.  Bytecode registers are function-scoped, so
 /// variables assigned inside a loop must be visible after the loop exits.
