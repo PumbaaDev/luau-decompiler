@@ -4966,14 +4966,6 @@ pub(super) fn lift_instruction_range(
                                 values: vec![call_expr],
                             });
                         } else {
-                            // All targets are already declared: assign to the names they
-                            // are BOUND to, not to a fresh hint that was never declared
-                            // (`success, err = pcall(..)` with `success` undeclared).
-                            for (i, n) in names.iter_mut().enumerate() {
-                                if let Some(bound) = locals.current_name(a + i) {
-                                    *n = bound.to_string();
-                                }
-                            }
                             let targets: Vec<Expr> = names.iter().map(|n| Expr::Name(n.clone())).collect();
                             stmts.push(Stat::Assign {
                                 targets,
@@ -7144,12 +7136,14 @@ fn pending_reads_crossing_call(code: &[u32], before: &[RegVal], chain: &OrAndCha
         .collect()
 }
 
-/// Does `[start, end)` hold a conditional jump (AUX-aligned scan)?
+/// Does `[start, end)` hold a conditional jump that leaves it (AUX-aligned scan)?
 fn segment_has_branch(code: &[u32], start: usize, end: usize) -> bool {
     let mut w = start;
     while w < end.min(code.len()) {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
-        if crate::analysis::bool_idiom::is_conditional_jump(op) {
+        if crate::analysis::bool_idiom::is_conditional_jump(op)
+            && w as i64 + insn_d(code[w]) as i64 + 1 > end as i64
+        {
             return true;
         }
         w += if op.has_aux() { 2 } else { 1 };

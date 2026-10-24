@@ -318,7 +318,7 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
 
 /// Is `[start, end)` in the HEADER prefix of a loop? True when a backward jump
 /// at or after `end` lands at or before `start` AND nothing between that loop
-/// head and `start` branches, so the chain's block would swallow the whole
+/// head and `start` branches out of the prefix, so the chain's block would swallow the whole
 /// prefix. A chain after the loop's own condition (a `while c do` body) is a
 /// plain statement and stays recognised.
 fn span_is_inside_loop(code: &[u32], start: usize, end: usize) -> bool {
@@ -349,7 +349,14 @@ fn span_is_inside_loop(code: &[u32], start: usize, end: usize) -> bool {
     while w < start {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
         if is_jump(op) {
-            return false;
+            // A short forward skip that lands at or before the chain is part of the
+            // same prefix (`a and a.b` feeding the chain, AdoptMe DevConsoleButtonApp
+            // `while true do`); only the loop's own exit or a back edge ends it.
+            let target = w as i64 + insn_d(code[w]) as i64 + 1;
+            let internal_skip = is_conditional_jump(op) && target > w as i64 && target <= start as i64;
+            if !internal_skip {
+                return false;
+            }
         }
         w += if op.has_aux() { 2 } else { 1 };
     }
