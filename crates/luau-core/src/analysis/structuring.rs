@@ -1664,7 +1664,15 @@ pub(crate) fn structure_numeric_for_body(
                         && spans.windows(2).all(|w| w[0].1 == w[1].0);
                     if spans_loop && tiles && !is_loop_cond && !then_blocks.is_empty()
                         && !then_blocks.contains(&cond_id) {
-                        if linear_start < pc { regions.push(Region::Linear { start: linear_start, end: pc }); }
+                        // Arms the flat lift mangles (numeric loop, several loops, or
+                        // a branch outside a loop body) would be newly emitted
+                        // half-lifted (HazardView `v23`, LemonSignal `v10`, a
+                        // duplicated ClickToMove block), so keep the old split.
+                        let nested = arm_needs_old_split(
+                            code, cfg, then_blocks.iter().chain(else_blocks.iter()));
+                        let cut = if nested { pc }
+                            else { cond_prefix_cut(code, cfg, cond_id, pc) };
+                        if linear_start < cut { regions.push(Region::Linear { start: linear_start, end: cut }); }
                         regions.push(Region::IfThenElse { cond_pc: cond_id,
                             then_region: then_blocks, else_region: else_blocks, merge_pc: Some(merge) });
                         pc = merge; linear_start = pc; continue;
@@ -2268,4 +2276,227 @@ fn last_real_pc(code: &[u32], block: &BasicBlock) -> usize {
         }
     }
     last_pc
+}
+
+/// Where the `Linear` region before a conditional-wrapping-a-loop must stop.
+///
+/// `Region::IfThenElse` lifts its own condition block (`block.start..branch`),
+/// so a `Linear` that runs up to the branch pc lifts that prefix a SECOND time.
+/// When the prefix contains a call, the first lift consumes the call's argument
+/// registers and the second finds them `Unknown` and mints undeclared `vN`
+/// temporaries (`EasyVisuals.new(...)(v6, v7, ...)`). Cutting the `Linear` at the
+/// condition block's start lifts the prefix once.
+///
+/// Limited to prefixes that hold a call: for call-free prefixes the double lift
+/// has no side effects and the long-standing output is kept byte-for-byte.
+pub(crate) fn cond_prefix_cut(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    cond_id: usize,
+    pc: usize,
+) -> usize {
+    let start = match cfg.blocks.get(&cond_id) {
+        Some(b) => b.start.min(pc),
+        None => return pc,
+    };
+    let has_call = code.get(start..pc.min(code.len())).is_some_and(|w| {
+        w.iter().any(|&i| {
+            matches!(
+                LuauOpcode::from_u8(insn_op(i)),
+                LuauOpcode::Call | LuauOpcode::CallFb
+            )
+        })
+    });
+    if has_call { start } else { pc }
+}
+
+/// True when the arm is not safe to emit through the flat arm lift: it holds a
+/// numeric loop, two or more loops, or a forward branch of its own outside any
+/// generic-loop body. The flat lift handles an arm that is a straight run or a
+/// single generic loop, and mangles these shapes, so they keep the long-standing
+/// split instead of being newly emitted half-lifted.
+fn arm_needs_old_split<'a>(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    blocks: impl Iterator<Item = &'a usize>,
+) -> bool {
+    let mut spans: Vec<(usize, usize)> = blocks
+        .filter_map(|id| cfg.blocks.get(id))
+        .map(|b| (b.start, b.end.min(code.len())))
+        .collect();
+    spans.sort_unstable();
+    // Pass 1: generic-loop pc ranges [prep, loop_pc + aux]; a numeric loop is
+    // dropped by the flat lift (measured: ReactElementValidator
+    // `validateChildKeys`), so it disqualifies the arm outright.
+    let mut loop_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut branches: Vec<usize> = Vec::new();
+    for &(start, end) in &spans {
+        let mut p = start;
+        while p < end {
+            let op = LuauOpcode::from_u8(insn_op(code[p]));
+            match op {
+                LuauOpcode::ForNPrep => return true,
+                LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                    let loop_pc = (p as i64 + insn_d(code[p]) as i64 + 1).max(p as i64) as usize;
+                    loop_ranges.push((p, loop_pc + 2));
+                }
+                _ => {
+                    if forward_conditional_jump(op, p, code[p]).is_some() {
+                        branches.push(p);
+                    }
+                }
+            }
+            p += if op.has_aux() { 2 } else { 1 };
+        }
+    }
+    if loop_ranges.len() >= 2 {
+        return true;
+    }
+    // A branch of the arm's own, outside any loop body, is the shape the flat
+    // lift mangles (loops lost, whole sub-diamonds emitted twice).
+    branches
+        .iter()
+        .any(|&q| !loop_ranges.iter().any(|&(lo, hi)| q > lo && q < hi))
+}
+
+#[cfg(test)]
+mod cond_prefix_tests {
+    use super::*;
+
+    const OP_LOADNIL: u32 = 2;
+    const OP_CALL: u32 = 21;
+    const OP_RETURN: u32 = 22;
+    const OP_JUMPIFNOT: u32 = 26;
+    const OP_FORGPREP: u32 = 58;
+    const OP_FORGLOOP: u32 = 59;
+
+    fn ad(op: u32, a: u32, d: i16) -> u32 {
+        op | (a << 8) | ((d as u16 as u32) << 16)
+    }
+
+    fn abc(op: u32, a: u32, b: u32, c: u32) -> u32 {
+        op | (a << 8) | (b << 16) | (c << 24)
+    }
+
+    fn cfg_of(code: Vec<u32>) -> (Vec<u32>, ControlFlowGraph) {
+        let proto = Proto {
+            max_stack_size: 16,
+            num_params: 0,
+            num_upvalues: 0,
+            is_vararg: false,
+            flags: 0,
+            typeinfo: None,
+            code: code.clone(),
+            constants: Vec::new(),
+            child_protos: Vec::new(),
+            line_defined: 1,
+            debug_name: None,
+            line_info: None,
+            debug_info: None,
+        };
+        (code, ControlFlowGraph::build(&proto))
+    }
+
+    #[test]
+    fn cuts_at_block_start_when_the_condition_block_prefix_holds_a_call() {
+        // 0: LOADNIL 1: CALL 2: JUMPIFNOT -> 4 3: LOADNIL 4: RETURN
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 1, 0, 0),
+            abc(OP_CALL, 1, 1, 1),
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        assert_eq!(cond_prefix_cut(&code, &cfg, 0, 2), 0);
+    }
+
+    #[test]
+    fn keeps_the_branch_pc_when_the_prefix_has_no_call() {
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 1, 0, 0),
+            abc(OP_LOADNIL, 4, 0, 0),
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        assert_eq!(cond_prefix_cut(&code, &cfg, 0, 2), 2);
+    }
+
+    fn loop_code(with_leading_branch: bool) -> Vec<u32> {
+        let lead = if with_leading_branch {
+            ad(OP_JUMPIFNOT, 2, 5)
+        } else {
+            abc(OP_LOADNIL, 2, 0, 0)
+        };
+        vec![
+            lead,
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]
+    }
+
+    #[test]
+    fn flags_a_generic_for_nested_under_an_arm_branch() {
+        let (code, cfg) = cfg_of(loop_code(true));
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn flags_an_arm_holding_two_loops() {
+        // 0: LOADNIL 1: FORGPREP -> 3 2: LOADNIL 3: FORGLOOP (+AUX)
+        // 5: FORGPREP -> 7 6: LOADNIL 7: FORGLOOP (+AUX) 9: RETURN
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn allows_a_single_generic_loop_whose_only_branch_is_inside_its_body() {
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 3),
+            ad(OP_JUMPIFNOT, 9, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            abc(OP_LOADNIL, 10, 0, 0),
+            ad(OP_FORGLOOP, 5, -4),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(!arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn flags_a_loop_free_arm_with_its_own_branch() {
+        let (code, cfg) = cfg_of(vec![
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn ignores_a_generic_for_with_no_branch_before_it() {
+        let (code, cfg) = cfg_of(loop_code(false));
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(!arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
 }
