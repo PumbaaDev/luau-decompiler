@@ -1664,7 +1664,17 @@ pub(crate) fn structure_numeric_for_body(
                         && spans.windows(2).all(|w| w[0].1 == w[1].0);
                     if spans_loop && tiles && !is_loop_cond && !then_blocks.is_empty()
                         && !then_blocks.contains(&cond_id) {
-                        if linear_start < pc { regions.push(Region::Linear { start: linear_start, end: pc }); }
+                        // Arms the flat lift mangles (numeric loop, several loops, or
+                        // a branch outside a loop body) would be newly emitted
+                        // half-lifted (HazardView `v23`, LemonSignal `v10`, a
+                        // duplicated ClickToMove block), so keep the old split.
+                        let nested = arm_needs_old_split(
+                            code, cfg, then_blocks.iter().chain(else_blocks.iter()));
+                        let overwrites = arm_overwrites_prefix_value(
+                            code, cfg, cond_id, pc, merge, &then_blocks, &else_blocks);
+                        let cut = if nested || overwrites { pc }
+                            else { cond_prefix_cut(code, cfg, cond_id, pc) };
+                        if linear_start < cut { regions.push(Region::Linear { start: linear_start, end: cut }); }
                         regions.push(Region::IfThenElse { cond_pc: cond_id,
                             then_region: then_blocks, else_region: else_blocks, merge_pc: Some(merge) });
                         pc = merge; linear_start = pc; continue;
@@ -2268,4 +2278,419 @@ fn last_real_pc(code: &[u32], block: &BasicBlock) -> usize {
         }
     }
     last_pc
+}
+
+/// Where the `Linear` region before a conditional-wrapping-a-loop must stop.
+///
+/// `Region::IfThenElse` lifts its own condition block (`block.start..branch`),
+/// so a `Linear` that runs up to the branch pc lifts that prefix a SECOND time.
+/// When the prefix contains a call, the first lift consumes the call's argument
+/// registers and the second finds them `Unknown` and mints undeclared `vN`
+/// temporaries (`EasyVisuals.new(...)(v6, v7, ...)`). Cutting the `Linear` at the
+/// condition block's start lifts the prefix once.
+///
+/// Limited to prefixes that hold a call: for call-free prefixes the double lift
+/// has no side effects and the long-standing output is kept byte-for-byte.
+pub(crate) fn cond_prefix_cut(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    cond_id: usize,
+    pc: usize,
+) -> usize {
+    let start = match cfg.blocks.get(&cond_id) {
+        Some(b) => b.start.min(pc),
+        None => return pc,
+    };
+    let has_call = code.get(start..pc.min(code.len())).is_some_and(|w| {
+        w.iter().any(|&i| {
+            matches!(
+                LuauOpcode::from_u8(insn_op(i)),
+                LuauOpcode::Call | LuauOpcode::CallFb
+            )
+        })
+    });
+    if has_call { start } else { pc }
+}
+
+/// True when a register is written by the condition-block prefix AND by an arm,
+/// and the first touch after the merge READS it (`local c = base; if g then
+/// for .. do c = v.Color break end end; return c`, measured on
+/// DrScrambleTradeInController `themeForRow`).
+///
+/// Cutting the `Linear` at the block start lifts the prefix once, which leaves
+/// the register as an already-declared local; `premateralize_branch_escapes_spans`
+/// excludes such registers, so the arm write is parked and annihilated at the
+/// join and the post-merge read silently sees the pre-branch value. The old
+/// split (double lift) re-parks the prefix value, which that pass pins, so the
+/// write survives. Such shapes keep the old split.
+fn arm_overwrites_prefix_value<'a>(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    cond_id: usize,
+    pc: usize,
+    merge: usize,
+    then_blocks: &'a [usize],
+    else_blocks: &'a [usize],
+) -> bool {
+    use crate::decompiler::lifter::{
+        collect_body_writes, merge_first_touch_is_read, reg_read_before_write,
+    };
+    let Some(start) = cfg.blocks.get(&cond_id).map(|b| b.start.min(pc)) else {
+        return false;
+    };
+    // Only a value written BEFORE the prefix's last call is flushed into a
+    // declared local by that call; a value written after it stays a parked
+    // expression the premat pass pins (Recorder `ClassPropsByName = nil`).
+    let Some(last_call) = (start..pc.min(code.len())).rev().find(|&i| {
+        matches!(LuauOpcode::from_u8(insn_op(code[i])), LuauOpcode::Call | LuauOpcode::CallFb)
+    }) else {
+        return false;
+    };
+    let after_call = collect_body_writes(code, last_call + 1, pc);
+    let prefix_writes: Vec<usize> = collect_body_writes(code, start, last_call)
+        .into_iter()
+        .filter(|r| !after_call.contains(r))
+        .collect();
+    if prefix_writes.is_empty() {
+        return false;
+    }
+    let writes_of = |ids: &[usize]| -> BTreeSet<usize> {
+        let mut set = BTreeSet::new();
+        for id in ids {
+            if let Some(b) = cfg.blocks.get(id) {
+                set.extend(collect_body_writes(code, b.start, b.end.min(code.len())));
+            }
+        }
+        set
+    };
+    let then_writes = writes_of(then_blocks);
+    let else_writes = writes_of(else_blocks);
+    // A register both arms write never carries the prefix value to the merge
+    // (a call temp such as a NAMECALL self slot); only a register some path
+    // leaves untouched can lose a write to the declared-local exclusion.
+    let both_arms = !then_blocks.is_empty() && !else_blocks.is_empty();
+    prefix_writes.iter().any(|r| {
+        let in_then = then_writes.contains(r);
+        let in_else = else_writes.contains(r);
+        // An arm that reads the register before writing it is a carried
+        // identity (`ClassPropsByName = ClassPropsByName or {}`); the premat
+        // pass pins those, so the write already survives.
+        let carried = [then_blocks, else_blocks].iter().any(|ids| {
+            let span = ids.iter().filter_map(|id| cfg.blocks.get(id)).fold(None, |acc, b| {
+                Some(acc.map_or((b.start, b.end), |(s, e): (usize, usize)| (s.min(b.start), e.max(b.end))))
+            });
+            span.is_some_and(|(s, e)| reg_read_before_write(code, s, e.min(code.len()), *r))
+        });
+        !carried
+            && (in_then || in_else)
+            && !(both_arms && in_then && in_else)
+            && merge_first_touch_is_read(code, merge, code.len(), *r)
+    })
+}
+
+/// True when the arm is not safe to emit through the flat arm lift: it holds a
+/// numeric loop, two or more loops, or a forward branch of its own outside any
+/// generic-loop body. The flat lift handles an arm that is a straight run or a
+/// single generic loop, and mangles these shapes, so they keep the long-standing
+/// split instead of being newly emitted half-lifted.
+fn arm_needs_old_split<'a>(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    blocks: impl Iterator<Item = &'a usize>,
+) -> bool {
+    let mut spans: Vec<(usize, usize)> = blocks
+        .filter_map(|id| cfg.blocks.get(id))
+        .map(|b| (b.start, b.end.min(code.len())))
+        .collect();
+    spans.sort_unstable();
+    // Pass 1: generic-loop pc ranges [prep, loop_pc + aux]; a numeric loop is
+    // dropped by the flat lift (measured: ReactElementValidator
+    // `validateChildKeys`), so it disqualifies the arm outright.
+    let mut loop_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut branches: Vec<usize> = Vec::new();
+    for &(start, end) in &spans {
+        let mut p = start;
+        while p < end {
+            let op = LuauOpcode::from_u8(insn_op(code[p]));
+            match op {
+                LuauOpcode::ForNPrep => return true,
+                LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                    let loop_pc = (p as i64 + insn_d(code[p]) as i64 + 1).max(p as i64) as usize;
+                    loop_ranges.push((p, loop_pc + 2));
+                }
+                _ => {
+                    if forward_conditional_jump(op, p, code[p]).is_some() {
+                        branches.push(p);
+                    }
+                }
+            }
+            p += if op.has_aux() { 2 } else { 1 };
+        }
+    }
+    if loop_ranges.len() >= 2 {
+        return true;
+    }
+    // A branch of the arm's own, outside any loop body, is the shape the flat
+    // lift mangles (loops lost, whole sub-diamonds emitted twice).
+    branches
+        .iter()
+        .any(|&q| !loop_ranges.iter().any(|&(lo, hi)| q > lo && q < hi))
+}
+
+#[cfg(test)]
+mod cond_prefix_tests {
+    use super::*;
+
+    const OP_LOADNIL: u32 = 2;
+    const OP_CALL: u32 = 21;
+    const OP_RETURN: u32 = 22;
+    const OP_JUMPIFNOT: u32 = 26;
+    const OP_JUMP: u32 = 23;
+    const OP_FORGPREP: u32 = 58;
+    const OP_FORGLOOP: u32 = 59;
+
+    fn ad(op: u32, a: u32, d: i16) -> u32 {
+        op | (a << 8) | ((d as u16 as u32) << 16)
+    }
+
+    fn abc(op: u32, a: u32, b: u32, c: u32) -> u32 {
+        op | (a << 8) | (b << 16) | (c << 24)
+    }
+
+    fn cfg_of(code: Vec<u32>) -> (Vec<u32>, ControlFlowGraph) {
+        let proto = Proto {
+            max_stack_size: 16,
+            num_params: 0,
+            num_upvalues: 0,
+            is_vararg: false,
+            flags: 0,
+            typeinfo: None,
+            code: code.clone(),
+            constants: Vec::new(),
+            child_protos: Vec::new(),
+            line_defined: 1,
+            debug_name: None,
+            line_info: None,
+            debug_info: None,
+        };
+        (code, ControlFlowGraph::build(&proto))
+    }
+
+    #[test]
+    fn cuts_at_block_start_when_the_condition_block_prefix_holds_a_call() {
+        // 0: LOADNIL 1: CALL 2: JUMPIFNOT -> 4 3: LOADNIL 4: RETURN
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 1, 0, 0),
+            abc(OP_CALL, 1, 1, 1),
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        assert_eq!(cond_prefix_cut(&code, &cfg, 0, 2), 0);
+    }
+
+    #[test]
+    fn keeps_the_branch_pc_when_the_prefix_has_no_call() {
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 1, 0, 0),
+            abc(OP_LOADNIL, 4, 0, 0),
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        assert_eq!(cond_prefix_cut(&code, &cfg, 0, 2), 2);
+    }
+
+    fn loop_code(with_leading_branch: bool) -> Vec<u32> {
+        let lead = if with_leading_branch {
+            ad(OP_JUMPIFNOT, 2, 5)
+        } else {
+            abc(OP_LOADNIL, 2, 0, 0)
+        };
+        vec![
+            lead,
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]
+    }
+
+    #[test]
+    fn flags_a_generic_for_nested_under_an_arm_branch() {
+        let (code, cfg) = cfg_of(loop_code(true));
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn flags_an_arm_holding_two_loops() {
+        // 0: LOADNIL 1: FORGPREP -> 3 2: LOADNIL 3: FORGLOOP (+AUX)
+        // 5: FORGPREP -> 7 6: LOADNIL 7: FORGLOOP (+AUX) 9: RETURN
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            ad(OP_FORGPREP, 5, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            ad(OP_FORGLOOP, 5, -2),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn allows_a_single_generic_loop_whose_only_branch_is_inside_its_body() {
+        let (code, cfg) = cfg_of(vec![
+            abc(OP_LOADNIL, 5, 0, 0),
+            ad(OP_FORGPREP, 5, 3),
+            ad(OP_JUMPIFNOT, 9, 1),
+            abc(OP_LOADNIL, 9, 0, 0),
+            abc(OP_LOADNIL, 10, 0, 0),
+            ad(OP_FORGLOOP, 5, -4),
+            2,
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(!arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn flags_a_loop_free_arm_with_its_own_branch() {
+        let (code, cfg) = cfg_of(vec![
+            ad(OP_JUMPIFNOT, 2, 1),
+            abc(OP_LOADNIL, 3, 0, 0),
+            abc(OP_RETURN, 0, 1, 0),
+        ]);
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    #[test]
+    fn ignores_a_generic_for_with_no_branch_before_it() {
+        let (code, cfg) = cfg_of(loop_code(false));
+        let ids: Vec<usize> = cfg.blocks.keys().copied().collect();
+        assert!(!arm_needs_old_split(&code, &cfg, ids.iter()));
+    }
+
+    // themeForRow: `local c = base; local g = x:Find(); if g then for .. do
+    // if cond then c = v.Color break end end end; return c`. R2 is written in
+    // the call-holding condition prefix AND inside the loop arm, and read after
+    // the merge. Cutting the Linear at the block start drops the prefix's
+    // parked R2, the lifter names it, and the arm write is then lost.
+    fn theme_code(merge_reads_r2: bool) -> Vec<u32> {
+        vec![
+            abc(OP_LOADNIL, 2, 0, 0),          // 0 R2 = base (prefix write)
+            abc(OP_CALL, 3, 1, 1),             // 1 call in the prefix
+            ad(OP_JUMPIFNOT, 3, 7),            // 2 -> 10
+            abc(OP_LOADNIL, 5, 0, 0),          // 3
+            ad(OP_FORGPREP, 5, 3),             // 4 -> loop at 8
+            ad(OP_JUMPIFNOT, 9, 1),            // 5 -> 7
+            abc(OP_LOADNIL, 2, 0, 0),          // 6 R2 = v.Color (arm write)
+            abc(OP_LOADNIL, 10, 0, 0),         // 7
+            ad(OP_FORGLOOP, 5, -4),            // 8
+            2,                                 // 9 aux
+            if merge_reads_r2 { abc(OP_RETURN, 2, 2, 0) } else { abc(OP_RETURN, 0, 1, 0) }, // 10
+        ]
+    }
+
+    fn first_linear_end(regions: &[Region]) -> Option<usize> {
+        match regions.first() {
+            Some(Region::Linear { end, .. }) => Some(*end),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn keeps_the_branch_split_when_an_arm_overwrites_a_prefix_value_read_after_the_merge() {
+        let (code, cfg) = cfg_of(theme_code(true));
+        let regions =
+            structure_numeric_for_body(&code, 0, code.len(), &cfg, &BTreeSet::new());
+        assert_eq!(first_linear_end(&regions), Some(2), "{:?}", regions);
+    }
+
+    // `local t = x:M(); if g then R2 = a else R2/other = b end; return R2`.
+    fn two_arm_code(else_reg: u32) -> Vec<u32> {
+        vec![
+            abc(OP_LOADNIL, 2, 0, 0),    // 0 prefix write R2
+            abc(OP_CALL, 3, 1, 1),       // 1
+            ad(OP_JUMPIFNOT, 3, 2),      // 2 -> 5
+            abc(OP_LOADNIL, 2, 0, 0),    // 3 then: R2
+            ad(OP_JUMP, 0, 1),           // 4 -> 6
+            abc(OP_LOADNIL, else_reg, 0, 0), // 5 else
+            abc(OP_RETURN, 2, 2, 0),     // 6 merge reads R2
+        ]
+    }
+
+    fn overwrites_for(else_reg: u32) -> bool {
+        let (code, cfg) = cfg_of(two_arm_code(else_reg));
+        let ids = |lo: usize, hi: usize| -> Vec<usize> {
+            cfg.blocks.iter().filter(|(_, b)| b.start >= lo && b.start < hi)
+                .map(|(id, _)| *id).collect()
+        };
+        arm_overwrites_prefix_value(&code, &cfg, 0, 2, 6, &ids(3, 5), &ids(5, 6))
+    }
+
+    #[test]
+    fn ignores_a_prefix_value_written_after_the_last_call() {
+        let code = vec![
+            abc(OP_CALL, 3, 1, 1),       // 0 call first
+            abc(OP_LOADNIL, 2, 0, 0),    // 1 R2 = nil AFTER the call (stays parked)
+            ad(OP_JUMPIFNOT, 3, 2),      // 2 -> 5
+            abc(OP_LOADNIL, 2, 0, 0),    // 3 then: R2
+            ad(OP_JUMP, 0, 1),           // 4 -> 6
+            abc(OP_LOADNIL, 7, 0, 0),    // 5 else leaves R2
+            abc(OP_RETURN, 2, 2, 0),     // 6 merge reads R2
+        ];
+        let (code, cfg) = cfg_of(code);
+        let ids = |lo: usize, hi: usize| -> Vec<usize> {
+            cfg.blocks.iter().filter(|(_, b)| b.start >= lo && b.start < hi)
+                .map(|(id, _)| *id).collect()
+        };
+        assert!(!arm_overwrites_prefix_value(&code, &cfg, 0, 2, 6, &ids(3, 5), &ids(5, 6)));
+    }
+
+    #[test]
+    fn ignores_a_carried_identity_the_arm_reads_before_writing() {
+        let code = vec![
+            abc(OP_LOADNIL, 2, 0, 0),    // 0 prefix write R2
+            abc(OP_CALL, 3, 1, 1),       // 1
+            ad(OP_JUMPIFNOT, 3, 3),      // 2 -> 6
+            abc(6, 9, 2, 0),             // 3 then: MOVE R9 R2 (read first)
+            abc(OP_LOADNIL, 2, 0, 0),    // 4 then: R2 written
+            ad(OP_JUMP, 0, 1),           // 5 -> 7
+            abc(OP_LOADNIL, 7, 0, 0),    // 6 else
+            abc(OP_RETURN, 2, 2, 0),     // 7 merge reads R2
+        ];
+        let (code, cfg) = cfg_of(code);
+        let ids = |lo: usize, hi: usize| -> Vec<usize> {
+            cfg.blocks.iter().filter(|(_, b)| b.start >= lo && b.start < hi)
+                .map(|(id, _)| *id).collect()
+        };
+        assert!(!arm_overwrites_prefix_value(&code, &cfg, 0, 2, 7, &ids(3, 6), &ids(6, 7)));
+    }
+
+    #[test]
+    fn ignores_a_register_that_both_arms_overwrite() {
+        assert!(!overwrites_for(2));
+    }
+
+    #[test]
+    fn flags_a_register_only_one_arm_overwrites() {
+        assert!(overwrites_for(7));
+    }
+
+    #[test]
+    fn still_cuts_at_the_block_start_when_the_merge_never_reads_the_overwritten_value() {
+        let (code, cfg) = cfg_of(theme_code(false));
+        let regions =
+            structure_numeric_for_body(&code, 0, code.len(), &cfg, &BTreeSet::new());
+        assert_eq!(first_linear_end(&regions), None, "{:?}", regions);
+    }
 }
