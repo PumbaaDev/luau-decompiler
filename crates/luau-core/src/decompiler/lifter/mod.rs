@@ -8733,6 +8733,39 @@ fn reg_touched_in_ranges(code: &[u32], ranges: &[(usize, usize)], reg: usize) ->
 /// still counts), because the only caller uses it to decide whether to give a
 /// register a name — a false positive costs one extra `local`, a false negative
 /// loses a value.
+/// Does the diamond at `pc` sit inside a loop whose back edge comes before any
+/// touch of `reg` after the merge? Then the "merge read" the arm-write seeds rely
+/// on is really a read AFTER the loop, and the register's value can reach it
+/// without passing through this diamond (an iteration that `continue`s or
+/// `break`s, or no iteration at all). Seeding a fresh `local` for the arm writes
+/// would hide those writes from the outer declaration (the register's own
+/// pre-loop local), so the arm writes must stay assignments to that local.
+/// Kill-switch: `LUAU_NO_NFG_D`.
+fn value_escapes_enclosing_loop(
+    code: &[u32],
+    pc: usize,
+    after_start: usize,
+    after_end: usize,
+    reg: usize,
+) -> bool {
+    if std::env::var("LUAU_NO_NFG_D").is_ok() {
+        return false;
+    }
+    let end = after_end.min(code.len());
+    let mut w = after_start;
+    while w < end {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::ForGLoop | LuauOpcode::ForNLoop | LuauOpcode::JumpBack) {
+            let target = w as i64 + insn_d(code[w]) as i64 + 1;
+            if target <= pc as i64 {
+                return !reg_used_in_range(code, after_start, w, reg);
+            }
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
     let mut i = start;
     let end = end.min(code.len());
@@ -9016,7 +9049,8 @@ fn premateralize_branch_escapes_spans(
                 && !else_ranges.is_empty()
                 && ranges_write_reg(&proto.code, then_ranges, reg)
                 && ranges_write_reg(&proto.code, else_ranges, reg)
-                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
+                && !value_escapes_enclosing_loop(&proto.code, pc, after_start, after_end, reg);
             if unknown_seed {
                 let mut name = ctx.reg_name(proto, reg as u8, pc);
                 if opcode_handlers::is_generic_placeholder(&name) {
@@ -9086,7 +9120,8 @@ fn premateralize_branch_escapes_spans(
                 && !else_ranges.is_empty()
                 && ranges_write_reg(&proto.code, then_ranges, reg)
                 && ranges_write_reg(&proto.code, else_ranges, reg)
-                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
+                && !value_escapes_enclosing_loop(&proto.code, pc, after_start, after_end, reg);
             if bound_seed {
                 let mut name = ctx.reg_name(proto, reg as u8, pc);
                 // A generic `vN` cannot be used: chunk-wide `vN` folding

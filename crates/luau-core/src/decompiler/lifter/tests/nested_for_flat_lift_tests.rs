@@ -58,3 +58,20 @@ fn rotated_while_true_with_for_is_not_lifted_twice() {
     assert!(out.contains("while true do"), "loop shape lost:\n{out}");
     assert!(out.contains("AdvanceToNextPageAsync"), "step call lost:\n{out}");
 }
+
+// Outer-local write: a local declared BEFORE a loop is assigned in both arms of
+// a diamond inside a generic-for and read only after the loop (iterations that
+// `continue` or `break` leave it alone). The arm-write seeds took the post-loop
+// read for a merge read and minted a fresh `local sel<N>` for the arm writes, so
+// the outer local never saw them. Same shape as a BloxFruits spawn-point script.
+const FIXTURE_OUTER: &[u8] = include_bytes!("fixtures/nested_for_outer_write.luac");
+
+#[test]
+fn for_arm_writes_to_outer_local_are_not_redeclared() {
+    let out = crate::decompile(FIXTURE_OUTER).expect("fixture decompiles");
+    assert!(out.contains("in tbl.get("), "for header lost:\n{out}");
+    assert!(!out.contains("local sel"), "arm write minted a fresh local:\n{out}");
+    let assigns = out.lines().filter(|l| l.trim_start().starts_with("Key = ")).count();
+    assert_eq!(assigns, 3, "writes to the outer local lost:\n{out}");
+    assert!(out.contains("print(Key)"), "post-loop read of the outer local lost:\n{out}");
+}
