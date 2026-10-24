@@ -2503,7 +2503,9 @@ pub(super) fn lift_instruction_range(
                 // A pinned register's nil write is as much a write as any
                 // other: emit `<bound> = nil` (and do NOT mark the register
                 // as an explicit-nil park — it still holds its binding).
-                if pinned_write_consumed(ctx, regs, locals, stmts, a, pc, Expr::Nil) {
+                if ctx.default_merged_loads.contains(&(proto_index, pc)) {
+                    // The if-lift already declared the merged value (`c and X or nil`).
+                } else if pinned_write_consumed(ctx, regs, locals, stmts, a, pc, Expr::Nil) {
                     // consumed
                 } else {
                     // Just store nil in register for inlining — don't emit `local vN = nil`.

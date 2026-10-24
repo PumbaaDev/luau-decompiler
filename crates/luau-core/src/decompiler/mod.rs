@@ -304,6 +304,9 @@ pub struct DecompileContext<'a> {
     /// its own, so without these it drops FORNPREP/FORGPREP/FORGLOOP and the
     /// loop vanishes. Empty outside such a span.
     pub flat_for_regions: Vec<crate::analysis::structuring::Region>,
+    /// `(proto_index, pc)` of each LOADNIL default already folded into a
+    /// `c and X or nil` declaration by the if-lift; the LOADNIL must not re-park nil.
+    pub default_merged_loads: std::collections::HashSet<(usize, usize)>,
 }
 
 /// A loop the lifter is currently emitting, as seen by `continue` minting.
@@ -341,6 +344,7 @@ impl<'a> DecompileContext<'a> {
             current_loop_body: None,
             emitted_latches: Vec::new(),
             flat_for_regions: Vec::new(),
+            default_merged_loads: std::collections::HashSet::new(),
         }
     }
 
