@@ -5164,9 +5164,12 @@ pub(super) fn lift_instruction_range(
                     }
                 } else {
                     let raw_count = b - 1; // B=1 means 0 values, B=2 means 1
-                    // Clamp to sane max; very large B is likely corrupted.
-                    // Clamp to 1 (not 0) so we don't silently drop everything.
-                    let count = if raw_count > 10 { 1 } else { raw_count };
+                    // B is exact bytecode: obfuscated VM handlers legitimately
+                    // return 12-13 values. Only a window that leaves the proto
+                    // frame is corruption; clamp that to 1 (not 0) so we don't
+                    // silently drop everything.
+                    let fits_frame = a + raw_count <= proto.max_stack_size as usize;
+                    let count = if raw_count > 10 && !fits_frame { 1 } else { raw_count };
                     for i in 0..count {
                         // B0.127: sanitize stdlib-name string leakage in return values.
                         values.push(sanitize_leaked_global_string(reg_expr(regs, a + i)));
