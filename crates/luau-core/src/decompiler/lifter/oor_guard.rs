@@ -40,6 +40,37 @@ thread_local! {
     static OOR_DROPPED: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
 }
 
+thread_local! {
+    /// Lone `JUMP` pcs (by proto identity) whose effect an in-loop guard
+    /// already emitted as `if <cond> then continue|break end`. The JUMP is
+    /// lifted later as its own span; it must not add an unconditional
+    /// `continue`/`break` that dead-code elimination would truncate the loop
+    /// body at.
+    static CONSUMED_JUMPS: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
+}
+
+/// Record that the lone `JUMP` at `jump_pc` is already represented by a guard.
+pub(super) fn note_consumed_jump(proto: &Proto, jump_pc: usize) {
+    let entry = (proto_key(proto), jump_pc);
+    CONSUMED_JUMPS.with(|c| {
+        let mut c = c.borrow_mut();
+        if !c.contains(&entry) {
+            c.push(entry);
+        }
+    });
+}
+
+/// Was the `JUMP` at `jump_pc` already represented by a guard? Consumes the note.
+pub(super) fn take_consumed_jump(proto: &Proto, jump_pc: usize) -> bool {
+    let entry = (proto_key(proto), jump_pc);
+    CONSUMED_JUMPS.with(|c| {
+        let mut c = c.borrow_mut();
+        let before = c.len();
+        c.retain(|e| *e != entry);
+        c.len() != before
+    })
+}
+
 fn proto_key(proto: &Proto) -> usize {
     proto as *const Proto as usize
 }
@@ -103,6 +134,7 @@ pub(super) fn fired_reset(proto: &Proto) {
     });
     let key = proto_key(proto);
     OOR_DROPPED.with(|d| d.borrow_mut().retain(|&(k, _)| k != key));
+    CONSUMED_JUMPS.with(|c| c.borrow_mut().retain(|&(k, _)| k != key));
 }
 pub(super) fn fired_count(proto: &Proto) -> usize {
     FIRED.with(|f| f.borrow().get(&proto_key(proto)).copied().unwrap_or(0))
