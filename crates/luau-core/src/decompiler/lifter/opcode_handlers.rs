@@ -1187,7 +1187,7 @@ pub(super) fn push_oor_loop_guard(
     loop_end: Option<usize>,
     loop_body: Option<&[(usize, usize)]>,
 ) {
-    let is_continue = forward_target_is_continue(code, target, loop_end);
+    let is_continue = forward_target_is_continue(code, next_pc.saturating_sub(1), target, loop_end);
     stmts.push(Stat::If {
         condition,
         then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
@@ -1220,25 +1220,70 @@ pub(super) fn lone_exit_jump_after(
     if jt <= target {
         return None;
     }
-    // `loop_end` is not one convention: a numeric for sets none, a generic for
-    // sets one past FORGLOOP, a structured while sets the latch pc itself. So a
-    // jump whose target IS a back-edge instruction (FORNLOOP, FORGLOOP,
-    // JUMPBACK) is the loop's own latch and reads as `continue` whatever
-    // `loop_end` says, provided it is not past the construct's end.
-    Some(forward_target_is_continue(code, jt, loop_end))
+    // Only the INNERMOST enclosing loop's own latch is a `continue`. A target
+    // past that latch (even an outer loop's latch, which is where an inner
+    // loop's exit lands when it is the last statement of the outer body) is a
+    // `break`. A mid-body forward skip is neither: leave it alone.
+    match own_latch(code, jump_pc) {
+        Some(latch) if jt == latch => Some(true),
+        Some(latch) if jt < latch => None,
+        Some(_) => Some(false),
+        None => {
+            if loop_end.map_or(false, |le| jt < le) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+    }
 }
 
-/// Does a forward jump to `jt` inside a loop read as `continue`? True when the
-/// target is a back-edge instruction (the loop's own latch) not past the
-/// construct's end, or simply lies before `loop_end`.
-pub(super) fn forward_target_is_continue(code: &[u32], jt: usize, loop_end: Option<usize>) -> bool {
-    let targets_latch = jt < code.len()
-        && matches!(
-            LuauOpcode::from_u8(insn_op(code[jt])),
-            LuauOpcode::ForNLoop | LuauOpcode::ForGLoop | LuauOpcode::JumpBack
-        )
-        && loop_end.map_or(true, |le| jt <= le);
-    targets_latch || loop_end.map_or(false, |le| jt < le)
+fn is_back_edge_op(op: LuauOpcode) -> bool {
+    matches!(op, LuauOpcode::ForNLoop | LuauOpcode::ForGLoop | LuauOpcode::JumpBack)
+}
+
+/// The pc of the back-edge instruction (FORNLOOP, FORGLOOP or JUMPBACK) of the
+/// innermost loop that encloses `pc`: the first back-edge after `pc` whose
+/// target (the loop head) is at or before `pc`. For FORGLOOP this is the pc of
+/// the op itself, not its aux word.
+pub(super) fn own_latch(code: &[u32], pc: usize) -> Option<usize> {
+    if pc >= code.len() {
+        return None;
+    }
+    // Walk instruction by instruction: an AUX word can carry any low byte, so
+    // reading it as an opcode would invent a back edge.
+    let mut l = pc + 1 + LuauOpcode::from_u8(insn_op(code[pc])).has_aux() as usize;
+    while l < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[l]));
+        if is_back_edge_op(op) {
+            let head = l as i64 + insn_d(code[l]) as i64 + 1;
+            if head <= pc as i64 {
+                return Some(l);
+            }
+        }
+        l += 1 + op.has_aux() as usize;
+    }
+    None
+}
+
+/// Does a forward jump from `pc` to `jt` inside a loop read as `continue`?
+/// True when `jt` is the latch of the innermost enclosing loop. A back-edge
+/// target that is NOT that latch (an outer loop's) is a `break`. Otherwise the
+/// older `jt < loop_end` reading applies.
+pub(super) fn forward_target_is_continue(
+    code: &[u32],
+    pc: usize,
+    jt: usize,
+    loop_end: Option<usize>,
+) -> bool {
+    let own = own_latch(code, pc);
+    if own == Some(jt) {
+        return true;
+    }
+    if jt < code.len() && is_back_edge_op(LuauOpcode::from_u8(insn_op(code[jt]))) {
+        return false;
+    }
+    loop_end.map_or(false, |le| jt < le)
 }
 
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
@@ -5170,7 +5215,7 @@ pub(super) fn lift_instruction_range(
                     if in_loop && !oor_guard::take_consumed_jump(proto, pc) {
                         // A forward jump that stays INSIDE the loop skips the
                         // rest of the iteration; it is `continue`, not `break`.
-                        if forward_target_is_continue(code, target, ctx.classify_loop_end()) {
+                        if forward_target_is_continue(code, pc, target, ctx.current_loop_end) {
                             stmts.push(Stat::Continue);
                         } else {
                             stmts.push(Stat::Break);
@@ -5689,7 +5734,7 @@ pub(super) fn lift_instruction_range(
                             Expr::UnOp { op: UnOp::Not, operand: Box::new(cond) }
                         };
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + 1, target, ctx.classify_loop_end(),
+                            code, pc + 1, target, ctx.current_loop_end,
                         ) {
                             stmts.push(Stat::If {
                                 condition: super::negate_condition(&condition),
@@ -5706,7 +5751,7 @@ pub(super) fn lift_instruction_range(
                         }
                         push_oor_loop_guard(
                             stmts, condition, code, pc + 1, end, target,
-                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
                         );
                     }
                     // In non-loop context, out-of-range forward jumps are skipped
@@ -5916,7 +5961,7 @@ pub(super) fn lift_instruction_range(
                     }
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.classify_loop_end(),
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -5936,7 +5981,7 @@ pub(super) fn lift_instruction_range(
                         }
                         push_oor_loop_guard(
                             stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
-                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
                         );
                     }
                 }
@@ -6135,7 +6180,7 @@ pub(super) fn lift_instruction_range(
                     }
                     if in_loop {
                         if let Some(is_continue) = lone_exit_jump_after(
-                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.classify_loop_end(),
+                            code, pc + if op.has_aux() { 2 } else { 1 }, target, ctx.current_loop_end,
                         ) {
                             // `if <fall-through> then continue|break end`: the
                             // conditional skips a lone `JUMP` to the loop latch
@@ -6155,7 +6200,7 @@ pub(super) fn lift_instruction_range(
                         }
                         push_oor_loop_guard(
                             stmts, condition, code, pc + if op.has_aux() { 2 } else { 1 }, end, target,
-                            ctx.classify_loop_end(), ctx.current_loop_body.as_deref(),
+                            ctx.current_loop_end, ctx.current_loop_body.as_deref(),
                         );
                     }
                 }

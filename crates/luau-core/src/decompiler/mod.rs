@@ -292,22 +292,6 @@ pub struct DecompileContext<'a> {
     /// starts outside every one of them is lifted AFTER the loop, so reaching
     /// it by fall-through leaves the loop.
     pub current_loop_body: Option<Vec<(usize, usize)>>,
-    /// True while `current_loop_end` was inherited from an enclosing PROTO (a
-    /// pc in the parent's code) rather than set by a loop of the proto being
-    /// lifted. Such a bound says nothing about this proto's jumps.
-    pub loop_end_foreign: bool,
-}
-
-impl DecompileContext<'_> {
-    /// `current_loop_end` for `continue`/`break` classification: `None` when it
-    /// belongs to an enclosing proto.
-    pub fn classify_loop_end(&self) -> Option<usize> {
-        if self.loop_end_foreign {
-            None
-        } else {
-            self.current_loop_end
-        }
-    }
 }
 
 impl<'a> DecompileContext<'a> {
@@ -327,7 +311,6 @@ impl<'a> DecompileContext<'a> {
             arity_pinned_temps: std::collections::HashSet::new(),
             current_loop_end: None,
             current_loop_body: None,
-            loop_end_foreign: false,
         }
     }
 

@@ -23,51 +23,61 @@ fn jump(d: i16) -> u32 {
     OP_JUMP | ((d as u16 as u32) << 16)
 }
 
-#[test]
-fn lone_forward_jump_after_a_skipping_conditional_is_recognised() {
-    // pc0: <cond> (skips pc1), pc1: JUMP -> 5, pc2: body.
-    let code = [0u32, jump(3), 0, 0, 0, 0];
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(6)), Some(true));
-    // The JUMP leaves the loop: that is a `break`.
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5)), Some(false));
+fn edge(op: u32, d: i16) -> u32 {
+    op | ((d as u16 as u32) << 16)
 }
 
-// pc0: <cond> (skips pc1), pc1: JUMP -> 4, pc2..3: body, pc4: latch, pc5: after.
+// pc0: <cond> (skips pc1), pc1: JUMP -> 4, pc2..3: body, pc4: latch (head pc0),
+// pc5: after.
 fn latch_code(latch_op: u32) -> [u32; 6] {
-    [0u32, jump(2), 0, 0, latch_op, 0]
+    [0u32, jump(2), 0, 0, edge(latch_op, -5), 0]
 }
 
 #[test]
-fn jump_to_a_fornloop_latch_is_continue_whatever_loop_end_says() {
-    let code = latch_code(OP_FORNLOOP);
-    // A numeric for sets no loop end at all.
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, None), Some(true));
-    // A structured loop whose loop end is the latch pc itself.
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(4)), Some(true));
-    // One past the latch (exclusive end).
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5)), Some(true));
-}
-
-#[test]
-fn jump_to_forgloop_and_jumpback_latches_are_continue() {
-    assert_eq!(lone_exit_jump_after(&latch_code(OP_FORGLOOP), 1, 2, Some(4)), Some(true));
-    assert_eq!(lone_exit_jump_after(&latch_code(OP_JUMPBACK), 1, 2, Some(4)), Some(true));
+fn jump_to_the_own_latch_is_continue_whatever_loop_end_says() {
+    for op in [OP_FORNLOOP, OP_FORGLOOP, OP_JUMPBACK] {
+        let code = latch_code(op);
+        // A numeric for sets no loop end; a while sets the latch pc; a generic
+        // for sets one past it.
+        for le in [None, Some(4), Some(5)] {
+            assert_eq!(lone_exit_jump_after(&code, 1, 2, le), Some(true), "op {op} le {le:?}");
+        }
+    }
 }
 
 #[test]
 fn jump_past_the_latch_is_break() {
-    // pc1: JUMP -> 5, which is the instruction after the FORNLOOP at pc4.
-    let code = [0u32, jump(3), 0, 0, OP_FORNLOOP, 0];
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5)), Some(false));
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(4)), Some(false));
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, None), Some(false));
+    // pc1: JUMP -> 5, the instruction after the FORNLOOP at pc4.
+    let code = [0u32, jump(3), 0, 0, edge(OP_FORNLOOP, -5), 0];
+    for le in [None, Some(4), Some(5)] {
+        assert_eq!(lone_exit_jump_after(&code, 1, 2, le), Some(false));
+    }
 }
 
 #[test]
-fn jump_to_a_latch_beyond_the_loop_end_is_not_continue() {
-    // An enclosing loop's end that stops short of the target latch.
-    let code = latch_code(OP_FORNLOOP);
-    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(3)), Some(false));
+fn mid_body_forward_skip_is_not_a_latch_jump() {
+    // pc1: JUMP -> 3 lands mid-body, before the latch at pc4: neither
+    // continue nor break, so the lone path must not fire.
+    let code = [0u32, jump(1), 0, 0, edge(OP_FORNLOOP, -5), 0];
+    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(5)), None);
+}
+
+// Nested loops: the inner exit is the outer latch. pc0 outer head, pc1 inner
+// head, pc2 cond, pc3 JUMP -> 6, pc4 body, pc5 inner FORNLOOP (head pc1),
+// pc6 outer FORNLOOP (head pc0).
+#[test]
+fn inner_loop_exit_that_equals_the_outer_latch_is_break() {
+    use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
+
+    let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -7), 0];
+    // From inside the inner body, the inner latch is a continue...
+    assert!(forward_target_is_continue(&code, 3, 5, None));
+    // ...but the outer latch (past the inner loop) is a break.
+    assert!(!forward_target_is_continue(&code, 3, 6, None));
+    assert!(!forward_target_is_continue(&code, 3, 6, Some(8)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8)), Some(false));
+    // From the outer body only (pc 0), the outer latch is a continue.
+    assert!(forward_target_is_continue(&code, 0, 6, None));
 }
 
 #[test]
@@ -106,11 +116,14 @@ fn consumed_jump_note_is_taken_exactly_once() {
 }
 
 #[test]
-fn anti_afk_loop_body_keeps_all_its_calls() {
+fn anti_afk_idle_guard_jumping_to_the_latch_is_a_continue() {
+    // Only the pc 18/20 guard jumps to the loop's own JUMPBACK (pc 76) and is a
+    // `continue`. The guards at pc 22/24 and 55/57 skip forward MID-BODY; they
+    // are not latch jumps and are deliberately left alone, so the body after
+    // them is still truncated (no longer 8/8 calls).
     let out = crate::decompile(ANTI_AFK).expect("fixture decompiles");
-    assert!(!out.contains("call recovery"), "the loop body was truncated:\n{out}");
-    assert!(out.contains("AskRescueHop3:FireServer()"), "{out}");
-    assert!(out.contains("fallbackTeleport()"), "{out}");
+    assert!(out.contains("< 0x3C then"), "{out}");
+    assert!(!out.contains("if v7 then\n                    continue"), "{out}");
 }
 
 // A body-level `v = e` read once in the body and once in `until v ...` must
@@ -180,18 +193,17 @@ fn fall_through_into_a_block_outside_the_loop_body_leaves_the_loop() {
     assert!(!fallthrough_leaves_loop(None, &code, 5));
 }
 
-// A numeric for sets its loop end to one past FORNLOOP. A plain forward JUMP
-// onto the FORNLOOP is `continue` (RigDriver pc 139 -> 144); a jump past it
-// breaks; a jump to a non-latch pc inside the body keeps the `break` reading.
+// A plain forward JUMP onto the loop's own FORNLOOP is `continue` (RigDriver
+// pc 139 -> 144); a jump past it breaks; a jump to a non-latch pc inside the
+// body keeps the old `break` reading.
 #[test]
 fn numeric_for_plain_jump_to_fornloop_is_continue() {
     use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
 
-    // pc0..3 body, pc4 FORNLOOP, pc5 after, pc6 more.
-    let code = [0u32, 0, 0, 0, OP_FORNLOOP, 0, 0];
-    // A numeric for sets no loop end.
-    assert!(forward_target_is_continue(&code, 4, None));
-    assert!(!forward_target_is_continue(&code, 5, None));
-    assert!(!forward_target_is_continue(&code, 6, None));
-    assert!(!forward_target_is_continue(&code, 2, None));
+    // pc0..3 body (head pc0), pc4 FORNLOOP, pc5 after, pc6 more.
+    let code = [0u32, 0, 0, 0, edge(OP_FORNLOOP, -5), 0, 0];
+    assert!(forward_target_is_continue(&code, 2, 4, None));
+    assert!(!forward_target_is_continue(&code, 2, 5, None));
+    assert!(!forward_target_is_continue(&code, 2, 6, None));
+    assert!(!forward_target_is_continue(&code, 2, 3, None));
 }
