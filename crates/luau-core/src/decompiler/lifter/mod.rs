@@ -4120,7 +4120,10 @@ fn lift_region(
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
             let while_latch = cfg.blocks.get(header).and_then(|b| opcode_handlers::own_latch(&proto.code, b.start));
-            ctx.emitted_latches.push(while_latch);
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop {
+                latch: while_latch,
+                trailing_recompute: opcode_handlers::range_has_call(&proto.code, block.start, branch_pc),
+            });
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4213,7 +4216,10 @@ fn lift_region(
             // as it always was.
             let prev_loop_body = ctx.current_loop_body.replace(ranges.clone());
             let true_latch = ranges.iter().map(|r| r.0).min().and_then(|st| opcode_handlers::own_latch(&proto.code, st));
-            ctx.emitted_latches.push(true_latch);
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop {
+                latch: true_latch,
+                trailing_recompute: false,
+            });
             let last_idx = ranges.len().saturating_sub(1);
             for &(lo, hi) in &split_contiguous_runs(&ranges) {
                 let run_has_latch = hi == last_idx && ranges.len() > 1;
@@ -4294,7 +4300,10 @@ fn lift_region(
             // as "leaves the range" and is emitted as `break`.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
-            ctx.emitted_latches.push(None);
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop {
+                latch: None,
+                trailing_recompute: false,
+            });
             ctx.current_loop_end = body_blocks
                 .iter()
                 .filter_map(|id| cfg.blocks.get(id).map(|b| b.end))
@@ -4430,7 +4439,7 @@ fn lift_region(
             // Only the block-by-block `while true` body list is cleared, so an
             // enclosing loop's ranges are not applied to this body.
             let prev_loop_body = ctx.current_loop_body.take();
-            ctx.emitted_latches.push(Some(*loop_pc));
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop::with_latch(Some(*loop_pc)));
             if nested_body.is_empty() {
                 lift_instruction_range(
                     ctx, proto, proto_index, depth,
@@ -4671,7 +4680,7 @@ fn lift_region(
             // whole construct reads as break.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
-            ctx.emitted_latches.push(Some(*loop_pc));
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop::with_latch(Some(*loop_pc)));
             {
                 let lop = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
                 ctx.current_loop_end =
@@ -4895,7 +4904,10 @@ fn lift_region(
             //     loop, not the enclosing for.
             let prev_loop_end = ctx.current_loop_end;
             let prev_loop_body = ctx.current_loop_body.take();
-            ctx.emitted_latches.push(Some(*latch_pc));
+            ctx.emitted_latches.push(crate::decompiler::EmittedLoop {
+                latch: Some(*latch_pc),
+                trailing_recompute: opcode_handlers::range_has_call(&proto.code, *header_start, cond_start),
+            });
             ctx.current_loop_end = Some(*latch_pc);
             for sub_region in body {
                 match sub_region {

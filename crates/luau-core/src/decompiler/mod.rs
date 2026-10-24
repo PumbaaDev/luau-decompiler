@@ -297,7 +297,23 @@ pub struct DecompileContext<'a> {
     /// Raw loops that were collapsed or peeled never appear here, so a jump
     /// to the latch of the innermost emitted loop is a `continue` even when
     /// bytecode-level inner loops sit between.
-    pub emitted_latches: Vec<Option<usize>>,
+    pub emitted_latches: Vec<EmittedLoop>,
+}
+
+/// A loop the lifter is currently emitting, as seen by `continue` minting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmittedLoop {
+    /// Raw back-edge pc (FORNLOOP, FORGLOOP, JUMPBACK), when the kind has one.
+    pub latch: Option<usize>,
+    /// The condition recompute is printed as trailing body statements, which a
+    /// `continue` would skip.
+    pub trailing_recompute: bool,
+}
+
+impl EmittedLoop {
+    pub fn with_latch(latch: Option<usize>) -> Self {
+        Self { latch, ..Self::default() }
+    }
 }
 
 impl<'a> DecompileContext<'a> {

@@ -14,6 +14,12 @@ use crate::parser::types::Proto;
 
 const ANTI_AFK: &[u8] = include_bytes!("fixtures/loop_skip_jump_antiafk.luac");
 
+use crate::decompiler::EmittedLoop;
+
+fn el(latch: usize) -> Option<EmittedLoop> {
+    Some(EmittedLoop::with_latch(Some(latch)))
+}
+
 const OP_JUMP: u32 = 0x17;
 const OP_JUMPBACK: u32 = 24;
 const OP_FORNLOOP: u32 = 57;
@@ -219,9 +225,9 @@ fn jump_to_a_collapsed_outer_loops_latch_stays_break_under_an_emitted_loop() {
     // pc6 outer-raw FORNLOOP (head 0), pc7 emitted JUMPBACK (head 0).
     let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -6),
         edge(OP_JUMPBACK, -8), 0];
-    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(7)));
-    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(9), Some(7)), Some(false));
-    assert!(forward_target_is_continue(&code, 3, 7, None, Some(7)));
+    assert!(!forward_target_is_continue(&code, 3, 6, None, el(7)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(9), el(7)), Some(false));
+    assert!(forward_target_is_continue(&code, 3, 7, None, el(7)));
 }
 
 // Collapsed inner loop: raw bytecode has an inner loop (latch pc5, head pc1)
@@ -234,14 +240,34 @@ fn jump_to_outer_latch_is_continue_when_the_inner_loop_was_collapsed() {
     use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
 
     let code = [0u32, 0, 0, jump(2), 0, edge(OP_FORNLOOP, -5), edge(OP_FORNLOOP, -7), 0];
-    assert!(forward_target_is_continue(&code, 3, 6, None, Some(6)));
-    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), Some(6)), Some(true));
+    assert!(forward_target_is_continue(&code, 3, 6, None, el(6)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), el(6)), Some(true));
     // The collapsed inner loop's own latch (pc5) stays a continue (RigDriver n2
     // pc18 -> inner FORNLOOP).
-    assert!(forward_target_is_continue(&code, 3, 5, None, Some(6)));
+    assert!(forward_target_is_continue(&code, 3, 5, None, el(6)));
     // Inner loop emitted: break, as before.
-    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(5)));
-    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), Some(5)), Some(false));
+    assert!(!forward_target_is_continue(&code, 3, 6, None, el(5)));
+    assert_eq!(lone_exit_jump_after(&code, 3, 4, Some(8), el(5)), Some(false));
     // An emitted latch that does not enclose the jump is ignored.
-    assert!(!forward_target_is_continue(&code, 3, 6, None, Some(7)));
+    assert!(!forward_target_is_continue(&code, 3, 6, None, el(7)));
+}
+
+// (B) A loop that prints its condition recompute as trailing body statements
+// (JailbreakBanJail ChatMain pc29 -> JUMPBACK pc37, BloxFruits SetUpSkills
+// `min3 = math.min(task.wait(), 0.05)`) must not `continue` to its latch.
+#[test]
+fn latch_jump_is_break_when_the_recompute_is_a_trailing_statement() {
+    use crate::decompiler::lifter::opcode_handlers::forward_target_is_continue;
+
+    let code = [0u32, jump(2), 0, 0, edge(OP_JUMPBACK, -5), 0];
+    let rotated = Some(EmittedLoop { latch: Some(4), trailing_recompute: true });
+    assert!(!forward_target_is_continue(&code, 1, 4, None, rotated));
+    assert_eq!(lone_exit_jump_after(&code, 1, 2, None, rotated), Some(false));
+    // The pre-latch-fix reading (`jt < loop_end`) is kept for such a loop.
+    assert!(forward_target_is_continue(&code, 1, 4, Some(9), rotated));
+    assert_eq!(lone_exit_jump_after(&code, 1, 2, Some(9), rotated), Some(true));
+    // Without a trailing recompute the same jump is a continue.
+    let plain = Some(EmittedLoop::with_latch(Some(4)));
+    assert!(forward_target_is_continue(&code, 1, 4, None, plain));
+    assert_eq!(lone_exit_jump_after(&code, 1, 2, None, plain), Some(true));
 }
