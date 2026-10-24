@@ -5524,6 +5524,15 @@ pub(super) fn lift_instruction_range(
                     // Same shape when the bytecode DOES write the upvalue back
                     // (`if not v then v = f() end`): the chain would be stored under a
                     // fresh name that is never declared (`Move2 = v6 or ...`).
+                    // A chain that only became foldable through the prelude work must be
+                    // the sole way into its own span: an outside jump landing inside is
+                    // the `x and f() or g()` ternary, whose first operand is not the
+                    // register's value (AdoptMe profileViewSaveServer).
+                    if ok && chain_is_newly_visible(code, &chain, &seg_folded)
+                        && crate::analysis::bool_idiom::span_has_external_entry(code, pc, chain.end_pc)
+                    {
+                        ok = false;
+                    }
                     if ok && chain_is_newly_visible(code, &chain, &seg_folded)
                         && locals_snapshot.alias_upval_of(chain.dest).is_some()
                     {
@@ -5557,6 +5566,19 @@ pub(super) fn lift_instruction_range(
                         let acc = simplified;
                         let stmts_before = stmts.len();
                         store_complex(ctx, proto, regs, locals, stmts, chain.dest, pc, acc);
+                        // The same span lifted twice in one run declares the result twice
+                        // (BloxFruits QuestPro, RideAPet PetRenderer): drop an exact repeat
+                        // of the statements just before.
+                        if chain_is_newly_visible(code, &chain, &seg_folded) {
+                            let added = stmts.len() - stmts_before;
+                            if added > 0
+                                && stmts_before >= added
+                                && format!("{:?}", &stmts[stmts_before - added..stmts_before])
+                                    == format!("{:?}", &stmts[stmts_before..])
+                            {
+                                stmts.truncate(stmts_before);
+                            }
+                        }
                         // A newly visible chain must not be stored as a bare assignment to
                         // a name that was never declared: it would be hoisted to module
                         // scope later (BloxFruits CannonController `Cannon`).

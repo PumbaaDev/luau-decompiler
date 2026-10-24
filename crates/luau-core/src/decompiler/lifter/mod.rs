@@ -2761,8 +2761,14 @@ fn region_pc_extent_within(region: &Region, start: usize, end: usize) -> bool {
             within(*cond_pc)
                 && body.iter().all(|r| region_pc_extent_within(r, start, end))
         }
-        Region::IfThenElse { .. }
-        | Region::WhileTrue { .. }
+        // The loop-wrapping `if` the structurer emits since the single-lift prefix
+        // work (`cond_prefix_cut`): its blocks are arm blocks, named by start pc.
+        Region::IfThenElse { cond_pc, then_region, else_region, merge_pc } => {
+            within(*cond_pc)
+                && then_region.iter().chain(else_region.iter()).all(|&b| within(b))
+                && merge_pc.map_or(true, |m| m <= end)
+        }
+        Region::WhileTrue { .. }
         | Region::WhileDo { .. }
         | Region::GuardedTailIf { .. }
         | Region::OrGuardIf { .. }
@@ -3160,8 +3166,12 @@ fn lift_value_join(
     );
     let paths = match paths {
         Some(p) if p.len() >= 2 => {
+            // Two paths through one arm hoist the same temp twice; keep the first.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for st in hoisted_temps.drain(..) {
-                stmts.push(st);
+                if seen.insert(format!("{st:?}")) {
+                    stmts.push(st);
+                }
             }
             p
         }

@@ -1150,6 +1150,22 @@ fn find_or_chain_return_guard(
     entry: usize,
     handled: &BTreeSet<usize>,
 ) -> Option<(Vec<usize>, usize, usize)> {
+    // A chain that needs a pure-preamble link must own the terminal. When another
+    // edge (the ladder's last fall-through) also reaches it, retry with bare links
+    // only: that is the chain an entry reached by several edges has always got, and
+    // the rest of the ladder then starts its own chain (StealAnEgg
+    // FullscreenPresentation `Open`).
+    or_chain_return_guard_with(cfg, code, entry, handled, true)
+        .or_else(|| or_chain_return_guard_with(cfg, code, entry, handled, false))
+}
+
+fn or_chain_return_guard_with(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    entry: usize,
+    handled: &BTreeSet<usize>,
+    allow_pure_links: bool,
+) -> Option<(Vec<usize>, usize, usize)> {
     if handled.contains(&entry) {
         return None;
     }
@@ -1190,7 +1206,8 @@ fn find_or_chain_return_guard(
             // the guard would become an unconditional `notice(..); return` that
             // kills the whole function. Bare-link chains keep their original
             // (unrestricted) acceptance, so nothing that matched before changes.
-            if eb.predecessors.len() > 1
+            if !allow_pure_links
+                || eb.predecessors.len() > 1
                 || !is_pure_preamble_chain_link(cfg, code, cur, *chain.last()?)
             {
                 break;
