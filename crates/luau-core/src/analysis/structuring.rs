@@ -1608,6 +1608,32 @@ pub(crate) fn range_is_plain_generic_for(code: &[u32], start: usize, end: usize)
     generic && range_has_for_pair(code, start, end)
 }
 
+/// Does the generic for sit at the very top of the loop: the first FORGPREP is
+/// within a few instructions of the header and nothing before it branches? Shape
+/// C0 targets `while true do for .. end; ..` where the for opens the body. A loop
+/// whose for follows conditional code (a `continue` skipping the exit test, a
+/// guard that decides whether the for runs) is not claimed: its flat lift keeps
+/// the tail tests and yields that C0's condition-free rebuild loses.
+fn for_prep_opens_loop_body(code: &[u32], header: usize, latch: usize) -> bool {
+    const MAX_PREFIX: usize = 12;
+    let end = latch.min(code.len());
+    let mut w = header;
+    while w < end && w <= header + MAX_PREFIX {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(
+            op,
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+        ) {
+            return true;
+        }
+        if forward_conditional_jump(op, w, code[w]).is_some() {
+            return false;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Is the instruction run just before `latch` a forward conditional jump to
 /// `latch + 1` (a `repeat .. until c` / `while c` tail test whose back edge is the
 /// fall-through)? Shape C0 targets `if done then break end; step()`, where a
@@ -1758,6 +1784,7 @@ pub(crate) fn structure_numeric_for_body(
                 && latch_pc - pc <= MAX_C0_LOOP_SPAN
                 && range_is_plain_generic_for(code, pc, latch_pc)
                 && !has_tail_exit_guard(code, latch_pc)
+                && for_prep_opens_loop_body(code, pc, latch_pc)
             {
                 if std::env::var("LUAU_NFG_TRACE").is_ok() {
                     eprintln!("NFG_C0 header={} latch={} span={}", pc, latch_pc, latch_pc - pc);

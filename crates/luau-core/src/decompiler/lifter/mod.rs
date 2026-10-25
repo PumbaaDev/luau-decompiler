@@ -8798,6 +8798,15 @@ fn value_escapes_enclosing_loop(
         if matches!(op, LuauOpcode::ForGLoop) {
             let target = w as i64 + insn_d(code[w]) as i64 + 1;
             if target <= pc as i64 {
+                // A register the loop already touches before this diamond is
+                // loop-carried (e.g. an upvalue copy walked by `x = x:Find(v)`):
+                // its arm writes feed the next iteration and the post-loop read,
+                // so they must not be hidden behind a fresh local.
+                if target >= 0
+                    && reg_maybe_touched_in_range(code, target as usize, pc + 1, reg)
+                {
+                    return false;
+                }
                 return !reg_maybe_touched_in_range(code, after_start, w, reg);
             }
         }
