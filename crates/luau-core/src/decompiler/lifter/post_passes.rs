@@ -1034,6 +1034,16 @@ fn inline_single_use_temps_scoped(
                 continue;
             };
 
+            // The reader re-declares the name in a nested scope: its read may be
+            // of the inner binding, which the substitution would overwrite.
+            if super::opcode_handlers::midbody_lift_enabled()
+                && is_inlinable_literal(&def_expr)
+                && stmt_redeclares_name(&stmts[j], &def_name)
+            {
+                i += 1;
+                continue;
+            }
+
             // A write to `def_name` between the definition and the reader means
             // the reader observes the NEW value, not the initializer. Reads are
             // counted from expressions only, so an assignment target is
@@ -1336,6 +1346,26 @@ pub(super) fn stmt_writes_name_recursive(stmt: &Stat, name: &str) -> bool {
     }
 }
 
+/// Does `stmt` declare a NEW local called `name` anywhere inside it (a nested
+/// `local`, a `for` variable)? Name-based inlining resolves names, not scopes:
+/// substituting an outer binding's value into a statement that re-declares the
+/// name rewrites reads of the INNER binding too.
+pub(super) fn stmt_redeclares_name(stmt: &Stat, name: &str) -> bool {
+    let any = |b: &Vec<Stat>| b.iter().any(|s| stmt_redeclares_name(s, name));
+    match stmt {
+        Stat::Local { names, .. } => names.iter().any(|n| n == name),
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            any(then_body)
+                || elseif_clauses.iter().any(|(_, b)| any(b))
+                || else_body.as_ref().map_or(false, |b| any(b))
+        }
+        Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => any(body),
+        Stat::NumericFor { var, body, .. } => var == name || any(body),
+        Stat::GenericFor { vars, body, .. } => vars.iter().any(|v| v == name) || any(body),
+        _ => false,
+    }
+}
+
 /// Phase B0.51B: inline pure literal locals at ALL read sites
 /// (regardless of read count) up to the next reassignment of the name.
 ///
@@ -1422,6 +1452,11 @@ pub(super) fn inline_pure_literals(stmts: &mut Vec<Stat>) {
         let mut any_inlined = false;
         for j in (i + 1)..end {
             if stmt_reads_name(&stmts[j], &def_name) {
+                if super::opcode_handlers::midbody_lift_enabled()
+                    && stmt_redeclares_name(&stmts[j], &def_name)
+                {
+                    continue;
+                }
                 replace_name_in_stmt(&mut stmts[j], &def_name, &def_expr);
                 any_inlined = true;
             }

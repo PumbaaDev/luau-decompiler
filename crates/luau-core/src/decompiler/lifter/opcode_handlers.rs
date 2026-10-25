@@ -1188,8 +1188,9 @@ pub(super) fn push_oor_loop_guard(
     loop_body: Option<&[(usize, usize)]>,
     emitted: Option<EmittedLoop>,
 ) {
-    let is_continue =
-        forward_target_is_continue(code, next_pc.saturating_sub(1), target, loop_end, emitted);
+    let jump_pc = next_pc.saturating_sub(1);
+    let is_continue = forward_target_is_continue(code, jump_pc, target, loop_end, emitted)
+        && !lands_on_loop_exit_pad(code, jump_pc, target, loop_body);
     stmts.push(Stat::If {
         condition,
         then_body: vec![if is_continue { Stat::Continue } else { Stat::Break }],
@@ -1306,6 +1307,59 @@ pub(super) fn is_emitted_latch(code: &[u32], pc: usize, jt: usize, emitted: Opti
         && jt as i64 + insn_d(code[jt]) as i64 + 1 <= pc as i64
 }
 
+/// Is `reg` read at or after `from` before the first instruction that
+/// overwrites it, scanning in pc order (call results and the NAMECALL self slot
+/// count as overwrites)? Linear, so it ignores branches: a miss only means the
+/// register is rewritten on the straight-line path first.
+pub(super) fn reg_read_before_overwrite(code: &[u32], from: usize, reg: usize) -> bool {
+    let mut pc = from;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_reads_reg(code, pc, reg) {
+            return true;
+        }
+        let a = insn_a(insn) as usize;
+        let c = insn_c(insn) as usize;
+        let overwrites = match op {
+            LuauOpcode::Call => reg >= a && (c == 0 || reg + 1 < a + c),
+            LuauOpcode::NameCall => reg == a || reg == a + 1,
+            _ => a == reg && insn_defines_reg_a(op),
+        };
+        if overwrites {
+            return false;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
+/// Kill switch for the in-loop mid-body forward-skip lift and the loop-exit-pad
+/// `break` reading that goes with it. Set `LUAU_NO_MIDBODY_LIFT` to restore the
+/// previous behaviour.
+pub(super) fn midbody_lift_enabled() -> bool {
+    std::env::var("LUAU_NO_MIDBODY_LIFT").is_err()
+}
+
+/// Does a forward jump from `pc` to `target` land on a loop-exit landing pad?
+/// The pad is code between the loop body's last body block and its latch that
+/// the structurer left OUT of the body (it is lifted after the loop). Its pc is
+/// inside the loop's pc span, so the `jt < loop_end` reading called the jump a
+/// `continue`; it leaves the loop, so it is a `break`.
+pub(super) fn lands_on_loop_exit_pad(
+    code: &[u32],
+    pc: usize,
+    target: usize,
+    loop_body: Option<&[(usize, usize)]>,
+) -> bool {
+    midbody_lift_enabled()
+        && loop_body.is_some_and(|body| {
+            !body.is_empty()
+                && !body.iter().any(|&(s, e)| s <= target && target < e)
+                && own_latch(code, pc) != Some(target)
+        })
+}
+
 /// Does a forward jump from `pc` to `jt` inside a loop read as `continue`?
 /// True when `jt` is the latch of the innermost enclosing loop. A back-edge
 /// target that is NOT that latch (an outer loop's) is a `break`. Otherwise the
@@ -1330,7 +1384,7 @@ pub(super) fn forward_target_is_continue(
 }
 
 /// Is `op` a control-flow instruction (any branch, jump, loop header or return)?
-fn is_control_flow_op(op: LuauOpcode) -> bool {
+pub(super) fn is_control_flow_op(op: LuauOpcode) -> bool {
     matches!(
         op,
         LuauOpcode::Jump
@@ -5267,7 +5321,7 @@ pub(super) fn lift_instruction_range(
                         if forward_target_is_continue(
                             code, pc, target, ctx.current_loop_end,
                             ctx.emitted_latches.last().copied(),
-                        ) {
+                        ) && !lands_on_loop_exit_pad(code, pc, target, ctx.current_loop_body.as_deref()) {
                             stmts.push(Stat::Continue);
                         } else {
                             stmts.push(Stat::Break);
