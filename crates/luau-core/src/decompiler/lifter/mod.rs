@@ -2339,6 +2339,11 @@ fn lift_branch_region(
                         gap_start,
                         gap_end,
                     ) || (is_lone_forward_jump(&proto.code, gap_start, gap_end)
+                        && crate::analysis::structuring::range_is_plain_generic_for(
+                            &proto.code,
+                            span_lo,
+                            span_hi,
+                        )
                         && std::env::var("LUAU_NO_NFG_B").is_err()))
             });
             if gaps_are_early_exit {
@@ -2512,6 +2517,7 @@ fn nested_for_gap_span(
     let span_hi = ranges[last].0;
     if span_lo >= span_hi
         || !crate::analysis::structuring::range_contains_nested_for(code, span_lo, span_hi)
+        || !crate::analysis::structuring::range_is_plain_generic_for(code, span_lo, span_hi)
     {
         return None;
     }
@@ -8733,6 +8739,38 @@ fn reg_touched_in_ranges(code: &[u32], ranges: &[(usize, usize)], reg: usize) ->
 /// still counts), because the only caller uses it to decide whether to give a
 /// register a name — a false positive costs one extra `local`, a false negative
 /// loses a value.
+/// Over-approximate "is `reg` read or written in `[start, end)`": the A/B/C
+/// operand fields plus every multi-register window (CONCAT B..C, CALL/RETURN,
+/// SETLIST, the for-loop ops, NAMECALL, FASTCALL*, GETVARARGS), where any
+/// register at or above the base counts. A false positive only makes the
+/// caller keep the old behaviour; a false negative loses a value.
+fn reg_maybe_touched_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    use LuauOpcode as Op;
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = Op::from_u8(insn_op(insn));
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        if a == reg || b == reg || c == reg {
+            return true;
+        }
+        let window = match op {
+            Op::Concat => reg >= b && reg <= c,
+            Op::Call | Op::Return | Op::SetList | Op::ForGPrep | Op::ForGPrepINext
+            | Op::ForGPrepNext | Op::ForGLoop | Op::Deprecated61 | Op::ForNPrep | Op::ForNLoop
+            | Op::NameCall | Op::FastCall | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K
+            | Op::FastCall3 | Op::GetVarargs | Op::Capture => reg >= a,
+            _ => false,
+        };
+        if window {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Does the diamond at `pc` sit inside a loop whose back edge comes before any
 /// touch of `reg` after the merge? Then the "merge read" the arm-write seeds rely
 /// on is really a read AFTER the loop, and the register's value can reach it
@@ -8740,6 +8778,8 @@ fn reg_touched_in_ranges(code: &[u32], ranges: &[(usize, usize)], reg: usize) ->
 /// `break`s, or no iteration at all). Seeding a fresh `local` for the arm writes
 /// would hide those writes from the outer declaration (the register's own
 /// pre-loop local), so the arm writes must stay assignments to that local.
+/// Only generic-for back edges count: numeric-for and `while` loops (the shapes
+/// obfuscated dispatch loops are built from) keep the old seeding.
 /// Kill-switch: `LUAU_NO_NFG_D`.
 fn value_escapes_enclosing_loop(
     code: &[u32],
@@ -8755,10 +8795,10 @@ fn value_escapes_enclosing_loop(
     let mut w = after_start;
     while w < end {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
-        if matches!(op, LuauOpcode::ForGLoop | LuauOpcode::ForNLoop | LuauOpcode::JumpBack) {
+        if matches!(op, LuauOpcode::ForGLoop) {
             let target = w as i64 + insn_d(code[w]) as i64 + 1;
             if target <= pc as i64 {
-                return !reg_used_in_range(code, after_start, w, reg);
+                return !reg_maybe_touched_in_range(code, after_start, w, reg);
             }
         }
         w += if op.has_aux() { 2 } else { 1 };

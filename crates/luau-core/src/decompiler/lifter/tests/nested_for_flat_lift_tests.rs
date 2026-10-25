@@ -75,3 +75,43 @@ fn for_arm_writes_to_outer_local_are_not_redeclared() {
     assert_eq!(assigns, 3, "writes to the outer local lost:\n{out}");
     assert!(out.contains("print(Key)"), "post-loop read of the outer local lost:\n{out}");
 }
+
+fn abc(op: u8, a: u8, b: u8, c: u8) -> u32 {
+    (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
+}
+
+// `value_escapes_enclosing_loop` must see a register that is only a MIDDLE
+// operand of a multi-register window (CONCAT B..C, CALL args, ...): the ternary
+// merge register of `"Defeat " .. (v == 1 and "" or v .. " ") .. k` is consumed
+// that way, and treating it as untouched dropped the ternary.
+#[test]
+fn reg_touch_scan_models_multi_register_windows() {
+    use super::super::reg_maybe_touched_in_range;
+    const CONCAT: u8 = 49;
+    const CALL: u8 = 21;
+    const MOVE: u8 = 6;
+    // CONCAT R10 R11..R14: R12 is only a middle register.
+    let concat = [abc(CONCAT, 10, 11, 14)];
+    assert!(reg_maybe_touched_in_range(&concat, 0, 1, 12));
+    assert!(!reg_maybe_touched_in_range(&concat, 0, 1, 15));
+    // CALL R5 with 3 args: R7 is an argument, named by no operand field.
+    let call = [abc(CALL, 5, 4, 1)];
+    assert!(reg_maybe_touched_in_range(&call, 0, 1, 7));
+    // A plain MOVE R1 R2 touches only R1 and R2.
+    let mv = [abc(MOVE, 1, 2, 0)];
+    assert!(reg_maybe_touched_in_range(&mv, 0, 1, 2));
+    assert!(!reg_maybe_touched_in_range(&mv, 0, 1, 3));
+}
+
+// Shape C0 must not claim a `repeat .. until c` whose tail test jumps to latch+1
+// (the swap `cur, nxt = nxt, cur` before the test was lost, and the for body's
+// inserts were rebound to a fresh `{}`): that loop keeps the old lift.
+const FIXTURE_SWAP: &[u8] = include_bytes!("fixtures/nested_for_swap_repeat.luac");
+
+#[test]
+fn repeat_until_with_nested_generic_for_is_not_claimed_as_condition_free_loop() {
+    let out = crate::decompile(FIXTURE_SWAP).expect("fixture decompiles");
+    assert!(out.contains("repeat"), "repeat loop shape lost:\n{out}");
+    assert!(out.contains("until "), "until test lost:\n{out}");
+    assert!(!out.contains("while true do"), "claimed as a condition-free loop:\n{out}");
+}

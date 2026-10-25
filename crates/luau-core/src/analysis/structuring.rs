@@ -1579,6 +1579,48 @@ fn range_has_for_pair(code: &[u32], start: usize, end: usize) -> bool {
     false
 }
 
+/// Does `[start, end)` hold a complete GENERIC for pair and no numeric for at
+/// all? Obfuscated VM dispatch loops are built from numeric fors with dozens of
+/// forward JUMPs; the nested-generic-for repairs must not restructure them (the
+/// structured copy adopts bindings of the peeled first iteration).
+pub(crate) fn range_is_plain_generic_for(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut pc = start;
+    let mut generic = false;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::ForNPrep | LuauOpcode::ForNLoop) {
+            return false;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(
+            op,
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+        ) {
+            generic = true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    generic && range_has_for_pair(code, start, end)
+}
+
+/// Is the instruction run just before `latch` a forward conditional jump to
+/// `latch + 1` (a `repeat .. until c` / `while c` tail test whose back edge is the
+/// fall-through)? Shape C0 targets `if done then break end; step()`, where a
+/// statement sits between the exit test and the back edge.
+fn has_tail_exit_guard(code: &[u32], latch: usize) -> bool {
+    (latch.saturating_sub(2)..latch).any(|w| {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        forward_conditional_jump(op, w, code[w])
+            .map(|(next_pc, t)| next_pc == latch && t == latch + 1)
+            .unwrap_or(false)
+    })
+}
+
 /// Phase B0.4 + B0.5: build the nested region tree for a numeric-for body range.
 ///
 /// Scans `[body_start, body_end)` linearly, producing:
@@ -1714,7 +1756,8 @@ pub(crate) fn structure_numeric_for_body(
                 .unwrap_or(false);
             if !guard_at_header
                 && latch_pc - pc <= MAX_C0_LOOP_SPAN
-                && range_has_for_pair(code, pc, latch_pc)
+                && range_is_plain_generic_for(code, pc, latch_pc)
+                && !has_tail_exit_guard(code, latch_pc)
             {
                 if std::env::var("LUAU_NFG_TRACE").is_ok() {
                     eprintln!("NFG_C0 header={} latch={} span={}", pc, latch_pc, latch_pc - pc);
