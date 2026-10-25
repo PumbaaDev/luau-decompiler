@@ -2334,11 +2334,17 @@ fn lift_branch_region(
                 let gap_start = ranges[w[0].1].1; // end pc of the earlier run
                 let gap_end = ranges[w[1].0].0; // start pc of the later run
                 gap_start < gap_end
-                    && crate::analysis::structuring::arm_terminates(
+                    && (crate::analysis::structuring::arm_terminates(
                         &proto.code,
                         gap_start,
                         gap_end,
-                    )
+                    ) || (is_lone_forward_jump(&proto.code, gap_start, gap_end)
+                        && crate::analysis::structuring::range_is_plain_generic_for(
+                            &proto.code,
+                            span_lo,
+                            span_hi,
+                        )
+                        && std::env::var("LUAU_NO_NFG_B").is_err()))
             });
             if gaps_are_early_exit {
                 lift_structured_run(
@@ -2482,6 +2488,53 @@ fn lift_branch_region(
             lift_instruction_range(ctx, proto, proto_index, depth, start, end, regs, locals, out, in_loop);
         }
     }
+}
+
+/// Is `[start, end)` exactly one forward `JUMP`? Inside a nested for-loop that
+/// block is the `break` (or `continue` joiner) the arm's block list leaves out.
+fn is_lone_forward_jump(code: &[u32], start: usize, end: usize) -> bool {
+    end == start + 1
+        && end <= code.len()
+        && matches!(LuauOpcode::from_u8((code[start] & 0xFF) as u8), LuauOpcode::Jump)
+        && ((code[start] as i32) >> 16) >= 0
+}
+
+/// For a `while true` body (sorted block ranges, the last being the loop's
+/// latch), the pc span `[first start, latch start)` to structure as one run when
+/// a nested for-loop straddles pc gaps in the block list: no single contiguous
+/// run holds the complete prep->loop pair, the whole span does, and every hole
+/// inside it (including the one before the latch) is a RETURN-terminated block.
+fn nested_for_gap_span(
+    code: &[u32],
+    ranges: &[(usize, usize)],
+    runs: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    if ranges.len() < 2 || runs.len() < 2 {
+        return None;
+    }
+    let last = ranges.len() - 1;
+    let span_lo = ranges[0].0;
+    let span_hi = ranges[last].0;
+    if span_lo >= span_hi
+        || !crate::analysis::structuring::range_contains_nested_for(code, span_lo, span_hi)
+        || !crate::analysis::structuring::range_is_plain_generic_for(code, span_lo, span_hi)
+    {
+        return None;
+    }
+    let whole_in_one_run = runs.iter().any(|&(lo, hi)| {
+        let end = if hi == last { ranges[hi].0 } else { ranges[hi].1 };
+        ranges[lo].0 < end
+            && crate::analysis::structuring::range_contains_nested_for(code, ranges[lo].0, end)
+    });
+    if whole_in_one_run {
+        return None;
+    }
+    let holes_are_returns = ranges.windows(2).all(|w| {
+        w[0].1 == w[1].0
+            || (w[0].1 < w[1].0
+                && crate::analysis::structuring::arm_terminates(code, w[0].1, w[1].0))
+    });
+    holes_are_returns.then_some((span_lo, span_hi))
 }
 
 /// Split sorted block ranges into maximal runs of PC-adjacent ranges.
@@ -4299,7 +4352,28 @@ fn lift_region(
                 trailing_recompute: false,
             });
             let last_idx = ranges.len().saturating_sub(1);
-            for &(lo, hi) in &split_contiguous_runs(&ranges) {
+            let runs = split_contiguous_runs(&ranges);
+            // A generic-for whose FORGPREP and FORGLOOP sit in different runs
+            // (the body list has pc gaps at RETURN-terminated guard blocks) is
+            // invisible to the per-run check below. When every hole between the
+            // body blocks, up to the latch, is a RETURN-terminated early exit,
+            // the hole lies inside this loop's own pc extent and claims nothing
+            // a sibling region owns: structure the whole span once.
+            let gap_bridge = if std::env::var("LUAU_NO_NFG_A").is_ok() {
+                None
+            } else {
+                nested_for_gap_span(&proto.code, &ranges, &runs)
+            };
+            if let Some((span_lo, span_hi)) = gap_bridge {
+                liftpath(proto, "while_true_gap_bridge", span_lo, span_hi);
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, span_lo, span_hi, regs, locals,
+                    &mut body_stmts, true,
+                );
+                let (s, e) = ranges[last_idx];
+                lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
+            } else {
+            for &(lo, hi) in &runs {
                 let run_has_latch = hi == last_idx && ranges.len() > 1;
                 let run_start = ranges[lo].0;
                 let span_end = if run_has_latch { ranges[hi].0 } else { ranges[hi].1 };
@@ -4319,6 +4393,7 @@ fn lift_region(
                         lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                     }
                 }
+            }
             }
             ctx.emitted_latches.pop();
             ctx.current_loop_end = prev_loop_end;
@@ -8843,6 +8918,82 @@ fn reg_touched_in_ranges(code: &[u32], ranges: &[(usize, usize)], reg: usize) ->
 /// still counts), because the only caller uses it to decide whether to give a
 /// register a name — a false positive costs one extra `local`, a false negative
 /// loses a value.
+/// Over-approximate "is `reg` read or written in `[start, end)`": the A/B/C
+/// operand fields plus every multi-register window (CONCAT B..C, CALL/RETURN,
+/// SETLIST, the for-loop ops, NAMECALL, FASTCALL*, GETVARARGS), where any
+/// register at or above the base counts. A false positive only makes the
+/// caller keep the old behaviour; a false negative loses a value.
+fn reg_maybe_touched_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    use LuauOpcode as Op;
+    let mut i = start;
+    let end = end.min(code.len());
+    while i < end {
+        let insn = code[i];
+        let op = Op::from_u8(insn_op(insn));
+        let (a, b, c) = (insn_a(insn) as usize, insn_b(insn) as usize, insn_c(insn) as usize);
+        if a == reg || b == reg || c == reg {
+            return true;
+        }
+        let window = match op {
+            Op::Concat => reg >= b && reg <= c,
+            Op::Call | Op::Return | Op::SetList | Op::ForGPrep | Op::ForGPrepINext
+            | Op::ForGPrepNext | Op::ForGLoop | Op::Deprecated61 | Op::ForNPrep | Op::ForNLoop
+            | Op::NameCall | Op::FastCall | Op::FastCall1 | Op::FastCall2 | Op::FastCall2K
+            | Op::FastCall3 | Op::GetVarargs | Op::Capture => reg >= a,
+            _ => false,
+        };
+        if window {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Does the diamond at `pc` sit inside a loop whose back edge comes before any
+/// touch of `reg` after the merge? Then the "merge read" the arm-write seeds rely
+/// on is really a read AFTER the loop, and the register's value can reach it
+/// without passing through this diamond (an iteration that `continue`s or
+/// `break`s, or no iteration at all). Seeding a fresh `local` for the arm writes
+/// would hide those writes from the outer declaration (the register's own
+/// pre-loop local), so the arm writes must stay assignments to that local.
+/// Only generic-for back edges count: numeric-for and `while` loops (the shapes
+/// obfuscated dispatch loops are built from) keep the old seeding.
+/// Kill-switch: `LUAU_NO_NFG_D`.
+fn value_escapes_enclosing_loop(
+    code: &[u32],
+    pc: usize,
+    after_start: usize,
+    after_end: usize,
+    reg: usize,
+) -> bool {
+    if std::env::var("LUAU_NO_NFG_D").is_ok() {
+        return false;
+    }
+    let end = after_end.min(code.len());
+    let mut w = after_start;
+    while w < end {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::ForGLoop) {
+            let target = w as i64 + insn_d(code[w]) as i64 + 1;
+            if target <= pc as i64 {
+                // A register the loop already touches before this diamond is
+                // loop-carried (e.g. an upvalue copy walked by `x = x:Find(v)`):
+                // its arm writes feed the next iteration and the post-loop read,
+                // so they must not be hidden behind a fresh local.
+                if target >= 0
+                    && reg_maybe_touched_in_range(code, target as usize, pc + 1, reg)
+                {
+                    return false;
+                }
+                return !reg_maybe_touched_in_range(code, after_start, w, reg);
+            }
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
     let mut i = start;
     let end = end.min(code.len());
@@ -9126,7 +9277,8 @@ fn premateralize_branch_escapes_spans(
                 && !else_ranges.is_empty()
                 && ranges_write_reg(&proto.code, then_ranges, reg)
                 && ranges_write_reg(&proto.code, else_ranges, reg)
-                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
+                && !value_escapes_enclosing_loop(&proto.code, pc, after_start, after_end, reg);
             if unknown_seed {
                 let mut name = ctx.reg_name(proto, reg as u8, pc);
                 if opcode_handlers::is_generic_placeholder(&name) {
@@ -9216,7 +9368,8 @@ fn premateralize_branch_escapes_spans(
                 && !else_ranges.is_empty()
                 && ranges_write_reg(&proto.code, then_ranges, reg)
                 && ranges_write_reg(&proto.code, else_ranges, reg)
-                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg);
+                && merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
+                && !value_escapes_enclosing_loop(&proto.code, pc, after_start, after_end, reg);
             if bound_seed {
                 let mut name = ctx.reg_name(proto, reg as u8, pc);
                 // A generic `vN` cannot be used: chunk-wide `vN` folding

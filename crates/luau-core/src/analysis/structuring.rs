@@ -1531,6 +1531,122 @@ fn is_real_loop(
     false
 }
 
+/// Longest loop (in instructions) Shape C0 claims. Every ordinary loop measured on
+/// the 25k-file gate is under 330; the only ones past 3,000 are the dispatch loops
+/// of obfuscated bytecode VMs (hundreds of arms), where claiming the loop at its
+/// header makes the arms' pending-register state leak across joins and surfaces a
+/// `declared_never_assigned` that the old double-lift hid. Those keep the old path.
+const MAX_C0_LOOP_SPAN: usize = 2000;
+
+/// The last JUMPBACK in `(pc, end)` whose target is exactly `pc`, if any.
+fn back_edge_latch_to(code: &[u32], pc: usize, end: usize) -> Option<usize> {
+    let end = end.min(code.len());
+    let mut w = pc + 1;
+    let mut found = None;
+    while w < end {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(op, LuauOpcode::JumpBack) && w as i64 + insn_d(code[w]) as i64 + 1 == pc as i64 {
+            found = Some(w);
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    found
+}
+
+/// Does `[start, end)` hold a complete numeric or generic for prep->loop pair?
+/// (`range_contains_nested_for` also answers true for a bare back edge.)
+fn range_has_for_pair(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let d = insn_d(code[pc]) as i64;
+        let (target, loop_ops): (i64, &[LuauOpcode]) = match op {
+            LuauOpcode::ForNPrep => (pc as i64 + d, &[LuauOpcode::ForNLoop]),
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext => {
+                (pc as i64 + d + 1, &[LuauOpcode::ForGLoop, LuauOpcode::Deprecated61])
+            }
+            _ => (-1, &[]),
+        };
+        if target > pc as i64 && (target as usize) < end {
+            let top = LuauOpcode::from_u8(insn_op(code[target as usize]));
+            if loop_ops.contains(&top) {
+                return true;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Does `[start, end)` hold a complete GENERIC for pair and no numeric for at
+/// all? Obfuscated VM dispatch loops are built from numeric fors with dozens of
+/// forward JUMPs; the nested-generic-for repairs must not restructure them (the
+/// structured copy adopts bindings of the peeled first iteration).
+pub(crate) fn range_is_plain_generic_for(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut pc = start;
+    let mut generic = false;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::ForNPrep | LuauOpcode::ForNLoop) {
+            return false;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(
+            op,
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+        ) {
+            generic = true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    generic && range_has_for_pair(code, start, end)
+}
+
+/// Does the generic for sit at the very top of the loop: the first FORGPREP is
+/// within a few instructions of the header and nothing before it branches? Shape
+/// C0 targets `while true do for .. end; ..` where the for opens the body. A loop
+/// whose for follows conditional code (a `continue` skipping the exit test, a
+/// guard that decides whether the for runs) is not claimed: its flat lift keeps
+/// the tail tests and yields that C0's condition-free rebuild loses.
+fn for_prep_opens_loop_body(code: &[u32], header: usize, latch: usize) -> bool {
+    const MAX_PREFIX: usize = 12;
+    let end = latch.min(code.len());
+    let mut w = header;
+    while w < end && w <= header + MAX_PREFIX {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(
+            op,
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+        ) {
+            return true;
+        }
+        if forward_conditional_jump(op, w, code[w]).is_some() {
+            return false;
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Is the instruction run just before `latch` a forward conditional jump to
+/// `latch + 1` (a `repeat .. until c` / `while c` tail test whose back edge is the
+/// fall-through)? Shape C0 targets `if done then break end; step()`, where a
+/// statement sits between the exit test and the back edge.
+fn has_tail_exit_guard(code: &[u32], latch: usize) -> bool {
+    (latch.saturating_sub(2)..latch).any(|w| {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        forward_conditional_jump(op, w, code[w])
+            .map(|(next_pc, t)| next_pc == latch && t == latch + 1)
+            .unwrap_or(false)
+    })
+}
+
 /// Phase B0.4 + B0.5: build the nested region tree for a numeric-for body range.
 ///
 /// Scans `[body_start, body_end)` linearly, producing:
@@ -1640,6 +1756,53 @@ pub(crate) fn structure_numeric_for_body(
                     linear_start = pc;
                     continue;
                 }
+            }
+        }
+
+        // ── Shape C0: a `while true` loop whose header is reached BEFORE a
+        //    nested for-loop that sits directly in its body ─────────────────
+        //
+        // Shape C below keys off the JUMPBACK latch (or a header guard), so for
+        // `while true do for .. end; if done then break end; step() end` the
+        // scan met the nested for first, consumed it as a GenericFor region,
+        // and only then reached the latch: the loop's header was already behind
+        // `linear_start`, so the whole body (for included) was lifted a second
+        // time as flat code (loop variable never bound). Claim the loop here,
+        // at its header, as a condition-free loop: its body is structured
+        // recursively and the for is found there. A header that is itself the
+        // guard (`while c do`) is left to Shape C.
+        let c0_latch = if std::env::var("LUAU_NO_NFG_C").is_ok() {
+            None
+        } else {
+            back_edge_latch_to(code, pc, body_end)
+        };
+        if let Some(latch_pc) = c0_latch {
+            let guard_at_header = forward_conditional_jump(op, pc, insn)
+                .map(|(next_pc, t)| t > next_pc && t == latch_pc + 1)
+                .unwrap_or(false);
+            if !guard_at_header
+                && latch_pc - pc <= MAX_C0_LOOP_SPAN
+                && range_is_plain_generic_for(code, pc, latch_pc)
+                && !has_tail_exit_guard(code, latch_pc)
+                && for_prep_opens_loop_body(code, pc, latch_pc)
+            {
+                if std::env::var("LUAU_NFG_TRACE").is_ok() {
+                    eprintln!("NFG_C0 header={} latch={} span={}", pc, latch_pc, latch_pc - pc);
+                }
+                if linear_start < pc {
+                    regions.push(Region::Linear { start: linear_start, end: pc });
+                }
+                let nested_body = structure_numeric_for_body(code, pc, latch_pc, cfg, loop_headers);
+                regions.push(Region::InlineLoopInLoop {
+                    header_start: pc,
+                    cond_pc: None,
+                    body_start: pc,
+                    latch_pc,
+                    body: nested_body,
+                });
+                pc = latch_pc + 1;
+                linear_start = pc;
+                continue;
             }
         }
 

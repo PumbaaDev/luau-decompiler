@@ -135,3 +135,5 @@ mod tail_recompute_redeclared_local_tests;
 mod return_wide_list_tests;
 #[cfg(test)]
 mod loop_exit_read_carried_tests;
+#[cfg(test)]
+mod nested_for_flat_lift_tests;
