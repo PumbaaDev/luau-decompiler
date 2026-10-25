@@ -2510,12 +2510,16 @@ fn mid_body_block_at(ranges: &[(usize, usize)], from: usize, hi: usize, pc: usiz
 /// an else-skip: when the last instruction before the target is a forward `JUMP`
 /// to another mid-body block, the construct runs through that block.
 fn mid_body_branch_end_block(
+    ctx: &DecompileContext,
     code: &[u32],
     ranges: &[(usize, usize)],
     idx: usize,
     hi: usize,
 ) -> Option<usize> {
     use crate::parser::types::insn_d;
+    if !opcode_handlers::midbody_lift_enabled() {
+        return None;
+    }
     let (s, e) = ranges[idx];
     let lp = last_insn_pc(code, s, e)?;
     let op = LuauOpcode::from_u8(crate::parser::types::insn_op(code[lp]));
@@ -2579,6 +2583,21 @@ fn mid_body_branch_end_block(
     // defects the dropped code used to hide.
     if !opcode_handlers::range_has_call(code, e, end_pc) {
         return None;
+    }
+    // A register the skipped region writes and the code after it reads is a
+    // live-out value. Lifting the region as a nested `if` restores the
+    // pre-branch register view at its end, so a write that nothing pins or
+    // emits is lost and the later read sees the stale pre-branch value
+    // (`return wrap, arg2` for `arg2 = buffer` in the arm). The per-block lift
+    // carries the register file straight through and keeps that value.
+    for r in collect_body_writes(code, e, end_pc) {
+        if (e..end_pc).any(|pc| ctx.is_pinned_reg(r as u8, pc)) {
+            continue;
+        }
+        if opcode_handlers::reg_read_before_overwrite(code, end_pc, r) {
+            if std::env::var("LUAU_MIDBODY_TRACE").is_ok() { eprintln!("MIDBODY-REJECT live-out R{} span={}..{}", r, e, end_pc); }
+            return None;
+        }
     }
     Some(k)
 }
@@ -4386,7 +4405,7 @@ fn lift_region(
                         // A block-ending conditional that skips forward to a
                         // MID-BODY block is an inline `if`, not a `continue`:
                         // lift through its target so the walker sees it in range.
-                        match mid_body_branch_end_block(&proto.code, &ranges, i, hi) {
+                        match mid_body_branch_end_block(ctx, &proto.code, &ranges, i, hi) {
                             Some(k) => {
                                 if std::env::var("LUAU_MIDBODY_TRACE").is_ok() {
                                     eprintln!(

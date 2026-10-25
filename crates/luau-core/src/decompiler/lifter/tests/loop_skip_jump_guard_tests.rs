@@ -282,3 +282,91 @@ fn latch_jump_is_break_when_the_recompute_is_a_trailing_statement() {
     assert!(forward_target_is_continue(&code, 1, 4, None, plain));
     assert_eq!(lone_exit_jump_after(&code, 1, 2, None, plain), Some(true));
 }
+
+// Sae Blend `we`: the lift of `if v4 <= 0 then <call> end` re-declared the
+// register that an earlier pure literal (`result22 = 0`) lives in, under the
+// SAME name (`local result22, result23 = self:ye(..)`). Name-based inlining
+// then propagated `0` into `v4 = result22` inside the arm: a fabricated write.
+#[test]
+fn inlining_a_literal_never_rewrites_reads_of_a_shadowing_local() {
+    use crate::ast::{BinOp, Expr, Stat};
+    use crate::decompiler::lifter::post_passes::{inline_pure_literals, inline_single_use_temps};
+
+    let name = |n: &str| Expr::Name(n.to_string());
+    let arm = || {
+        vec![
+            Stat::Local {
+                names: vec!["result22".into(), "result23".into()],
+                values: vec![Expr::Call { func: Box::new(name("ye")), args: vec![] }],
+            },
+            Stat::Assign { targets: vec![name("v4")], values: vec![name("result22")] },
+        ]
+    };
+    let make = |def: Stat| {
+        vec![
+            def,
+            Stat::If {
+                condition: Expr::BinOp {
+                    left: Box::new(name("v4")),
+                    op: BinOp::LE,
+                    right: Box::new(Expr::Number(0.0)),
+                },
+                then_body: arm(),
+                elseif_clauses: vec![],
+                else_body: None,
+            },
+        ]
+    };
+    let assign = || Stat::Assign { targets: vec![name("result22")], values: vec![Expr::Number(0.0)] };
+    let local = || Stat::Local { names: vec!["result22".into()], values: vec![Expr::Number(0.0)] };
+    for def in [assign(), local()] {
+        let mut stmts = make(def);
+        inline_single_use_temps(&mut stmts);
+        inline_pure_literals(&mut stmts);
+        let Some(Stat::If { then_body, .. }) = stmts.iter().find(|s| matches!(s, Stat::If { .. })) else {
+            panic!("if lost: {stmts:?}");
+        };
+        let rendered = format!("{then_body:?}");
+        assert!(rendered.contains("Name(\"result22\")") && !rendered.contains("Number(0.0)"), "{rendered}");
+    }
+}
+
+// Sae Blend `we`: `if v4 < 101 then <exit> end` jumps to the loop-exit pad
+// (`DIVK; JUMP past the latch`), code inside the loop's pc span that is NOT a
+// body block. It leaves the loop, so it is a `break`, not a `continue`.
+#[test]
+fn jump_to_a_loop_exit_pad_is_not_a_continue() {
+    use crate::decompiler::lifter::opcode_handlers::lands_on_loop_exit_pad;
+
+    // Body blocks [0,3) [3,6); pad [6,8) is outside the body; latch [8,9)
+    // jumps back to pc 0.
+    let mut code = [0u32; 10];
+    code[8] = edge(OP_JUMPBACK, -9);
+    let body = [(0usize, 3usize), (3, 6), (8, 9)];
+    assert!(lands_on_loop_exit_pad(&code, 2, 6, Some(&body)), "pad target");
+    assert!(!lands_on_loop_exit_pad(&code, 2, 3, Some(&body)), "body block target");
+    assert!(!lands_on_loop_exit_pad(&code, 2, 8, Some(&body)), "latch target");
+    assert!(!lands_on_loop_exit_pad(&code, 2, 6, None), "no body known");
+}
+
+// ClientSynchronizer `k`: an arm writes a parameter register (`GETIMPORT R1`)
+// that the code after the arm returns. A nested-`if` lift restores the
+// pre-branch view and loses it, so the widening must leave such arms alone.
+#[test]
+fn live_out_register_is_read_before_overwrite() {
+    use crate::decompiler::lifter::opcode_handlers::reg_read_before_overwrite;
+    use crate::parser::opcodes::LuauOpcode;
+
+    let abc = |op: LuauOpcode, a: u32, b: u32, c: u32| (op as u32) | (a << 8) | (b << 16) | (c << 24);
+    // pc0: MOVE R5 R1 (reads R1, writes R5)   pc1: MOVE R1 R7 (overwrites R1)
+    // pc2: MOVE R6 R1 (reads the NEW R1)
+    let code = [
+        abc(LuauOpcode::Move, 5, 1, 0),
+        abc(LuauOpcode::Move, 1, 7, 0),
+        abc(LuauOpcode::Move, 6, 1, 0),
+    ];
+    assert!(reg_read_before_overwrite(&code, 0, 1), "read at pc0");
+    assert!(!reg_read_before_overwrite(&code, 1, 1), "overwritten before the pc2 read");
+    assert!(reg_read_before_overwrite(&code, 2, 1), "read at pc2");
+    assert!(!reg_read_before_overwrite(&code, 0, 9), "never touched");
+}
