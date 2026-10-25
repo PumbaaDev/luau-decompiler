@@ -975,6 +975,7 @@ fn inline_single_use_temps_scoped(
             // The reader re-declares the name in a nested scope: its read may be
             // of the inner binding, which the substitution would overwrite.
             if super::opcode_handlers::midbody_lift_enabled()
+                && is_inlinable_literal(&def_expr)
                 && stmt_redeclares_name(&stmts[j], &def_name)
             {
                 i += 1;
