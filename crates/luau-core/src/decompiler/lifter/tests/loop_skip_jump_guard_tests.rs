@@ -370,3 +370,58 @@ fn live_out_register_is_read_before_overwrite() {
     assert!(reg_read_before_overwrite(&code, 2, 1), "read at pc2");
     assert!(!reg_read_before_overwrite(&code, 0, 9), "never touched");
 }
+
+// Inline-if lift gate: regions the lift renders wrongly must fall back.
+mod region_gate {
+    use super::{edge, jump};
+    use crate::decompiler::lifter::mid_body_region_unsafe;
+    use crate::parser::opcodes::LuauOpcode;
+
+    fn op(o: LuauOpcode) -> u32 {
+        o as u32
+    }
+
+    #[test]
+    fn return_in_region_is_unsafe() {
+        let code = [op(LuauOpcode::LoadNil), op(LuauOpcode::Return), op(LuauOpcode::LoadNil)];
+        assert!(mid_body_region_unsafe(&code, 0, 2, None, 0));
+    }
+
+    #[test]
+    fn branch_leaving_region_is_unsafe() {
+        // pc1 jumps to pc5, past the region end (pc3).
+        let code = [0u32, edge(op(LuauOpcode::JumpIf), 3), 0, 0, 0, 0];
+        assert!(mid_body_region_unsafe(&code, 0, 3, None, 0));
+    }
+
+    #[test]
+    fn plain_straight_region_is_safe() {
+        let code = [op(LuauOpcode::LoadNil), op(LuauOpcode::LoadNil), 0];
+        assert!(!mid_body_region_unsafe(&code, 0, 2, None, 0));
+    }
+
+    #[test]
+    fn else_skip_jump_itself_is_allowed() {
+        let code = [op(LuauOpcode::LoadNil), jump(2), op(LuauOpcode::LoadB), 0, 0];
+        // LoadNil writes R0 in arm one; LoadB writes R0 in arm two: merge.
+        assert!(mid_body_region_unsafe(&code, 0, 4, Some(1), 2));
+    }
+}
+
+#[test]
+fn nested_branch_in_region_is_unsafe() {
+    use crate::decompiler::lifter::mid_body_region_unsafe;
+    use crate::parser::opcodes::LuauOpcode;
+    // pc1 is a conditional inside the region that lands inside it (pc3 < end 4).
+    let code = [0u32, edge(LuauOpcode::JumpIf as u32, 1), 0, 0, 0];
+    assert!(mid_body_region_unsafe(&code, 0, 4, None, 0));
+}
+
+#[test]
+fn guard_block_value_chain_is_unsafe() {
+    use crate::decompiler::lifter::mid_body_region_unsafe;
+    use crate::parser::opcodes::LuauOpcode;
+    // `a and b` chain: a conditional inside the guard block, before its final jump.
+    let code = [0u32, edge(LuauOpcode::JumpIfNot as u32, 2), 0, 0, 0, 0];
+    assert!(mid_body_region_unsafe(&code, 0, 4, None, 4));
+}

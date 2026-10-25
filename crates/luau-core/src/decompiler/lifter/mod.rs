@@ -2545,6 +2545,11 @@ fn mid_body_branch_end_block(
     if target <= e as i64 {
         return None;
     }
+    // A branch inside the guard block itself is an `a and b` value chain (a
+    // value-select), which the straight lift reads wrongly.
+    if mid_body_region_unsafe(code, s, lp, None, lp) {
+        return None;
+    }
     let mut k = mid_body_block_at(ranges, idx + 1, hi, target as usize)?;
     // The back edge itself: a latch block may hold real code before it.
     let (ls, le) = ranges[ranges.len() - 1];
@@ -2561,6 +2566,7 @@ fn mid_body_branch_end_block(
         LuauOpcode::Jump => Some(arm_last as i64 + insn_d(code[arm_last]) as i64 + 1),
         _ => None,
     };
+    let else_start = ranges[k].0;
     let mut skip_pc = None;
     if let Some(t2) = arm_target.filter(|&t2| t2 > ranges[k].0 as i64 && t2 < latch_start as i64) {
         // Lone mid-body JUMP: the else arm runs from the target to `t2`.
@@ -2572,6 +2578,9 @@ fn mid_body_branch_end_block(
         k = k2;
     }
     let end_pc = ranges[k].0;
+    if mid_body_region_unsafe(code, e, end_pc, skip_pc, else_start) {
+        return None;
+    }
     // An arm that jumps to a mid-body pc past the construct (a shared tail, an
     // `a or b` join) is not a diamond; leave it to the per-block lift.
     if branch_escapes_mid_body(code, e, end_pc, skip_pc, latch_start) {
@@ -2600,6 +2609,52 @@ fn mid_body_branch_end_block(
         }
     }
     Some(k)
+}
+
+/// Shapes the inline-`if` lift renders wrongly (reviewed against bytecode):
+/// a RETURN in the region, any branch leaving the region forward (it prints as
+/// `continue` and skips the code the bytecode runs next), and an else-skip whose
+/// two arms write the same register (and now any nested branch) (a value merge: the lift writes the other
+/// arm's expression into the call result's register). `arm_end` is the else
+/// target (start of the second arm).
+fn mid_body_region_unsafe(
+    code: &[u32],
+    from: usize,
+    to: usize,
+    skip_pc: Option<usize>,
+    arm_end: usize,
+) -> bool {
+    use crate::parser::types::{insn_d, insn_e, insn_op};
+    let mut pc = from;
+    while pc < to.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if op == LuauOpcode::Return {
+            return true;
+        }
+        if Some(pc) != skip_pc && opcode_handlers::is_control_flow_op(op) {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            if t > to as i64 {
+                return true;
+            }
+            // Any other branch inside the region is a nested construct (merge
+            // joins, `a and b or c` selections, chained guards): the straight
+            // lift fabricates writes or `continue`s there. Only call/straight
+            // regions, and the alias's own else-skip, are lifted inline.
+            return true;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    if skip_pc.is_some() {
+        let first = collect_body_writes(code, from, arm_end);
+        let second = collect_body_writes(code, arm_end, to);
+        if first.iter().any(|r| second.contains(r)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Does any branch in `[from, to)` (but `skip_pc`) go backward (an inner loop)
