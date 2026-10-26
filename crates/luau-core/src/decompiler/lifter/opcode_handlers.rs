@@ -56,6 +56,7 @@ use super::{
     sanitize_leaked_global_string,
     simplify_expr,
     premateralize_branch_escapes_split,
+    nil_tail_call_arm_reg,
     store_complex,
     table_expr,
     // Recursive closure lifting — called on every `NewClosure` opcode.
@@ -1076,6 +1077,95 @@ fn fold_or_link_condition(
     Some((cond, exit))
 }
 
+/// `a and <value> or c` over computed values compiles to
+///
+/// ```text
+///     JUMPIF*  cond -> ELSE        ; cond false: take the `or` arm
+///     <THEN: computes Rx>
+///     JUMPIF   Rx   -> JOIN        ; Rx truthy: keep it, skip the `or` arm
+/// ELSE: <pure arithmetic into Rx>  ; reached from the cond jump AND from the
+///                                  ; fall-through when Rx was falsy
+/// JOIN:
+/// ```
+///
+/// The `then` arm ends in a conditional jump PAST the arm (`target`), which the
+/// arm lift discards, so the `or` arm ran unconditionally after the `if`.
+/// Returns `JOIN` when the shape matches, so the caller can lift the `then` arm
+/// as `[then_start, JOIN)` (its own `JUMPIF` then becomes an inline
+/// `if not Rx then <ELSE> end`) with ELSE also as the plain else arm. ELSE is
+/// duplicated in the output, so it must be straight-line, call-free arithmetic
+/// that nothing else jumps into.
+fn cond_else_skip_join(code: &[u32], then_start: usize, target: usize, end: usize) -> Option<usize> {
+    if std::env::var("LUAU_NO_COND_ELSE_SKIP").is_ok() {
+        return None;
+    }
+    if target <= then_start + 1 || target > code.len() {
+        return None;
+    }
+    let last_pc = target - 1;
+    let last = code[last_pc];
+    let lop = LuauOpcode::from_u8(insn_op(last));
+    if !matches!(lop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+        return None;
+    }
+    let join = (last_pc as i32 + insn_d(last) as i32 + 1) as usize;
+    if join <= target || join > end || join > code.len() {
+        return None;
+    }
+    // The tested register must be computed by the arm itself.
+    let reg = insn_a(last) as usize;
+    let mut computed = false;
+    let mut pc = then_start;
+    while pc < last_pc {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if is_control_flow_op(op) {
+            return None;
+        }
+        if insn_a(code[pc]) as usize == reg {
+            computed = true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if !computed {
+        return None;
+    }
+    // ELSE: call-free arithmetic and loads only.
+    let mut pc = target;
+    let mut has_arith = false;
+    while pc < join {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        match op {
+            LuauOpcode::Add | LuauOpcode::Sub | LuauOpcode::Mul | LuauOpcode::Div
+            | LuauOpcode::Pow | LuauOpcode::AddK | LuauOpcode::SubK | LuauOpcode::MulK
+            | LuauOpcode::DivK | LuauOpcode::PowK | LuauOpcode::SubRK | LuauOpcode::DivRK => {
+                has_arith = true;
+            }
+            LuauOpcode::LoadN | LuauOpcode::LoadK | LuauOpcode::LoadB | LuauOpcode::Move => {}
+            _ => return None,
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if !has_arith {
+        return None;
+    }
+    // Nothing may jump into the middle of ELSE.
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if is_control_flow_op(op) {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            if t > target as i64 && t < join as i64 {
+                return None;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    Some(join)
+}
+
 fn detect_else_skip(
     code: &[u32],
     then_start: usize,
@@ -1461,6 +1551,52 @@ fn reg_is_open_ref_capture(code: &[u32], upto_pc: usize, a: usize) -> bool {
     open
 }
 
+/// Will `reg`, as written by the instruction at `pc`, be captured BY REFERENCE
+/// before anything else rewrites or releases it?
+///
+/// Such a value is observed through the closure's upvalue, so it has no
+/// register-file reader the lazy inliner can see: parking it (a leaf-leaf
+/// `BinOp` such as `ADDK R8 R9 + K` looks inlinable) drops the write and the
+/// closure reads a never-assigned local (HugePartyUtil `isOver = now + 90`).
+/// The scan is linear and stops at the next write of `reg`, a `CLOSEUPVALS`
+/// that releases it, or a `RETURN`.
+///
+/// Only a capture that some forward jump SKIPS counts (the first capture sits
+/// in a conditional arm): that is where the parked value is lost at the join.
+/// When every path reaches the capture, the existing flush-at-capture logic
+/// already materialises the value at its first use.
+pub(super) fn reg_ref_captured_ahead(code: &[u32], pc: usize, reg: usize) -> bool {
+    let first = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if first.has_aux() { 2 } else { 1 };
+    let mut furthest_jump = 0usize;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        match op {
+            LuauOpcode::Capture => {
+                if insn_a(insn) == 1 && insn_b(insn) as usize == reg {
+                    return furthest_jump > i;
+                }
+            }
+            LuauOpcode::CloseUpvals if (insn_a(insn) as usize) <= reg => return false,
+            LuauOpcode::Return => return false,
+            _ => {
+                if insn_writes_regs(code, i).contains(&reg) {
+                    return false;
+                }
+                if is_control_flow_op(op) {
+                    let target = i as i64 + 1 + ((insn >> 16) as u16 as i16) as i64;
+                    if target > i as i64 {
+                        furthest_jump = furthest_jump.max(target as usize);
+                    }
+                }
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Forward-looking twin of [`reg_is_open_ref_capture`]: the pc of the first
 /// `CLOSEUPVALS` at or after `from_pc` whose A operand closes `reg`
 /// (`A <= reg`), or `code.len()` when the capture stays open to the end of
@@ -1552,6 +1688,92 @@ fn pinned_write_consumed(
     });
     regs[a] = RegVal::Expr(Expr::Name(bound));
     true
+}
+
+/// Inline lift of `r = c and f(..) or nil`:
+/// `JUMPIFNOT c -> L; ..; CALL Rr .. 1; JUMPIF Rr -> L+1; L: LOADNIL Rr`.
+///
+/// The arm defines `r` (its old value is dead on both edges), so it starts a
+/// fresh binding. The generic inline-if path lifts the arm as a block-scoped
+/// `local`, then lets the LOADNIL park nil over the register, so the join reads
+/// a name nothing assigns. Returns the pc to resume at (the LOADNIL, which the
+/// caller's LOADNIL handler then skips) once the selection has been emitted.
+#[allow(clippy::too_many_arguments)]
+fn lift_nil_tail_call_select(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    in_loop: bool,
+    branch_pc: usize,
+    jump_next: usize,
+    target: usize,
+    guard: &Expr,
+) -> Option<usize> {
+    if !super::nil_tail_gate::enabled(proto) {
+        return None;
+    }
+    let code = &proto.code;
+    let r = nil_tail_call_arm_reg(code, jump_next - 1, branch_pc, target)?;
+    if r >= regs.len()
+        || !locals.is_non_param(r)
+        || !super::nil_tail_gate::register_value_is_replaceable(&regs[r])
+    {
+        return None;
+    }
+    let regs_snapshot = regs.clone();
+    locals.forget_binding(r);
+    regs[r] = RegVal::Unknown;
+    let mut then_stmts = Vec::new();
+    // The arm ends with the `JUMPIF Rr` that skips the LOADNIL; it is the
+    // selection itself, not arm code.
+    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, target - 1, regs, locals, &mut then_stmts, in_loop);
+    let bound = match (&regs[r], then_stmts.last()) {
+        (RegVal::Expr(Expr::Name(n)), Some(Stat::Local { names, values }))
+            if names.len() == 1 && names[0] == *n && values.len() == 1 =>
+        {
+            Some((n.clone(), values[0].clone()))
+        }
+        _ => None,
+    };
+    *regs = regs_snapshot;
+    let Some((name, value)) = bound else {
+        // Unrecognised arm: emit it as the plain guarded block and let the
+        // LOADNIL handler run as before.
+        stmts.push(Stat::If { condition: guard.clone(), then_body: then_stmts, elseif_clauses: vec![], else_body: None });
+        return Some(target);
+    };
+    if then_stmts.len() == 1 {
+        let selected = Expr::BinOp {
+            left: Box::new(Expr::BinOp {
+                left: Box::new(guard.clone()),
+                op: BinOp::And,
+                right: Box::new(value),
+            }),
+            op: BinOp::Or,
+            right: Box::new(Expr::Nil),
+        };
+        stmts.push(Stat::Local { names: vec![name.clone()], values: vec![selected] });
+    } else {
+        // The arm needs statements of its own (materialised argument calls):
+        // keep them in a real if/else over one declaration.
+        let last = then_stmts.len() - 1;
+        then_stmts[last] = Stat::Assign { targets: vec![Expr::Name(name.clone())], values: vec![value] };
+        stmts.push(Stat::Local { names: vec![name.clone()], values: Vec::new() });
+        stmts.push(Stat::If {
+            condition: guard.clone(),
+            then_body: then_stmts,
+            elseif_clauses: vec![],
+            else_body: Some(vec![Stat::Assign { targets: vec![Expr::Name(name.clone())], values: vec![Expr::Nil] }]),
+        });
+    }
+    regs[r] = RegVal::Expr(Expr::Name(name));
+    ctx.default_merged_loads.insert((proto_index, target));
+    super::nil_tail_gate::note_fired(proto);
+    Some(target)
 }
 
 /// Restore the pre-branch register view after an arm, optionally KEEPING values
@@ -1741,7 +1963,7 @@ fn bind_arm_merge_seeds(
 /// list so an unrecognised or Roblox-extension opcode counts as a definition:
 /// stopping the scan early under-counts reads, which is the safe direction —
 /// it keeps the historical park-the-literal behaviour.
-fn insn_defines_reg_a(op: LuauOpcode) -> bool {
+pub(super) fn insn_defines_reg_a(op: LuauOpcode) -> bool {
     !matches!(
         op,
         LuauOpcode::Nop
@@ -2585,6 +2807,10 @@ pub(super) fn lift_instruction_range(
             regs.resize(max_reg + 8, RegVal::Unknown);
         }
 
+        if ctx.preloaded_exit_loads.contains(&(proto_index, pc)) {
+            pc += 1;
+            continue;
+        }
         match op {
             LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::Coverage
             | LuauOpcode::NativeCall | LuauOpcode::CloseUpvals
@@ -2786,6 +3012,25 @@ pub(super) fn lift_instruction_range(
                     }
                     pc += 1;
                     continue;
+                }
+                // A copy of an overlapped-diamond shadow (`MOVE R4 R5` after the
+                // `a and <arith> or c` join) must be a real local when R5 is
+                // rewritten while R4 is still read: the rewrite is emitted as an
+                // assignment to the shared name and would change the alias.
+                if let Expr::Name(n) = &src_expr {
+                    if b != a
+                        && (super::is_overlap_seed(proto, n) || super::is_cond_join(proto, pc))
+                        && super::move_alias_goes_stale(code, pc, a, b)
+                    {
+                        // A FRESH name: the register's own earlier binding may still
+                        // be read by pending expressions (`v42 + 0.46832`).
+                        let fresh = ctx.gen_scoped_name(&format!("sel{}", a));
+                        let copy_name = locals.reseed_shadow(a, &fresh);
+                        stmts.push(Stat::Local { names: vec![copy_name.clone()], values: vec![src_expr] });
+                        regs[a] = RegVal::Expr(Expr::Name(copy_name));
+                        pc += 1;
+                        continue;
+                    }
                 }
                 match &src_expr {
                     Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
@@ -5809,6 +6054,19 @@ pub(super) fn lift_instruction_range(
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &condition,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
+
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join
@@ -6165,6 +6423,26 @@ pub(super) fn lift_instruction_range(
                     // out-of-range handler and becomes a spurious `break`.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
+                    let (then_end, else_range) = match (else_range, cond_else_skip_join(code, jump_next, target, end)) {
+                        (None, Some(join)) => {
+                            super::note_cond_join(proto, pc, join);
+                            (join, Some((target, join)))
+                        }
+                        other => (then_end, other.0),
+                    };
+
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &guard_cond,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
@@ -6385,6 +6663,19 @@ pub(super) fn lift_instruction_range(
                     // the else body is lifted as if it were unconditional.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
+
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &guard_cond,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore

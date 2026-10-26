@@ -95,3 +95,66 @@ fn drop_baby_helper_length_link_does_not_write_the_upvalue() {
 end",
     );
 }
+
+const CHANNEL_FOR: &[u8] = include_bytes!("fixtures/or_guard_typeof_link_channel_for.luac");
+
+/// SAE `Notifications.channelFor` (proto 0, pc7/pc15): both links of
+/// `if typeof(t) ~= "table" or typeof(t.Show) ~= "function" then warn(..)
+/// return nil end return t` park a `typeof` call and test it with a
+/// JUMPXEQKS compare. The call-link gate only took JUMPIF/JUMPIFNOT tests and
+/// no FASTCALL1 in the preamble, so the guard was not recognised and the plain
+/// fallback emitted two nested ifs, dropping the whole warn / `return nil`
+/// body (3 calls).
+#[test]
+fn typeof_compare_links_keep_the_warn_and_nil_return_body() {
+    let out = decompiled(CHANNEL_FOR);
+    assert_has(
+        &out,
+        "    if typeof(tbl[arg1]) ~= \"table\" or typeof(tbl[arg1].Show) ~= \"function\" then
+        local result = tostring(arg1)
+        local formatted = (\"Alerts.Raise addressed an unknown notification channel: %*\"):format(result)
+        warn(formatted)
+        return nil
+    end
+    return tbl[arg1]",
+    );
+}
+
+const DR_SCRAMBLE: &[u8] = include_bytes!("fixtures/or_guard_loop_elseif_dr_scramble.luac");
+
+/// SAE `DrScrambleSequence.setRiftShown` (proto 10): inside the FORGPREP loop
+/// `if v:IsA("BasePart") then .. elseif v:IsA("ParticleEmitter") or
+/// v:IsA("Beam") or v:IsA("Light") then .. end`. Both arms contain a value
+/// join (`arg2 and 0 or 1`, `arg3[v] ~= nil and arg3[v] or true`). Cutting the
+/// loop body into regions at those joins left the first `if`'s jump to the
+/// elseif (pc10 -> 18) and the or-chain's last exit (pc35 -> 49) past the end
+/// of their range; the elseif arm and its three IsA calls were dropped.
+#[test]
+fn loop_elseif_or_chain_keeps_its_arm_and_all_three_isa_links() {
+    let out = decompiled(DR_SCRAMBLE);
+    assert!(
+        out.contains("v:IsA(\"ParticleEmitter\")")
+            && out.contains("v:IsA(\"Beam\")")
+            && out.contains("v:IsA(\"Light\")")
+            && out.contains("v.Enabled = "),
+        "elseif arm lost:\n{out}"
+    );
+    assert!(
+        !out.contains("emitted 3 fewer call"),
+        "call recovery still reports a loss:\n{out}"
+    );
+}
+
+/// Same proto: the `if arg2 then Enabled = arg3[v] ~= nil .. else
+/// v.Enabled = false end` after the `or` chain (pc36 JUMPIFNOT R1 -> pc46, then
+/// LOADB false / SETTABLEKS Enabled) must keep its else write instead of
+/// collapsing to `if not arg2 then continue end`.
+#[test]
+fn loop_elseif_or_chain_keeps_the_enabled_false_else_write() {
+    let out = decompiled(DR_SCRAMBLE);
+    assert!(
+        out.contains("v.Enabled = false"),
+        "else write v.Enabled = false lost:
+{out}"
+    );
+}

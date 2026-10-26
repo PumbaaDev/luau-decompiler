@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod phase_b03_numeric_for_tests;
+mod loop_exit_preload_tests;
 #[cfg(test)]
 mod phase_b042_control_flow_polish_tests;
 #[cfg(test)]
@@ -88,6 +89,7 @@ mod branch_arm_for_recovery_tests;
 mod branch_merge_reg_tests;
 mod default_load_merge_tests;
 #[cfg(test)]
+mod ref_capture_arith_init_tests;
 mod ref_capture_write_pin_tests;
 #[cfg(test)]
 mod capture_param_global_upval_tests;
@@ -137,4 +139,10 @@ mod return_wide_list_tests;
 mod loop_exit_read_carried_tests;
 #[cfg(test)]
 mod nested_for_flat_lift_tests;
+#[cfg(test)]
+mod dispatch_tail_for_tests;
 mod declared_never_assigned_ternary_tests;
+#[cfg(test)]
+mod andor_nil_call_join_tests;
+mod while_true_if_else_body_tests;
+mod combine7r_regression_tests;

@@ -1405,7 +1405,17 @@ fn is_call_link_block(code: &[u32], block: &BasicBlock) -> bool {
         return false;
     }
     let bop = LuauOpcode::from_u8(insn_op(code[branch_pc]));
-    if !matches!(bop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+    // `typeof(x) ~= "table"` tests the call result with a JUMPXEQK* compare
+    // instead of a truthiness jump; the operand is still register A.
+    if !matches!(
+        bop,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    ) {
         return false;
     }
     let tested = insn_a(code[branch_pc]) as usize;
@@ -1415,7 +1425,14 @@ fn is_call_link_block(code: &[u32], block: &BasicBlock) -> bool {
     while i < branch_pc && i < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[i]));
         match op {
-            LuauOpcode::NameCall => {}
+            // A builtin fast path (`typeof`, `type`, `math.*`) sits in front of
+            // the CALL it shortcuts; it only parks the same value.
+            LuauOpcode::NameCall
+            | LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3 => {}
             LuauOpcode::Call => {
                 calls += 1;
                 // C == 2: exactly one result.
@@ -1451,6 +1468,103 @@ fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
         i += if op.has_aux() { 2 } else { 1 };
     }
     is_conditional_branch_op(LuauOpcode::from_u8(insn_op(code[branch_pc])))
+}
+
+/// Where does the arm `[arm_start, target)` leave by its closing unconditional
+/// JUMP, when that JUMP lands past `target` (so `target` starts an else /
+/// elseif part)? `None` when the arm does not end in such a JUMP.
+fn arm_exit_jump_target(code: &[u32], arm_start: usize, target: usize) -> Option<usize> {
+    let mut k = arm_start;
+    let mut last = None;
+    while k < target && k < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        last = Some((k, op));
+        k += if op.has_aux() { 2 } else { 1 };
+    }
+    match last {
+        Some((k, LuauOpcode::Jump)) => {
+            let dest = k as i64 + insn_d(code[k]) as i64 + 1;
+            (dest > target as i64).then_some(dest as usize)
+        }
+        _ => None,
+    }
+}
+
+/// Is it safe to keep the join of the open arm `[.., target)` in the flat span,
+/// given that the arm leaves by a JUMP to `exit` and `[target, exit)` is the
+/// else / elseif part?
+///
+/// The flat lift copes with an else part that is straight-line, and with an
+/// elseif chain whose arms all leave the span (`exit == end`: a loop body's
+/// last statement). An else part with branches of its own inside a span that
+/// carries on past `exit` (an or-guard body, a selection chain followed by more
+/// code) is only lifted correctly when the span is cut at the join: kept flat,
+/// the guard or the chain's other arms are lost or a fabricated chain is
+/// emitted (AdoptMe OfferPane `_start_fade_promise`, BloxFruits Skyjump,
+/// PetSimulator99 Egg_Opening_Frontend before `WaitClick`).
+fn else_part_keeps_flat_lift(code: &[u32], target: usize, exit: usize, end: usize) -> bool {
+    if exit == end {
+        return true;
+    }
+    let mut k = target;
+    while k < exit && k < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        if is_conditional_branch_op(op) {
+            return false;
+        }
+        k += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
+/// Longest value join `value_join_inside_open_arm` keeps whole: one and/or
+/// ternary. A longer join (a multi-way `a and 7 or b and 14 or 21`) lifted flat
+/// inside the arm loses an arm (RIVALS MiscellaneousController).
+const OPEN_ARM_JOIN_MAX_INSNS: usize = 6;
+
+/// Does the value join entered at `vj_pc` (ending at `join_start`) sit inside
+/// the then-arm of an if/else (or elseif) started in `[span_start, vj_pc)`,
+/// whose else part starts past the join?
+///
+/// Cutting the flat span at such a join leaves that jump as the last
+/// instruction of its range with its target out of range, and the enclosing
+/// construct (an if/else diamond, an `a or b` chain) is lifted as a bare
+/// `continue` guard instead.
+fn value_join_inside_open_arm(
+    code: &[u32],
+    span_start: usize,
+    vj_pc: usize,
+    join_start: usize,
+    end: usize,
+) -> bool {
+    let mut j = span_start;
+    // Targets of the forward conditionals seen so far: a second conditional
+    // skipping to the same else is another `and` operand of the SAME test, and
+    // the flat lift of that chain mislifts a join inside it (SAE
+    // `SetLogLevel`), so only the first operand to reach a given else counts.
+    // Earlier conditionals with other targets (an elseif chain's `or` links)
+    // do not disqualify it (SAE `setRiftShown`: `if arg2 then .. else
+    // v.Enabled = false end` after an `or` chain).
+    let mut seen_targets: Vec<usize> = Vec::new();
+    while j < vj_pc && j < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[j]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        if let Some((next_pc, target)) = forward_conditional_jump(op, j, code[j]) {
+            if target > join_start
+                && target <= end
+                && next_pc == vj_pc
+                && join_start - vj_pc <= OPEN_ARM_JOIN_MAX_INSNS
+                && !seen_targets.contains(&target)
+                && arm_exit_jump_target(code, next_pc, target)
+                    .is_some_and(|exit| else_part_keeps_flat_lift(code, target, exit, end))
+            {
+                return true;
+            }
+            seen_targets.push(target);
+        }
+        j += size;
+    }
+    false
 }
 
 /// Upper bounds that keep `find_or_guard_body` a local pattern, not a search.
@@ -1792,6 +1906,48 @@ fn for_prep_opens_loop_body(code: &[u32], header: usize, latch: usize) -> bool {
 /// `latch + 1` (a `repeat .. until c` / `while c` tail test whose back edge is the
 /// fall-through)? Shape C0 targets `if done then break end; step()`, where a
 /// statement sits between the exit test and the back edge.
+/// Does `[start, end)` hold a three-MOVE register swap (`T=A; A=B; B=T`, i.e.
+/// `a, b = b, a`)? Such a loop carries two registers that trade values every
+/// iteration. The `repeat` lift names registers by alias, so the swap and the
+/// pending tables behind it come out as `table.insert({}, v)` / `tbl = table.clear`
+/// (Fusion `Graph/change`): leave those loops to the older path.
+fn range_has_register_swap(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut moves: Vec<(usize, usize)> = Vec::new(); // (a, b) of the last MOVEs in a row
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if op == LuauOpcode::Move {
+            moves.push((insn_a(code[pc]) as usize, insn_b(code[pc]) as usize));
+            let n = moves.len();
+            if n >= 3 {
+                let (t, a1) = moves[n - 3];
+                let (a2, b2) = moves[n - 2];
+                let (b3, t3) = moves[n - 1];
+                if a1 == a2 && b2 == b3 && t3 == t && t != a1 && t != b2 && a1 != b2 {
+                    return true;
+                }
+            }
+        } else {
+            moves.clear();
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// PC of the forward conditional jump that sits immediately before `latch` and
+/// targets `latch + 1` (the `until` test of a `repeat`, or a `while` tail test),
+/// if any. `has_tail_exit_guard` is the boolean form of the same question.
+fn tail_exit_test_pc(code: &[u32], latch: usize) -> Option<usize> {
+    (latch.saturating_sub(2)..latch).find(|&w| {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        forward_conditional_jump(op, w, code[w])
+            .map(|(next_pc, t)| next_pc == latch && t == latch + 1)
+            .unwrap_or(false)
+    })
+}
+
 fn has_tail_exit_guard(code: &[u32], latch: usize) -> bool {
     (latch.saturating_sub(2)..latch).any(|w| {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
@@ -1897,7 +2053,12 @@ pub(crate) fn structure_numeric_for_body(
                 let join_start = cfg.blocks.get(&vj.join).map(|b| b.start).unwrap_or(body_end);
                 // Must be wholly inside the range being scanned, or the region
                 // would claim instructions this call is not responsible for.
-                if join_start <= body_end {
+                // A join inside the arm of an open conditional stays in the flat
+                // span: cutting it there strands that conditional's target past
+                // the range and its other arm / `or` links are dropped.
+                if join_start <= body_end
+                    && !value_join_inside_open_arm(code, linear_start, pc, join_start, body_end)
+                {
                     if linear_start < pc {
                         regions.push(Region::Linear { start: linear_start, end: pc });
                     }
@@ -1934,6 +2095,41 @@ pub(crate) fn structure_numeric_for_body(
             let guard_at_header = forward_conditional_jump(op, pc, insn)
                 .map(|(next_pc, t)| t > next_pc && t == latch_pc + 1)
                 .unwrap_or(false);
+            // `repeat <for ..> until c`: the exit test sits right before the latch.
+            // The old shape (`if done then break end; step()`) has a statement
+            // between test and latch and is handled below; this one is a loop
+            // whose BODY ends at the test, claimed at its header and lifted as
+            // `repeat .. until` (see `lifter/inline_tail_loop.rs`).
+            let tail_test = if std::env::var("LUAU_NO_NFG_C1").is_ok() {
+                None
+            } else {
+                tail_exit_test_pc(code, latch_pc)
+            };
+            if let Some(cp) = tail_test.filter(|&cp| {
+                !guard_at_header
+                    && cp > pc
+                    && latch_pc - pc <= MAX_C0_LOOP_SPAN
+                    && range_is_plain_generic_for(code, pc, cp)
+                    && !range_has_register_swap(code, pc, cp)
+            }) {
+                if std::env::var("LUAU_NFG_TRACE").is_ok() {
+                    eprintln!("NFG_C1 header={} test={} latch={}", pc, cp, latch_pc);
+                }
+                if linear_start < pc {
+                    regions.push(Region::Linear { start: linear_start, end: pc });
+                }
+                let nested_body = structure_numeric_for_body(code, pc, cp, cfg, loop_headers);
+                regions.push(Region::InlineLoopInLoop {
+                    header_start: pc,
+                    cond_pc: Some(cp),
+                    body_start: pc,
+                    latch_pc,
+                    body: nested_body,
+                });
+                pc = latch_pc + 1;
+                linear_start = pc;
+                continue;
+            }
             if !guard_at_header
                 && latch_pc - pc <= MAX_C0_LOOP_SPAN
                 && range_is_plain_generic_for(code, pc, latch_pc)
