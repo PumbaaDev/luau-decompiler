@@ -2992,6 +2992,7 @@ pub(super) fn lift_instruction_range(
                 }
 
                 let name = ctx.upval_name(proto, proto_index, b as u8);
+                ctx.stored_upvalue_names.entry(proto_index).or_default().insert(name.clone());
                 // B0.127: sanitize stdlib-name strings in assignment value.
                 emit_assign(stmts, Expr::Name(name), sanitize_leaked_global_string(reg_expr(regs, a)));
             }

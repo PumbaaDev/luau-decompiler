@@ -229,6 +229,9 @@ pub struct DecompileContext<'a> {
     /// or from usage-based analysis for the main proto (which has no parent).
     /// Keyed by proto index in chunk.protos for O(1) lookup.
     pub inferred_upvalue_names: std::collections::HashMap<usize, Vec<String>>,
+    /// Names a proto's SETUPVAL instructions store to. A store to one of
+    /// these is observable outside the proto, so it is never a dead store.
+    pub stored_upvalue_names: std::collections::HashMap<usize, std::collections::HashSet<String>>,
     /// Per-proto naming context, keyed by proto index.
     /// Each proto gets its own namespace to avoid cross-proto counter inflation.
     proto_naming: std::collections::HashMap<usize, ProtoNaming>,
@@ -333,6 +336,7 @@ impl<'a> DecompileContext<'a> {
             used_names: std::collections::HashSet::new(),
             proto_stack: Vec::new(),
             inferred_upvalue_names: std::collections::HashMap::new(),
+            stored_upvalue_names: std::collections::HashMap::new(),
             proto_naming: std::collections::HashMap::new(),
             current_proto_index: None,
             upval_parent_links: std::collections::HashMap::new(),

@@ -13,6 +13,7 @@ use crate::parser::types::*;
 
 mod naming;
 mod retired_scope;
+mod upvalue_live;
 use naming::{WriteKind, LocalTracker, is_semantic_local_name};
 pub(crate) use naming::RegVal;
 
@@ -1806,7 +1807,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    eliminate_dead_stores(&mut stmts);
+    eliminate_dead_stores_for_proto(&mut stmts, ctx.stored_upvalue_names.get(&proto_index));
     retired_scope::fix_retired_scopes(&mut stmts, &naming::retired_fresh_names());
     pass_probe(proto, "eliminate_dead_stores", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
@@ -7341,7 +7342,24 @@ fn call_already_emitted(stmts: &[Stat], skip: usize, kept: &Stat) -> bool {
 
 // ---------------------------------------------------------------------------
 /// Also recursively processes nested statements in control flow.
+#[cfg(test)]
 fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
+    eliminate_dead_stores_with(stmts, &HashSet::new());
+}
+
+/// Dead-store elimination for a finished proto body. A store to an upvalue
+/// (a SETUPVAL target of this proto) or to a name some closure
+/// in the body refers to is observable by code this block cannot see, so it
+/// is never dead: `flag = true; work(); flag = false` keeps both stores.
+fn eliminate_dead_stores_for_proto(stmts: &mut Vec<Stat>, stored_upvalues: Option<&HashSet<String>>) {
+    let mut protected = upvalue_live::closure_free_names(stmts);
+    if let Some(names) = stored_upvalues {
+        protected.extend(names.iter().cloned());
+    }
+    eliminate_dead_stores_with(stmts, &protected);
+}
+
+fn eliminate_dead_stores_with(stmts: &mut Vec<Stat>, protected: &HashSet<String>) {
     let mut i = 0;
     while i < stmts.len() {
         let should_remove = {
@@ -7377,6 +7395,13 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
                                 // Stops on any read (including through control flow).
                                 other => {
                                     if stmt_reads_name(other, var_name) {
+                                        break;
+                                    }
+                                    // A store to an upvalue or closure-shared name is
+                                    // live across anything that can observe it.
+                                    if protected.contains(var_name)
+                                        && upvalue_live::stat_may_observe(other)
+                                    {
                                         break;
                                     }
                                     // Statement doesn't read the variable — safe to continue.
@@ -7417,19 +7442,19 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
             // Recursively process nested statements
             match &mut stmts[i] {
                 Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                    eliminate_dead_stores(then_body);
+                    eliminate_dead_stores_with(then_body, protected);
                     for (_, body) in elseif_clauses.iter_mut() {
-                        eliminate_dead_stores(body);
+                        eliminate_dead_stores_with(body, protected);
                     }
                     if let Some(ref mut eb) = else_body {
-                        eliminate_dead_stores(eb);
+                        eliminate_dead_stores_with(eb, protected);
                     }
                 }
                 Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
-                    eliminate_dead_stores(body);
+                    eliminate_dead_stores_with(body, protected);
                 }
                 Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
-                    eliminate_dead_stores(body);
+                    eliminate_dead_stores_with(body, protected);
                 }
                 _ => {}
             }
@@ -13657,6 +13682,50 @@ mod dead_store_call_tests {
         eliminate_dead_stores(&mut stmts);
         assert_eq!(stmts.len(), 3);
         assert!(matches!(&stmts[0], Stat::ExprStat(Expr::Call { .. })));
+    }
+
+    fn protected(n: &str) -> HashSet<String> {
+        std::iter::once(n.to_string()).collect()
+    }
+
+    /// `flag = true; work(); flag = false` where `flag` is an upvalue: the call
+    /// can observe the first store, so it is not dead.
+    #[test]
+    fn upvalue_store_before_a_call_is_live() {
+        let call = Stat::ExprStat(Expr::Call { func: Box::new(name("work")), args: vec![] });
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("flag")], values: vec![Expr::Bool(true)] },
+            call,
+            Stat::Assign { targets: vec![name("flag")], values: vec![Expr::Bool(false)] },
+        ];
+        eliminate_dead_stores_with(&mut stmts, &protected("flag"));
+        assert_eq!(stmts.len(), 3);
+    }
+
+    /// Nothing between the two stores can observe the first: still dead.
+    #[test]
+    fn upvalue_store_overwritten_with_only_pure_statements_between_is_dead() {
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("flag")], values: vec![Expr::Bool(true)] },
+            Stat::Local { names: vec!["p".into()], values: vec![Expr::Field { object: Box::new(name("game")), field: "Players".into() }] },
+            Stat::Assign { targets: vec![name("flag")], values: vec![Expr::Bool(false)] },
+        ];
+        eliminate_dead_stores_with(&mut stmts, &protected("flag"));
+        assert_eq!(stmts.len(), 2);
+    }
+
+    /// A closure created between the stores may read the first value later.
+    #[test]
+    fn local_store_before_closure_creation_is_live_when_closure_uses_it() {
+        let closure = Expr::Function { params: vec![], is_vararg: false, body: vec![Stat::Return { values: vec![name("x")] }] };
+        let mut stmts = vec![
+            Stat::Assign { targets: vec![name("x")], values: vec![Expr::Number(1.0)] },
+            Stat::Local { names: vec!["f".into()], values: vec![closure] },
+            Stat::Assign { targets: vec![name("x")], values: vec![Expr::Number(2.0)] },
+        ];
+        let captured = upvalue_live::closure_free_names(&stmts);
+        eliminate_dead_stores_with(&mut stmts, &captured);
+        assert_eq!(stmts.len(), 3);
     }
 
     #[test]

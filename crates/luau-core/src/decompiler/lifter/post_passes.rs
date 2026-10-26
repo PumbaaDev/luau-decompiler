@@ -1014,6 +1014,12 @@ fn inline_single_use_temps_scoped(
                 (stmt_reads_name_deep(s, &def_name) && !stmt_reads_name(s, &def_name))
                     || (stmt_writes_name(s, &def_name)
                         && !stmt_writes_name_recursive(s, &def_name))
+                    // A literal flag whose only writer is a closure passed as a
+                    // call argument (`task.spawn(function() flag = true end)`)
+                    // must not be folded into its one read: `while not flag`
+                    // would become `while true`.
+                    || (is_inlinable_literal(&def_expr)
+                        && super::upvalue_live::stat_has_closure_writing(s, &def_name))
             });
             if captured_by_closure {
                 i += 1;
@@ -1427,6 +1433,9 @@ pub(super) fn inline_pure_literals(stmts: &mut Vec<Stat>) {
             (stmt_reads_name_deep(s, &def_name) && !stmt_reads_name(s, &def_name))
                 || (stmt_writes_name(s, &def_name)
                     && !stmt_writes_name_recursive(s, &def_name))
+                // `task.spawn(function() flag = true end)`: the closure is a
+                // call argument, which `stmt_writes_name` does not enter.
+                || super::upvalue_live::stat_has_closure_writing(s, &def_name)
         });
         if captured_by_closure {
             i += 1;
