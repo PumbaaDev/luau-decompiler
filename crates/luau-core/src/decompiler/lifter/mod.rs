@@ -2622,17 +2622,25 @@ fn mid_body_branch_end_block(
     };
     let else_start = ranges[k].0;
     let mut skip_pc = None;
+    let mut value_join = false;
     if let Some(t2) = arm_target.filter(|&t2| t2 > ranges[k].0 as i64 && t2 < latch_start as i64) {
         // Lone mid-body JUMP: the else arm runs from the target to `t2`.
-        if arm_last != e {
-            return None;
-        }
+        // A longer straight-line arm ending in that JUMP is an if/else whose
+        // arms both run on into the join (`local x = c and a or f()` and its
+        // statement forms), accepted by `mid_body_region_unsafe` when each arm
+        // is call/straight code.
+        value_join = arm_last != e;
         let k2 = mid_body_block_at(ranges, k + 1, hi, t2 as usize)?;
         skip_pc = Some(arm_last);
         k = k2;
+    } else if arm_target == Some(latch_start as i64) && arm_last >= e {
+        // The arm ends in a JUMP straight to the loop's JUMPBACK: the lifted
+        // arm prints `...; continue`, and the other arm (the code from the
+        // branch target on) falls into the JUMPBACK and is lifted per block.
+        skip_pc = Some(arm_last);
     }
     let end_pc = ranges[k].0;
-    if mid_body_region_unsafe(code, e, end_pc, skip_pc, else_start) {
+    if mid_body_region_unsafe_ex(code, e, end_pc, skip_pc, else_start, value_join) {
         return None;
     }
     // An arm that jumps to a mid-body pc past the construct (a shared tail, an
@@ -2644,7 +2652,13 @@ fn mid_body_branch_end_block(
     // `continue` reading dropped. A call-free region (the arithmetic arms of an
     // obfuscated dispatch loop) gains nothing and only exposes structuring
     // defects the dropped code used to hide.
-    if !opcode_handlers::range_has_call(code, e, end_pc) {
+    // A value-join whose arms only compute the value is a call argument when
+    // the join block makes the call (`f(c and x or y)`): that call is the code
+    // the `continue` reading dropped.
+    let join_has_call = value_join
+        && skip_pc.is_some()
+        && opcode_handlers::range_has_call(code, end_pc, ranges[k].1);
+    if !opcode_handlers::range_has_call(code, e, end_pc) && !join_has_call {
         return None;
     }
     // A register the skipped region writes and the code after it reads is a
@@ -2653,7 +2667,21 @@ fn mid_body_branch_end_block(
     // emits is lost and the later read sees the stale pre-branch value
     // (`return wrap, arg2` for `arg2 = buffer` in the arm). The per-block lift
     // carries the register file straight through and keeps that value.
+    let both_arms: Vec<usize> = if value_join {
+        let first = collect_body_writes(code, e, else_start);
+        collect_body_writes(code, else_start, end_pc)
+            .into_iter()
+            .filter(|r| first.contains(r))
+            .collect()
+    } else {
+        Vec::new()
+    };
     for r in collect_body_writes(code, e, end_pc) {
+        // A register BOTH arms write is the if/else value being joined: the
+        // arm lift binds it at the merge, so the join's read is not stale.
+        if value_join && both_arms.contains(&r) {
+            continue;
+        }
         if (e..end_pc).any(|pc| ctx.is_pinned_reg(r as u8, pc)) {
             continue;
         }
@@ -2678,6 +2706,19 @@ fn mid_body_region_unsafe(
     skip_pc: Option<usize>,
     arm_end: usize,
 ) -> bool {
+    mid_body_region_unsafe_ex(code, from, to, skip_pc, arm_end, false)
+}
+
+/// `value_join` accepts an else-skip whose two arms write the same register
+/// (an if/else value merge); the arms are still call/straight code only.
+fn mid_body_region_unsafe_ex(
+    code: &[u32],
+    from: usize,
+    to: usize,
+    skip_pc: Option<usize>,
+    arm_end: usize,
+    value_join: bool,
+) -> bool {
     use crate::parser::types::{insn_d, insn_e, insn_op};
     let mut pc = from;
     while pc < to.min(code.len()) {
@@ -2701,7 +2742,7 @@ fn mid_body_region_unsafe(
         }
         pc += 1 + op.has_aux() as usize;
     }
-    if skip_pc.is_some() {
+    if skip_pc.is_some() && !value_join {
         let first = collect_body_writes(code, from, arm_end);
         let second = collect_body_writes(code, arm_end, to);
         if first.iter().any(|r| second.contains(r)) {

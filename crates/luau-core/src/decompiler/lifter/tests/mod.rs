@@ -138,3 +138,5 @@ mod loop_exit_read_carried_tests;
 #[cfg(test)]
 mod nested_for_flat_lift_tests;
 mod declared_never_assigned_ternary_tests;
+#[cfg(test)]
+mod while_true_if_else_body_tests;
