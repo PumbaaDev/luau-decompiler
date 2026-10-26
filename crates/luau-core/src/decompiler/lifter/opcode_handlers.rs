@@ -1551,6 +1551,52 @@ fn reg_is_open_ref_capture(code: &[u32], upto_pc: usize, a: usize) -> bool {
     open
 }
 
+/// Will `reg`, as written by the instruction at `pc`, be captured BY REFERENCE
+/// before anything else rewrites or releases it?
+///
+/// Such a value is observed through the closure's upvalue, so it has no
+/// register-file reader the lazy inliner can see: parking it (a leaf-leaf
+/// `BinOp` such as `ADDK R8 R9 + K` looks inlinable) drops the write and the
+/// closure reads a never-assigned local (HugePartyUtil `isOver = now + 90`).
+/// The scan is linear and stops at the next write of `reg`, a `CLOSEUPVALS`
+/// that releases it, or a `RETURN`.
+///
+/// Only a capture that some forward jump SKIPS counts (the first capture sits
+/// in a conditional arm): that is where the parked value is lost at the join.
+/// When every path reaches the capture, the existing flush-at-capture logic
+/// already materialises the value at its first use.
+pub(super) fn reg_ref_captured_ahead(code: &[u32], pc: usize, reg: usize) -> bool {
+    let first = LuauOpcode::from_u8(insn_op(code[pc]));
+    let mut i = pc + if first.has_aux() { 2 } else { 1 };
+    let mut furthest_jump = 0usize;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        match op {
+            LuauOpcode::Capture => {
+                if insn_a(insn) == 1 && insn_b(insn) as usize == reg {
+                    return furthest_jump > i;
+                }
+            }
+            LuauOpcode::CloseUpvals if (insn_a(insn) as usize) <= reg => return false,
+            LuauOpcode::Return => return false,
+            _ => {
+                if insn_writes_regs(code, i).contains(&reg) {
+                    return false;
+                }
+                if is_control_flow_op(op) {
+                    let target = i as i64 + 1 + ((insn >> 16) as u16 as i16) as i64;
+                    if target > i as i64 {
+                        furthest_jump = furthest_jump.max(target as usize);
+                    }
+                }
+            }
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Forward-looking twin of [`reg_is_open_ref_capture`]: the pc of the first
 /// `CLOSEUPVALS` at or after `from_pc` whose A operand closes `reg`
 /// (`A <= reg`), or `code.len()` when the capture stays open to the end of
