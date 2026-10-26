@@ -1510,7 +1510,10 @@ fn value_join_inside_open_arm(
     // Targets of the forward conditionals seen so far: a second conditional
     // skipping to the same else is another `and` operand of the SAME test, and
     // the flat lift of that chain mislifts a join inside it (SAE
-    // `SetLogLevel`), so only the first operand counts.
+    // `SetLogLevel`), so only the first operand to reach a given else counts.
+    // Earlier conditionals with other targets (an elseif chain's `or` links)
+    // do not disqualify it (SAE `setRiftShown`: `if arg2 then .. else
+    // v.Enabled = false end` after an `or` chain).
     let mut seen_targets: Vec<usize> = Vec::new();
     while j < vj_pc && j < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[j]));
@@ -1520,7 +1523,7 @@ fn value_join_inside_open_arm(
                 && target <= end
                 && next_pc == vj_pc
                 && join_start - vj_pc <= OPEN_ARM_JOIN_MAX_INSNS
-                && seen_targets.is_empty()
+                && !seen_targets.contains(&target)
                 && arm_skips_past_with_jump(code, next_pc, target)
             {
                 return true;

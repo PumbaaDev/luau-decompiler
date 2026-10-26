@@ -144,3 +144,17 @@ fn loop_elseif_or_chain_keeps_its_arm_and_all_three_isa_links() {
         "call recovery still reports a loss:\n{out}"
     );
 }
+
+/// Same proto: the `if arg2 then Enabled = arg3[v] ~= nil .. else
+/// v.Enabled = false end` after the `or` chain (pc36 JUMPIFNOT R1 -> pc46, then
+/// LOADB false / SETTABLEKS Enabled) must keep its else write instead of
+/// collapsing to `if not arg2 then continue end`.
+#[test]
+fn loop_elseif_or_chain_keeps_the_enabled_false_else_write() {
+    let out = decompiled(DR_SCRAMBLE);
+    assert!(
+        out.contains("v.Enabled = false"),
+        "else write v.Enabled = false lost:
+{out}"
+    );
+}
