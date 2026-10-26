@@ -84,6 +84,16 @@ pub(super) fn detect(code: &[u32], prep_pc: usize, loop_pc: usize) -> Option<Exi
         LuauOpcode::LoadB if insn_c(insn) == 0 => Expr::Bool(insn_b(insn) != 0),
         _ => return None,
     };
+    // The join must test R itself (JUMPIF/JUMPIFNOT R): otherwise the next
+    // statement is unrelated and R's value after the loop is not what is read.
+    let join_word = code[join];
+    let join_tests_reg = matches!(
+        LuauOpcode::from_u8(insn_op(join_word)),
+        LuauOpcode::JumpIf | LuauOpcode::JumpIfNot
+    ) && insn_a(join_word) as usize == reg;
+    if !join_tests_reg {
+        return None;
+    }
     if join_has_other_preds(code, prep_pc, loop_pc, join) {
         return None;
     }

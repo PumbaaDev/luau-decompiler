@@ -87,3 +87,20 @@ fn break_arm_flag_survives_to_the_post_loop_guard() {
     assert!(source.contains("return arg1"), "guarded return lost:\n{source}");
     assert!(source.contains("return arg2"), "continuation lost:\n{source}");
 }
+
+/// AdoptMe VehicleClient: the join is the NEXT statement (a LOADN here), not a
+/// test of the flag, so hoisting the flag load would lose the flag's value.
+#[test]
+fn join_that_does_not_test_the_flag_is_not_preloaded() {
+    let mut code = flag_loop_code(false);
+    code[9] = ad(OP_LOADN, 6, 7); // join no longer reads R5
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
+    assert!(found.is_none(), "join must test the flag register");
+}
+
+#[test]
+fn join_that_tests_the_flag_is_preloaded() {
+    let code = flag_loop_code(false);
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
+    assert!(found.is_some());
+}
