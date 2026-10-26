@@ -9744,7 +9744,7 @@ fn premateralize_branch_escapes_spans(
                 && arm_ranges
                     .iter()
                     .filter(|(s, e)| e > s)
-                    .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg));
+                    .any(|&(s, e)| merge_first_touch_is_read(&proto.code, s, e, reg));
             let bound_seed = (matches!(
                 regs.get(reg),
                 Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
