@@ -1309,6 +1309,87 @@ fn is_for_loop_body_head(cfg: &ControlFlowGraph, code: &[u32], b: usize) -> bool
     has_prep_pred && has_loop_pred
 }
 
+/// Is `b` entered only from a `for` loop's prep block and its own back edge
+/// (FORNPREP / FORGPREP and FORNLOOP / FORGLOOP), in any pc order?
+fn is_for_loop_entry_join(cfg: &ControlFlowGraph, code: &[u32], b: usize) -> bool {
+    let Some(blk) = cfg.blocks.get(&b) else { return false };
+    let is_prep = |p: &usize| {
+        cfg.blocks.get(p).map_or(false, |pb| {
+            pb.branch_pc.map_or(false, |pc| {
+                pc < code.len()
+                    && matches!(
+                        LuauOpcode::from_u8(insn_op(code[pc])),
+                        LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+                    )
+            })
+        })
+    };
+    let is_back = |p: &usize| {
+        cfg.blocks.get(p).map_or(false, |pb| block_ends_in_for_loop_back_edge(code, pb))
+    };
+    blk.predecessors.iter().any(is_prep)
+        && blk.predecessors.iter().all(|p| is_prep(p) || is_back(p))
+}
+
+/// Do two or more predecessors of `entry` each write the register `entry`'s
+/// branch tests, one of them through a multi-edge default-write block?
+///
+/// Then the tested value is a JOIN of per-path writes (`a and a:IsA("T") and
+/// a.Value` parked into one register), which the guard lifter cannot see: the
+/// register reads as `nil`, the guard is constant true, and its body swallows
+/// the continuation (SAE EnchantedPond overWater).
+fn tested_reg_is_value_join(cfg: &ControlFlowGraph, code: &[u32], entry: usize) -> bool {
+    let Some(eb) = cfg.blocks.get(&entry) else { return true };
+    let Some(bpc) = eb.branch_pc else { return true };
+    if bpc >= code.len() {
+        return true;
+    }
+    let reg = insn_a(code[bpc]);
+    let writers: Vec<usize> = eb.predecessors.iter().copied().filter(|p| {
+        let Some(pb) = cfg.blocks.get(p) else { return true };
+        let mut i = pb.start;
+        while i < pb.end.min(code.len()) {
+            let op = LuauOpcode::from_u8(insn_op(code[i]));
+            if insn_a(code[i]) == reg
+                && matches!(
+                    op,
+                    LuauOpcode::LoadNil
+                        | LuauOpcode::LoadB
+                        | LuauOpcode::LoadN
+                        | LuauOpcode::LoadK
+                        | LuauOpcode::Move
+                        | LuauOpcode::GetUpval
+                        | LuauOpcode::GetGlobal
+                        | LuauOpcode::GetImport
+                        | LuauOpcode::GetTable
+                        | LuauOpcode::GetTableKS
+                        | LuauOpcode::GetTableN
+                        | LuauOpcode::NameCall
+                        | LuauOpcode::Call
+                        | LuauOpcode::NewTable
+                        | LuauOpcode::DupTable
+                        | LuauOpcode::NewClosure
+                        | LuauOpcode::Not
+                        | LuauOpcode::Minus
+                        | LuauOpcode::Length
+                )
+            {
+                return true;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    }).collect();
+    // A single `if/else` diamond writing the register is materialised as a
+    // named local by the lifter (SAE ManorGateTimer `Hitbox2`) and the guard
+    // reads it fine. A CHAIN (`a and a:IsA(T) and a.Value`: several tests
+    // jumping to one default-write block) is not.
+    writers.len() >= 2
+        && writers
+            .iter()
+            .any(|w| cfg.blocks.get(w).map_or(true, |b| b.predecessors.len() >= 2))
+}
+
 /// A non-entry OR-guard link whose only effect beyond pure value parking is
 /// ONE call whose result is the very register the link's branch tests
 /// (`x:IsA("T")` in `if not (a and a:IsA("T")) then ... end`).
@@ -1404,8 +1485,25 @@ fn find_or_guard_body(
     {
         return None;
     }
+    // A join entry (several predecessors that are not a `for` body head) tests
+    // a register fed by a value join the lifter cannot see here: it reads as
+    // `nil`, the guard is constant true, and its body swallows the
+    // continuation (SAE EnchantedPond overWater). Leave those to the general
+    // structurer.
+    let join_entry = eb.predecessors.len() > 1
+        && !is_for_loop_entry_join(cfg, code, entry)
+        && tested_reg_is_value_join(cfg, code, entry);
     for &head in &[eb.successors[1], eb.successors[0]] {
         if let Some(found) = or_guard_with_head(cfg, code, entry, head, handled, loop_headers) {
+            if join_entry {
+                if std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
+                    eprintln!(
+                        "ORGUARD-JOINDECLINE entry={} len={} links={:?} body={:?} cont={}",
+                        entry, code.len(), found.0, found.1, found.2
+                    );
+                }
+                return None;
+            }
             return Some(found);
         }
     }

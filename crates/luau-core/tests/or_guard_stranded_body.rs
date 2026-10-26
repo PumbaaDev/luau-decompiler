@@ -82,3 +82,53 @@ fn call_link_guard_does_not_duplicate_the_body() {
     assert_eq!(src.matches("tbl3.onCancel(").count(), 1, "onCancel call duplicated");
     assert_eq!(src.matches("tbl3.onFinish(").count(), 3, "onFinish call duplicated");
 }
+
+/// `local ok = a and a:IsA("X") and a.Value` feeds an OR guard whose entry is a
+/// value JOIN (several predecessors, not a loop head). The lifter has no value
+/// for the joined register there, so the guard condition read `not nil`, was
+/// constant true, and the guard body (`return arg2`) swallowed the whole loop
+/// that follows (SAE EnchantedPond overWater). Only a `for` loop body head may
+/// be an OR-guard entry with several predecessors.
+#[test]
+fn value_join_entry_guard_does_not_swallow_the_continuation() {
+    let dir = std::env::var_os("LUAU_SAE_BC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Users/jep/AppData/Local/Potassium/workspace/sae_fresh_bc_2026-10-24"));
+    let Ok(bytes) = std::fs::read(
+        dir.join("ReplicatedStorage.Client.ShrineFusionSequences.EnchantedPond__1a41592a.luac"),
+    ) else {
+        eprintln!("SKIP: bytecode absent");
+        return;
+    };
+    let opts = DecompileOptions { v10plus: V10PlusMode::DetectorFallback, ..Default::default() };
+    let src = decompile_with_options(&bytes, &opts).expect("decompile");
+    let start = src.find("local function overWater").expect("overWater present");
+    let body = &src[start..];
+    let end = body.find("\nend\n").expect("overWater end");
+    let body = &body[..end];
+    for needle in ["math.max", "Magnitude", "table.insert(", "return tbl"] {
+        assert!(body.contains(needle), "overWater lost `{needle}`:\n{body}");
+    }
+}
+
+/// A parked `x and 1 or 0` that no later code reads keeps its historical dead
+/// store: dropping it left a sibling function's unbound `v2` read undeclared
+/// (a new declared_never_assigned row in SAE AssetBillboardController).
+#[test]
+fn dead_parked_ternary_keeps_its_store_across_an_if() {
+    let dir = std::env::var_os("LUAU_SAE_BC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Users/jep/AppData/Local/Potassium/workspace/sae_fresh_bc_2026-10-24"));
+    let Ok(bytes) = std::fs::read(dir.join(
+        "ReplicatedStorage.Controllers.Game.Plots.ActiveAssetsController.AssetBillboardController__dfcf50e2.luac",
+    )) else {
+        eprintln!("SKIP: bytecode absent");
+        return;
+    };
+    let opts = DecompileOptions { v10plus: V10PlusMode::DetectorFallback, ..Default::default() };
+    let src = decompile_with_options(&bytes, &opts).expect("decompile");
+    assert!(
+        src.contains("local v2 = self.TargetVisible and 1 or 0"),
+        "dead ternary store dropped:\n{src}"
+    );
+}

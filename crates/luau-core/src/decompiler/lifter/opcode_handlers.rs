@@ -7397,6 +7397,26 @@ pub(super) fn reg_dead_after_branch(code: &[u32], branch_pc: usize, reg: usize) 
             || !reg_live_after_ex(code, target as usize, reg, 0, 0, true))
 }
 
+/// Is `reg` never read at or after `from` (before something overwrites it)?
+pub(super) fn reg_dead_from(code: &[u32], from: usize, reg: usize) -> bool {
+    !reg_live_after_ex(code, from, reg, 0, 0, true)
+}
+
+/// Is `reg` unread from `from` to the END of the function, by position as well
+/// as by flow? A flow walk alone misses reads that only another edge into the
+/// code below reaches (an arm jumping past a merge block that just returns).
+pub(super) fn reg_unread_from_to_end(code: &[u32], from: usize, reg: usize) -> bool {
+    let mut pc = from;
+    while pc < code.len() {
+        if !reg_dead_from(code, pc, reg) {
+            return false;
+        }
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
 /// Is `reg` possibly read at or after `from` before something overwrites it?
 ///
 /// Walks the control-flow graph from `from` (both successors of every
@@ -7469,6 +7489,12 @@ fn reg_live_after_ex(
                         return true;
                     }
                 }
+                LuauOpcode::SetTableKS if exact => {
+                    // C is the slot hint, not a register.
+                    if !in_range && (a == reg || b == reg) {
+                        return true;
+                    }
+                }
                 LuauOpcode::GetTableKS | LuauOpcode::NameCall if exact => {
                     if !in_range && b == reg {
                         return true;
@@ -7489,6 +7515,23 @@ fn reg_live_after_ex(
                 }
                 _ => {
                     if !in_range && (a == reg || b == reg || c == reg) {
+                        return true;
+                    }
+                    // The compare-and-jump family keeps its second operand
+                    // register in the AUX word.
+                    if exact
+                        && !in_range
+                        && matches!(
+                            op,
+                            LuauOpcode::JumpIfEq
+                                | LuauOpcode::JumpIfLE
+                                | LuauOpcode::JumpIfLT
+                                | LuauOpcode::JumpIfNotEq
+                                | LuauOpcode::JumpIfNotLE
+                                | LuauOpcode::JumpIfNotLT
+                        )
+                        && (code.get(i + 1).copied().unwrap_or(0) as usize & 0xff) == reg
+                    {
                         return true;
                     }
                 }

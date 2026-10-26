@@ -4126,7 +4126,47 @@ fn lift_region(
             // but correct — after an if/else, only values that are the
             // same on both paths are guaranteed to hold.
             set_merge_site(*cond_pc, *merge_pc);
+            // A parked and/or ternary both arms left alone survives the join
+            // only when something reads it later. A register that is dead at
+            // the merge keeps the historical reset: its dead store used to be
+            // written back, and dropping it left a sibling function's
+            // unbound read of the same name undeclared (SAE
+            // AssetBillboardController `v2`).
+            // "Dead" must hold on EVERY edge leaving the arms, not only at
+            // the merge: an arm can jump past a merge block that just returns
+            // (SAE PlotClient), straight into code that reads the ternary.
+            let arm_exits: Vec<usize> = then_region
+                .iter()
+                .chain(else_region.iter())
+                .chain(std::iter::once(cond_pc))
+                .filter_map(|id| cfg.blocks.get(id))
+                .flat_map(|b| b.successors.iter().copied())
+                .filter(|s| !then_region.contains(s) && !else_region.contains(s))
+                .filter_map(|s| cfg.blocks.get(&s).map(|b| b.start))
+                .collect();
+            let dead_ternaries: Vec<usize> = match merge_pc {
+                Some(mpc) => regs
+                    .iter()
+                    .zip(regs_after_then.iter())
+                    .enumerate()
+                    .filter(|(i, (a, b))| {
+                        matches!(a, RegVal::Expr(Expr::Ternary { .. }))
+                            && matches!(b, RegVal::Expr(Expr::Ternary { .. }))
+                            && opcode_handlers::reg_unread_from_to_end(&proto.code, *mpc, *i)
+                            && arm_exits
+                                .iter()
+                                .all(|&pc| opcode_handlers::reg_dead_from(&proto.code, pc, *i))
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+                None => Vec::new(),
+            };
             merge_regs(regs, &regs_after_then, &regs_before);
+            for &i in &dead_ternaries {
+                if matches!(regs.get(i), Some(RegVal::Expr(Expr::Ternary { .. }))) {
+                    regs[i] = RegVal::Unknown;
+                }
+            }
 
             // B0.116: Import-guard MethodCall propagation.
             // Roblox bytecode uses GETIMPORT + guard + NAMECALL + CALL for
@@ -4277,7 +4317,7 @@ fn lift_region(
                             (RegVal::Expr(t), RegVal::Expr(e)) => (t.clone(), e.clone()),
                             _ => continue,
                         };
-                        if exprs_structurally_equal(&t, &e) {
+                        if exprs_structurally_equal(&t, &e) && !dead_ternaries.contains(&i) {
                             continue;
                         }
                         // Every path must assign, or this becomes the rejected
