@@ -5197,7 +5197,14 @@ fn lift_region(
             // `regs[a..=a+2]` — this recovers `for k, v in next, t do` style
             // iterators where the compiler never emits a CALL because the
             // three-value iterator triple is already in the right registers.
-            let iter_exprs = absorb_iterator_setup(stmts, regs, a);
+            // Folding the iterator call into the `for` header deletes its
+            // `local`. If a closure created after the loop captures that
+            // local (CAPTURE of the call-result register or of an alias of
+            // it), the upvalue would then name a binding that no longer
+            // exists, so keep the local and iterate over it.
+            let iter_local_captured_later = iterator_local_captured_after(code, *loop_pc, regs, a);
+            let iter_exprs =
+                absorb_iterator_setup(stmts, regs, a, !iter_local_captured_later);
             // First iterator is the generator expression used by name-inference
             // below; the whole vec is what we emit into `Stat::GenericFor`.
             let primary_iter = iter_exprs
@@ -11054,6 +11061,45 @@ fn premateralize_loop_carried(
     }
 }
 
+/// Is the register holding a generic-for's iterator call result (register `a`,
+/// or any register aliasing the same binding) captured by a closure created
+/// after the loop (`loop_pc` is the FORGLOOP)? The scan for a register stops at
+/// the next write to it.
+fn iterator_local_captured_after(
+    code: &[u32],
+    loop_pc: usize,
+    regs: &[RegVal],
+    a: usize,
+) -> bool {
+    let Some(RegVal::Expr(Expr::Name(iter_name))) = regs.get(a) else {
+        return false;
+    };
+    let from = loop_pc
+        + if LuauOpcode::from_u8(insn_op(code[loop_pc])).has_aux() { 2 } else { 1 };
+    let aliases: Vec<usize> = regs
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v, RegVal::Expr(Expr::Name(n)) if n == iter_name))
+        .map(|(r, _)| r)
+        .collect();
+    aliases.into_iter().any(|reg| {
+        let mut i = from;
+        while i < code.len() {
+            let insn = code[i];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            if op == LuauOpcode::Capture {
+                if insn_a(insn) <= 1 && insn_b(insn) as usize == reg {
+                    return true;
+                }
+            } else if opcode_handlers::insn_writes_regs(code, i).contains(&reg) {
+                return false;
+            }
+            i += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    })
+}
+
 /// Try to absorb the iterator setup from the preceding statement for a generic
 /// for-loop.  When a CALL immediately precedes FORGPREP, the emitted code
 /// typically looks like `local v5, v6, v7 = pairs(t)`.  We want to fold that
@@ -11077,8 +11123,17 @@ fn premateralize_loop_carried(
 /// There is *no* `CALL` in this shape — the compiler has already set up the
 /// three-value iterator triple in registers — so the absorb path fails and
 /// pre-Phase-B0.7 would render it as `for k, v in next do`, losing the table.
-fn absorb_iterator_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], a: usize) -> Vec<Expr> {
-    if let Some(RegVal::Expr(Expr::Name(reg_name))) = regs.get(a) {
+/// `allow_absorb` is false when a later closure captures the call-result local:
+/// the `local` must then survive, so the call is not folded into the header.
+fn absorb_iterator_setup(
+    stmts: &mut Vec<Stat>,
+    regs: &[RegVal],
+    a: usize,
+    allow_absorb: bool,
+) -> Vec<Expr> {
+    if !allow_absorb {
+        // fall through to the register-triple fallback below
+    } else if let Some(RegVal::Expr(Expr::Name(reg_name))) = regs.get(a) {
         let reg_name = reg_name.clone();
         if let Some(last) = stmts.last() {
             // Extract the first assigned name and the value expression
@@ -12997,7 +13052,13 @@ fn collapse_method_chains(stmts: &mut Vec<Stat>) {
         if let Some(is_same_name) = chain_info {
             if !is_same_name {
                 // For different-name chains, verify prev_name isn't read later
-                let used_later = stmts[i + 2..].iter().any(|s| stmt_reads_name(s, &prev_name));
+                // A closure body that captures `prev_name` is a read too:
+                // `stmt_reads_name` does not descend into `Expr::Function`, so a
+                // call result captured by a later closure looked unused and the
+                // declaration was deleted, leaving the upvalue undeclared.
+                let used_later = stmts[i + 2..].iter().any(|s| {
+                    stmt_reads_name(s, &prev_name) || stmt_reads_name_deep(s, &prev_name)
+                });
                 if used_later {
                     i += 1;
                     continue;

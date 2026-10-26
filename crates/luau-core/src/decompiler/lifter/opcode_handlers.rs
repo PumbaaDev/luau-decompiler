@@ -724,7 +724,7 @@ fn reg_maybe_live(code: &[u32], start: usize, reg: usize) -> bool {
 /// minus the FASTCALL family: their A is a builtin id, not a register (the
 /// builtin's result lands in the CALL that follows). Counting it as a write
 /// made `math.abs`'s id 2 look like a write of R2 (PropsBillboardSlider).
-fn insn_writes_regs(code: &[u32], pc: usize) -> Vec<usize> {
+pub(super) fn insn_writes_regs(code: &[u32], pc: usize) -> Vec<usize> {
     let op = LuauOpcode::from_u8(insn_op(code[pc]));
     if matches!(
         op,

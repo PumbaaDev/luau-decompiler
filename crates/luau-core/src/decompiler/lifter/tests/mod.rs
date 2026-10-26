@@ -146,3 +146,4 @@ mod declared_never_assigned_ternary_tests;
 mod andor_nil_call_join_tests;
 mod while_true_if_else_body_tests;
 mod combine7r_regression_tests;
+mod capture_blind_inline_tests;
