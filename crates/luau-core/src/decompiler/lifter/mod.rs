@@ -6392,7 +6392,14 @@ pub(super) fn store_complex(
         && ctx.is_pinned_reg(reg as u8, pc);
 
     let clobbered_before_use = field_read_clobbered_before_use(ctx, proto, pc, reg, &value);
+    // Only an ARITHMETIC first value needs this: its leaf-leaf shape is the one
+    // `expr_is_inlinable` parks. Gated on the register not already holding a
+    // bound name so existing pinned/carried paths are untouched.
+    let is_ref_captured_arith = matches!(value, Expr::BinOp { .. })
+        && !matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::LoopVar(_)))
+        && opcode_handlers::reg_ref_captured_ahead(&proto.code, pc, reg);
     if !is_self_mutation && !is_pinned_loop_carried && !clobbered_before_use
+        && !is_ref_captured_arith
         && expr_is_inlinable(&value)
     {
         regs[reg] = RegVal::Expr(value);

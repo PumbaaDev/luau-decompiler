@@ -88,6 +88,7 @@ mod branch_arm_for_recovery_tests;
 mod branch_merge_reg_tests;
 mod default_load_merge_tests;
 #[cfg(test)]
+mod ref_capture_arith_init_tests;
 mod ref_capture_write_pin_tests;
 #[cfg(test)]
 mod capture_param_global_upval_tests;
