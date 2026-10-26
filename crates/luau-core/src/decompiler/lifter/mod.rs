@@ -2637,6 +2637,13 @@ fn mid_body_branch_end_block(
         // The arm ends in a JUMP straight to the loop's JUMPBACK: the lifted
         // arm prints `...; continue`, and the other arm (the code from the
         // branch target on) falls into the JUMPBACK and is lifted per block.
+        // That per-block lift is only faithful for straight-line code: a
+        // branch in the else part (a compare join, a conditional jumping to a
+        // shared tail) would print as `if c then continue end` and skip the
+        // tail, so such bodies keep the per-block lift of the whole run.
+        if range_has_branch(code, else_start, latch_start) {
+            return None;
+        }
         skip_pc = Some(arm_last);
     }
     let end_pc = ranges[k].0;
@@ -2748,6 +2755,19 @@ fn mid_body_region_unsafe_ex(
         if first.iter().any(|r| second.contains(r)) {
             return true;
         }
+    }
+    false
+}
+
+/// Does `[from, to)` hold any jump, loop or return instruction?
+fn range_has_branch(code: &[u32], from: usize, to: usize) -> bool {
+    let mut pc = from;
+    while pc < to.min(code.len()) {
+        let op = LuauOpcode::from_u8(crate::parser::types::insn_op(code[pc]));
+        if opcode_handlers::is_control_flow_op(op) {
+            return true;
+        }
+        pc += 1 + op.has_aux() as usize;
     }
     false
 }

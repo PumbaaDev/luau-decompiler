@@ -18,6 +18,10 @@ const OP_RETURN: u8 = 22;
 const OP_JUMP: u8 = 23;
 const OP_JUMPBACK: u8 = 24;
 const OP_JUMPIF: u8 = 25;
+const OP_LOADB: u8 = 3;
+const OP_LOADN: u8 = 4;
+const OP_JUMPIFEQ: u8 = 27;
+const OP_JUMPIFLT: u8 = 29;
 
 fn ad(op: u8, a: u8, d: i16) -> u32 {
     (op as u32) | ((a as u32) << 8) | ((d as u16 as u32) << 16)
@@ -119,4 +123,40 @@ fn shape_c_value_join_arms_without_calls_feed_a_call_in_the_join() {
     let out = lift(code, "shape_c");
     assert!(call_lines(&out) >= 1, "the join's call must be emitted:\n{}", out);
     assert!(!out.contains("continue"), "no bare continue may replace the arms:\n{}", out);
+}
+
+#[test]
+fn shape_d_latch_jump_arm_with_conditional_in_else_part_is_not_lifted_inline() {
+    // Brookhaven Jukebox: `if not c then wait() continue end; local near = d < 70;
+    // if x ~= near then f() end; wait()`. The compare join and the second
+    // conditional (jumping to the shared tail, not the latch) sit in the else
+    // part; lifting them block by block printed `if x == near then continue end`
+    // and skipped the tail wait.
+    let code = vec![
+        abc(OP_GETUPVAL, 0, 0, 0), // 0: cond
+        ad(OP_JUMPIF, 0, 3),       // 1: true -> 5
+        abc(OP_GETUPVAL, 1, 1, 0), // 2
+        abc(OP_CALL, 1, 1, 1),     // 3: wait() in the no-cond arm
+        ad(OP_JUMP, 0, 13),        // 4: -> 18 (the JUMPBACK)
+        abc(OP_GETUPVAL, 2, 2, 0), // 5
+        ad(OP_LOADN, 3, 70),       // 6
+        ad(OP_JUMPIFLT, 2, 2),     // 7: R2 < R3 -> 10
+        3,                         // 8: aux R3
+        abc(OP_LOADB, 4, 0, 1),    // 9: R4 = false, skip
+        abc(OP_LOADB, 4, 1, 0),    // 10: R4 = true
+        abc(OP_GETUPVAL, 5, 3, 0), // 11
+        ad(OP_JUMPIFEQ, 5, 3),     // 12: R5 == R4 -> 16
+        4,                         // 13: aux R4
+        abc(OP_GETUPVAL, 5, 4, 0), // 14
+        abc(OP_CALL, 5, 1, 1),     // 15: notify()
+        abc(OP_GETUPVAL, 5, 4, 0), // 16: shared tail
+        abc(OP_CALL, 5, 1, 1),     // 17: wait()
+        ad(OP_JUMPBACK, 0, -19),   // 18: -> 0
+        abc(OP_RETURN, 0, 1, 0),   // 19
+    ];
+    let out = lift(code, "shape_d");
+    // The shape stays on the per-block lift (known gutted, same as before the
+    // family fix); what it must not do is print the half-lifted compare.
+    assert!(!out.contains("== ("), "fake continue over the compare join:
+{}", out);
 }
