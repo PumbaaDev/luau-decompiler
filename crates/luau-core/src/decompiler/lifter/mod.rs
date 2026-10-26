@@ -5539,6 +5539,17 @@ fn exprs_structurally_equal(a: &Expr, b: &Expr) -> bool {
             f1.len() == f2.len()
                 && f1.iter().zip(f2.iter()).all(|(a, b)| table_fields_equal(a, b))
         }
+        // A parked phi (`cond and a or b`, built by the value-join / pure
+        // diamond path) that neither arm of a LATER branch touched is the same
+        // clone on both sides. Without this arm `merge_regs` reset it to
+        // Unknown (declared_never_assigned: the ternary vanished and its
+        // register read as a never-assigned `vN`).
+        (Expr::Ternary { cond: c1, then_expr: t1, else_expr: e1 },
+         Expr::Ternary { cond: c2, then_expr: t2, else_expr: e2 }) => {
+            exprs_structurally_equal(c1, c2)
+                && exprs_structurally_equal(t1, t2)
+                && exprs_structurally_equal(e1, e2)
+        }
         // Function expressions: skip — full body comparison is expensive
         // and function literals are rarely in registers across branches.
         // Vector: compare all three components by bits.
