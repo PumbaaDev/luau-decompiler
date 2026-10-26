@@ -1270,6 +1270,87 @@ fn or_chain_return_guard_with(
     Some((chain, terminal, cur))
 }
 
+/// Does `block` end in a `for` loop's own back edge (FORNLOOP / FORGLOOP)?
+fn block_ends_in_for_loop_back_edge(code: &[u32], block: &BasicBlock) -> bool {
+    let Some(pc) = block.branch_pc else { return false };
+    pc < code.len()
+        && matches!(
+            LuauOpcode::from_u8(insn_op(code[pc])),
+            LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+        )
+}
+
+/// Is `b` the body-start block of a counted or generic `for` loop?
+///
+/// The loop header the CFG reports for a `for` is its body start, entered from
+/// the FORNPREP/FORGPREP block above and from the FOR*LOOP back edge. Such a
+/// header is part of a closed region as long as the back edge is the loop's
+/// own (see `block_ends_in_for_loop_back_edge`).
+fn is_for_loop_body_head(cfg: &ControlFlowGraph, code: &[u32], b: usize) -> bool {
+    let Some(blk) = cfg.blocks.get(&b) else { return false };
+    let has_prep_pred = blk.predecessors.iter().any(|p| {
+        cfg.blocks.get(p).map_or(false, |pb| {
+            pb.branch_pc.map_or(false, |pc| {
+                pc < code.len()
+                    && matches!(
+                        LuauOpcode::from_u8(insn_op(code[pc])),
+                        LuauOpcode::ForNPrep | LuauOpcode::ForGPrep
+                    )
+            })
+        })
+    });
+    let has_loop_pred = blk.predecessors.iter().any(|p| {
+        *p >= b
+            && cfg
+                .blocks
+                .get(p)
+                .map_or(false, |pb| block_ends_in_for_loop_back_edge(code, pb))
+    });
+    has_prep_pred && has_loop_pred
+}
+
+/// A non-entry OR-guard link whose only effect beyond pure value parking is
+/// ONE call whose result is the very register the link's branch tests
+/// (`x:IsA("T")` in `if not (a and a:IsA("T")) then ... end`).
+///
+/// The call runs only when every earlier link fell through, exactly when the
+/// bytecode reaches it, so folding it into the `or` operand keeps both the
+/// order and the count of evaluations. The lifter folds the call into the
+/// condition (see `fold_preamble_into_cond`); a link it cannot fold splits the
+/// chain, which lifts the body once per group.
+fn is_call_link_block(code: &[u32], block: &BasicBlock) -> bool {
+    let Some(branch_pc) = block.branch_pc else { return false };
+    if branch_pc >= code.len() {
+        return false;
+    }
+    let bop = LuauOpcode::from_u8(insn_op(code[branch_pc]));
+    if !matches!(bop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+        return false;
+    }
+    let tested = insn_a(code[branch_pc]) as usize;
+    let mut calls = 0usize;
+    let mut last_call_result = None;
+    let mut i = block.start;
+    while i < branch_pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        match op {
+            LuauOpcode::NameCall => {}
+            LuauOpcode::Call => {
+                calls += 1;
+                // C == 2: exactly one result.
+                if insn_c(code[i]) != 2 {
+                    return false;
+                }
+                last_call_result = Some(insn_a(code[i]) as usize);
+            }
+            _ if is_pure_guard_setup_op(op) => {}
+            _ => return false,
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    calls == 1 && last_call_result == Some(tested)
+}
+
 /// A non-entry OR-guard link: a pure guard block (`is_pure_guard_block`) whose
 /// preamble may also take a length (`#x`). LENGTH only parks a value like the
 /// table reads already whitelisted; the link is folded into the `or` condition,
@@ -1298,14 +1379,14 @@ const OR_GUARD_MAX_BODY_BLOCKS: usize = 16;
 /// Match `Region::OrGuardIf` at `entry`: returns `(links, body, cont)`.
 ///
 /// Gate, all required:
-/// * `entry` is straight-line (at most one predecessor; a join tests a value
-///   the register file may not carry, see `find_or_chain_return_guard`);
+/// * `entry` is a conditional block (it may be a loop-body head or a join);
 /// * every later link is a pure (`is_pure_or_link_block`) conditional whose
 ///   ONLY predecessor is the previous link, and one of its successors is the
 ///   shared body head `T`; at least two links;
 /// * every edge into `T` comes from a link;
-/// * the body (everything reachable from `T`) is closed, acyclic, unclaimed,
-///   entered only through `T`, and every exit returns;
+/// * the body (everything reachable from `T`) is closed, unclaimed, entered
+///   only through `T`, and every exit returns; its only back edges are `for`
+///   loops' own FORNLOOP / FORGLOOP edges;
 /// * the body lies BEFORE the continuation in PC order (stranded). A body
 ///   after the continuation is the natural tail the if/else fallback already
 ///   nests correctly.
@@ -1318,7 +1399,6 @@ fn find_or_guard_body(
 ) -> Option<(Vec<(usize, bool)>, Vec<usize>, usize)> {
     let eb = cfg.blocks.get(&entry)?;
     if eb.successors.len() != 2
-        || eb.predecessors.len() > 1
         || handled.contains(&entry)
         || loop_headers.contains(&entry)
     {
@@ -1356,7 +1436,7 @@ fn or_guard_with_head(
             && cb.predecessors[0] == prev
             && !handled.contains(&cur)
             && !loop_headers.contains(&cur)
-            && is_pure_guard_block(code, cb);
+            && (is_pure_guard_block(code, cb) || is_call_link_block(code, cb));
         if !is_link {
             break;
         }
@@ -1407,7 +1487,7 @@ fn closed_return_body(
             || b == cont
             || link_ids.contains(&b)
             || handled.contains(&b)
-            || loop_headers.contains(&b)
+            || (loop_headers.contains(&b) && !is_for_loop_body_head(cfg, code, b))
         {
             return None;
         }
@@ -1418,7 +1498,10 @@ fn closed_return_body(
             }
             continue;
         }
-        if blk.successors.iter().any(|&s| s <= b) {
+        // A backward edge is allowed only as a counted/generic `for` loop's own
+        // back edge (FORNLOOP / FORGLOOP): the body then stays closed, because
+        // the loop's single exit is its fall-through successor.
+        if blk.successors.iter().any(|&s| s <= b) && !block_ends_in_for_loop_back_edge(code, blk) {
             return None; // a backward edge: not a forward-only body
         }
         work.extend(blk.successors.iter().copied());
@@ -1429,33 +1512,6 @@ fn closed_return_body(
             .map_or(false, |blk| blk.predecessors.iter().all(|p| body.contains(p)))
     });
     if !entered_only_at_head {
-        return None;
-    }
-    // An inner `if a or b then X elseif c then ...`: a block X entered ONLY
-    // by conditional branches, one of which also leads to a conditional block
-    // reached from nowhere else (the `elseif` test). The arm lifter cannot
-    // rebuild that chain inside a body and drops the later `elseif` arms
-    // (Brookhaven GiftSelectRecipient promptGift loses its IN_PROGRESS /
-    // OWNED messages), so such a body is left to the general structurer.
-    let is_cond = |id: &usize| cfg.blocks.get(id).map_or(false, |b| b.successors.len() == 2);
-    let has_inner_short_circuit = body.iter().filter(|&&b| b != head).any(|&x| {
-        let Some(xb) = cfg.blocks.get(&x) else { return false };
-        xb.predecessors.len() >= 2
-            && xb.predecessors.iter().all(is_cond)
-            && xb.predecessors.iter().any(|p| {
-                cfg.blocks.get(p).map_or(false, |pb| {
-                    pb.successors.iter().filter(|&&y| y != x).any(|y| {
-                        body.contains(y)
-                            && is_cond(y)
-                            && cfg.blocks.get(y).map_or(false, |yb| yb.predecessors == vec![*p])
-                    })
-                })
-            })
-    });
-    if has_inner_short_circuit {
-        if std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
-            eprintln!("ORGUARD-DECLINE inner_short_circuit head={}", head);
-        }
         return None;
     }
     Some(body.into_iter().collect())

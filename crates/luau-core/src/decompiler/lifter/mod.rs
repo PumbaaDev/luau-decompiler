@@ -3713,6 +3713,26 @@ fn lift_or_guard_if(
             ctx, proto, proto_index, depth, block.start, branch_pc, regs, locals, &mut preamble,
             false,
         );
+        // A call-only link (`a:IsA("T")` tested by the link's own branch) folds
+        // into the `or` operand instead of splitting the chain: the call runs
+        // only when every earlier link fell through, as in the bytecode, and a
+        // split would lift (and so duplicate) the whole body a second time.
+        let mut folded_cond: Option<Expr> = None;
+        if i > 0 && condition.is_some() && !preamble.is_empty() {
+            let fall = extract_branch_condition(ctx, proto, branch_pc, regs);
+            let this = if body_is_taken { negate_condition(&fall) } else { fall };
+            folded_cond = fold_preamble_into_cond(&preamble, &this, regs, &proto.code, branch_pc);
+        }
+        if let Some(this) = folded_cond {
+            if let Some(acc) = condition.take() {
+                condition = Some(Expr::BinOp {
+                    left: Box::new(acc),
+                    op: BinOp::Or,
+                    right: Box::new(this),
+                });
+            }
+            continue;
+        }
         if !preamble.is_empty() {
             if i > 0 && std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
                 eprintln!(
@@ -3746,6 +3766,45 @@ fn lift_or_guard_if(
         // Detection requires two conditional links; never drop the body.
         None => lift_or_guard_body(ctx, proto, proto_index, cfg, depth, &body_sorted, regs, locals, stmts),
     }
+}
+
+/// Fold a link's preamble into the link's own condition.
+///
+/// The preamble must be nothing but single-name `local n = <value>` statements
+/// (a parked read or one call result), and each `n` must be read EXACTLY once in
+/// the condition (or in a later preamble value), and no register that still names
+/// the local may be read after the branch. The values then move into the `or` operand, which Lua
+/// evaluates only when every earlier operand was false, exactly when the
+/// bytecode reaches the link. Anything else returns `None` and the caller splits
+/// the chain instead.
+fn fold_preamble_into_cond(
+    preamble: &[Stat],
+    cond: &Expr,
+    regs: &[RegVal],
+    code: &[u32],
+    branch_pc: usize,
+) -> Option<Expr> {
+    let mut folded = cond.clone();
+    for stat in preamble.iter().rev() {
+        let Stat::Local { names, values } = stat else { return None };
+        let ([name], [value]) = (names.as_slice(), values.as_slice()) else { return None };
+        if count_name_reads_in_expr(&folded, name) != 1 {
+            return None;
+        }
+        // A register that still names the dropped local must be dead after the
+        // branch, or later code would read a name that no longer exists.
+        let needle = format!("Name(\"{}\")", name);
+        let still_named = regs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| format!("{:?}", r).contains(&needle))
+            .all(|(idx, _)| opcode_handlers::reg_dead_after_branch(code, branch_pc, idx));
+        if !still_named {
+            return None;
+        }
+        replace_name_in_expr(&mut folded, name, value);
+    }
+    Some(folded)
 }
 
 /// Emit `if condition then <body> end`, leaving `regs` and `locals` as they

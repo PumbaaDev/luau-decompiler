@@ -7378,6 +7378,25 @@ fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool 
 }
 
 
+/// Is `reg` dead once the conditional branch at `branch_pc` has consumed it, on
+/// BOTH of the branch's edges?
+///
+/// This is what lets a link's preamble (`local n = x:IsA("T")`) fold into the
+/// link's own condition: nothing reads the parked value afterwards, so dropping
+/// the `local` cannot leave a dangling name.
+pub(super) fn reg_dead_after_branch(code: &[u32], branch_pc: usize, reg: usize) -> bool {
+    if branch_pc >= code.len() {
+        return false;
+    }
+    let bop = LuauOpcode::from_u8(insn_op(code[branch_pc]));
+    let after = branch_pc + if bop.has_aux() { 2 } else { 1 };
+    let target = branch_pc as i64 + insn_d(code[branch_pc]) as i64 + 1;
+    !reg_live_after_ex(code, after, reg, 0, 0, true)
+        && (target < 0
+            || target as usize >= code.len()
+            || !reg_live_after_ex(code, target as usize, reg, 0, 0, true))
+}
+
 /// Is `reg` possibly read at or after `from` before something overwrites it?
 ///
 /// Walks the control-flow graph from `from` (both successors of every
@@ -7387,6 +7406,20 @@ fn upval_stored_back(code: &[u32], pc: usize, reg: usize, upval: usize) -> bool 
 /// would be scoped to an arm or loop body from replacing a value that is
 /// consumed after it.
 fn reg_live_after(code: &[u32], from: usize, reg: usize, start: usize, end: usize) -> bool {
+    reg_live_after_ex(code, from, reg, start, end, false)
+}
+
+/// `reg_live_after` with an optional operand-exact mode: when `exact` is set the
+/// FASTCALL builtin id (A) and the GETTABLEKS/NAMECALL slot hint (C) are not
+/// counted as register reads, and FASTCALL1/2/3 read only their real operands.
+fn reg_live_after_ex(
+    code: &[u32],
+    from: usize,
+    reg: usize,
+    start: usize,
+    end: usize,
+    exact: bool,
+) -> bool {
     let mut visited = vec![false; code.len()];
     let mut work = vec![from];
     while let Some(start) = work.pop() {
@@ -7418,6 +7451,29 @@ fn reg_live_after(code: &[u32], from: usize, reg: usize, start: usize, end: usiz
             }
             let in_range = i >= start && i < end;
             match op {
+                LuauOpcode::FastCall
+                | LuauOpcode::FastCall1
+                | LuauOpcode::FastCall2
+                | LuauOpcode::FastCall2K
+                | LuauOpcode::FastCall3
+                    if exact =>
+                {
+                    let aux = code.get(i + 1).copied().unwrap_or(0) as usize;
+                    let reads = match op {
+                        LuauOpcode::FastCall => false,
+                        LuauOpcode::FastCall1 | LuauOpcode::FastCall2K => b == reg,
+                        LuauOpcode::FastCall2 => b == reg || (aux & 0xff) == reg,
+                        _ => b == reg || (aux & 0xff) == reg || ((aux >> 8) & 0xff) == reg,
+                    };
+                    if !in_range && reads {
+                        return true;
+                    }
+                }
+                LuauOpcode::GetTableKS | LuauOpcode::NameCall if exact => {
+                    if !in_range && b == reg {
+                        return true;
+                    }
+                }
                 LuauOpcode::Call => {
                     // Reads the function (A) and its arguments A+1..A+B-1; B == 0
                     // means every register above A up to the stack top.
