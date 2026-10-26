@@ -291,3 +291,29 @@ fn iterated_literal_is_not_duplicated_inside_the_loop_body() {
     );
     assert!(out.contains("Touch"), "the arm's call must survive:\n{out}");
 }
+
+#[test]
+fn fastcall_builtin_id_in_a_is_not_a_register_read() {
+    let live = super::super::reg_live_at;
+    // FASTCALL1 A = builtin id (2 = bit32.band here), B = the argument register.
+    // 0: FASTCALL1 id=2 R3 skip=0   -- reads R3 only; id 2 is NOT register 2
+    // 1: RETURN R0 1
+    let code = vec![insn_abc(73, 2, 3, 0), insn_abc(OP_RETURN, 0, 1, 0)];
+    assert!(!live(&code, 0, 2), "builtin id 2 must not make R2 live");
+    assert!(live(&code, 0, 3), "the argument register is read");
+}
+
+#[test]
+fn setlist_count_and_capture_kind_are_not_register_reads() {
+    let live = super::super::reg_live_at;
+    // SETLIST A=19 B=20 C=2 (one value, R20): C is a COUNT, so R2 is not read.
+    let code = vec![insn_abc(OP_SETLIST, 19, 20, 2), 0, insn_abc(OP_RETURN, 0, 1, 0)];
+    assert!(!live(&code, 0, 2), "SETLIST count 2 must not make R2 live");
+    assert!(live(&code, 0, 20), "the value window is read");
+    assert!(live(&code, 0, 19), "the table is read");
+    // CAPTURE VAL (A=0) R3 reads R3; CAPTURE UPVAL (A=2) B=2 is an upvalue index.
+    let cap = vec![insn_abc(70, 2, 2, 0), insn_abc(OP_RETURN, 0, 1, 0)];
+    assert!(!live(&cap, 0, 2), "CAPTURE kind 2 B is an upvalue index, not R2");
+    let cap_val = vec![insn_abc(70, 0, 2, 0), insn_abc(OP_RETURN, 0, 1, 0)];
+    assert!(live(&cap_val, 0, 2), "CAPTURE val reads its register");
+}

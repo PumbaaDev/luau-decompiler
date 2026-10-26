@@ -115,12 +115,18 @@ pub(super) fn reconstruct_table_constructors(stmts: &mut Vec<Stat>) {
     let mut i = 0;
     while i < stmts.len() {
         // Try to identify the local-empty-table seed at index i.
-        let local_name = match constructor_seed_name(&stmts[i]) {
-            Some(n) => n,
-            None => {
-                i += 1;
-                continue;
-            }
+        // A seed that already holds a positional run (the first SETLIST chunk
+        // of a longer array) may only be extended by the next consecutive
+        // integer keys; an empty seed absorbs any field as before.
+        let (local_name, seq_len) = match constructor_seed_name(&stmts[i]) {
+            Some(n) => (n, None),
+            None => match sequential_seed(&stmts[i]) {
+                Some((n, len)) => (n, Some(len)),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
         };
 
         // Greedily collect the contiguous prefix of statements starting at
@@ -144,10 +150,20 @@ pub(super) fn reconstruct_table_constructors(stmts: &mut Vec<Stat>) {
         while j < stmts.len() {
             // Try direct shape first — it's the common case and cheaper.
             if let Some(field) = field_assign_to_constructor_field(&stmts[j], &local_name) {
+                let field = match seq_len {
+                    None => field,
+                    Some(len) => match next_sequential_field(field, len + absorbed.len() + 1) {
+                        Some(f) => f,
+                        None => break,
+                    },
+                };
                 absorbed.push(field);
                 subtract_name_reads_in_stmt(&stmts[j], &mut remaining_reads);
                 j += 1;
                 continue;
+            }
+            if seq_len.is_some() {
+                break;
             }
 
             // Two-step shape: current must be a single-name Local with a pure
@@ -196,6 +212,32 @@ pub(super) fn reconstruct_table_constructors(stmts: &mut Vec<Stat>) {
         // After folding we move past the seed (which now holds the constructor)
         // — there could be ANOTHER independent table constructor right after.
         i += 1;
+    }
+}
+
+/// A `local N = { a, b, ... }` seed whose fields are all positional and
+/// non-empty: returns the name and the element count.
+fn sequential_seed(stmt: &Stat) -> Option<(String, usize)> {
+    let (name, fields) = match stmt {
+        Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            match &values[0] {
+                Expr::Table { fields } => (names[0].clone(), fields),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let all_positional = fields.iter().all(|f| matches!(f, TableField::Sequential(_)));
+    (all_positional && !fields.is_empty()).then(|| (name, fields.len()))
+}
+
+/// `t[expected] = v` as a positional field, or None for any other key.
+fn next_sequential_field(field: TableField, expected: usize) -> Option<TableField> {
+    match field {
+        TableField::Indexed(Expr::Number(k), v) if k == expected as f64 => {
+            Some(TableField::Sequential(v))
+        }
+        _ => None,
     }
 }
 
@@ -536,7 +578,14 @@ fn accumulate_name_reads_in_expr(expr: &Expr, counts: &mut HashMap<String, usize
                 }
             }
         }
-        Expr::Function { .. } => {} // closures capture by upvalue, not name
+        // A closure body reads a captured local by the same name, so those
+        // reads count: folding `local F = {}; t.F = F` into a constructor
+        // while a later closure still reads `F` leaves that closure with an
+        // undeclared name. Over-counting (a shadowing param of the same
+        // name) only blocks the fold, the safe direction.
+        Expr::Function { body, .. } => {
+            for s in body { accumulate_name_reads_in_stmt(s, counts); }
+        }
         Expr::Ternary { cond, then_expr, else_expr } => {
             accumulate_name_reads_in_expr(cond, counts);
             accumulate_name_reads_in_expr(then_expr, counts);

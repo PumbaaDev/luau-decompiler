@@ -8939,14 +8939,15 @@ fn reg_live_at(code: &[u32], pc: usize, reg: usize) -> bool {
                     (reg >= a && reg <= a + 2, false, Some(vec![next, jump_d]))
                 }
                 Op::ForNLoop | Op::ForGLoop => (false, false, Some(vec![next, jump_d])),
-                Op::FastCall | Op::FastCall1 | Op::FastCall2K => {
-                    (mentions, false, Some(vec![next]))
-                }
+                // FASTCALL*: A is the BUILTIN ID, not a register. Counting it as a
+                // mention made `bit32.band` (id 2) read R2 and kept dead tables live.
+                Op::FastCall => (false, false, Some(vec![next])),
+                Op::FastCall1 | Op::FastCall2K => (b == reg, false, Some(vec![next])),
                 Op::FastCall2 => {
-                    (mentions || (aux & 0xFF) as usize == reg, false, Some(vec![next]))
+                    (b == reg || (aux & 0xFF) as usize == reg, false, Some(vec![next]))
                 }
                 Op::FastCall3 => {
-                    let r = mentions
+                    let r = b == reg
                         || (aux & 0xFF) as usize == reg
                         || ((aux >> 8) & 0xFF) as usize == reg;
                     (r, false, Some(vec![next]))
@@ -8957,10 +8958,20 @@ fn reg_live_at(code: &[u32], pc: usize, reg: usize) -> bool {
                 | Op::NativeCall => {
                     // SETLIST reads the value window B..B+C-2 (C == 0: up to
                     // the stack top).
-                    let r = mentions
-                        || (op == Op::SetList
-                            && reg >= b
-                            && (c == 0 || reg + 1 < b + c));
+                    // Only REGISTER operands count: SETTABLEKS/N C is a slot or
+                    // literal index, SETLIST C is a count, CAPTURE A is the kind
+                    // (kind 2 puts an UPVALUE index in B). Counting them as
+                    // mentions made a count of 1 read R2 and kept dead tables live.
+                    let r = match op {
+                        Op::SetTable => a == reg || b == reg || c == reg,
+                        Op::SetTableKS | Op::SetTableN => a == reg || b == reg,
+                        Op::SetUpval | Op::SetGlobal => a == reg,
+                        Op::SetList => {
+                            a == reg || (reg >= b && (c == 0 || reg + 1 < b + c))
+                        }
+                        Op::Capture => a != 2 && b == reg,
+                        _ => false,
+                    };
                     (r, false, Some(vec![next]))
                 }
                 _ => return true,

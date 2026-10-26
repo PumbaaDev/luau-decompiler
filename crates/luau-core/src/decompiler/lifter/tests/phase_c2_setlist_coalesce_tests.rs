@@ -193,3 +193,46 @@ fn c2_gap_in_indices_does_not_fold_past_gap() {
     // Silence unused-import warning for `name` — we only use helper fns above.
     let _ = name;
 }
+
+// ─── Later SETLIST chunks extend a positional seed ───────────────────────
+
+fn seq_table(items: &[&str]) -> Expr {
+    Expr::Table {
+        fields: items.iter().map(|s| TableField::Sequential(Expr::String((*s).into()))).collect(),
+    }
+}
+
+#[test]
+fn c2_later_setlist_chunk_extends_positional_seed() {
+    // local t = {"a", "b"}; t[3] = "c"; t[4] = "d"  ->  local t = {"a","b","c","d"}
+    let mut stmts = vec![
+        Stat::Local { names: vec!["t".into()], values: vec![seq_table(&["a", "b"])] },
+        index_assign("t", num(3.0), Expr::String("c".into())),
+        index_assign("t", num(4.0), Expr::String("d".into())),
+        ret_name("t"),
+    ];
+    reconstruct_table_constructors(&mut stmts);
+    assert_eq!(stmts.len(), 2);
+    match &stmts[0] {
+        Stat::Local { values, .. } => match &values[0] {
+            Expr::Table { fields } => {
+                assert_eq!(fields.len(), 4);
+                assert!(fields.iter().all(|f| matches!(f, TableField::Sequential(_))));
+            }
+            other => panic!("expected table, got {other:?}"),
+        },
+        other => panic!("expected local, got {other:?}"),
+    }
+}
+
+#[test]
+fn c2_non_consecutive_key_leaves_positional_seed_alone() {
+    // t[5] after a 2-element seed is a gap: nothing is absorbed.
+    let mut stmts = vec![
+        Stat::Local { names: vec!["t".into()], values: vec![seq_table(&["a", "b"])] },
+        index_assign("t", num(5.0), Expr::String("c".into())),
+        ret_name("t"),
+    ];
+    reconstruct_table_constructors(&mut stmts);
+    assert_eq!(stmts.len(), 3);
+}

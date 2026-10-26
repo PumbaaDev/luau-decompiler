@@ -1784,10 +1784,14 @@ fn insn_defines_reg_a(op: LuauOpcode) -> bool {
     )
 }
 
-/// How far ahead `table_needs_binding` will look for a cross-branch use.
-/// Bounded so a proto with many table constructors stays linear-ish; protos
-/// longer than this keep the historical park-the-literal behaviour.
-const TABLE_USE_SCAN_LIMIT: usize = 1024;
+/// How far ahead `table_needs_binding` will look for a later use.
+/// Bounded so a proto with many table constructors stays linear-ish; a use
+/// beyond this keeps the historical park-the-literal behaviour. 1024 was too
+/// short: a module's top-level table is stored into its export early and
+/// captured by a closure 1,000+ instructions later, and the two uses never
+/// met. The scan ends at the first redefinition of the register, so temps
+/// still stop almost at once.
+const TABLE_USE_SCAN_LIMIT: usize = 8192;
 
 /// Should the table created at `pc` in register `a` be materialised as a real
 /// `local NAME = {}` binding instead of being parked as a pending literal?
@@ -1819,6 +1823,7 @@ pub(in crate::decompiler::lifter) fn table_needs_binding(code: &[u32], pc: usize
     let scan_end = code.len().min(pc + TABLE_USE_SCAN_LIMIT);
     let mut crossed_branch = false;
     let mut reads = 0usize;
+    let mut captured = false;
     while i < scan_end {
         let insn = code[i];
         let op = LuauOpcode::from_u8(insn_op(insn));
@@ -1826,6 +1831,17 @@ pub(in crate::decompiler::lifter) fn table_needs_binding(code: &[u32], pc: usize
         let ib = insn_b(insn) as usize;
         if is_control_flow_op(op) {
             crossed_branch = true;
+            // RETURN is classed as control flow but is also a hand-out of
+            // the table when its value range covers `a`.
+            if matches!(op, LuauOpcode::Return)
+                && a >= ia
+                && (ib == 0 || a + 1 < ia + ib)
+            {
+                reads += 1;
+                if reads >= 2 {
+                    return true;
+                }
+            }
         } else {
             // A multret SETLIST (`{ 1, 2, f() }`) splices ALL of the call's
             // results into the array part. There is no statement form that
@@ -1848,6 +1864,27 @@ pub(in crate::decompiler::lifter) fn table_needs_binding(code: &[u32], pc: usize
                     | LuauOpcode::Length
                     | LuauOpcode::Move
             ) && ib == a;
+            // The table ESCAPING counts as a use too: stored as a value into
+            // another table (SETTABLE* A == a, B != a), captured by a closure,
+            // or returned. Each is a hand-out of the one object, so a second
+            // use of any kind must see the same binding rather than a fresh
+            // constructor.
+            let escapes = match op {
+                LuauOpcode::SetTable | LuauOpcode::SetTableKS | LuauOpcode::SetTableN => {
+                    ia == a && ib != a
+                }
+                // CAPTURE A=kind (0 val, 1 ref, 2 upval) B=register or, for
+                // kind 2, an UPVALUE INDEX that is not a register at all.
+                // Closures capturing the table share one materialised binding
+                // (the first capture declares it), so only the FIRST capture
+                // is a use that can meet another kind of use.
+                LuauOpcode::Capture => {
+                    let first = ia != 2 && ib == a && !captured;
+                    captured |= ia != 2 && ib == a;
+                    first
+                }
+                _ => false,
+            };
             // A store with A == B == a is the self reference `t.__index = t`.
             // Folding it into the pending constructor snapshots an EMPTY clone
             // of the literal (`__index = {}`), so that shape always needs a
@@ -1860,7 +1897,7 @@ pub(in crate::decompiler::lifter) fn table_needs_binding(code: &[u32], pc: usize
             {
                 return true;
             }
-            if reads_table {
+            if reads_table || escapes {
                 reads += 1;
                 if reads >= 2 {
                     return true;
