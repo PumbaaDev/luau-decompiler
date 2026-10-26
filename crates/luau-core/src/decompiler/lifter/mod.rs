@@ -9735,6 +9735,16 @@ fn premateralize_branch_escapes_spans(
                     .iter()
                     .filter(|(s, e)| e > s)
                     .any(|&(s, e)| range_has_cond_jump(&proto.code, s, e));
+            // A bound register whose entry value an arm READS before overwriting it
+            // is not a repurposed slot: a bare fresh `local` would discard that
+            // value (luvToRgb: `SUB R8 R8 - R7` in the arm, then `local new16`
+            // with no initialiser and `new17 -= new16`). The fresh local is then
+            // initialised from the old binding.
+            let arm_reads_bound_entry = matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+                && arm_ranges
+                    .iter()
+                    .filter(|(s, e)| e > s)
+                    .any(|&(s, e)| merge_first_touch_is_read(&proto.code, s, e, reg));
             let bound_seed = (matches!(
                 regs.get(reg),
                 Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
@@ -9772,7 +9782,23 @@ fn premateralize_branch_escapes_spans(
                 // redefinition, so the dead pre-branch value is never observed and
                 // a fresh declaration is bit-exact. A fresh name (never the stale
                 // one) keeps clear of the 476_BadgeMenu name-reuse hazard.
-                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown)) || stale_expr;
+                // A bound register whose old value no arm reads is a REPURPOSED slot
+                // too, but only the `a and <arith> or c` diamond is trusted with a
+                // fresh identity: its arms overlap (the `then` arm ends in the
+                // short-circuit JUMPIF to the join, so the `else` arm lies inside
+                // it and both end at the join). The old name survives for pending
+                // expressions that still read it (`v53 / 116`).
+                let overlapped_arms = then_ranges.len() == 1
+                    && else_ranges.len() == 1
+                    && then_ranges[0].1 == else_ranges[0].1
+                    && else_ranges[0].0 < then_ranges[0].1
+                    && matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+                    && !arm_ranges
+                        .iter()
+                        .filter(|(s, e)| e > s)
+                        .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg));
+                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown)) || stale_expr || overlapped_arms;
+                let overlap_name = overlapped_arms.then(|| name.clone());
                 let (kind, final_name) = if reg_is_dead {
                     (WriteKind::Shadow, locals.reseed_shadow(reg, &name))
                 } else {
@@ -9783,6 +9809,9 @@ fn premateralize_branch_escapes_spans(
                 // this case exists to avoid - so leave those to the gates below
                 // rather than forcing a rebind we cannot justify.
                 if matches!(kind, WriteKind::Shadow | WriteKind::FirstDecl) {
+                    if overlap_name.is_some() {
+                        note_overlap_seed(proto, &final_name);
+                    }
                     if std::env::var("LUAU_SEED_TRACE").is_ok() {
                         let sc = arm_ranges.iter().filter(|(a,b)| b>a).any(|&(a,b)| {
                             let mut w=a; while w<b && w<proto.code.len() {
@@ -9796,9 +9825,13 @@ fn premateralize_branch_escapes_spans(
                             proto.debug_name.as_deref().unwrap_or("?"),
                             proto.line_defined, reg, pc, final_name, sc, arm_ranges);
                     }
+                    let entry_init: Vec<Expr> = match (arm_reads_bound_entry, regs.get(reg)) {
+                        (true, Some(RegVal::Expr(e))) => vec![e.clone()],
+                        _ => Vec::new(),
+                    };
                     stmts.push(Stat::Local {
                         names: vec![final_name.clone()],
-                        values: Vec::new(),
+                        values: entry_init,
                     });
                     regs[reg] = RegVal::Expr(Expr::Name(final_name.clone()));
                     for &(s, e) in arm_ranges {
@@ -9945,6 +9978,23 @@ fn premateralize_branch_escapes_spans(
         if !parked_pure && !carried_identity {
             continue;
         }
+        // A pre-branch parked value that no arm reads and that the merge
+        // overwrites before reading is dead: materialising it only fabricates a
+        // statement (`local result229 = arg1 * result32` in luvToRgb-shaped
+        // diamonds, where R6 is a long-dead scratch value).
+        if parked_pure
+            && !carried_identity
+            && split_arms.is_some()
+            && is_cond_join_branch(proto, pc)
+            && !merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
+            && !arm_ranges
+                .iter()
+                .filter(|(s, e)| e > s)
+                .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg))
+        {
+            regs[reg] = RegVal::Unknown;
+            continue;
+        }
         if carried_identity && !parked_pure {
             if let Some(RegVal::Expr(Expr::Name(n))) = regs.get(reg) {
                 let name = n.clone();
@@ -9967,6 +10017,65 @@ fn premateralize_branch_escapes_spans(
             }
         }
     }
+}
+
+thread_local! {
+    /// Shadow names (by proto identity) minted for the overlapped
+    /// `a and <arith> or c` diamond; see `premateralize_branch_escapes_spans`.
+    static OVERLAP_SEEDS: std::cell::RefCell<Vec<(usize, String)>> = std::cell::RefCell::new(Vec::new());
+}
+
+thread_local! {
+    /// `(proto identity, branch pc, join pc)` of every `a and <arith> or c`
+    /// diamond lifted through `cond_else_skip_join`.
+    static COND_JOINS: std::cell::RefCell<Vec<(usize, usize, usize)>> = std::cell::RefCell::new(Vec::new());
+}
+
+pub(super) fn note_cond_join(proto: &Proto, branch_pc: usize, join_pc: usize) {
+    let key = proto as *const Proto as usize;
+    COND_JOINS.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.contains(&(key, branch_pc, join_pc)) {
+            v.push((key, branch_pc, join_pc));
+        }
+    });
+}
+
+/// Is `pc` the join of a `cond_else_skip_join` diamond of this proto?
+pub(super) fn is_cond_join(proto: &Proto, pc: usize) -> bool {
+    let key = proto as *const Proto as usize;
+    COND_JOINS.with(|s| s.borrow().iter().any(|&(k, _, j)| k == key && j == pc))
+}
+
+/// Is `branch_pc` the branch of a `cond_else_skip_join` diamond of this proto?
+fn is_cond_join_branch(proto: &Proto, branch_pc: usize) -> bool {
+    let key = proto as *const Proto as usize;
+    COND_JOINS.with(|s| s.borrow().iter().any(|&(k, b, _)| k == key && b == branch_pc))
+}
+
+fn note_overlap_seed(proto: &Proto, name: &str) {
+    OVERLAP_SEEDS.with(|s| s.borrow_mut().push((proto as *const Proto as usize, name.to_string())));
+}
+
+/// Was `name` minted as an overlapped-diamond shadow in this proto?
+pub(super) fn is_overlap_seed(proto: &Proto, name: &str) -> bool {
+    let key = proto as *const Proto as usize;
+    OVERLAP_SEEDS.with(|s| s.borrow().iter().any(|(k, n)| *k == key && n == name))
+}
+
+/// After `pc`, is `src` overwritten while `dst` (a copy of it) is still read?
+/// Over-approximate on reads (a false yes only adds a harmless copy).
+pub(super) fn move_alias_goes_stale(code: &[u32], pc: usize, dst: usize, src: usize) -> bool {
+    let mut i = pc + 1;
+    while i < code.len() {
+        let insn = code[i];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == src && opcode_handlers::insn_defines_reg_a(op) && !opcode_handlers::is_control_flow_op(op) {
+            return reg_used_in_range(code, i, code.len(), dst);
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Does ANY span in `ranges` contain an instruction writing `reg`?

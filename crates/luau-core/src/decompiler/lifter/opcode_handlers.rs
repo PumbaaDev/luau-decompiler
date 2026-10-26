@@ -1076,6 +1076,95 @@ fn fold_or_link_condition(
     Some((cond, exit))
 }
 
+/// `a and <value> or c` over computed values compiles to
+///
+/// ```text
+///     JUMPIF*  cond -> ELSE        ; cond false: take the `or` arm
+///     <THEN: computes Rx>
+///     JUMPIF   Rx   -> JOIN        ; Rx truthy: keep it, skip the `or` arm
+/// ELSE: <pure arithmetic into Rx>  ; reached from the cond jump AND from the
+///                                  ; fall-through when Rx was falsy
+/// JOIN:
+/// ```
+///
+/// The `then` arm ends in a conditional jump PAST the arm (`target`), which the
+/// arm lift discards, so the `or` arm ran unconditionally after the `if`.
+/// Returns `JOIN` when the shape matches, so the caller can lift the `then` arm
+/// as `[then_start, JOIN)` (its own `JUMPIF` then becomes an inline
+/// `if not Rx then <ELSE> end`) with ELSE also as the plain else arm. ELSE is
+/// duplicated in the output, so it must be straight-line, call-free arithmetic
+/// that nothing else jumps into.
+fn cond_else_skip_join(code: &[u32], then_start: usize, target: usize, end: usize) -> Option<usize> {
+    if std::env::var("LUAU_NO_COND_ELSE_SKIP").is_ok() {
+        return None;
+    }
+    if target <= then_start + 1 || target > code.len() {
+        return None;
+    }
+    let last_pc = target - 1;
+    let last = code[last_pc];
+    let lop = LuauOpcode::from_u8(insn_op(last));
+    if !matches!(lop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+        return None;
+    }
+    let join = (last_pc as i32 + insn_d(last) as i32 + 1) as usize;
+    if join <= target || join > end || join > code.len() {
+        return None;
+    }
+    // The tested register must be computed by the arm itself.
+    let reg = insn_a(last) as usize;
+    let mut computed = false;
+    let mut pc = then_start;
+    while pc < last_pc {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if is_control_flow_op(op) {
+            return None;
+        }
+        if insn_a(code[pc]) as usize == reg {
+            computed = true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if !computed {
+        return None;
+    }
+    // ELSE: call-free arithmetic and loads only.
+    let mut pc = target;
+    let mut has_arith = false;
+    while pc < join {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        match op {
+            LuauOpcode::Add | LuauOpcode::Sub | LuauOpcode::Mul | LuauOpcode::Div
+            | LuauOpcode::Pow | LuauOpcode::AddK | LuauOpcode::SubK | LuauOpcode::MulK
+            | LuauOpcode::DivK | LuauOpcode::PowK | LuauOpcode::SubRK | LuauOpcode::DivRK => {
+                has_arith = true;
+            }
+            LuauOpcode::LoadN | LuauOpcode::LoadK | LuauOpcode::LoadB | LuauOpcode::Move => {}
+            _ => return None,
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    if !has_arith {
+        return None;
+    }
+    // Nothing may jump into the middle of ELSE.
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if is_control_flow_op(op) {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            if t > target as i64 && t < join as i64 {
+                return None;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    Some(join)
+}
+
 fn detect_else_skip(
     code: &[u32],
     then_start: usize,
@@ -1741,7 +1830,7 @@ fn bind_arm_merge_seeds(
 /// list so an unrecognised or Roblox-extension opcode counts as a definition:
 /// stopping the scan early under-counts reads, which is the safe direction —
 /// it keeps the historical park-the-literal behaviour.
-fn insn_defines_reg_a(op: LuauOpcode) -> bool {
+pub(super) fn insn_defines_reg_a(op: LuauOpcode) -> bool {
     !matches!(
         op,
         LuauOpcode::Nop
@@ -2786,6 +2875,25 @@ pub(super) fn lift_instruction_range(
                     }
                     pc += 1;
                     continue;
+                }
+                // A copy of an overlapped-diamond shadow (`MOVE R4 R5` after the
+                // `a and <arith> or c` join) must be a real local when R5 is
+                // rewritten while R4 is still read: the rewrite is emitted as an
+                // assignment to the shared name and would change the alias.
+                if let Expr::Name(n) = &src_expr {
+                    if b != a
+                        && (super::is_overlap_seed(proto, n) || super::is_cond_join(proto, pc))
+                        && super::move_alias_goes_stale(code, pc, a, b)
+                    {
+                        // A FRESH name: the register's own earlier binding may still
+                        // be read by pending expressions (`v42 + 0.46832`).
+                        let fresh = ctx.gen_scoped_name(&format!("sel{}", a));
+                        let copy_name = locals.reseed_shadow(a, &fresh);
+                        stmts.push(Stat::Local { names: vec![copy_name.clone()], values: vec![src_expr] });
+                        regs[a] = RegVal::Expr(Expr::Name(copy_name));
+                        pc += 1;
+                        continue;
+                    }
                 }
                 match &src_expr {
                     Expr::Name(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_)
@@ -6165,6 +6273,13 @@ pub(super) fn lift_instruction_range(
                     // out-of-range handler and becomes a spurious `break`.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
+                    let (then_end, else_range) = match (else_range, cond_else_skip_join(code, jump_next, target, end)) {
+                        (None, Some(join)) => {
+                            super::note_cond_join(proto, pc, join);
+                            (join, Some((target, join)))
+                        }
+                        other => (then_end, other.0),
+                    };
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
