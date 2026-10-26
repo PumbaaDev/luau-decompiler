@@ -13,7 +13,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::ast::Stat;
+use crate::ast::{Expr, Stat};
+use super::naming::RegVal;
 use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{insn_a, insn_d, insn_op, Proto};
 
@@ -30,6 +31,19 @@ fn key(proto: &Proto) -> usize {
 
 fn kill_switch() -> bool {
     std::env::var("LUAU_NO_NIL_TAIL_BIND").is_ok()
+}
+
+/// May a nil-tail rewrite replace what register state `val` holds?
+///
+/// The rewrite starts a fresh binding and resets the register, which is sound
+/// for a dead local, a dead parked expression (`src.Event` read once and never
+/// used again) or nothing. A parked string/number/boolean LITERAL is different:
+/// it is a constant default that a later MOVE already copied (`x or "Normal"`,
+/// the `LOADK` arm of the diamond), and the overwrite pass names it with a
+/// declaration of its own; resetting the register here drops the constant
+/// (Slayers2 TextPlusUtility `fontface` lost its "Normal" default).
+pub(super) fn register_value_is_replaceable(val: &RegVal) -> bool {
+    !matches!(val, RegVal::Expr(Expr::String(_) | Expr::Number(_) | Expr::Bool(_)))
 }
 
 /// May the nil-tail binding rewrites run for `proto` right now?

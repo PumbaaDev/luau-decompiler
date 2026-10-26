@@ -1470,9 +1470,10 @@ fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
     is_conditional_branch_op(LuauOpcode::from_u8(insn_op(code[branch_pc])))
 }
 
-/// Does the arm `[arm_start, target)` end by an unconditional JUMP that lands
-/// past `target`, i.e. is `target` the start of an else / elseif part?
-fn arm_skips_past_with_jump(code: &[u32], arm_start: usize, target: usize) -> bool {
+/// Where does the arm `[arm_start, target)` leave by its closing unconditional
+/// JUMP, when that JUMP lands past `target` (so `target` starts an else /
+/// elseif part)? `None` when the arm does not end in such a JUMP.
+fn arm_exit_jump_target(code: &[u32], arm_start: usize, target: usize) -> Option<usize> {
     let mut k = arm_start;
     let mut last = None;
     while k < target && k < code.len() {
@@ -1481,9 +1482,39 @@ fn arm_skips_past_with_jump(code: &[u32], arm_start: usize, target: usize) -> bo
         k += if op.has_aux() { 2 } else { 1 };
     }
     match last {
-        Some((k, LuauOpcode::Jump)) => k as i64 + insn_d(code[k]) as i64 + 1 > target as i64,
-        _ => false,
+        Some((k, LuauOpcode::Jump)) => {
+            let dest = k as i64 + insn_d(code[k]) as i64 + 1;
+            (dest > target as i64).then_some(dest as usize)
+        }
+        _ => None,
     }
+}
+
+/// Is it safe to keep the join of the open arm `[.., target)` in the flat span,
+/// given that the arm leaves by a JUMP to `exit` and `[target, exit)` is the
+/// else / elseif part?
+///
+/// The flat lift copes with an else part that is straight-line, and with an
+/// elseif chain whose arms all leave the span (`exit == end`: a loop body's
+/// last statement). An else part with branches of its own inside a span that
+/// carries on past `exit` (an or-guard body, a selection chain followed by more
+/// code) is only lifted correctly when the span is cut at the join: kept flat,
+/// the guard or the chain's other arms are lost or a fabricated chain is
+/// emitted (AdoptMe OfferPane `_start_fade_promise`, BloxFruits Skyjump,
+/// PetSimulator99 Egg_Opening_Frontend before `WaitClick`).
+fn else_part_keeps_flat_lift(code: &[u32], target: usize, exit: usize, end: usize) -> bool {
+    if exit == end {
+        return true;
+    }
+    let mut k = target;
+    while k < exit && k < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        if is_conditional_branch_op(op) {
+            return false;
+        }
+        k += if op.has_aux() { 2 } else { 1 };
+    }
+    true
 }
 
 /// Longest value join `value_join_inside_open_arm` keeps whole: one and/or
@@ -1524,7 +1555,8 @@ fn value_join_inside_open_arm(
                 && next_pc == vj_pc
                 && join_start - vj_pc <= OPEN_ARM_JOIN_MAX_INSNS
                 && !seen_targets.contains(&target)
-                && arm_skips_past_with_jump(code, next_pc, target)
+                && arm_exit_jump_target(code, next_pc, target)
+                    .is_some_and(|exit| else_part_keeps_flat_lift(code, target, exit, end))
             {
                 return true;
             }

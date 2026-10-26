@@ -4028,6 +4028,7 @@ fn lift_region(
                 Some(mpc) if else_region.is_empty() && nil_tail_gate::enabled(proto) => {
                     nil_tail_call_arm_reg(&proto.code, *cond_pc, branch_pc, *mpc)
                         .filter(|&r| r < regs.len() && locals.is_non_param(r))
+                        .filter(|&r| nil_tail_gate::register_value_is_replaceable(&regs[r]))
                 }
                 _ => None,
             };

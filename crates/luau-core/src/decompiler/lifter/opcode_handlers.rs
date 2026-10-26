@@ -1718,7 +1718,10 @@ fn lift_nil_tail_call_select(
     }
     let code = &proto.code;
     let r = nil_tail_call_arm_reg(code, jump_next - 1, branch_pc, target)?;
-    if r >= regs.len() || !locals.is_non_param(r) {
+    if r >= regs.len()
+        || !locals.is_non_param(r)
+        || !super::nil_tail_gate::register_value_is_replaceable(&regs[r])
+    {
         return None;
     }
     let regs_snapshot = regs.clone();
