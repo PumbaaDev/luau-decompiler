@@ -102,3 +102,21 @@ fn moved_copy_does_not_alias_a_rewritten_name() {
         assert!(copy, "{f}: the Y copy (`MOVE R4 R5`) became an alias:\n{text}");
     }
 }
+
+/// AdoptMe `LerpCIELUV` carries the same cube-or-fallback diamond with a long
+/// dead scratch value (`arg1 * result32`, R6) parked across it. The diamond must
+/// not fabricate that value as a statement, and the copy `MOVE R4 R5` must not
+/// alias the register that is rewritten two lines later.
+#[test]
+fn lerp_cieluv_has_no_fabricated_scratch_and_no_stale_alias() {
+    let p = PathBuf::from("C:/Users/jep/Desktop/AdoptMe_v12_bytecode/ReplicatedStorage_SharedModules_LerpCIELUV.luac");
+    let Ok(bytes) = std::fs::read(&p) else { eprintln!("SKIP: {p:?} absent"); return };
+    let Ok(Ok(src)) = std::panic::catch_unwind(|| luau_core::decompile(&bytes)) else { return };
+    assert!(!src.contains("arg1 * result32\n            if 0.2"), "fabricated scratch statement:\n{src}");
+    let fabricated = src
+        .lines()
+        .filter(|l| l.trim() == "local result229 = arg1 * result32")
+        .count();
+    assert_eq!(fabricated, 0, "fabricated `arg1 * result32` statement:\n{src}");
+    assert!(src.contains("local sel4 = result227"), "Y copy aliased the rewritten name:\n{src}");
+}

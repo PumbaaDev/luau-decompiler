@@ -2882,7 +2882,7 @@ pub(super) fn lift_instruction_range(
                 // assignment to the shared name and would change the alias.
                 if let Expr::Name(n) = &src_expr {
                     if b != a
-                        && super::is_overlap_seed(proto, n)
+                        && (super::is_overlap_seed(proto, n) || super::is_cond_join(proto, pc))
                         && super::move_alias_goes_stale(code, pc, a, b)
                     {
                         // A FRESH name: the register's own earlier binding may still
@@ -6274,7 +6274,10 @@ pub(super) fn lift_instruction_range(
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
                     let (then_end, else_range) = match (else_range, cond_else_skip_join(code, jump_next, target, end)) {
-                        (None, Some(join)) => (join, Some((target, join))),
+                        (None, Some(join)) => {
+                            super::note_cond_join(proto, pc, join);
+                            (join, Some((target, join)))
+                        }
                         other => (then_end, other.0),
                     };
 
