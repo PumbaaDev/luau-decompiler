@@ -169,6 +169,15 @@ impl LocalTracker {
         }
     }
 
+    /// Drop the binding of `reg` so its next write declares a fresh local. Only
+    /// for a register whose previous value is provably dead.
+    pub(super) fn forget_binding(&mut self, reg: usize) {
+        self.declared.remove(&reg);
+        self.current_names.remove(&reg);
+        self.alias_regs.remove(&reg);
+        self.alias_upval.remove(&reg);
+    }
+
     /// Returns true if this register needs a `local` declaration (first write).
     pub(super) fn needs_local(&mut self, reg: usize) -> bool {
         if reg < self.param_count {

@@ -56,6 +56,7 @@ use super::{
     sanitize_leaked_global_string,
     simplify_expr,
     premateralize_branch_escapes_split,
+    nil_tail_call_arm_reg,
     store_complex,
     table_expr,
     // Recursive closure lifting — called on every `NewClosure` opcode.
@@ -1552,6 +1553,85 @@ fn pinned_write_consumed(
     });
     regs[a] = RegVal::Expr(Expr::Name(bound));
     true
+}
+
+/// Inline lift of `r = c and f(..) or nil`:
+/// `JUMPIFNOT c -> L; ..; CALL Rr .. 1; JUMPIF Rr -> L+1; L: LOADNIL Rr`.
+///
+/// The arm defines `r` (its old value is dead on both edges), so it starts a
+/// fresh binding. The generic inline-if path lifts the arm as a block-scoped
+/// `local`, then lets the LOADNIL park nil over the register, so the join reads
+/// a name nothing assigns. Returns the pc to resume at (the LOADNIL, which the
+/// caller's LOADNIL handler then skips) once the selection has been emitted.
+#[allow(clippy::too_many_arguments)]
+fn lift_nil_tail_call_select(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    stmts: &mut Vec<Stat>,
+    in_loop: bool,
+    branch_pc: usize,
+    jump_next: usize,
+    target: usize,
+    guard: &Expr,
+) -> Option<usize> {
+    let code = &proto.code;
+    let r = nil_tail_call_arm_reg(code, jump_next - 1, branch_pc, target)?;
+    if r >= regs.len() || !locals.is_non_param(r) {
+        return None;
+    }
+    let regs_snapshot = regs.clone();
+    locals.forget_binding(r);
+    regs[r] = RegVal::Unknown;
+    let mut then_stmts = Vec::new();
+    // The arm ends with the `JUMPIF Rr` that skips the LOADNIL; it is the
+    // selection itself, not arm code.
+    lift_instruction_range(ctx, proto, proto_index, depth + 1, jump_next, target - 1, regs, locals, &mut then_stmts, in_loop);
+    let bound = match (&regs[r], then_stmts.last()) {
+        (RegVal::Expr(Expr::Name(n)), Some(Stat::Local { names, values }))
+            if names.len() == 1 && names[0] == *n && values.len() == 1 =>
+        {
+            Some((n.clone(), values[0].clone()))
+        }
+        _ => None,
+    };
+    *regs = regs_snapshot;
+    let Some((name, value)) = bound else {
+        // Unrecognised arm: emit it as the plain guarded block and let the
+        // LOADNIL handler run as before.
+        stmts.push(Stat::If { condition: guard.clone(), then_body: then_stmts, elseif_clauses: vec![], else_body: None });
+        return Some(target);
+    };
+    if then_stmts.len() == 1 {
+        let selected = Expr::BinOp {
+            left: Box::new(Expr::BinOp {
+                left: Box::new(guard.clone()),
+                op: BinOp::And,
+                right: Box::new(value),
+            }),
+            op: BinOp::Or,
+            right: Box::new(Expr::Nil),
+        };
+        stmts.push(Stat::Local { names: vec![name.clone()], values: vec![selected] });
+    } else {
+        // The arm needs statements of its own (materialised argument calls):
+        // keep them in a real if/else over one declaration.
+        let last = then_stmts.len() - 1;
+        then_stmts[last] = Stat::Assign { targets: vec![Expr::Name(name.clone())], values: vec![value] };
+        stmts.push(Stat::Local { names: vec![name.clone()], values: Vec::new() });
+        stmts.push(Stat::If {
+            condition: guard.clone(),
+            then_body: then_stmts,
+            elseif_clauses: vec![],
+            else_body: Some(vec![Stat::Assign { targets: vec![Expr::Name(name.clone())], values: vec![Expr::Nil] }]),
+        });
+    }
+    regs[r] = RegVal::Expr(Expr::Name(name));
+    ctx.default_merged_loads.insert((proto_index, target));
+    Some(target)
 }
 
 /// Restore the pre-branch register view after an arm, optionally KEEPING values
@@ -5809,6 +5889,19 @@ pub(super) fn lift_instruction_range(
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &condition,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
+
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join
@@ -6166,6 +6259,19 @@ pub(super) fn lift_instruction_range(
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
 
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &guard_cond,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
+
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore
                     // below annihilates the branch's result and the join silently
@@ -6385,6 +6491,19 @@ pub(super) fn lift_instruction_range(
                     // the else body is lifted as if it were unconditional.
                     let (then_end, else_range) =
                         detect_else_skip(code, jump_next, target, end, Some((proto, pc, in_loop)));
+
+                    // `r = c and f(..) or nil`: the arm defines a register that
+                    // carries a new value across the join. See
+                    // `lift_nil_tail_call_select`.
+                    if else_range.is_none() {
+                        if let Some(np) = lift_nil_tail_call_select(
+                            ctx, proto, proto_index, depth, regs, locals, stmts, in_loop,
+                            pc, jump_next, target, &guard_cond,
+                        ) {
+                            pc = np;
+                            continue;
+                        }
+                    }
 
                     // Name any parked literal this branch overwrites and later
                     // code reads, BEFORE snapshotting — otherwise the restore

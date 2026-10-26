@@ -3897,6 +3897,22 @@ fn lift_region(
             // Extract the condition expression from the branch instruction
             let condition = extract_branch_condition(ctx, proto, branch_pc, regs);
 
+            // `r = c and f(..) or nil` over a register that held a dead bound
+            // value: start a fresh binding so the arm's call declares it
+            // (`default_merge_local` below then folds the whole selection into
+            // one declaration) instead of reassigning the stale name.
+            let nil_tail_fresh = match merge_pc {
+                Some(mpc) if else_region.is_empty() => {
+                    nil_tail_call_arm_reg(&proto.code, *cond_pc, branch_pc, *mpc)
+                        .filter(|&r| r < regs.len() && locals.is_non_param(r))
+                }
+                _ => None,
+            };
+            if let Some(r) = nil_tail_fresh {
+                locals.forget_binding(r);
+                regs[r] = RegVal::Unknown;
+            }
+
             // Name any parked literal the arms overwrite and later code reads,
             // BEFORE snapshotting. Without this the arm writes stay parked in
             // the register file, `merge_regs` collapses the disagreeing parks
@@ -3913,7 +3929,7 @@ fn lift_region(
             // Only when a merge exists: arms that return/diverge have no join
             // to feed, and the write scan walks the arm's ACTUAL block ranges
             // (never `min..max` of a disjoint arm — the double-lift lesson).
-            if let Some(mpc) = merge_pc {
+            if let (Some(mpc), None) = (merge_pc, nil_tail_fresh) {
                 let then_ranges: Vec<(usize, usize)> = then_region
                     .iter()
                     .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
@@ -4435,6 +4451,30 @@ fn lift_region(
             }
             if default_merge_local.is_some() {
                 then_stmts.clear();
+            }
+
+            // `cond and f(..)` over a LOADNIL else arm: `merge_regs` keeps the
+            // call arm's Name (the one-sided Name rule) while the arm's own
+            // `local` is scoped to the `if`, so the join reads an unbound name.
+            if else_body.is_some() {
+                let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                for i in 0..n {
+                    if let (
+                        RegVal::Expr(Expr::Name(a)),
+                        RegVal::Expr(Expr::Name(b)),
+                        RegVal::Expr(Expr::Nil),
+                    ) = (&regs[i], &regs_after_then[i], &regs_after_else[i])
+                    {
+                        if a == b {
+                            bind_call_arm_nil_tail(
+                                &mut then_stmts,
+                                else_body.as_mut(),
+                                &mut hoisted_phis,
+                                a,
+                            );
+                        }
+                    }
+                }
             }
 
             // B0.57: hoist `Stat::Local` declarations out of branch bodies
@@ -5432,6 +5472,45 @@ fn lift_region(
             });
         }
     }
+}
+
+/// The call arm of `cond and f(..)` whose else arm is a bare `LOADNIL`.
+///
+/// The then arm ends up as `local n = f(..)`, scoped to the `if`, while the
+/// else arm parks `nil` in the same register; the join then reads `n` from
+/// outside its scope. Both arms assign, so declaring `n` ahead of the `if` and
+/// turning the arm's `local` into a plain assignment is sound (unlike the
+/// rejected hoists, no path leaves `n` unassigned), and the else arm gets
+/// `n = nil`. Only a top-level `local n = <call>` of the then arm qualifies.
+fn bind_call_arm_nil_tail(
+    then_stmts: &mut [Stat],
+    else_body: Option<&mut Vec<Stat>>,
+    hoisted_phis: &mut Vec<Stat>,
+    name: &str,
+) {
+    let Some(else_stmts) = else_body else {
+        return;
+    };
+    let Some(idx) = then_stmts.iter().position(|s| {
+        matches!(s, Stat::Local { names, values }
+            if names.len() == 1 && names[0] == name && values.len() == 1
+                && matches!(values[0], Expr::Call { .. } | Expr::MethodCall { .. }))
+    }) else {
+        return;
+    };
+    let Stat::Local { values, .. } = &then_stmts[idx] else {
+        return;
+    };
+    let init = values[0].clone();
+    then_stmts[idx] = Stat::Assign {
+        targets: vec![Expr::Name(name.to_string())],
+        values: vec![init],
+    };
+    hoisted_phis.push(Stat::Local { names: vec![name.to_string()], values: Vec::new() });
+    else_stmts.push(Stat::Assign {
+        targets: vec![Expr::Name(name.to_string())],
+        values: vec![Expr::Nil],
+    });
 }
 
 /// B0.57 — hoist `Stat::Local { names: [n], values: [init] }` statements out
@@ -7195,7 +7274,13 @@ fn simplify_expr(expr: &Expr) -> Expr {
                     if matches!(l, Expr::Bool(false)) { return r; }
                     if matches!(l, Expr::Bool(true))  { return Expr::Bool(true); }
                     if matches!(l, Expr::Nil)         { return r; }
-                    if matches!(r, Expr::Nil)         { return l; }
+                    // `a and b or nil` is a selection, not an identity: when
+                    // `a` is false the whole expression is nil, not false, and
+                    // a following `~= nil` test (an `a and a:Find() or nil`
+                    // chain) tells them apart.
+                    if matches!(r, Expr::Nil) && !matches!(&l, Expr::BinOp { op: BinOp::And, .. }) {
+                        return l;
+                    }
                     // Phase B0.97b: x or x → x (idempotent)
                     if exprs_structurally_equal(&l, &r) { return l; }
                 }
@@ -8038,6 +8123,83 @@ fn default_load_merge_reg(code: &[u32], cond_pc: usize, merge_pc: usize) -> Opti
         pc += if op.has_aux() { 2 } else { 1 };
     }
     None
+}
+
+/// `local h = c and f(..) or nil` assigned over a register that already holds a
+/// dead, bound value: `JUMPIFNOT c -> L; ..; CALL Rr .. 1; JUMPIF Rr -> L+1;
+/// L: LOADNIL Rr`. Returns `r` when the arm is a bare call that defines `r`
+/// (its previous value is dead on both edges) and every other register the arm
+/// writes is a dead temporary above `r`. Such a register carries a brand new
+/// value across the join, so it must start a fresh binding instead of
+/// reassigning the stale one.
+pub(super) fn nil_tail_call_arm_reg(code: &[u32], cond_pc: usize, branch_pc: usize, mpc: usize) -> Option<usize> {
+    let r = default_load_merge_reg(code, cond_pc, mpc)?;
+    let bop = LuauOpcode::from_u8(insn_op(*code.get(branch_pc)?));
+    let arm_start = branch_pc + if bop.has_aux() { 2 } else { 1 };
+    let mut pc = arm_start;
+    let mut last_real: Option<usize> = None;
+    let mut jump_over_ok = false;
+    while pc < mpc {
+        let i = *code.get(pc)?;
+        let op = LuauOpcode::from_u8(insn_op(i));
+        let step = if op.has_aux() { 2 } else { 1 };
+        let jumps_over = op == LuauOpcode::JumpIf
+            && insn_a(i) as usize == r
+            && pc as i64 + 1 + insn_d(i) as i64 == mpc as i64 + 1;
+        if jumps_over {
+            let prev = *code.get(last_real?)?;
+            jump_over_ok = pc + step == mpc
+                && LuauOpcode::from_u8(insn_op(prev)) == LuauOpcode::Call
+                && insn_a(prev) as usize == r
+                && insn_c(prev) == 2;
+            break;
+        }
+        if op != LuauOpcode::Nop {
+            last_real = Some(pc);
+        }
+        pc += step;
+    }
+    if !jump_over_ok {
+        return None;
+    }
+    // The arm is an expression: loads, field reads, method lookups and calls
+    // only, so the operand roles `merge_first_touch_is_read` assigns are exact.
+    let mut pc = arm_start;
+    while pc < mpc {
+        let op = LuauOpcode::from_u8(insn_op(*code.get(pc)?));
+        let allowed = matches!(
+            op,
+            LuauOpcode::Nop
+                | LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::Move
+                | LuauOpcode::GetUpval
+                | LuauOpcode::GetGlobal
+                | LuauOpcode::GetImport
+                | LuauOpcode::GetTableKS
+                | LuauOpcode::GetTableN
+                | LuauOpcode::GetTable
+                | LuauOpcode::NameCall
+                | LuauOpcode::Call
+                | LuauOpcode::JumpIf
+        );
+        if !allowed {
+            return None;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    // The old value of `r` must not be read before the arm redefines it, and
+    // every other register the arm writes sits above `r`: a CALL frame must be
+    // the top of the live registers, so those are call temporaries.
+    if merge_first_touch_is_read(code, arm_start, mpc, r) {
+        return None;
+    }
+    collect_body_writes(code, arm_start, mpc)
+        .into_iter()
+        .all(|w| w >= r)
+        .then_some(r)
 }
 
 /// Returns true if an if-statement is entirely empty (all branches have no
@@ -9411,6 +9573,15 @@ fn reg_used_in_range(code: &[u32], start: usize, end: usize, reg: usize) -> bool
                     return true;
                 }
             }
+            // SETLIST A B C reads the value window R(B)..R(B+C-2) (C == 0:
+            // up to the stack top); only B is named by an operand field.
+            LuauOpcode::SetList => {
+                let first = insn_b(insn) as usize;
+                let count = insn_c(insn) as usize;
+                if reg >= first && (count == 0 || reg + 1 < first + count) {
+                    return true;
+                }
+            }
             _ => {}
         }
         i += if op.has_aux() { 2 } else { 1 };
@@ -10213,8 +10384,21 @@ pub(crate) fn merge_first_touch_is_read(code: &[u32], start: usize, end: usize, 
             Op::SetList => {
                 // Table A, values B.. — everything involved is a read of state
                 // built earlier; A is mutated in place, not redefined.
+                // The values are R(B)..R(B+C-2); C == 0 takes everything up
+                // to the stack top. A joined value stored as a table element
+                // (`{ f(), c and g() }`) sits above B, so naming only B hid
+                // its read from the seeding gate.
                 reads.push(a);
                 reads.push(b);
+                if c == 0 {
+                    if reg >= b {
+                        return true;
+                    }
+                } else {
+                    for r in b..(b + c).saturating_sub(1) {
+                        reads.push(r);
+                    }
+                }
             }
             Op::NameCall => {
                 reads.push(b);
