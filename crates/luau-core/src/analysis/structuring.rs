@@ -1405,7 +1405,17 @@ fn is_call_link_block(code: &[u32], block: &BasicBlock) -> bool {
         return false;
     }
     let bop = LuauOpcode::from_u8(insn_op(code[branch_pc]));
-    if !matches!(bop, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+    // `typeof(x) ~= "table"` tests the call result with a JUMPXEQK* compare
+    // instead of a truthiness jump; the operand is still register A.
+    if !matches!(
+        bop,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS
+    ) {
         return false;
     }
     let tested = insn_a(code[branch_pc]) as usize;
@@ -1415,7 +1425,14 @@ fn is_call_link_block(code: &[u32], block: &BasicBlock) -> bool {
     while i < branch_pc && i < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[i]));
         match op {
-            LuauOpcode::NameCall => {}
+            // A builtin fast path (`typeof`, `type`, `math.*`) sits in front of
+            // the CALL it shortcuts; it only parks the same value.
+            LuauOpcode::NameCall
+            | LuauOpcode::FastCall
+            | LuauOpcode::FastCall1
+            | LuauOpcode::FastCall2
+            | LuauOpcode::FastCall2K
+            | LuauOpcode::FastCall3 => {}
             LuauOpcode::Call => {
                 calls += 1;
                 // C == 2: exactly one result.
@@ -1451,6 +1468,68 @@ fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
         i += if op.has_aux() { 2 } else { 1 };
     }
     is_conditional_branch_op(LuauOpcode::from_u8(insn_op(code[branch_pc])))
+}
+
+/// Does the arm `[arm_start, target)` end by an unconditional JUMP that lands
+/// past `target`, i.e. is `target` the start of an else / elseif part?
+fn arm_skips_past_with_jump(code: &[u32], arm_start: usize, target: usize) -> bool {
+    let mut k = arm_start;
+    let mut last = None;
+    while k < target && k < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        last = Some((k, op));
+        k += if op.has_aux() { 2 } else { 1 };
+    }
+    match last {
+        Some((k, LuauOpcode::Jump)) => k as i64 + insn_d(code[k]) as i64 + 1 > target as i64,
+        _ => false,
+    }
+}
+
+/// Longest value join `value_join_inside_open_arm` keeps whole: one and/or
+/// ternary. A longer join (a multi-way `a and 7 or b and 14 or 21`) lifted flat
+/// inside the arm loses an arm (RIVALS MiscellaneousController).
+const OPEN_ARM_JOIN_MAX_INSNS: usize = 6;
+
+/// Does the value join entered at `vj_pc` (ending at `join_start`) sit inside
+/// the then-arm of an if/else (or elseif) started in `[span_start, vj_pc)`,
+/// whose else part starts past the join?
+///
+/// Cutting the flat span at such a join leaves that jump as the last
+/// instruction of its range with its target out of range, and the enclosing
+/// construct (an if/else diamond, an `a or b` chain) is lifted as a bare
+/// `continue` guard instead.
+fn value_join_inside_open_arm(
+    code: &[u32],
+    span_start: usize,
+    vj_pc: usize,
+    join_start: usize,
+    end: usize,
+) -> bool {
+    let mut j = span_start;
+    // Targets of the forward conditionals seen so far: a second conditional
+    // skipping to the same else is another `and` operand of the SAME test, and
+    // the flat lift of that chain mislifts a join inside it (SAE
+    // `SetLogLevel`), so only the first operand counts.
+    let mut seen_targets: Vec<usize> = Vec::new();
+    while j < vj_pc && j < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[j]));
+        let size = if op.has_aux() { 2 } else { 1 };
+        if let Some((next_pc, target)) = forward_conditional_jump(op, j, code[j]) {
+            if target > join_start
+                && target <= end
+                && next_pc == vj_pc
+                && join_start - vj_pc <= OPEN_ARM_JOIN_MAX_INSNS
+                && seen_targets.is_empty()
+                && arm_skips_past_with_jump(code, next_pc, target)
+            {
+                return true;
+            }
+            seen_targets.push(target);
+        }
+        j += size;
+    }
+    false
 }
 
 /// Upper bounds that keep `find_or_guard_body` a local pattern, not a search.
@@ -1897,7 +1976,12 @@ pub(crate) fn structure_numeric_for_body(
                 let join_start = cfg.blocks.get(&vj.join).map(|b| b.start).unwrap_or(body_end);
                 // Must be wholly inside the range being scanned, or the region
                 // would claim instructions this call is not responsible for.
-                if join_start <= body_end {
+                // A join inside the arm of an open conditional stays in the flat
+                // span: cutting it there strands that conditional's target past
+                // the range and its other arm / `or` links are dropped.
+                if join_start <= body_end
+                    && !value_join_inside_open_arm(code, linear_start, pc, join_start, body_end)
+                {
                     if linear_start < pc {
                         regions.push(Region::Linear { start: linear_start, end: pc });
                     }
