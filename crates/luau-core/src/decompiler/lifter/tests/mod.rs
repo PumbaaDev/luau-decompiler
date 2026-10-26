@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod phase_b03_numeric_for_tests;
+mod loop_exit_preload_tests;
 #[cfg(test)]
 mod phase_b042_control_flow_polish_tests;
 #[cfg(test)]

@@ -2585,6 +2585,10 @@ pub(super) fn lift_instruction_range(
             regs.resize(max_reg + 8, RegVal::Unknown);
         }
 
+        if ctx.preloaded_exit_loads.contains(&(proto_index, pc)) {
+            pc += 1;
+            continue;
+        }
         match op {
             LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::Coverage
             | LuauOpcode::NativeCall | LuauOpcode::CloseUpvals

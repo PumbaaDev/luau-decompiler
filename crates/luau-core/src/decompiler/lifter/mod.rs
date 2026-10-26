@@ -33,6 +33,7 @@ use post_passes::{
 };
 
 mod oor_guard;
+mod loop_exit_preload;
 mod prelude_fold;
 mod opcode_handlers;
 use opcode_handlers::lift_instruction_range;
@@ -4868,6 +4869,7 @@ fn lift_region(
             // themselves (R(A), R(A+1), R(A+2)) because those are either
             // already absorbed (start/limit/step) or about to be rebound to
             // the loop variable name below.
+            loop_exit_preload::apply(ctx, proto, proto_index, regs, locals, stmts, (*prep_pc, *loop_pc));
             {
                 let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
                 premateralize_loop_carried(
@@ -5113,6 +5115,7 @@ fn lift_region(
             // BEFORE the LoopVar seeding below, so a stale literal in a
             // loop-variable slot is not turned into a bogus `local k = <stale>`
             // that the seeding then shadows.
+            loop_exit_preload::apply(ctx, proto, proto_index, regs, locals, stmts, (*prep_pc, *loop_pc));
             {
                 let body_writes = collect_body_writes(&proto.code, *body_start, *body_end);
                 let mut skip = vec![a, a + 1, a + 2];
