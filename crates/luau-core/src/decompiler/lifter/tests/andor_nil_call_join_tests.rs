@@ -168,3 +168,29 @@ fn setlist_element_call_arm_keeps_its_value() {
         "value not bound across the join:\n{out}"
     );
 }
+
+/// BigNum `change`: the register holds a stale `nil`, the then arm assigns it
+/// from a call and the else arm only calls `error(..)` -- it never writes the
+/// register. No `len = nil` may be invented in the else arm.
+#[test]
+fn else_arm_that_never_writes_the_register_gets_no_nil_store() {
+    let code = vec![
+        insn_abc(OP_LOADNIL, 5, 0, 0), // 0: R5 = nil (stale)
+        insn_abc(OP_GETGLOBAL, 1, 0, 0), // 1: R1 = c
+        0,
+        insn_ad(OP_JUMPIFNOT, 1, 5), // 3: -> 9 (else arm)
+        insn_abc(OP_GETGLOBAL, 5, 1, 0), // 4: R5 = make
+        1,
+        insn_ad(OP_LOADK, 6, 2), // 6: R6 = "K"
+        insn_abc(OP_CALL, 5, 2, 2), // 7: R5 = make("K")
+        insn_ad(OP_JUMP, 0, 4), // 8: -> 13
+        insn_abc(OP_GETGLOBAL, 7, 4, 0), // 9: R7 = error
+        4,
+        insn_ad(OP_LOADK, 8, 5), // 11
+        insn_abc(OP_CALL, 7, 2, 1), // 12: error("bad")
+        insn_abc(OP_RETURN, 0, 1, 0), // 13
+    ];
+    let out = lift_single(code, vec!["c", "make", "K", "use", "error", "bad"]);
+    println!("{out}");
+    assert!(!out.lines().any(|l| l.trim().starts_with("make_2 = nil")), "invented a nil store the bytecode lacks:\n{out}");
+}

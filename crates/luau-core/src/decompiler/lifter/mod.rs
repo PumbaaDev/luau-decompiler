@@ -33,6 +33,7 @@ use post_passes::{
 };
 
 mod oor_guard;
+mod nil_tail_gate;
 mod prelude_fold;
 mod opcode_handlers;
 use opcode_handlers::lift_instruction_range;
@@ -1007,7 +1008,7 @@ fn count_calls_expr(e: &Expr) -> usize {
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let outer_loop_body = ctx.current_loop_body.take();
     let outer_latches = std::mem::take(&mut ctx.emitted_latches);
-    let out = lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
+    let out = lift_proto_with_nil_tail_fallback(ctx, proto, proto_index, depth);
     ctx.emitted_latches = outer_latches;
     ctx.current_loop_body = outer_loop_body;
     // Always recorded, not gated: this feeds a semantic check, not a trace.
@@ -1562,6 +1563,65 @@ fn lift_hazards(ctx: &DecompileContext, proto: &Proto, proto_index: usize, out: 
         scope_uses: scope_hazard_uses(out),
         orphan: orphan_assign_count(ctx, proto, proto_index, out),
     }
+}
+
+/// HAZARD FALLBACK for the `c and f(..) or nil` binding rewrites
+/// (`nil_tail_gate`). A proto in which a rewrite fired is lifted again without
+/// them; the rewrite-free lift is kept when the rewritten one has more
+/// `break`/`continue` exits or more binding hazards. Binding a register makes
+/// code liftable that used to read an unbound name, and that code can meet
+/// heuristics that are wrong for its shape (an out-of-range jump to a mid-body
+/// `task.wait` printed as `continue`), so a bound join is never bought with
+/// new control-flow guesses. Kill-switch: `LUAU_NO_NIL_TAIL_BIND`.
+fn lift_proto_with_nil_tail_fallback(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    if !nil_tail_gate::proto_has_candidates(proto) {
+        return lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
+    }
+    let snapshot = ctx.clone();
+    let budget = (
+        STMTS_EMITTED.with(|c| c.get()),
+        STMT_BUDGET_TRIPPED.with(|c| c.get()),
+    );
+    nil_tail_gate::fired_reset(proto);
+    let out = lift_proto_with_oor_fallback(ctx, proto, proto_index, depth);
+    if nil_tail_gate::fired_count(proto) == 0 {
+        return out;
+    }
+    let exits_on = nil_tail_gate::loop_exits(&out);
+    let h_on = lift_hazards(ctx, proto, proto_index, &out);
+    if exits_on == 0 && h_on.total() == 0 {
+        return out;
+    }
+    let ctx_on = std::mem::replace(ctx, snapshot);
+    let budget_on = (
+        STMTS_EMITTED.with(|c| c.get()),
+        STMT_BUDGET_TRIPPED.with(|c| c.get()),
+    );
+    STMTS_EMITTED.with(|c| c.set(budget.0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(budget.1));
+    let out_off = nil_tail_gate::with_disabled(proto, || lift_proto_with_oor_fallback(ctx, proto, proto_index, depth));
+    let exits_off = nil_tail_gate::loop_exits(&out_off);
+    let h_off = lift_hazards(ctx, proto, proto_index, &out_off);
+    let off = exits_on > exits_off || h_on.worse_than(h_off);
+    if std::env::var("LUAU_NIL_TAIL_TRACE").is_ok() {
+        eprintln!(
+            "NILTAIL	{}@{}	exits on={} off={} hazards on={:?} off={:?} -> {}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            exits_on,
+            exits_off,
+            h_on,
+            h_off,
+            if off { "OFF" } else { "ON" }
+        );
+    }
+    if off {
+        return out_off;
+    }
+    *ctx = ctx_on;
+    STMTS_EMITTED.with(|c| c.set(budget_on.0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(budget_on.1));
+    out
 }
 
 /// HAZARD FALLBACK for the non-loop out-of-range rewrites (`oor_guard`).
@@ -3902,13 +3962,14 @@ fn lift_region(
             // (`default_merge_local` below then folds the whole selection into
             // one declaration) instead of reassigning the stale name.
             let nil_tail_fresh = match merge_pc {
-                Some(mpc) if else_region.is_empty() => {
+                Some(mpc) if else_region.is_empty() && nil_tail_gate::enabled(proto) => {
                     nil_tail_call_arm_reg(&proto.code, *cond_pc, branch_pc, *mpc)
                         .filter(|&r| r < regs.len() && locals.is_non_param(r))
                 }
                 _ => None,
             };
             if let Some(r) = nil_tail_fresh {
+                nil_tail_gate::note_fired(proto);
                 locals.forget_binding(r);
                 regs[r] = RegVal::Unknown;
             }
@@ -4456,22 +4517,34 @@ fn lift_region(
             // `cond and f(..)` over a LOADNIL else arm: `merge_regs` keeps the
             // call arm's Name (the one-sided Name rule) while the arm's own
             // `local` is scoped to the `if`, so the join reads an unbound name.
-            if else_body.is_some() {
+            if else_body.is_some() && nil_tail_gate::enabled(proto) {
                 let n = regs.len().min(regs_after_then.len()).min(regs_after_else.len());
+                // The nil must come from a LOADNIL in the else arm itself; a
+                // register that merely held a stale nil before the branch is
+                // not written by that arm (BigNum.change: `error(..)` arm).
+                let else_spans: Vec<(usize, usize)> = else_region
+                    .iter()
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
                 for i in 0..n {
+                    if !else_spans.iter().any(|&(s, e)| range_loads_nil_into(&proto.code, s, e, i)) {
+                        continue;
+                    }
                     if let (
                         RegVal::Expr(Expr::Name(a)),
                         RegVal::Expr(Expr::Name(b)),
                         RegVal::Expr(Expr::Nil),
                     ) = (&regs[i], &regs_after_then[i], &regs_after_else[i])
                     {
-                        if a == b {
-                            bind_call_arm_nil_tail(
+                        if a == b
+                            && bind_call_arm_nil_tail(
                                 &mut then_stmts,
                                 else_body.as_mut(),
                                 &mut hoisted_phis,
                                 a,
-                            );
+                            )
+                        {
+                            nil_tail_gate::note_fired(proto);
                         }
                     }
                 }
@@ -5474,6 +5547,20 @@ fn lift_region(
     }
 }
 
+/// Does `[start, end)` hold a `LOADNIL` that covers register `reg`?
+fn range_loads_nil_into(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut pc = start;
+    while pc < end.min(code.len()) {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::LoadNil && insn_a(insn) as usize == reg {
+            return true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// The call arm of `cond and f(..)` whose else arm is a bare `LOADNIL`.
 ///
 /// The then arm ends up as `local n = f(..)`, scoped to the `if`, while the
@@ -5487,19 +5574,19 @@ fn bind_call_arm_nil_tail(
     else_body: Option<&mut Vec<Stat>>,
     hoisted_phis: &mut Vec<Stat>,
     name: &str,
-) {
+) -> bool {
     let Some(else_stmts) = else_body else {
-        return;
+        return false;
     };
     let Some(idx) = then_stmts.iter().position(|s| {
         matches!(s, Stat::Local { names, values }
             if names.len() == 1 && names[0] == name && values.len() == 1
                 && matches!(values[0], Expr::Call { .. } | Expr::MethodCall { .. }))
     }) else {
-        return;
+        return false;
     };
     let Stat::Local { values, .. } = &then_stmts[idx] else {
-        return;
+        return false;
     };
     let init = values[0].clone();
     then_stmts[idx] = Stat::Assign {
@@ -5511,6 +5598,7 @@ fn bind_call_arm_nil_tail(
         targets: vec![Expr::Name(name.to_string())],
         values: vec![Expr::Nil],
     });
+    true
 }
 
 /// B0.57 — hoist `Stat::Local { names: [n], values: [init] }` statements out

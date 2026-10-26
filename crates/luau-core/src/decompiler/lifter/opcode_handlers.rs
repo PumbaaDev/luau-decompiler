@@ -1578,6 +1578,9 @@ fn lift_nil_tail_call_select(
     target: usize,
     guard: &Expr,
 ) -> Option<usize> {
+    if !super::nil_tail_gate::enabled(proto) {
+        return None;
+    }
     let code = &proto.code;
     let r = nil_tail_call_arm_reg(code, jump_next - 1, branch_pc, target)?;
     if r >= regs.len() || !locals.is_non_param(r) {
@@ -1631,6 +1634,7 @@ fn lift_nil_tail_call_select(
     }
     regs[r] = RegVal::Expr(Expr::Name(name));
     ctx.default_merged_loads.insert((proto_index, target));
+    super::nil_tail_gate::note_fired(proto);
     Some(target)
 }
 
