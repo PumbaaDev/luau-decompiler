@@ -310,6 +310,9 @@ pub struct DecompileContext<'a> {
     /// `(proto_index, pc)` of each LOADNIL default already folded into a
     /// `c and X or nil` declaration by the if-lift; the LOADNIL must not re-park nil.
     pub default_merged_loads: std::collections::HashSet<(usize, usize)>,
+    /// `(proto_index, pc)` of each post-loop LOADNIL/LOADB hoisted before its
+    /// `for` loop (`lifter/loop_exit_preload.rs`); it must not re-park.
+    pub preloaded_exit_loads: std::collections::HashSet<(usize, usize)>,
 }
 
 /// A loop the lifter is currently emitting, as seen by `continue` minting.
@@ -349,6 +352,7 @@ impl<'a> DecompileContext<'a> {
             emitted_latches: Vec::new(),
             flat_for_regions: Vec::new(),
             default_merged_loads: std::collections::HashSet::new(),
+            preloaded_exit_loads: std::collections::HashSet::new(),
         }
     }
 
