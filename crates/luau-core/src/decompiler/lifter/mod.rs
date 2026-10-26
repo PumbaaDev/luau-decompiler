@@ -4526,8 +4526,19 @@ fn lift_region(
                     .iter()
                     .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
                     .collect();
+                // The call result must land in the register itself (CALL Rr, one
+                // result) in the then arm: a MOVE alias of the call's local
+                // (DisplayStandUseHelper `refresh_worn_items`: R3 = R2) is not
+                // the join.
+                let then_spans: Vec<(usize, usize)> = then_region
+                    .iter()
+                    .filter_map(|id| cfg.blocks.get(id).map(|b| (b.start, b.end)))
+                    .collect();
                 for i in 0..n {
                     if !else_spans.iter().any(|&(s, e)| range_loads_nil_into(&proto.code, s, e, i)) {
+                        continue;
+                    }
+                    if !then_spans.iter().any(|&(s, e)| range_calls_into(&proto.code, s, e, i)) {
                         continue;
                     }
                     if let (
@@ -5545,6 +5556,20 @@ fn lift_region(
             });
         }
     }
+}
+
+/// Does `[start, end)` hold a single-result `CALL` whose result lands in `reg`?
+fn range_calls_into(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut pc = start;
+    while pc < end.min(code.len()) {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if op == LuauOpcode::Call && insn_a(insn) as usize == reg && insn_c(insn) == 2 {
+            return true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Does `[start, end)` hold a `LOADNIL` that covers register `reg`?
