@@ -1792,6 +1792,48 @@ fn for_prep_opens_loop_body(code: &[u32], header: usize, latch: usize) -> bool {
 /// `latch + 1` (a `repeat .. until c` / `while c` tail test whose back edge is the
 /// fall-through)? Shape C0 targets `if done then break end; step()`, where a
 /// statement sits between the exit test and the back edge.
+/// Does `[start, end)` hold a three-MOVE register swap (`T=A; A=B; B=T`, i.e.
+/// `a, b = b, a`)? Such a loop carries two registers that trade values every
+/// iteration. The `repeat` lift names registers by alias, so the swap and the
+/// pending tables behind it come out as `table.insert({}, v)` / `tbl = table.clear`
+/// (Fusion `Graph/change`): leave those loops to the older path.
+fn range_has_register_swap(code: &[u32], start: usize, end: usize) -> bool {
+    let end = end.min(code.len());
+    let mut moves: Vec<(usize, usize)> = Vec::new(); // (a, b) of the last MOVEs in a row
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if op == LuauOpcode::Move {
+            moves.push((insn_a(code[pc]) as usize, insn_b(code[pc]) as usize));
+            let n = moves.len();
+            if n >= 3 {
+                let (t, a1) = moves[n - 3];
+                let (a2, b2) = moves[n - 2];
+                let (b3, t3) = moves[n - 1];
+                if a1 == a2 && b2 == b3 && t3 == t && t != a1 && t != b2 && a1 != b2 {
+                    return true;
+                }
+            }
+        } else {
+            moves.clear();
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// PC of the forward conditional jump that sits immediately before `latch` and
+/// targets `latch + 1` (the `until` test of a `repeat`, or a `while` tail test),
+/// if any. `has_tail_exit_guard` is the boolean form of the same question.
+fn tail_exit_test_pc(code: &[u32], latch: usize) -> Option<usize> {
+    (latch.saturating_sub(2)..latch).find(|&w| {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        forward_conditional_jump(op, w, code[w])
+            .map(|(next_pc, t)| next_pc == latch && t == latch + 1)
+            .unwrap_or(false)
+    })
+}
+
 fn has_tail_exit_guard(code: &[u32], latch: usize) -> bool {
     (latch.saturating_sub(2)..latch).any(|w| {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
@@ -1934,6 +1976,41 @@ pub(crate) fn structure_numeric_for_body(
             let guard_at_header = forward_conditional_jump(op, pc, insn)
                 .map(|(next_pc, t)| t > next_pc && t == latch_pc + 1)
                 .unwrap_or(false);
+            // `repeat <for ..> until c`: the exit test sits right before the latch.
+            // The old shape (`if done then break end; step()`) has a statement
+            // between test and latch and is handled below; this one is a loop
+            // whose BODY ends at the test, claimed at its header and lifted as
+            // `repeat .. until` (see `lifter/inline_tail_loop.rs`).
+            let tail_test = if std::env::var("LUAU_NO_NFG_C1").is_ok() {
+                None
+            } else {
+                tail_exit_test_pc(code, latch_pc)
+            };
+            if let Some(cp) = tail_test.filter(|&cp| {
+                !guard_at_header
+                    && cp > pc
+                    && latch_pc - pc <= MAX_C0_LOOP_SPAN
+                    && range_is_plain_generic_for(code, pc, cp)
+                    && !range_has_register_swap(code, pc, cp)
+            }) {
+                if std::env::var("LUAU_NFG_TRACE").is_ok() {
+                    eprintln!("NFG_C1 header={} test={} latch={}", pc, cp, latch_pc);
+                }
+                if linear_start < pc {
+                    regions.push(Region::Linear { start: linear_start, end: pc });
+                }
+                let nested_body = structure_numeric_for_body(code, pc, cp, cfg, loop_headers);
+                regions.push(Region::InlineLoopInLoop {
+                    header_start: pc,
+                    cond_pc: Some(cp),
+                    body_start: pc,
+                    latch_pc,
+                    body: nested_body,
+                });
+                pc = latch_pc + 1;
+                linear_start = pc;
+                continue;
+            }
             if !guard_at_header
                 && latch_pc - pc <= MAX_C0_LOOP_SPAN
                 && range_is_plain_generic_for(code, pc, latch_pc)

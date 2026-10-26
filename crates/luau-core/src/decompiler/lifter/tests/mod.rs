@@ -137,6 +137,8 @@ mod return_wide_list_tests;
 mod loop_exit_read_carried_tests;
 #[cfg(test)]
 mod nested_for_flat_lift_tests;
+#[cfg(test)]
+mod dispatch_tail_for_tests;
 mod declared_never_assigned_ternary_tests;
 #[cfg(test)]
 mod andor_nil_call_join_tests;

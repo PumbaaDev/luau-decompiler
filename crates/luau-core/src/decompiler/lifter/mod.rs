@@ -36,6 +36,7 @@ mod oor_guard;
 mod nil_tail_gate;
 mod prelude_fold;
 mod opcode_handlers;
+mod inline_tail_loop;
 use opcode_handlers::lift_instruction_range;
 
 // Re-exported solely for the `#[cfg(test)]` submodules under `lifter/tests/`,
@@ -5372,11 +5373,31 @@ fn lift_region(
                             // the body, so stop iterating rather than lift any
                             // of it twice.
                             let esc = linear_branch_escapes(code, *start, *end, *body_end);
+                            // The escaped span is lifted FLAT up to the body end,
+                            // and the flat walker drops FORGPREP/FORGLOOP: a for
+                            // in the dispatch's last arm vanished and its iterator
+                            // CALL was left as a bare 3-value assign. Hand it the
+                            // for-regions the structurer found in that tail.
+                            let prev_for_regions = std::mem::take(&mut ctx.flat_for_regions);
+                            if esc && std::env::var("LUAU_NO_ESC_FOR").is_err() {
+                                ctx.flat_for_regions = nested_body
+                                    .iter()
+                                    .filter(|r| match r {
+                                        Region::NumericFor { prep_pc, loop_pc, .. }
+                                        | Region::GenericFor { prep_pc, loop_pc, .. } => {
+                                            *prep_pc >= *end && *loop_pc < *body_end
+                                        }
+                                        _ => false,
+                                    })
+                                    .cloned()
+                                    .collect();
+                            }
                             lift_instruction_range(
                                 ctx, proto, proto_index, depth,
                                 *start, if esc { *body_end } else { *end },
                                 regs, locals, &mut body_stmts, true,
                             );
+                            ctx.flat_for_regions = prev_for_regions;
                             if esc {
                                 break;
                             }
@@ -5526,6 +5547,16 @@ fn lift_region(
             latch_pc,
             body,
         } => {
+            // Exit test at the TAIL (`repeat .. until`): emitted as a repeat.
+            if let Some(cp) = *cond_pc {
+                if cp >= *body_start {
+                    inline_tail_loop::lift_inline_tail_loop(
+                        ctx, proto, proto_index, cfg, depth, *header_start, cp, *latch_pc, body,
+                        regs, locals, stmts,
+                    );
+                    return;
+                }
+            }
             // Mirrors `Region::WhileDo`; the ordering below is load-bearing.
             //
             // (a) The header's pre-branch instructions run once on entry.
