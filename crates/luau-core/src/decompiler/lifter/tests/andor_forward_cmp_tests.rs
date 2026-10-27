@@ -120,7 +120,10 @@ fn isa_test_between_and_links_is_kept_in_the_condition() {
     let out = lift(&isa_chunk());
     eprintln!("{out}");
     assert!(out.contains(":IsA(\"Model\")"), "IsA test dropped:\n{out}");
-    assert!(!out.contains("local result"), "unused IsA local left behind:\n{out}");
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("local ") && l.contains(":IsA(")),
+        "IsA(..) parked in a local instead of the condition:\n{out}"
+    );
 }
 
 /// A side-effecting call between the tests must not be folded: the call has to
