@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod phase_b03_numeric_for_tests;
+mod numeric_for_shared_setup_tests;
 mod loop_exit_preload_tests;
 #[cfg(test)]
 mod phase_b042_control_flow_polish_tests;
@@ -146,3 +147,4 @@ mod declared_never_assigned_ternary_tests;
 mod andor_nil_call_join_tests;
 mod while_true_if_else_body_tests;
 mod combine7r_regression_tests;
+mod capture_blind_inline_tests;
