@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod phase_b03_numeric_for_tests;
 mod numeric_for_shared_setup_tests;
+mod andor_forward_cmp_tests;
 mod loop_exit_preload_tests;
 #[cfg(test)]
 mod phase_b042_control_flow_polish_tests;
