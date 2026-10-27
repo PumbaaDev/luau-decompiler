@@ -963,7 +963,11 @@ fn try_emit_long_string(s: &str) -> Option<String> {
     for level in 0..=8 {
         let eq: String = "=".repeat(level);
         let close = format!("]{}]", eq);
-        if !s.contains(&close) {
+        // The first occurrence of the closer in `content + closer` must be the
+        // real closer. Content ending in `]` (level 0) or `]=` (level 1) would
+        // otherwise close early and leave a stray bracket.
+        let probe = format!("{}{}", s, close);
+        if probe.find(&close) == Some(s.len()) {
             // Insert a leading newline only if user content begins with `]`,
             // which would otherwise be ambiguous; not strictly required.
             return Some(format!("[{}[{}]{}]", eq, s, eq));
@@ -1285,6 +1289,19 @@ mod tests {
         let out = emit_string("foo\n]]bar");
         assert!(out.starts_with("[=["), "expected level-1, got: {out}");
         assert!(out.ends_with("]=]"));
+    }
+
+    #[test]
+    fn long_string_ending_in_bracket_does_not_close_early() {
+        // Content ending in `]` plus the closer `]]` reads `]]]`, which the
+        // lexer closes after two brackets, leaving a stray `]`.
+        let out = emit_string("[%* %* remaining]
+x]");
+        assert!(out.starts_with("[=["), "expected level-1, got: {out}");
+        // Level 1 also closes early on content ending `]=`, so use level 2.
+        let out = emit_string("a
+]]b]=");
+        assert!(out.starts_with("[==["), "expected level-2, got: {out}");
     }
 
     #[test]
