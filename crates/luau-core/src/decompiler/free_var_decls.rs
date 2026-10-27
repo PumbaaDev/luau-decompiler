@@ -494,6 +494,7 @@ fn count_name_expr(expr: &Expr, name: &str) -> usize {
         Expr::Ternary { cond, then_expr, else_expr } => {
             count_name_expr(cond, name) + count_name_expr(then_expr, name) + count_name_expr(else_expr, name)
         }
+        Expr::Paren(inner) => count_name_expr(inner, name),
         Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Varargs | Expr::Vector(..) => 0,
     }
 }
@@ -651,6 +652,7 @@ fn scan_expr(expr: &Expr, out: &mut Scan) {
             scan_expr(then_expr, out);
             scan_expr(else_expr, out);
         }
+        Expr::Paren(inner) => scan_expr(inner, out),
         Expr::Nil
         | Expr::Bool(_)
         | Expr::Number(_)

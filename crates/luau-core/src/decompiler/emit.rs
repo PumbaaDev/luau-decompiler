@@ -803,6 +803,7 @@ fn emit_expr(expr: &Expr, depth: usize) -> String {
         // minimal flat form.  We delegate the parenthesisation decision to
         // `emit_prefix_expr` via the existing needs_parens rules (Ternary
         // is added to that list below).
+        Expr::Paren(inner) => format!("({})", emit_expr(inner, depth)),
         Expr::Ternary { cond, then_expr, else_expr } => {
             // Phase B0.107: full_moon 2.1.1 (our parse validator) doesn't
             // support Luau if-expressions (`if c then a else b` as expr).

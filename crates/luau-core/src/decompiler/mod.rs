@@ -1,5 +1,6 @@
 pub mod emit;
 pub mod free_var_decls;
+pub mod local_pressure;
 pub mod call_recovery;
 pub mod mint_trace;
 pub mod walk_cover;
@@ -2209,6 +2210,10 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
             );
         }
     }
+
+    // Fold single-use temporaries back into their one use when a scope holds
+    // enough locals to risk Luau's 200-local limit.
+    local_pressure::relieve(&mut stmts);
 
     let mut output = String::new();
     emit::emit_block(&mut output, &stmts, depth);
