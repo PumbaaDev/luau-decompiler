@@ -5036,9 +5036,14 @@ fn lift_region(
             // from the preceding statements. Absorb in reverse order because
             // the start expression (highest register) is usually the most
             // recently emitted statement on top of the stmts stack.
-            let start_expr = absorb_numeric_for_setup(stmts, regs, a + 2);
-            let step_expr  = absorb_numeric_for_setup(stmts, regs, a + 1);
-            let stop_expr  = absorb_numeric_for_setup(stmts, regs, a);
+            // A setup local that something else still reads (the body, or a
+            // pending expression such as `x / limit`) must stay a local: popping
+            // its declaration leaves those readers on a never-bound name.
+            let shared = |reg: usize| numeric_for_setup_is_shared(&proto.code, regs, *prep_pc, a, reg);
+            let (shared_start, shared_step, shared_stop) = (shared(a + 2), shared(a + 1), shared(a));
+            let start_expr = absorb_numeric_for_setup(stmts, regs, a + 2, shared_start);
+            let step_expr  = absorb_numeric_for_setup(stmts, regs, a + 1, shared_step);
+            let stop_expr  = absorb_numeric_for_setup(stmts, regs, a, shared_stop);
             let var_name   = ctx.reg_name(proto, ((a + 2) & 0xFF) as u8, *prep_pc);
 
             // Phase B0.3 fix: pre-materialize any register that (a) currently
@@ -10948,7 +10953,61 @@ pub(crate) fn collect_body_writes(code: &[u32], start: usize, end: usize) -> Vec
     out.into_iter().collect()
 }
 
-fn absorb_numeric_for_setup(stmts: &mut Vec<Stat>, regs: &[RegVal], reg: usize) -> Expr {
+/// How far back from FORNPREP to look for the instruction that filled a setup
+/// register.
+const NUMERIC_FOR_SETUP_LOOKBACK: usize = 24;
+
+/// Is the setup register a plain copy (`MOVE reg, S`) of a named local `S` that
+/// something else still reads after the FORNPREP?
+///
+/// Only a MOVE from a register that still holds that very local counts: a setup
+/// value computed straight into the control register has no separate local to
+/// keep, and a bare name match is not enough (one name can stand for two
+/// different values of one register at different pcs).
+fn numeric_for_setup_is_shared(
+    code: &[u32],
+    regs: &[RegVal],
+    prep_pc: usize,
+    a: usize,
+    reg: usize,
+) -> bool {
+    let Some(RegVal::Expr(Expr::Name(name))) = regs.get(reg) else {
+        return false;
+    };
+    let lowest = prep_pc.saturating_sub(NUMERIC_FOR_SETUP_LOOKBACK);
+    let Some(src) = (lowest..prep_pc).rev().find_map(|pc| {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        (insn_a(insn) as usize == reg && opcode_handlers::insn_defines_reg_a(op))
+            .then_some((op, insn_b(insn) as usize))
+    }) else {
+        return false;
+    };
+    let (LuauOpcode::Move, src) = src else {
+        return false;
+    };
+    if (a..=a + 2).contains(&src) || !matches!(regs.get(src), Some(RegVal::Expr(Expr::Name(n))) if n == name) {
+        return false;
+    }
+    if opcode_handlers::reg_read_before_overwrite(code, prep_pc + 1, src) {
+        return true;
+    }
+    regs.iter().enumerate().any(|(r, val)| {
+        !(a..=a + 2).contains(&r)
+            && matches!(val, RegVal::Expr(e) if expr_references_name(e, name))
+            && opcode_handlers::reg_read_before_overwrite(code, prep_pc + 1, r)
+    })
+}
+
+fn absorb_numeric_for_setup(
+    stmts: &mut Vec<Stat>,
+    regs: &[RegVal],
+    reg: usize,
+    keep_local: bool,
+) -> Expr {
+    if keep_local {
+        return reg_expr(regs, reg);
+    }
     let reg_name = match regs.get(reg) {
         Some(RegVal::Expr(Expr::Name(n))) => n.as_str(),
         _ => return reg_expr(regs, reg),
