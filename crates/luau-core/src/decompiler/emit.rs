@@ -54,6 +54,62 @@ pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
     }
 }
 
+/// True when `stat` holds a `continue` that targets the enclosing loop
+/// (nested loops and function bodies own their own `continue`).
+fn has_loop_continue(stat: &Stat) -> bool {
+    let any = |b: &[Stat]| b.iter().any(has_loop_continue);
+    match stat {
+        Stat::Continue => true,
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            any(then_body)
+                || elseif_clauses.iter().any(|(_, b)| any(b))
+                || else_body.as_deref().is_some_and(any)
+        }
+        Stat::DoBlock { body } => any(body),
+        _ => false,
+    }
+}
+
+/// True when `name` occurs in `text` as a whole identifier.
+fn mentions_identifier(text: &str, name: &str) -> bool {
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + name.len()..].chars().next();
+        !before.is_some_and(is_id) && !after.is_some_and(is_id)
+    })
+}
+
+/// Luau rejects `repeat ... continue ... local x ... until x`: the `continue`
+/// jumps over a local that the `until` condition reads. The bytecode keeps the
+/// value in a register that survives the jump, so declaring the local before
+/// the loop and assigning it inside matches that behaviour. Returns the names
+/// to declare before the loop and the rewritten body.
+fn hoist_repeat_locals(body: &[Stat], cond_str: &str) -> (Vec<String>, Vec<Stat>) {
+    let Some(first_continue) = body.iter().position(has_loop_continue) else {
+        return (Vec::new(), body.to_vec());
+    };
+    let mut hoisted = Vec::new();
+    let mut out = Vec::with_capacity(body.len());
+    for (i, stat) in body.iter().enumerate() {
+        match stat {
+            Stat::Local { names, values }
+                if i > first_continue && names.iter().any(|n| mentions_identifier(cond_str, n)) =>
+            {
+                hoisted.extend(names.iter().cloned());
+                if !values.is_empty() {
+                    out.push(Stat::Assign {
+                        targets: names.iter().map(|n| Expr::Name(n.clone())).collect(),
+                        values: values.clone(),
+                    });
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    (hoisted, out)
+}
+
 /// True for statements Luau only accepts as the last statement of a block.
 /// A `return` of a single non-truthy-then ternary is expanded to an
 /// `if/else` statement by the emitter and so is not a terminator.
@@ -255,11 +311,17 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
         }
 
         Stat::Repeat { body, condition } => {
+            let cond_str = emit_expr(condition, depth);
+            let (hoisted, body) = hoist_repeat_locals(body, &cond_str);
+            if !hoisted.is_empty() {
+                indent(out, depth);
+                out.push_str(&format!("local {}\n", hoisted.join(", ")));
+            }
             indent(out, depth);
             out.push_str("repeat\n");
-            emit_block(out, body, depth + 1);
+            emit_block(out, &body, depth + 1);
             indent(out, depth);
-            out.push_str(&format!("until {}\n", emit_expr(condition, depth)));
+            out.push_str(&format!("until {}\n", cond_str));
         }
 
         Stat::NumericFor {
@@ -1590,6 +1652,38 @@ f()
 {text}
 "), "last statement stays bare");
         }
+    }
+
+    #[test]
+    fn repeat_local_read_by_until_is_hoisted_past_a_continue() {
+        let guard = Stat::If {
+            condition: name("c"),
+            then_body: vec![Stat::Continue],
+            elseif_clauses: vec![],
+            else_body: None,
+        };
+        let decl = Stat::Local { names: vec!["ready".to_string()], values: vec![name("g")] };
+        let other = Stat::Local { names: vec!["unused".to_string()], values: vec![name("h")] };
+        let s = Stat::Repeat { body: vec![guard.clone(), decl, other], condition: name("ready") };
+        let out = emit_stmt_str(&s);
+        assert_eq!(
+            out,
+            "local ready
+repeat
+    if c then
+        continue
+    end
+    ready = g
+    local unused = h
+until ready
+"
+        );
+        // No continue before the local: untouched.
+        let decl = Stat::Local { names: vec!["ready".to_string()], values: vec![name("g")] };
+        let s = Stat::Repeat { body: vec![decl, guard], condition: name("ready") };
+        assert!(emit_stmt_str(&s).starts_with("repeat
+    local ready = g
+"));
     }
 
     #[test]
