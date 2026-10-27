@@ -207,7 +207,13 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
             // valid.  Emit as a comment instead of broken syntax.
             if targets.len() == 1 {
                 let probe = emit_expr(&targets[0], 0);
-                if probe.starts_with('(') || probe.starts_with('"') || probe.starts_with('\'') {
+                // Only Name / Field / Index are assignable; `v + 3 = 8` and
+                // `f() = x` print without a leading quote or paren.
+                let not_an_lvalue = !matches!(
+                    &targets[0],
+                    Expr::Name(_) | Expr::Field { .. } | Expr::Index { .. }
+                );
+                if not_an_lvalue || probe.starts_with('(') ||probe.starts_with('"') || probe.starts_with('\'') {
                     indent(out, depth);
                     let trunc = if probe.len() > 80 { &probe[..80] } else { &probe };
                     let val_str = if values.len() == 1 {
@@ -1684,6 +1690,19 @@ until ready
         assert!(emit_stmt_str(&s).starts_with("repeat
     local ready = g
 "));
+    }
+
+    #[test]
+    fn assignment_to_an_arithmetic_expression_is_commented_not_emitted() {
+        let s = Stat::Assign {
+            targets: vec![Expr::BinOp {
+                left: Box::new(name("v83")),
+                op: BinOp::Add,
+                right: Box::new(Expr::Number(3.0)),
+            }],
+            values: vec![Expr::Number(8.0)],
+        };
+        assert_eq!(emit_stmt_str(&s), "-- invalid lvalue: v83 + 3 = 8\n");
     }
 
     #[test]
