@@ -324,6 +324,9 @@ fn format_instruction(
         }
 
         LuauOpcode::FastCall => format!("{} skip={}", builtin_name(a), c),
+        LuauOpcode::FastPCall => {
+            format!("{} args={} skip={}", if a == 0 { "pcall" } else { "xpcall" }, b, c)
+        }
         LuauOpcode::FastCall1 => format!("{} R{} skip={}", builtin_name(a), b, c),
         LuauOpcode::FastCall2 => {
             let arg2 = aux.unwrap_or(0);

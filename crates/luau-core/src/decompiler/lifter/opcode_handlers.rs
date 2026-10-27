@@ -2814,7 +2814,10 @@ pub(super) fn lift_instruction_range(
         match op {
             LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::Coverage
             | LuauOpcode::NativeCall | LuauOpcode::CloseUpvals
-            | LuauOpcode::PrepVarargs | LuauOpcode::Capture => {}
+            | LuauOpcode::PrepVarargs | LuauOpcode::Capture
+            // remap_chunk rewrites FASTPCALL to FASTCALL, so this is unreachable in
+            // practice; listed so the match stays exhaustive.
+            | LuauOpcode::FastPCall => {}
 
             LuauOpcode::LoadNil => {
                 // A pinned register's nil write is as much a write as any

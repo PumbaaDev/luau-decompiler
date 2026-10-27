@@ -278,6 +278,13 @@ pub enum LuauOpcode {
     /// semantics with every jump offset preserved.
     CallFb = 106,
 
+    /// FASTPCALL — v14+ fast path for `pcall`/`xpcall`. Same shape as FASTCALL:
+    /// A = protected-function id (0 pcall, 1 xpcall), B = explicit argument
+    /// count, C = jump offset to the following CALL, NO aux word. Like the other
+    /// FASTCALL forms it is a speculative mirror of that CALL, so `remap_chunk`
+    /// rewrites it to a plain FASTCALL and the lifter needs no new handling.
+    FastPCall = 107,
+
     // Unknown opcode
     Unknown = 255,
 }
@@ -285,7 +292,7 @@ pub enum LuauOpcode {
 impl LuauOpcode {
     /// One past the highest valid canonical opcode number (exclusive upper bound).
     /// Includes Roblox-specific extensions 92-99 and CALLFB (106).
-    pub const MAX_OPCODE: usize = 107;
+    pub const MAX_OPCODE: usize = 108;
 
     pub fn from_u8(val: u8) -> Self {
         match val {
@@ -374,6 +381,7 @@ impl LuauOpcode {
             82 => Self::DupClosure,
             83 => Self::FastCall3,
             106 => Self::CallFb,
+            107 => Self::FastPCall,
             84 => Self::Band,
             85 => Self::Bor,
             86 => Self::Bxor,
@@ -488,6 +496,7 @@ impl LuauOpcode {
             Self::DupClosure => "DUPCLOSURE",
             Self::FastCall3 => "FASTCALL3",
             Self::CallFb => "CALLFB",
+            Self::FastPCall => "FASTPCALL",
             Self::Band => "BAND",
             Self::Bor => "BOR",
             Self::Bxor => "BXOR",
