@@ -8,7 +8,21 @@ const INDENT: &str = "    ";
 pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
     for (i, stmt) in stmts.iter().enumerate() {
         let before = out.len();
-        emit_stat(out, stmt, depth);
+        // Luau requires `return`, `break` and `continue` to be the LAST
+        // statement of a block. When the lifter leaves one mid-block (code
+        // that is reachable by another path follows it), wrap it in `do ... end`
+        // so the program keeps its exact behaviour and still parses.
+        if i + 1 < stmts.len() && is_block_terminator(stmt) {
+            indent(out, depth);
+            out.push_str("do
+");
+            emit_stat(out, stmt, depth + 1);
+            indent(out, depth);
+            out.push_str("end
+");
+        } else {
+            emit_stat(out, stmt, depth);
+        }
 
         // A statement that begins with '(' fuses with the line above it. Lua's
         // grammar does not treat a newline as a separator, so
@@ -37,6 +51,20 @@ pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
                 out.insert(at, ';');
             }
         }
+    }
+}
+
+/// True for statements Luau only accepts as the last statement of a block.
+/// A `return` of a single non-truthy-then ternary is expanded to an
+/// `if/else` statement by the emitter and so is not a terminator.
+fn is_block_terminator(stmt: &Stat) -> bool {
+    match stmt {
+        Stat::Break | Stat::Continue => true,
+        Stat::Return { values } => match values.as_slice() {
+            [Expr::Ternary { then_expr, .. }] => is_provably_truthy(then_expr),
+            _ => true,
+        },
+        _ => false,
     }
 }
 
@@ -1538,6 +1566,30 @@ end
         assert_eq!(emit_stmt_str(&s), "tbl[\"1\"].go = function(self, a)
 end
 ");
+    }
+
+    #[test]
+    fn mid_block_terminators_are_wrapped_in_do_end() {
+        let ret = Stat::Return { values: vec![] };
+        let call = Stat::ExprStat(Expr::Call { func: Box::new(name("f")), args: vec![] });
+        for (term, text) in [
+            (ret.clone(), "return"),
+            (Stat::Break, "break"),
+            (Stat::Continue, "continue"),
+        ] {
+            let mut out = String::new();
+            emit_block(&mut out, &[term.clone(), call.clone()], 0);
+            assert_eq!(out, format!("do
+    {text}
+end
+f()
+"));
+            let mut last = String::new();
+            emit_block(&mut last, &[call.clone(), term], 0);
+            assert_eq!(last, format!("f()
+{text}
+"), "last statement stays bare");
+        }
     }
 
     #[test]
