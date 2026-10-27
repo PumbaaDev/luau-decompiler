@@ -8,7 +8,21 @@ const INDENT: &str = "    ";
 pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
     for (i, stmt) in stmts.iter().enumerate() {
         let before = out.len();
-        emit_stat(out, stmt, depth);
+        // Luau requires `return`, `break` and `continue` to be the LAST
+        // statement of a block. When the lifter leaves one mid-block (code
+        // that is reachable by another path follows it), wrap it in `do ... end`
+        // so the program keeps its exact behaviour and still parses.
+        if i + 1 < stmts.len() && is_block_terminator(stmt) {
+            indent(out, depth);
+            out.push_str("do
+");
+            emit_stat(out, stmt, depth + 1);
+            indent(out, depth);
+            out.push_str("end
+");
+        } else {
+            emit_stat(out, stmt, depth);
+        }
 
         // A statement that begins with '(' fuses with the line above it. Lua's
         // grammar does not treat a newline as a separator, so
@@ -37,6 +51,76 @@ pub fn emit_block(out: &mut String, stmts: &[Stat], depth: usize) {
                 out.insert(at, ';');
             }
         }
+    }
+}
+
+/// True when `stat` holds a `continue` that targets the enclosing loop
+/// (nested loops and function bodies own their own `continue`).
+fn has_loop_continue(stat: &Stat) -> bool {
+    let any = |b: &[Stat]| b.iter().any(has_loop_continue);
+    match stat {
+        Stat::Continue => true,
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            any(then_body)
+                || elseif_clauses.iter().any(|(_, b)| any(b))
+                || else_body.as_deref().is_some_and(any)
+        }
+        Stat::DoBlock { body } => any(body),
+        _ => false,
+    }
+}
+
+/// True when `name` occurs in `text` as a whole identifier.
+fn mentions_identifier(text: &str, name: &str) -> bool {
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + name.len()..].chars().next();
+        !before.is_some_and(is_id) && !after.is_some_and(is_id)
+    })
+}
+
+/// Luau rejects `repeat ... continue ... local x ... until x`: the `continue`
+/// jumps over a local that the `until` condition reads. The bytecode keeps the
+/// value in a register that survives the jump, so declaring the local before
+/// the loop and assigning it inside matches that behaviour. Returns the names
+/// to declare before the loop and the rewritten body.
+fn hoist_repeat_locals(body: &[Stat], cond_str: &str) -> (Vec<String>, Vec<Stat>) {
+    let Some(first_continue) = body.iter().position(has_loop_continue) else {
+        return (Vec::new(), body.to_vec());
+    };
+    let mut hoisted = Vec::new();
+    let mut out = Vec::with_capacity(body.len());
+    for (i, stat) in body.iter().enumerate() {
+        match stat {
+            Stat::Local { names, values }
+                if i > first_continue && names.iter().any(|n| mentions_identifier(cond_str, n)) =>
+            {
+                hoisted.extend(names.iter().cloned());
+                if !values.is_empty() {
+                    out.push(Stat::Assign {
+                        targets: names.iter().map(|n| Expr::Name(n.clone())).collect(),
+                        values: values.clone(),
+                    });
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    (hoisted, out)
+}
+
+/// True for statements Luau only accepts as the last statement of a block.
+/// A `return` of a single non-truthy-then ternary is expanded to an
+/// `if/else` statement by the emitter and so is not a terminator.
+fn is_block_terminator(stmt: &Stat) -> bool {
+    match stmt {
+        Stat::Break | Stat::Continue => true,
+        Stat::Return { values } => match values.as_slice() {
+            [Expr::Ternary { then_expr, .. }] => is_provably_truthy(then_expr),
+            _ => true,
+        },
+        _ => false,
     }
 }
 
@@ -123,7 +207,13 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
             // valid.  Emit as a comment instead of broken syntax.
             if targets.len() == 1 {
                 let probe = emit_expr(&targets[0], 0);
-                if probe.starts_with('(') || probe.starts_with('"') || probe.starts_with('\'') {
+                // Only Name / Field / Index are assignable; `v + 3 = 8` and
+                // `f() = x` print without a leading quote or paren.
+                let not_an_lvalue = !matches!(
+                    &targets[0],
+                    Expr::Name(_) | Expr::Field { .. } | Expr::Index { .. }
+                );
+                if not_an_lvalue || probe.starts_with('(') ||probe.starts_with('"') || probe.starts_with('\'') {
                     indent(out, depth);
                     let trunc = if probe.len() > 80 { &probe[..80] } else { &probe };
                     let val_str = if values.len() == 1 {
@@ -227,11 +317,17 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
         }
 
         Stat::Repeat { body, condition } => {
+            let cond_str = emit_expr(condition, depth);
+            let (hoisted, body) = hoist_repeat_locals(body, &cond_str);
+            if !hoisted.is_empty() {
+                indent(out, depth);
+                out.push_str(&format!("local {}\n", hoisted.join(", ")));
+            }
             indent(out, depth);
             out.push_str("repeat\n");
-            emit_block(out, body, depth + 1);
+            emit_block(out, &body, depth + 1);
             indent(out, depth);
-            out.push_str(&format!("until {}\n", emit_expr(condition, depth)));
+            out.push_str(&format!("until {}\n", cond_str));
         }
 
         Stat::NumericFor {
@@ -375,7 +471,10 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
         // false we render as `function obj.method(params) ... end`.
         Stat::MethodFunction { receiver, method, is_method, func } => {
             indent(out, depth);
-            if let Expr::Function { params, is_vararg, body } = func {
+            // `function a.b.c()` only accepts a Name{.Name} path and a plain
+            // identifier method; anything else must use the assign form.
+            let sugar_ok = is_valid_identifier(method) && is_function_name_path(receiver);
+            if let (true, Expr::Function { params, is_vararg, body }) = (sugar_ok, func) {
                 let sep = if *is_method { ":" } else { "." };
                 // For `:method` sugar, skip a leading implicit `self` param
                 // if present.  If the lifter produced method-function shape
@@ -404,15 +503,11 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
                 indent(out, depth);
                 out.push_str("end\n");
             } else {
-                // Defensive fallback: treat as assign.
-                let sep = if *is_method { ":" } else { "." };
-                out.push_str(&format!(
-                    "{}{}{} = {}\n",
-                    emit_prefix_expr(receiver, depth),
-                    sep,
-                    method,
-                    emit_expr(func, depth)
-                ));
+                // Assign form. `self` stays an explicit first parameter in
+                // `func`, so `recv.method = function(self, ...)` is equivalent
+                // to the `:method` sugar. Non-identifier names use `[...]`.
+                let field = Expr::Field { object: Box::new(receiver.clone()), field: method.clone() };
+                out.push_str(&format!("{} = {}\n", emit_expr(&field, depth), emit_expr(func, depth)));
             }
         }
     }
@@ -932,6 +1027,16 @@ fn emit_string(s: &str) -> String {
     escaped
 }
 
+/// True when `e` is a `Name` or `Name.Name...` path, the only receiver shapes
+/// the `function a.b.c()` statement accepts.
+fn is_function_name_path(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n) => is_valid_identifier(n),
+        Expr::Field { object, field } => is_valid_identifier(field) && is_function_name_path(object),
+        _ => false,
+    }
+}
+
 /// Try to render `s` as a Luau long-string literal `[[...]]` (or `[=[...]=]`
 /// etc., picking the shortest level that doesn't appear inside).  Returns
 /// `None` if long-string form is unsuitable for this content.
@@ -963,7 +1068,11 @@ fn try_emit_long_string(s: &str) -> Option<String> {
     for level in 0..=8 {
         let eq: String = "=".repeat(level);
         let close = format!("]{}]", eq);
-        if !s.contains(&close) {
+        // The first occurrence of the closer in `content + closer` must be the
+        // real closer. Content ending in `]` (level 0) or `]=` (level 1) would
+        // otherwise close early and leave a stray bracket.
+        let probe = format!("{}{}", s, close);
+        if probe.find(&close) == Some(s.len()) {
             // Insert a leading newline only if user content begins with `]`,
             // which would otherwise be ambiguous; not strictly required.
             return Some(format!("[{}[{}]{}]", eq, s, eq));
@@ -1288,6 +1397,19 @@ mod tests {
     }
 
     #[test]
+    fn long_string_ending_in_bracket_does_not_close_early() {
+        // Content ending in `]` plus the closer `]]` reads `]]]`, which the
+        // lexer closes after two brackets, leaving a stray `]`.
+        let out = emit_string("[%* %* remaining]
+x]");
+        assert!(out.starts_with("[=["), "expected level-1, got: {out}");
+        // Level 1 also closes early on content ending `]=`, so use level 2.
+        let out = emit_string("a
+]]b]=");
+        assert!(out.starts_with("[==["), "expected level-2, got: {out}");
+    }
+
+    #[test]
     fn long_string_skipped_for_leading_newline() {
         // Luau eats leading newline of long-string → fall back to quoted form
         let out = emit_string("\nhello");
@@ -1480,6 +1602,107 @@ mod tests {
         };
         let out = emit_stmt_str(&s);
         assert_eq!(out, "function Obj:method(a)\nend\n");
+    }
+
+    #[test]
+    fn method_function_with_non_identifier_name_uses_assign_form() {
+        // `function tbl2.nil(a)` and `function t["1"].1(a)` do not parse.
+        let s = Stat::MethodFunction {
+            receiver: name("tbl2"),
+            method: "nil".to_string(),
+            is_method: false,
+            func: func(vec!["a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl2[\"nil\"] = function(a)
+end
+");
+        let s = Stat::MethodFunction {
+            receiver: Expr::Field { object: Box::new(name("tbl")), field: "1".to_string() },
+            method: "1".to_string(),
+            is_method: false,
+            func: func(vec!["a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl[\"1\"][\"1\"] = function(a)
+end
+");
+        let s = Stat::MethodFunction {
+            receiver: Expr::Field { object: Box::new(name("tbl")), field: "1".to_string() },
+            method: "go".to_string(),
+            is_method: true,
+            func: func(vec!["self", "a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl[\"1\"].go = function(self, a)
+end
+");
+    }
+
+    #[test]
+    fn mid_block_terminators_are_wrapped_in_do_end() {
+        let ret = Stat::Return { values: vec![] };
+        let call = Stat::ExprStat(Expr::Call { func: Box::new(name("f")), args: vec![] });
+        for (term, text) in [
+            (ret.clone(), "return"),
+            (Stat::Break, "break"),
+            (Stat::Continue, "continue"),
+        ] {
+            let mut out = String::new();
+            emit_block(&mut out, &[term.clone(), call.clone()], 0);
+            assert_eq!(out, format!("do
+    {text}
+end
+f()
+"));
+            let mut last = String::new();
+            emit_block(&mut last, &[call.clone(), term], 0);
+            assert_eq!(last, format!("f()
+{text}
+"), "last statement stays bare");
+        }
+    }
+
+    #[test]
+    fn repeat_local_read_by_until_is_hoisted_past_a_continue() {
+        let guard = Stat::If {
+            condition: name("c"),
+            then_body: vec![Stat::Continue],
+            elseif_clauses: vec![],
+            else_body: None,
+        };
+        let decl = Stat::Local { names: vec!["ready".to_string()], values: vec![name("g")] };
+        let other = Stat::Local { names: vec!["unused".to_string()], values: vec![name("h")] };
+        let s = Stat::Repeat { body: vec![guard.clone(), decl, other], condition: name("ready") };
+        let out = emit_stmt_str(&s);
+        assert_eq!(
+            out,
+            "local ready
+repeat
+    if c then
+        continue
+    end
+    ready = g
+    local unused = h
+until ready
+"
+        );
+        // No continue before the local: untouched.
+        let decl = Stat::Local { names: vec!["ready".to_string()], values: vec![name("g")] };
+        let s = Stat::Repeat { body: vec![decl, guard], condition: name("ready") };
+        assert!(emit_stmt_str(&s).starts_with("repeat
+    local ready = g
+"));
+    }
+
+    #[test]
+    fn assignment_to_an_arithmetic_expression_is_commented_not_emitted() {
+        let s = Stat::Assign {
+            targets: vec![Expr::BinOp {
+                left: Box::new(name("v83")),
+                op: BinOp::Add,
+                right: Box::new(Expr::Number(3.0)),
+            }],
+            values: vec![Expr::Number(8.0)],
+        };
+        assert_eq!(emit_stmt_str(&s), "-- invalid lvalue: v83 + 3 = 8\n");
     }
 
     #[test]
