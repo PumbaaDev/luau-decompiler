@@ -375,7 +375,10 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
         // false we render as `function obj.method(params) ... end`.
         Stat::MethodFunction { receiver, method, is_method, func } => {
             indent(out, depth);
-            if let Expr::Function { params, is_vararg, body } = func {
+            // `function a.b.c()` only accepts a Name{.Name} path and a plain
+            // identifier method; anything else must use the assign form.
+            let sugar_ok = is_valid_identifier(method) && is_function_name_path(receiver);
+            if let (true, Expr::Function { params, is_vararg, body }) = (sugar_ok, func) {
                 let sep = if *is_method { ":" } else { "." };
                 // For `:method` sugar, skip a leading implicit `self` param
                 // if present.  If the lifter produced method-function shape
@@ -404,15 +407,11 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
                 indent(out, depth);
                 out.push_str("end\n");
             } else {
-                // Defensive fallback: treat as assign.
-                let sep = if *is_method { ":" } else { "." };
-                out.push_str(&format!(
-                    "{}{}{} = {}\n",
-                    emit_prefix_expr(receiver, depth),
-                    sep,
-                    method,
-                    emit_expr(func, depth)
-                ));
+                // Assign form. `self` stays an explicit first parameter in
+                // `func`, so `recv.method = function(self, ...)` is equivalent
+                // to the `:method` sugar. Non-identifier names use `[...]`.
+                let field = Expr::Field { object: Box::new(receiver.clone()), field: method.clone() };
+                out.push_str(&format!("{} = {}\n", emit_expr(&field, depth), emit_expr(func, depth)));
             }
         }
     }
@@ -930,6 +929,16 @@ fn emit_string(s: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+/// True when `e` is a `Name` or `Name.Name...` path, the only receiver shapes
+/// the `function a.b.c()` statement accepts.
+fn is_function_name_path(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n) => is_valid_identifier(n),
+        Expr::Field { object, field } => is_valid_identifier(field) && is_function_name_path(object),
+        _ => false,
+    }
 }
 
 /// Try to render `s` as a Luau long-string literal `[[...]]` (or `[=[...]=]`
@@ -1497,6 +1506,38 @@ x]");
         };
         let out = emit_stmt_str(&s);
         assert_eq!(out, "function Obj:method(a)\nend\n");
+    }
+
+    #[test]
+    fn method_function_with_non_identifier_name_uses_assign_form() {
+        // `function tbl2.nil(a)` and `function t["1"].1(a)` do not parse.
+        let s = Stat::MethodFunction {
+            receiver: name("tbl2"),
+            method: "nil".to_string(),
+            is_method: false,
+            func: func(vec!["a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl2[\"nil\"] = function(a)
+end
+");
+        let s = Stat::MethodFunction {
+            receiver: Expr::Field { object: Box::new(name("tbl")), field: "1".to_string() },
+            method: "1".to_string(),
+            is_method: false,
+            func: func(vec!["a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl[\"1\"][\"1\"] = function(a)
+end
+");
+        let s = Stat::MethodFunction {
+            receiver: Expr::Field { object: Box::new(name("tbl")), field: "1".to_string() },
+            method: "go".to_string(),
+            is_method: true,
+            func: func(vec!["self", "a"], false, vec![]),
+        };
+        assert_eq!(emit_stmt_str(&s), "tbl[\"1\"].go = function(self, a)
+end
+");
     }
 
     #[test]
