@@ -97,6 +97,7 @@ fn visit_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
             visit_expr(then_expr, f);
             visit_expr(else_expr, f);
         }
+        Expr::Paren(inner) => visit_expr(inner, f),
         Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Varargs
         | Expr::Name(_) | Expr::Vector(..) => {}
     }

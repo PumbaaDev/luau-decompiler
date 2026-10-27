@@ -1004,6 +1004,7 @@ fn count_calls_expr(e: &Expr) -> usize {
         Expr::Ternary { cond, then_expr, else_expr } => {
             count_calls_expr(cond) + count_calls_expr(then_expr) + count_calls_expr(else_expr)
         }
+        Expr::Paren(inner) => count_calls_expr(inner),
     }
 }
 
@@ -7036,6 +7037,7 @@ pub(super) fn expr_references_name(expr: &Expr, name: &str) -> bool {
                 || expr_references_name(then_expr, name)
                 || expr_references_name(else_expr, name)
         }
+        Expr::Paren(inner) => expr_references_name(inner, name),
         Expr::Nil
         | Expr::Bool(_)
         | Expr::Number(_)
@@ -13386,6 +13388,7 @@ pub(super) fn is_pure_expr(expr: &Expr) -> bool {
         Expr::Ternary { cond, then_expr, else_expr } => {
             is_pure_expr(cond) && is_pure_expr(then_expr) && is_pure_expr(else_expr)
         }
+        Expr::Paren(inner) => is_pure_expr(inner),
         // Calls, method calls, and function literals are never pure for the
         // purpose of reorder safety.
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Function { .. } => false,

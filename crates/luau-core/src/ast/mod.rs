@@ -167,6 +167,10 @@ pub enum Expr {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
+    /// `(expr)`: truncates a multi-value call/vararg to exactly one value.
+    /// Only the local-pressure pass creates it, where splicing a single-use
+    /// `local x = f()` into a multi-value position must keep its truncation.
+    Paren(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
