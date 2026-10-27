@@ -391,6 +391,8 @@ impl<'a> BytecodeReader<'a> {
         if version >= 10 && !raw_v10plus {
             const LOP_CALL: u32 = 21;
             const LOP_CALLFB: u8 = 87;
+            const LOP_FASTPCALL: u8 = 89;
+            const LOP_FASTCALL: u32 = 68;
             let mut j = 0;
             while j < code.len() {
                 let raw = (code[j] & 0xFF) as u8;
@@ -406,12 +408,18 @@ impl<'a> BytecodeReader<'a> {
                     // The other upstream opcodes in the 84-90 range carry an aux
                     // word upstream but are read as no-aux bitwise ops by the
                     // Roblox map (SETUDATAKS 84, NAMECALLUDATA 85, NEWCLASSMEMBER
-                    // 86, CMPPROTO 88, FASTPCALL 89, NEWCLASS 90). They belong to
+                    // 86, CMPPROTO 88, NEWCLASS 90). They belong to
                     // Luau classes / typed-userdata / proto-compare, none of which
                     // occur in ordinary game code. We do not model them, and a
                     // no-aux walk over them would desync into garbage -- so refuse
                     // cleanly rather than emit plausible-but-wrong output.
-                    84..=86 | 88..=90 => {
+                    // FASTPCALL (89) has FASTCALL's layout and no aux word: rewrite
+                    // it to FASTCALL (68) so the lifter skips it like any fastcall.
+                    LOP_FASTPCALL => {
+                        code[j] = (code[j] & 0xFFFF_FF00) | LOP_FASTCALL;
+                        j += 1;
+                    }
+                    84..=86 | 88 | 90 => {
                         bail!(
                             "v{} chunk uses upstream opcode {} (Luau class / \
                              typed-userdata / proto-compare) which the lifter does \

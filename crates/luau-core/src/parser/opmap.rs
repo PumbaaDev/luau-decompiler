@@ -1389,6 +1389,16 @@ impl OpcodeMap {
                     i += 2;
                     continue;
                 }
+                if new_op == super::opcodes::LuauOpcode::FastPCall as u8 {
+                    // FASTPCALL (v14+) has FASTCALL's operand layout and no aux
+                    // word, and is a speculative mirror of the following CALL.
+                    // Rewrite it to a plain FASTCALL so the lifter treats it the
+                    // same way (A is an id, C the jump over the CALL).
+                    proto.code[i] =
+                        (insn & 0xFFFFFF00) | (super::opcodes::LuauOpcode::FastCall as u32);
+                    i += 1;
+                    continue;
+                }
                 if new_op != 255 {
                     // Remap this instruction's opcode byte
                     proto.code[i] = (insn & 0xFFFFFF00) | (new_op as u32);
@@ -16148,5 +16158,39 @@ mod tests {
         assert_eq!(cov.present_invented, 0);
         assert_eq!(cov.present_unmapped, 0);
         assert_eq!(cov.confidence_pct(), 100);
+    }
+    /// FASTPCALL (v14+) is FASTCALL's layout with no aux word. `remap_chunk` must
+    /// rewrite it to FASTCALL and advance ONE word, so the CALL that follows is
+    /// not swallowed as an aux word and every later instruction stays aligned.
+    #[test]
+    fn remap_chunk_rewrites_fastpcall_to_fastcall_without_aux() {
+        const FASTPCALL_BYTE: u8 = 0x5A;
+        const RETURN_BYTE: u8 = 0x33;
+        let code = vec![
+            insn_abc(FASTPCALL_BYTE, 0, 2, 1), // FASTPCALL id=0 (pcall), 2 args, skip 1
+            insn_abc(RETURN_BYTE, 0, 1, 0),    // stands in for the CALL it mirrors
+            insn_abc(RETURN_BYTE, 0, 1, 0),
+        ];
+        let mut chunk = chunk_from_code(code, 4);
+        let mut map = [255u8; 256];
+        map[FASTPCALL_BYTE as usize] = LuauOpcode::FastPCall as u8;
+        map[RETURN_BYTE as usize] = LuauOpcode::Return as u8;
+        let (unknown, _, _) = OpcodeMap::from_exact_map(map).remap_chunk(&mut chunk);
+        let code = &chunk.protos[0].code;
+        assert_eq!(unknown, 0);
+        assert_eq!(LuauOpcode::from_u8((code[0] & 0xFF) as u8), LuauOpcode::FastCall);
+        assert_eq!(code[0] >> 8, insn_abc(0, 0, 2, 1) >> 8, "A/B/C operands are kept");
+        assert_eq!(LuauOpcode::from_u8((code[1] & 0xFF) as u8), LuauOpcode::Return);
+        assert_eq!(LuauOpcode::from_u8((code[2] & 0xFF) as u8), LuauOpcode::Return);
+    }
+
+    #[test]
+    fn fastpcall_name_resolves_and_has_no_aux() {
+        assert_eq!(LuauOpcode::FastPCall.name(), "FASTPCALL");
+        assert_eq!(
+            crate::parser::ground_truth::opcode_name_to_byte("fastpcall"),
+            Some(LuauOpcode::FastPCall as u8)
+        );
+        assert!(!LuauOpcode::FastPCall.has_aux());
     }
 }
