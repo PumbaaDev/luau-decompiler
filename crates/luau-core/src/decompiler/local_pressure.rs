@@ -66,7 +66,11 @@ fn direct_locals(stmts: &[Stat]) -> usize {
 
 fn relieve_block(stmts: &mut Vec<Stat>, inherited: usize) {
     if inherited + direct_locals(stmts) > PRESSURE_TRIGGER {
+        localize_forward_decls(stmts);
         inline_block(stmts);
+        if inherited + direct_locals(stmts) > PRESSURE_TRIGGER {
+            wrap_closed_segments(stmts);
+        }
     }
     let live = inherited + direct_locals(stmts);
     for s in stmts.iter_mut() {
@@ -370,6 +374,141 @@ fn declared_names_in_expr(e: &mut Expr, out: &mut HashSet<String>) {
         }
         _ => expr_children_mut(e, &mut |ch| declared_names_in_expr(ch, out)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+
+/// `local a, b, c` (no values) declared early but only ever mentioned inside
+/// ONE later statement is re-declared right before that statement. Nothing
+/// runs in between that could see the variable, and its initial value is nil
+/// either way, so behaviour is unchanged; `wrap_closed_segments` can then
+/// scope it together with that statement.
+fn localize_forward_decls(stmts: &mut Vec<Stat>) {
+    let mut c = Census::default();
+    census_block(stmts, &mut c, false);
+    let mut first: HashMap<String, usize> = HashMap::new();
+    let mut last: HashMap<String, usize> = HashMap::new();
+    for (k, s) in stmts.iter_mut().enumerate() {
+        let mut names = HashSet::new();
+        names_in_stat(s, &mut names);
+        for nm in names {
+            first.entry(nm.clone()).or_insert(k);
+            last.insert(nm, k);
+        }
+    }
+    let mut before: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut changed = false;
+    for (i, s) in stmts.iter_mut().enumerate() {
+        let Stat::Local { names, values } = s else { continue };
+        if !values.is_empty() {
+            continue;
+        }
+        let mut keep = Vec::new();
+        for nm in names.drain(..) {
+            let single = c.decls.get(&nm) == Some(&1);
+            match (first.get(&nm), last.get(&nm)) {
+                (Some(&f), Some(&l)) if single && f == l && f > i => {
+                    before.entry(f).or_default().push(nm);
+                    changed = true;
+                }
+                _ => keep.push(nm),
+            }
+        }
+        *names = keep;
+    }
+    if !changed {
+        return;
+    }
+    let mut out = Vec::with_capacity(stmts.len() + before.len());
+    for (k, s) in std::mem::take(stmts).into_iter().enumerate() {
+        if let Some(ns) = before.remove(&k) {
+            out.push(Stat::Local { names: ns, values: Vec::new() });
+        }
+        let emptied = matches!(&s, Stat::Local { names, values } if names.is_empty() && values.is_empty());
+        if !emptied {
+            out.push(s);
+        }
+    }
+    *stmts = out;
+}
+
+// ---------------------------------------------------------------------------
+// Scope closed segments
+// ---------------------------------------------------------------------------
+
+/// Locals a statement declares into the enclosing block.
+fn declared_here(s: &Stat) -> Vec<&String> {
+    match s {
+        Stat::Local { names, .. } => names.iter().collect(),
+        Stat::LocalFunction { name, .. } => vec![name],
+        _ => Vec::new(),
+    }
+}
+
+/// Wrap runs of statements in `do ... end` when every local they declare is
+/// last mentioned inside the run. Nothing after the run can see those locals,
+/// so scoping them changes no behaviour and frees their slots.
+fn wrap_closed_segments(stmts: &mut Vec<Stat>) {
+    let n = stmts.len();
+    if n < 3 {
+        return;
+    }
+    let mut last: HashMap<String, usize> = HashMap::new();
+    for (k, s) in stmts.iter_mut().enumerate() {
+        let mut names = HashSet::new();
+        names_in_stat(s, &mut names);
+        declared_names_shallow(s, &mut names);
+        for nm in names {
+            last.insert(nm, k);
+        }
+    }
+    let mut plan: Vec<(usize, usize)> = Vec::new();
+    let mut a = 0;
+    while a < n {
+        if declared_here(&stmts[a]).is_empty() {
+            a += 1;
+            continue;
+        }
+        let mut b = a;
+        let mut k = a;
+        while k <= b {
+            for nm in declared_here(&stmts[k]) {
+                b = b.max(*last.get(nm.as_str()).unwrap_or(&k));
+            }
+            k += 1;
+        }
+        let reaches_end = b == n - 1;
+        if !reaches_end && b > a {
+            plan.push((a, b));
+            a = b + 1;
+        } else {
+            a += 1;
+        }
+    }
+    if plan.is_empty() {
+        return;
+    }
+    let mut out: Vec<Stat> = Vec::with_capacity(n);
+    let mut it = std::mem::take(stmts).into_iter().enumerate().peekable();
+    let mut plan_i = 0;
+    while let Some((k, st)) = it.next() {
+        match plan.get(plan_i) {
+            Some(&(a, b)) if a == k => {
+                let mut body = vec![st];
+                for _ in a + 1..=b {
+                    if let Some((_, nx)) = it.next() {
+                        body.push(nx);
+                    }
+                }
+                out.push(Stat::DoBlock { body });
+                plan_i += 1;
+            }
+            _ => out.push(st),
+        }
+    }
+    *stmts = out;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +976,13 @@ mod tests {
     fn pad(count: usize) -> Vec<Stat> {
         (0..count).map(|k| local(&format!("pad{k}"), Expr::Number(k as f64))).collect()
     }
+    /// Padding whose locals are all used (twice), so only the scenario under test changes.
+    fn pad_kept(count: usize) -> Vec<Stat> {
+        let mut v = pad(count);
+        let args: Vec<Expr> = (0..count).flat_map(|k| [name(&format!("pad{k}")), name(&format!("pad{k}"))]).collect();
+        v.push(Stat::ExprStat(call(name("keep"), args)));
+        v
+    }
     fn render(stmts: &[Stat]) -> String {
         let mut out = String::new();
         emit_block(&mut out, stmts, 0);
@@ -934,5 +1080,98 @@ mod tests {
         relieve(&mut stmts);
         let out = render(&stmts);
         assert!(out.contains("local c = Color3.fromRGB(5, 2, 3)"), "{out}");
+    }
+
+    fn func(body: Vec<Stat>) -> Expr {
+        Expr::Function { params: vec![], is_vararg: false, body }
+    }
+    fn ret1() -> Vec<Stat> {
+        vec![Stat::Return { values: vec![Expr::Number(1.0)] }]
+    }
+
+    #[test]
+    fn a_single_use_function_moves_to_its_use_but_not_into_a_loop() {
+        let mut stmts = pad(PRESSURE_TRIGGER);
+        stmts.push(Stat::LocalFunction { name: "once".into(), func: func(ret1()) });
+        stmts.push(Stat::LocalFunction { name: "looped".into(), func: func(ret1()) });
+        stmts.push(Stat::ExprStat(call(name("between"), vec![])));
+        stmts.push(Stat::While {
+            condition: Expr::Bool(true),
+            body: vec![Stat::ExprStat(call(name("run"), vec![name("looped")]))],
+        });
+        stmts.push(Stat::Return {
+            values: vec![Expr::Table { fields: vec![TableField::Named("F".into(), name("once"))] }],
+        });
+        relieve(&mut stmts);
+        let out = render(&stmts);
+        assert!(!out.contains("local function once"), "{out}");
+        assert!(out.contains("F = function()"), "{out}");
+        assert!(out.contains("local function looped"), "{out}");
+    }
+
+    #[test]
+    fn a_function_is_not_moved_past_a_local_its_body_would_capture() {
+        // `x` inside the body is a global at the definition; moving the function below
+        // `local x` would bind it to the local instead.
+        let mut stmts = pad(PRESSURE_TRIGGER);
+        stmts.push(Stat::LocalFunction {
+            name: "g".into(),
+            func: func(vec![Stat::Return { values: vec![name("x")] }]),
+        });
+        stmts.push(local("x", Expr::Number(7.0)));
+        stmts.push(Stat::Return { values: vec![name("g"), name("x")] });
+        relieve(&mut stmts);
+        assert!(render(&stmts).contains("local function g"));
+    }
+
+    #[test]
+    fn an_unused_local_is_scoped_not_dropped() {
+        let mut stmts = pad(PRESSURE_TRIGGER);
+        stmts.push(local("dead", call(name("sideEffect"), vec![Expr::String("kept".into())])));
+        stmts.push(Stat::ExprStat(call(name("after"), vec![])));
+        relieve(&mut stmts);
+        let out = render(&stmts);
+        assert!(out.contains("do
+    local dead = sideEffect(\"kept\")
+end"), "{out}");
+    }
+
+    #[test]
+    fn a_closed_run_is_wrapped_and_a_run_reaching_the_block_end_is_not() {
+        let mut stmts = pad_kept(PRESSURE_TRIGGER);
+        stmts.push(local("seg", call(name("make"), vec![])));
+        stmts.push(Stat::ExprStat(call(name("use"), vec![name("seg"), name("seg")])));
+        stmts.push(Stat::ExprStat(call(name("after"), vec![])));
+        stmts.push(local("tail", call(name("make2"), vec![])));
+        stmts.push(Stat::ExprStat(call(name("use"), vec![name("tail"), name("tail")])));
+        relieve(&mut stmts);
+        let out = render(&stmts);
+        assert!(out.contains("do
+    local seg = make()
+    use(seg, seg)
+end
+after()"), "{out}");
+        assert!(out.contains("
+local tail = make2()
+use(tail, tail)"), "{out}");
+    }
+
+    #[test]
+    fn a_forward_declaration_used_in_one_statement_moves_next_to_it() {
+        let mut stmts = pad_kept(PRESSURE_TRIGGER);
+        stmts.push(Stat::Local { names: vec!["a".into(), "spread".into()], values: vec![] });
+        stmts.push(Stat::ExprStat(call(name("first"), vec![])));
+        stmts.push(Stat::ExprStat(call(name("mid"), vec![name("a"), name("a")])));
+        stmts.push(Stat::Assign { targets: vec![name("spread")], values: vec![Expr::Number(2.0)] });
+        stmts.push(Stat::ExprStat(call(name("last"), vec![name("spread")])));
+        stmts.push(Stat::ExprStat(call(name("end_"), vec![])));
+        relieve(&mut stmts);
+        let out = render(&stmts);
+        // `a` is only mentioned by `mid(a, a)`: declared next to it.
+        assert!(out.contains("    local a
+    mid(a, a)"), "{out}");
+        // `spread` is mentioned by two statements: it stays a forward declaration.
+        assert!(out.contains("local spread"), "{out}");
+        assert!(!out.contains("local a, spread"), "{out}");
     }
 }
