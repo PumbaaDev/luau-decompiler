@@ -392,7 +392,8 @@ fn guard_span_has_single_call(code: &[u32], start: usize, g: usize) -> bool {
     let mut w = start;
     while w < g {
         let op = LuauOpcode::from_u8(insn_op(code[w]));
-        calls += matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) as usize;
+        // A method call is NAMECALL + CALL: count the CALL, which ends each one.
+        calls += matches!(op, LuauOpcode::Call) as usize;
         w += if op.has_aux() { 2 } else { 1 };
     }
     calls == 1

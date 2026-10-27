@@ -6,7 +6,11 @@
 //! Real shape: GhostHunter `converse` (v14) and `ws ~= nil and ws:IsA("Model")
 //! and ws or nil` in HalloweenDimensionController `syncChase`.
 
-use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::ast::Expr;
+use crate::decompiler::emit::emit_block;
+use crate::decompiler::lifter::naming::{LocalTracker, RegVal};
+use crate::decompiler::lifter::opcode_handlers::lift_instruction_range;
+use crate::decompiler::{analyze_register_usage, DecompileContext};
 use crate::parser::types::{Chunk, Constant, Proto};
 
 const OP_LOADNIL: u8 = 2;
@@ -14,6 +18,7 @@ const OP_LOADN: u8 = 4;
 const OP_LOADK: u8 = 5;
 const OP_MOVE: u8 = 6;
 const OP_GETGLOBAL: u8 = 7;
+const OP_SETTABLEKS: u8 = 16;
 const OP_NAMECALL: u8 = 20;
 const OP_CALL: u8 = 21;
 const OP_RETURN: u8 = 22;
@@ -49,9 +54,30 @@ fn chunk_of(code: Vec<u32>, constants: Vec<Constant>) -> Chunk {
     Chunk { version: 6, types_version: 0, strings: Vec::new(), protos: vec![proto], main_proto: 0 }
 }
 
+/// Lift the whole proto as ONE flat range, the way a `Region::Linear` is
+/// lifted (the structured regions do not claim every and/or value; the real
+/// GhostHunter and syncChase shapes reach the conditional-jump arms through
+/// this flat path). Returns the emitted source of the raw statements.
 fn lift(chunk: &Chunk) -> String {
+    let proto = &chunk.protos[0];
     let mut ctx = DecompileContext::new(chunk);
-    decompile_proto(&mut ctx, &chunk.protos[0], 0, 0)
+    let hints = analyze_register_usage(proto, &ctx.chunk.strings, None, Some(&ctx.chunk.protos));
+    ctx.init_proto_naming(0, hints, &[]);
+    ctx.current_proto_index = Some(0);
+    let mut regs = vec![RegVal::Unknown; 256];
+    let mut locals = LocalTracker::new(proto.num_params as usize);
+    for i in 0..proto.num_params {
+        let name = ctx.reg_name(proto, i, 0);
+        regs[i as usize] = RegVal::Expr(Expr::Name(name.clone()));
+        locals.record_name(i as usize, &name);
+    }
+    let mut stmts = Vec::new();
+    lift_instruction_range(
+        &mut ctx, proto, 0, 0, 0, proto.code.len(), &mut regs, &mut locals, &mut stmts, false,
+    );
+    let mut out = String::new();
+    emit_block(&mut out, &stmts, 0);
+    out
 }
 
 fn strs(names: &[&str]) -> Vec<Constant> {
@@ -60,7 +86,7 @@ fn strs(names: &[&str]) -> Vec<Constant> {
 
 /// ```lua
 /// -- params: ok (R0), r (R1)
-/// return ok and typeof(r) == "string" and r or "fallback"
+/// r.Color = ok and typeof(r) == "string" and r or "fallback"
 /// ```
 /// `between` is spliced in right after the outer test; it must not change the
 /// jump layout, so callers pass a block of known length via `pad`.
@@ -80,9 +106,15 @@ fn typeof_chunk(between: &[u32]) -> Chunk {
         insn_abc(OP_MOVE, 2, 1, 0),           // R2 = r
         insn_ad(OP_JUMP, 0, 1),               // else-skip
         insn_ad(OP_LOADK, 2, 2),              // else: R2 = "fallback"
-        insn_abc(OP_RETURN, 2, 2, 0),
+        insn_abc(OP_SETTABLEKS, 2, 1, 0),     // r.Color = R2
+        4,                                    // aux K4 "Color"
+        insn_abc(OP_GETGLOBAL, 5, 0, 0),
+        3,                                    // aux K3 "print"
+        insn_abc(OP_MOVE, 6, 1, 0),
+        insn_abc(OP_CALL, 5, 2, 1),           // print(r)
+        insn_abc(OP_RETURN, 0, 1, 0),
     ]);
-    chunk_of(code, strs(&["typeof", "string", "fallback", "print"]))
+    chunk_of(code, strs(&["typeof", "string", "fallback", "print", "Color"]))
 }
 
 #[test]
@@ -96,7 +128,7 @@ fn typeof_compare_between_and_links_is_kept_in_the_condition() {
 
 /// ```lua
 /// -- params: ws (R0)
-/// return ws ~= nil and ws:IsA("Model") and ws or nil
+/// ws.Target = ws ~= nil and ws:IsA("Model") and ws or nil
 /// ```
 fn isa_chunk() -> Chunk {
     let code = vec![
@@ -107,12 +139,14 @@ fn isa_chunk() -> Chunk {
         insn_ad(OP_LOADK, 4, 1),              // R4 = "Model"
         insn_abc(OP_CALL, 2, 3, 2),           // R2 = R2(R3, R4)
         insn_ad(OP_JUMPIFNOT, 2, 2),          // not R2 -> else
-        insn_abc(OP_MOVE, 1, 0, 0),           // R1 = ws
+        insn_abc(OP_MOVE, 5, 0, 0),           // R5 = ws
         insn_ad(OP_JUMP, 0, 1),               // else-skip
-        insn_abc(OP_LOADNIL, 1, 0, 0),        // else: R1 = nil
-        insn_abc(OP_RETURN, 1, 2, 0),
+        insn_abc(OP_LOADNIL, 5, 0, 0),        // else: R5 = nil
+        insn_abc(OP_SETTABLEKS, 5, 0, 0),     // ws.Target = R5
+        2,                                    // aux K2 "Target"
+        insn_abc(OP_RETURN, 0, 1, 0),
     ];
-    chunk_of(code, strs(&["IsA", "Model"]))
+    chunk_of(code, strs(&["IsA", "Model", "Target"]))
 }
 
 #[test]
