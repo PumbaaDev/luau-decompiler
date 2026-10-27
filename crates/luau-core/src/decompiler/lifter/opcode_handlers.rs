@@ -6839,6 +6839,37 @@ pub(super) fn lift_instruction_range(
                 continue;
             }
 
+            // A generic-for the structurer never turned into a region (it sits
+            // inside an if-arm the structurer keeps as block ids) reached the
+            // no-op arm below: its iterator CALL stayed a bare multi-assign and
+            // the body read unbound loop variables. Structure the pair on the
+            // spot and lift it as a loop, the same way a handed-in region is.
+            LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+                if unclaimed_generic_for_region(proto, pc, end).is_some() =>
+            {
+                let Some(region) = unclaimed_generic_for_region(proto, pc, end) else { break };
+                let super::Region::GenericFor { loop_pc, .. } = &region else { break };
+                let loop_op = LuauOpcode::from_u8(insn_op(code[*loop_pc]));
+                let next_pc = *loop_pc + if loop_op.has_aux() { 2 } else { 1 };
+                let cfg = crate::analysis::cfg::ControlFlowGraph::build(proto);
+                let saved = std::mem::take(&mut ctx.flat_for_regions);
+                super::lift_region(
+                    ctx, proto, proto_index, &cfg, &region, regs, locals, depth + 1, stmts,
+                );
+                ctx.flat_for_regions = saved;
+                // The loop variables go out of scope with the loop. A later
+                // write into one of their registers (a closure built there)
+                // must declare afresh, not assign to the dead loop name.
+                let loop_a = insn_a(code[pc]) as usize;
+                let aux = if *loop_pc + 1 < code.len() { code[*loop_pc + 1] & 0x7FFF_FFFF } else { 2 };
+                let nvars = if loop_op == LuauOpcode::Deprecated61 { 2 } else { (aux as usize).clamp(2, 5) };
+                for reg in loop_a + 3..loop_a + 3 + nvars {
+                    locals.forget_binding(reg);
+                }
+                pc = next_pc;
+                continue;
+            }
+
             // For-loop ops are handled at the region level
             LuauOpcode::ForNPrep | LuauOpcode::ForNLoop
             | LuauOpcode::ForGPrep | LuauOpcode::ForGLoop
@@ -7902,6 +7933,42 @@ fn consumer_writes_param(code: &[u32], pc: usize, reg: usize, num_params: usize)
         i += if op.has_aux() { 2 } else { 1 };
     }
     false
+}
+
+/// A generic-for whose FORGPREP sits at `pc` and whose whole extent (back edge
+/// and its AUX word) lies inside the flat span ending at `end`, structured on
+/// the spot. Only reached when no handed-in region claimed the pair.
+fn unclaimed_generic_for_region(
+    proto: &crate::parser::types::Proto,
+    pc: usize,
+    end: usize,
+) -> Option<crate::analysis::structuring::Region> {
+    use crate::analysis::structuring::{structure_numeric_for_body, Region};
+    let code = &proto.code;
+    let target = pc as i64 + insn_d(*code.get(pc)?) as i64 + 1;
+    if target <= pc as i64 {
+        return None;
+    }
+    let loop_pc = target as usize;
+    let loop_op = LuauOpcode::from_u8(insn_op(*code.get(loop_pc)?));
+    let is_inext_loop = loop_op == LuauOpcode::Deprecated61;
+    if loop_op != LuauOpcode::ForGLoop && !is_inext_loop {
+        return None;
+    }
+    if loop_pc + if is_inext_loop { 1 } else { 2 } > end {
+        return None;
+    }
+    let cfg = crate::analysis::cfg::ControlFlowGraph::build(proto);
+    let headers: std::collections::BTreeSet<usize> =
+        cfg.find_loops().iter().map(|l| l.header).collect();
+    let body = structure_numeric_for_body(code, pc + 1, loop_pc, &cfg, &headers);
+    Some(Region::GenericFor {
+        prep_pc: pc,
+        loop_pc,
+        body_start: pc + 1,
+        body_end: loop_pc,
+        body,
+    })
 }
 
 /// The structured for-region whose prep sits at `pc` and whose back edge lies
