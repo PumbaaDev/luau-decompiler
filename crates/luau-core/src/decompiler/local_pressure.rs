@@ -257,6 +257,121 @@ fn names_in_expr(e: &mut Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// Names visible to code after this statement may be declared by it or by its
+/// nested blocks (not by closures, which have their own scope).
+fn declared_names_shallow(s: &mut Stat, out: &mut HashSet<String>) {
+    match s {
+        Stat::Local { names, .. } => out.extend(names.iter().cloned()),
+        Stat::LocalFunction { name, .. } => {
+            out.insert(name.clone());
+        }
+        Stat::NumericFor { var, .. } => {
+            out.insert(var.clone());
+        }
+        Stat::GenericFor { vars, .. } => out.extend(vars.iter().cloned()),
+        _ => {}
+    }
+    stat_blocks_mut(s, &mut |b| b.iter_mut().for_each(|x| declared_names_shallow(x, out)));
+}
+
+/// Free variables of a block: names read or written that no enclosing scope
+/// inside it declares. `scopes` holds the enclosing scopes (innermost last).
+fn free_in_block(stmts: &mut [Stat], scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+    scopes.push(HashSet::new());
+    for s in stmts.iter_mut() {
+        free_in_stat(s, scopes, free);
+    }
+    scopes.pop();
+}
+
+fn bind(scopes: &mut [HashSet<String>], name: &str) {
+    if let Some(top) = scopes.last_mut() {
+        top.insert(name.to_string());
+    }
+}
+
+fn free_in_stat(s: &mut Stat, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+    // A local's initialiser is evaluated before its names are bound.
+    match s {
+        Stat::Local { names, values } => {
+            values.iter_mut().for_each(|e| free_in_expr(e, scopes, free));
+            names.iter().for_each(|n| bind(scopes, n));
+            return;
+        }
+        Stat::LocalFunction { name, func } => {
+            bind(scopes, name);
+            free_in_expr(func, scopes, free);
+            return;
+        }
+        Stat::NumericFor { var, start, stop, step, body } => {
+            free_in_expr(start, scopes, free);
+            free_in_expr(stop, scopes, free);
+            if let Some(st) = step {
+                free_in_expr(st, scopes, free);
+            }
+            scopes.push([var.clone()].into_iter().collect());
+            free_in_block(body, scopes, free);
+            scopes.pop();
+            return;
+        }
+        Stat::GenericFor { vars, iterators, body } => {
+            iterators.iter_mut().for_each(|e| free_in_expr(e, scopes, free));
+            scopes.push(vars.iter().cloned().collect());
+            free_in_block(body, scopes, free);
+            scopes.pop();
+            return;
+        }
+        _ => {}
+    }
+    stat_exprs_mut(s, &mut |e| free_in_expr(e, scopes, free));
+    stat_blocks_mut(s, &mut |b| free_in_block(b, scopes, free));
+}
+
+fn free_in_expr(e: &mut Expr, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+    match e {
+        Expr::Name(n) => {
+            if !scopes.iter().any(|sc| sc.contains(n.as_str())) {
+                free.insert(n.clone());
+            }
+        }
+        Expr::Function { params, body, .. } => {
+            scopes.push(params.iter().cloned().collect());
+            free_in_block(body, scopes, free);
+            scopes.pop();
+        }
+        _ => expr_children_mut(e, &mut |ch| free_in_expr(ch, scopes, free)),
+    }
+}
+
+/// Names declared anywhere inside a statement (locals, params, loop vars).
+#[allow(dead_code)]
+fn declared_names_in_stat(s: &mut Stat, out: &mut HashSet<String>) {
+    match s {
+        Stat::Local { names, .. } => out.extend(names.iter().cloned()),
+        Stat::LocalFunction { name, .. } => {
+            out.insert(name.clone());
+        }
+        Stat::NumericFor { var, .. } => {
+            out.insert(var.clone());
+        }
+        Stat::GenericFor { vars, .. } => out.extend(vars.iter().cloned()),
+        _ => {}
+    }
+    stat_exprs_mut(s, &mut |e| declared_names_in_expr(e, out));
+    stat_blocks_mut(s, &mut |b| b.iter_mut().for_each(|x| declared_names_in_stat(x, out)));
+}
+
+#[allow(dead_code)]
+fn declared_names_in_expr(e: &mut Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Function { params, body, .. } => {
+            out.extend(params.iter().cloned());
+            body.iter_mut().for_each(|x| declared_names_in_stat(x, out));
+        }
+        _ => expr_children_mut(e, &mut |ch| declared_names_in_expr(ch, out)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure builtin initialisers
 // ---------------------------------------------------------------------------
@@ -317,6 +432,10 @@ struct Rep<'a> {
     unstable: bool,
     done: bool,
     failed: bool,
+    /// Refuse to place the value inside a loop or closure body (it would be
+    /// created more than once). Used for function values.
+    forbid_cross: bool,
+    in_cross: bool,
 }
 
 impl Rep<'_> {
@@ -342,6 +461,9 @@ impl Rep<'_> {
                 if prefix && !self.repl_prefix_ok {
                     return self.fail();
                 }
+                if self.forbid_cross && self.in_cross {
+                    return self.fail();
+                }
                 let mut v = self.repl.clone();
                 if tail && self.repl_multi {
                     v = Expr::Paren(Box::new(v));
@@ -362,9 +484,12 @@ impl Rep<'_> {
             | Expr::Vector(..) => {}
             Expr::Function { body, .. } => {
                 if !self.ordered {
+                    let saved = self.in_cross;
+                    self.in_cross = true;
                     for s in body.iter_mut() {
                         self.pure_stat(s);
                     }
+                    self.in_cross = saved;
                 }
             }
             Expr::Field { object, .. } => {
@@ -454,12 +579,23 @@ impl Rep<'_> {
             }
             return;
         }
+        let loopy = matches!(
+            s,
+            Stat::While { .. } | Stat::Repeat { .. } | Stat::NumericFor { .. } | Stat::GenericFor { .. }
+        );
+        let cond_repeats = matches!(s, Stat::While { .. } | Stat::Repeat { .. });
+        let saved = self.in_cross;
+        if cond_repeats {
+            self.in_cross = true;
+        }
         stat_exprs_mut(s, &mut |e| self.expr(e, false, false, false, false));
+        self.in_cross = saved || loopy;
         stat_blocks_mut(s, &mut |b| {
             for x in b.iter_mut() {
                 self.pure_stat(x);
             }
         });
+        self.in_cross = saved;
     }
 
     /// ORDERED mode: only plain straight-line statements.
@@ -555,6 +691,8 @@ fn inline_block(stmts: &mut Vec<Stat>) {
             unstable: false,
             done: false,
             failed: false,
+            forbid_cross: false,
+            in_cross: false,
         };
         rep.pure_stat(&mut stmts[j]);
         if rep.done && !rep.failed {
@@ -585,6 +723,8 @@ fn inline_block(stmts: &mut Vec<Stat>) {
                 unstable: false,
                 done: false,
                 failed: false,
+                forbid_cross: false,
+                in_cross: false,
             };
             rep.ordered_stat(&mut stmts[j]);
             if rep.done && !rep.failed {
@@ -592,6 +732,77 @@ fn inline_block(stmts: &mut Vec<Stat>) {
             } else {
                 break;
             }
+        }
+    }
+
+    // Phase 4: a single-use function value moves to its one use. Creating a
+    // closure has no effect; it is refused when the use sits inside a loop or
+    // another closure (it would be created more than once) or when the body
+    // mentions a name that is declared between here and the use (the name
+    // would then resolve to the new local instead of the global it meant).
+    for i in 0..n {
+        if dead[i] {
+            continue;
+        }
+        let (name, func) = match &stmts[i] {
+            Stat::LocalFunction { name, func } => (name.clone(), func.clone()),
+            other => match single_local(other) {
+                Some((nm, f @ Expr::Function { .. })) => (nm.clone(), f.clone()),
+                _ => continue,
+            },
+        };
+        if c.uses.get(&name) != Some(&1) || c.decls.get(&name) != Some(&1) {
+            continue;
+        }
+        let Some(&j) = first_use.get(&name) else { continue };
+        if j <= i || dead[j] {
+            continue;
+        }
+        let mut free = HashSet::new();
+        if let Expr::Function { params, body, .. } = &func {
+            let mut scopes = vec![params.iter().cloned().collect::<HashSet<String>>()];
+            free_in_block(&mut body.clone(), &mut scopes, &mut free);
+        }
+        let mut declared_between = HashSet::new();
+        for s in stmts[i + 1..=j].iter_mut() {
+            declared_names_shallow(s, &mut declared_between);
+        }
+        if free.iter().any(|n| declared_between.contains(n)) {
+            continue;
+        }
+        let mut rep = Rep {
+            name: &name,
+            repl: &func,
+            ordered: false,
+            repl_multi: false,
+            repl_prefix_ok: false,
+            closure_written: &c.closure_written,
+            unstable: false,
+            done: false,
+            failed: false,
+            forbid_cross: true,
+            in_cross: false,
+        };
+        rep.pure_stat(&mut stmts[j]);
+        if rep.done && !rep.failed {
+            dead[i] = true;
+        }
+    }
+
+    // Phase 5: a local that nothing mentions holds a slot for no reason, but
+    // its initialiser may call or contain strings, so it is scoped, not dropped.
+    for i in 0..n {
+        if dead[i] {
+            continue;
+        }
+        let unused = match &stmts[i] {
+            Stat::Local { names, .. } => names.iter().all(|nm| !c.uses.contains_key(nm)),
+            Stat::LocalFunction { name, .. } => !c.uses.contains_key(name),
+            _ => false,
+        };
+        if unused && n > 1 {
+            let inner = std::mem::replace(&mut stmts[i], Stat::Break);
+            stmts[i] = Stat::DoBlock { body: vec![inner] };
         }
     }
 
