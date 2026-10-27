@@ -415,6 +415,87 @@ fn arms_carry_live_value(
     written.into_iter().any(|r| reg_maybe_live(code, construct_end, r))
 }
 
+/// Is `[start, end)` a short run that only selects a constant or register
+/// (`LOADB`/`LOADN`/`LOADK`/`LOADNIL`/`MOVE`)? Such an else arm can be repeated
+/// in front of each nested guard without repeating any side effect.
+fn range_is_pure_select(code: &[u32], start: usize, end: usize) -> bool {
+    const MAX_WORDS: usize = 6;
+    if end <= start || end - start > MAX_WORDS || end > code.len() {
+        return false;
+    }
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if !matches!(
+            op,
+            LuauOpcode::Nop
+                | LuauOpcode::LoadNil
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::Move
+        ) {
+            return false;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    true
+}
+
+/// Lift a guard chain as NESTED `if`s, the way the source nests them, when the
+/// chain cannot become one `and` condition. Each guard span is lifted as plain
+/// statements (its calls keep their locals, so nothing is evaluated twice), the
+/// guard becomes `if <test> then <rest> else <else arm> end`, and the pure
+/// select else arm is repeated per guard. Nothing is hoisted above a guard.
+/// Returns `then_end` so the caller's own range lift is empty.
+#[allow(clippy::too_many_arguments)]
+fn lift_guard_chain_nested(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+    regs: &mut Vec<RegVal>,
+    locals: &mut LocalTracker,
+    in_loop: bool,
+    arm_start: usize,
+    then_end: usize,
+    else_range: Option<(usize, usize)>,
+    stmts: &mut Vec<Stat>,
+) -> usize {
+    let code = &proto.code;
+    let Some((else_start, else_end)) = else_range else {
+        return arm_start;
+    };
+    let guard = find_leading_guard_jump(code, arm_start, then_end, else_start)
+        .filter(|(g, _, _)| *g > arm_start);
+    let Some((g, _, g_reg)) = guard else {
+        lift_instruction_range(
+            ctx, proto, proto_index, depth + 1, arm_start, then_end, regs, locals, stmts, in_loop,
+        );
+        return then_end;
+    };
+    lift_instruction_range(ctx, proto, proto_index, depth + 1, arm_start, g, regs, locals, stmts, in_loop);
+    let test = simplify_expr(&guard_pass_term(ctx, proto, g, reg_expr(regs, g_reg)));
+    let after_span = regs.clone();
+    let mut inner = Vec::new();
+    lift_guard_chain_nested(
+        ctx, proto, proto_index, depth, regs, locals, in_loop,
+        g + guard_jump_size(code, g), then_end, else_range, &mut inner,
+    );
+    *regs = after_span;
+    let mut else_stmts = Vec::new();
+    lift_instruction_range(
+        ctx, proto, proto_index, depth + 1, else_start, else_end, regs, locals, &mut else_stmts, in_loop,
+    );
+    stmts.push(Stat::If {
+        condition: test,
+        then_body: inner,
+        elseif_clauses: vec![],
+        else_body: Some(else_stmts),
+    });
+    then_end
+}
+
 /// SHORT-CIRCUIT TYPE-GUARD FOLD.
 ///
 /// `if x and x:IsA(T) then keep else make end` compiles to two JUMPIFNOTs that
@@ -491,6 +572,19 @@ fn fold_type_guard_chain(
             || (single_call
                 && arms_carry_live_value(code, (probe, then_end), else_range, construct_end)));
     if !do_fold {
+        // A chain the expression fold refuses because a span holds a nested
+        // feeder call (`type(rawget(mt, "__call")) == "function"`) keeps every
+        // test as a nested `if` instead of dropping the tests.
+        if probe > jump_next
+            && !single_call
+            && else_range.map_or(false, |(es, ee)| range_is_pure_select(code, es, ee))
+            && arms_carry_live_value(code, (probe, then_end), else_range, construct_end)
+        {
+            return lift_guard_chain_nested(
+                ctx, proto, proto_index, depth, regs, locals, in_loop, jump_next, then_end,
+                else_range, then_stmts,
+            );
+        }
         return arm_start;
     }
     // Phase 3: lift each guard span and fold its call into the condition.
