@@ -11093,6 +11093,22 @@ fn iterator_local_captured_after(
                 }
             } else if opcode_handlers::insn_writes_regs(code, i).contains(&reg) {
                 return false;
+            } else if matches!(
+                op,
+                LuauOpcode::ForGPrep
+                    | LuauOpcode::ForGPrepNext
+                    | LuauOpcode::ForGPrepINext
+                    | LuauOpcode::ForGLoop
+                    | LuauOpcode::ForNPrep
+                    | LuauOpcode::ForNLoop
+            ) && reg >= insn_a(insn) as usize
+            {
+                // A later loop owns every register from its base up (state
+                // and loop variables), none of which `insn_writes_regs`
+                // reports. A capture past this point names that loop's
+                // variable, not our call result (Brookhaven MainAudioNew:
+                // R17 is the first loop's iterator and a later loop's `v`).
+                return false;
             }
             i += if op.has_aux() { 2 } else { 1 };
         }

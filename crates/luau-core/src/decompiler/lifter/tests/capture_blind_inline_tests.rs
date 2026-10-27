@@ -217,3 +217,77 @@ fn val_captured_for_in_iterator_call_stays_a_declared_local() {
 {out}"
     );
 }
+
+/// Mirrors Brookhaven MainAudioNew pc 409-461: a three-result call feeds the
+/// first loop's iterator registers (R7). Later a SECOND loop reuses R7 as its
+/// own loop variable and a closure captures that loop variable. The capture
+/// belongs to the second loop's variable, not to the call result, so the call
+/// must still fold into the first loop's header.
+fn build_reused_register() -> Chunk {
+    let code = vec![
+        insn_ad(OP_GETGLOBAL, 8, 0),    // 0
+        0,                              // 1 aux "workspace"
+        insn_abc(OP_NAMECALL, 7, 8, 0), // 2
+        1,                              // 3 aux "GetChildren"
+        insn_abc(OP_CALL, 7, 2, 4),     // 4 results=3
+        insn_ad(OP_FORGPREP, 7, 4),     // 5 -> 10
+        insn_ad(OP_GETGLOBAL, 12, 0),   // 6
+        2,                              // 7 aux "print"
+        insn_abc(OP_MOVE, 13, 11, 0),   // 8
+        insn_abc(OP_CALL, 12, 2, 1),    // 9
+        insn_ad(OP_FORGLOOP, 7, -5),    // 10 -> 6
+        2,                              // 11
+        insn_ad(OP_GETGLOBAL, 3, 0),    // 12
+        0,                              // 13 aux "workspace"
+        insn_abc(OP_LOADNIL, 4, 0, 0),  // 14
+        insn_abc(OP_LOADNIL, 5, 0, 0),  // 15
+        insn_ad(OP_FORGPREP, 3, 5),     // 16 -> 22
+        insn_ad(OP_GETGLOBAL, 9, 0),    // 17
+        3,                              // 18 aux "spawn"
+        insn_ad(OP_NEWCLOSURE, 10, 0),  // 19
+        insn_abc(OP_CAPTURE, 0, 7, 0),  // 20 val R7 (second loop's variable)
+        insn_abc(OP_CALL, 9, 2, 1),     // 21
+        insn_ad(OP_FORGLOOP, 3, -6),    // 22 -> 17
+        2,                              // 23
+        insn_abc(OP_RETURN, 0, 1, 0),   // 24
+    ];
+    let consts = vec![
+        Constant::String("workspace".into()),
+        Constant::String("GetChildren".into()),
+        Constant::String("print".into()),
+        Constant::String("spawn".into()),
+    ];
+    let mut main = proto(code, consts, 0, "main");
+    main.child_protos = vec![1];
+    let child = proto(
+        vec![
+            insn_abc(OP_GETUPVAL, 0, 0, 0),
+            insn_abc(OP_RETURN, 0, 1, 0),
+        ],
+        vec![],
+        1,
+        "child",
+    );
+    Chunk {
+        version: 6,
+        types_version: 0,
+        strings: vec![],
+        protos: vec![main, child],
+        main_proto: 0,
+    }
+}
+
+#[test]
+fn reused_loop_variable_capture_does_not_split_earlier_iterator_call() {
+    let chunk = build_reused_register();
+    let mut ctx = DecompileContext::new(&chunk);
+    let out = decompile_proto(&mut ctx, &chunk.protos[0], 0, 0);
+    assert!(
+        out.contains(":GetChildren() do"),
+        "the call must stay folded into the loop header:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("local ") && l.contains("GetChildren")),
+        "no needless local for the iterator call:\n{out}"
+    );
+}
