@@ -151,3 +151,5 @@ mod combine7r_regression_tests;
 mod capture_blind_inline_tests;
 #[cfg(test)]
 mod arm_zero_result_call_chain_tests;
+#[cfg(test)]
+mod arm_and_isa_chain_tests;
