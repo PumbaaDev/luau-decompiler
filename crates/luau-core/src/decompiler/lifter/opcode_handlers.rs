@@ -6302,16 +6302,22 @@ pub(super) fn lift_instruction_range(
 
                     // `if A or B then`: this jump fires INTO the body and the
                     // "arm" before `target` is B's link. See `or_link_shape`.
-                    // Only for the raw target: an `extended_arm_end` target is
-                    // a different construct.
-                    if target == raw_target {
+                    // Tried at the RAW target even when `extended_arm_end` moved
+                    // `target`: a link whose escaping jump leaves the arm, with
+                    // the swallowed block ending in the range-end join, is
+                    // `if not A or not B then <x> else <y> end` laid out with
+                    // the pass path last (`x and x:IsA(T)` inlined; PetSim99
+                    // DragDelete getTitleText, BloxFruits Fireflies). The
+                    // extension read it as `if A then .. end` and lost the
+                    // second term and the whole else.
+                    {
                         let fire = super::negate_condition(&condition);
                         if let Some((or_cond, exit)) = fold_or_link_condition(
                             ctx, proto, proto_index, depth, regs, locals, in_loop,
-                            &fire, jump_next, target, end,
+                            &fire, jump_next, raw_target, end,
                         ) {
                             condition = or_cond;
-                            jump_next = target;
+                            jump_next = raw_target;
                             target = exit;
                         }
                     }

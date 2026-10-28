@@ -273,6 +273,13 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
         {
             return None;
         }
+        // A zero-result CALL leaves no value in `dest` for ANY chain, not only a
+        // CALLFB one: a body that ends in `t.insert(..)` on the tested register
+        // is an ordinary `if` body, not an operand (AdoptMe hide_billboards, a
+        // whole loop body read as `R6 = R6 and <body>`; the guard was lost).
+        if LuauOpcode::from_u8(insn_op(writer)) == LuauOpcode::Call && insn_c(writer) == 1 {
+            return None;
+        }
         if !writes_reg_a(LuauOpcode::from_u8(insn_op(writer)))
             || insn_a(writer) as usize != dest
         {
@@ -512,11 +519,11 @@ mod tests {
             ad(LuauOpcode::JumpIf, 3, 7),
             abc(LuauOpcode::Move, 3, 2, 0),
             abc(LuauOpcode::LoadK, 4, 0, 0),
-            abc(LuauOpcode::Call, 3, 2, 1),
+            abc(LuauOpcode::Call, 3, 2, 2),
             ad(LuauOpcode::JumpIf, 3, 3),
             abc(LuauOpcode::Move, 3, 2, 0),
             abc(LuauOpcode::LoadK, 4, 0, 0),
-            abc(LuauOpcode::Call, 3, 2, 1),
+            abc(LuauOpcode::Call, 3, 2, 2),
             abc(LuauOpcode::Return, 3, 2, 0),
         ];
         let chain = recognize_or_and_chain(&code, 0).expect("genuine or-chain");
