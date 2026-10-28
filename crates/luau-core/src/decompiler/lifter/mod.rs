@@ -2753,6 +2753,15 @@ fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, 
         }
         let target = target as usize;
         if target < latch_start && ranges[j + 1..hi].iter().any(|r| r.0 == target) {
+            // An arm that hands a VALUE to the tail (`R = a and b or c`) is a
+            // value join, which the structured run cannot rebuild.
+            if let Some(wp) = last_insn_pc(code, s, lp) {
+                let w = code[wp];
+                let writes_a = LuauOpcode::from_u8(insn_op(w)) == LuauOpcode::Move;
+                if writes_a && reg_live_at(code, target, usize::from(crate::parser::types::insn_a(w))) {
+                    return false;
+                }
+            }
             has_join_jump = true;
         }
     }
