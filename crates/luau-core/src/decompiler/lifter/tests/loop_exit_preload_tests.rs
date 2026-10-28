@@ -104,3 +104,61 @@ fn join_that_tests_the_flag_is_preloaded() {
     let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
     assert!(found.is_some());
 }
+
+/// Luau inlines a helper that searches a table and returns the hit
+/// (DungeonQuest sellShop `showWeaponStats`, StealAnEgg MonsterParasite
+/// `BoostMultiplier`). The hit register is written by the break arm
+/// (`MOVE R5 R3; JUMP join`); the normal exit runs OTHER statements (an
+/// `error(...)` call in MonsterParasite) and only then `LOADNIL R5`; the join
+/// READS R5 a few instructions later without testing it. The preload must
+/// still apply, or every read of R5 becomes a never-assigned local.
+fn inlined_search_code() -> Vec<u32> {
+    vec![
+        abc(OP_MOVE, 2, 1, 0),   // 0: limit
+        ad(OP_LOADN, 3, 1),      // 1: step
+        ad(OP_LOADN, 4, 1),      // 2: start
+        ad(OP_FORNPREP, 2, 4),   // 3: exit at 8
+        ad(OP_JUMPIFNOT, 0, 2),  // 4: -> 7
+        abc(OP_MOVE, 5, 3, 0),   // 5: hit = i
+        ad(OP_JUMP, 0, 3),       // 6: break -> 10 (join)
+        ad(OP_FORNLOOP, 2, -4),  // 7: back to 4
+        ad(OP_LOADN, 6, 9),      // 8: unrelated exit statement
+        abc(OP_LOADB, 5, 0, 0),  // 9: hit = false (normal exit)
+        abc(OP_MOVE, 6, 5, 0),   // 10: join reads hit, no test
+        abc(OP_RETURN, 6, 2, 0), // 11
+    ]
+}
+
+#[test]
+fn exit_load_after_unrelated_statements_with_a_reading_join_is_preloaded() {
+    let code = inlined_search_code();
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7)
+        .expect("shape must be detected");
+    assert_eq!(found.load_pc, 9);
+    assert_eq!(found.reg, 5);
+}
+
+#[test]
+fn inlined_search_keeps_the_hit_register_assigned() {
+    let source = lift(inlined_search_code());
+    let for_at = source.find("for ").unwrap_or_else(|| panic!("no loop:\n{source}"));
+    let decl = source.find("= false").unwrap_or_else(|| panic!("no hit init:\n{source}"));
+    assert!(decl < for_at, "hit must be initialised before the loop:\n{source}");
+    assert!(source.contains("break"), "break lost:\n{source}");
+}
+
+#[test]
+fn an_unrelated_jump_between_loop_and_exit_load_is_refused() {
+    let mut code = inlined_search_code();
+    code[8] = ad(OP_JUMPIFNOT, 0, 0); // control flow in the exit run
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
+    assert!(found.is_none(), "exit run must be straight-line");
+}
+
+#[test]
+fn a_statement_that_touches_the_flag_before_the_exit_load_is_refused() {
+    let mut code = inlined_search_code();
+    code[8] = ad(OP_LOADN, 5, 9); // R5 rewritten before the load
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
+    assert!(found.is_none());
+}
