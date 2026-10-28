@@ -2734,6 +2734,28 @@ fn mid_body_structured_else(
 /// Returns true when the run `lo..=hi` (ending at the latch) has such a JUMP and
 /// contains no loop opcode or RETURN before the latch, so the whole span before
 /// the latch can be structured in one pass.
+/// True when the forward `JUMPIF[NOT] R` at `pc` skips a table constructor that
+/// writes `R` itself (the default-value shape `R = R or {..}`).
+fn jump_skips_write_to_tested(code: &[u32], pc: usize) -> bool {
+    use crate::parser::types::{insn_a, insn_d, insn_op};
+    let d = insn_d(code[pc]);
+    if d <= 0 {
+        return false;
+    }
+    let tested = insn_a(code[pc]);
+    let target = pc + 1 + d as usize;
+    let mut k = pc + 1;
+    while k < target.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        let writes = matches!(op, LuauOpcode::NewTable | LuauOpcode::DupTable);
+        if writes && insn_a(code[k]) == tested {
+            return true;
+        }
+        k += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
 fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
     use crate::parser::types::{insn_d, insn_op};
     if !opcode_handlers::midbody_lift_enabled() || hi + 1 != ranges.len() || hi < lo + 2 {
@@ -2771,6 +2793,12 @@ fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, 
     let mut pc = ranges[lo].0;
     while pc < latch_start {
         let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+            && jump_skips_write_to_tested(code, pc)
+        {
+            // `x = x or default`: a value join the structured run mis-binds.
+            return false;
+        }
         if matches!(
             op,
             LuauOpcode::Return
