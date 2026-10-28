@@ -149,3 +149,4 @@ mod andor_nil_call_join_tests;
 mod while_true_if_else_body_tests;
 mod combine7r_regression_tests;
 mod capture_blind_inline_tests;
+mod cne_ifelse_dead_jump_tests;

@@ -3021,9 +3021,199 @@ fn lift_structured_run(
         regions.iter().all(|r| region_pc_extent_within(r, start, end)),
         "structured arm run [{start}, {end}) produced a region outside its span"
     );
+    if !in_loop {
+        if let Some(split) = nested_else_split(&proto.code, cfg, &regions, start, end) {
+            liftpath(proto, "nested_else_split", start, end);
+            if split.cond_block > start {
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, start, split.cond_block, regs, locals,
+                    out, in_loop,
+                );
+            }
+            let region = Region::IfThenElse {
+                cond_pc: split.cond_block,
+                then_region: split.then_blocks,
+                else_region: split.else_blocks,
+                merge_pc: Some(split.merge),
+            };
+            lift_region(ctx, proto, proto_index, cfg, &region, regs, locals, depth, out);
+            if split.merge < end {
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, split.merge, end, regs, locals, out,
+                    in_loop,
+                );
+            }
+            return;
+        }
+    }
     lift_structured_regions(
         ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
     );
+}
+
+/// An if/else the run structurer flattened: see `nested_else_split`.
+struct NestedElseSplit {
+    cond_block: usize,
+    then_blocks: Vec<usize>,
+    else_blocks: Vec<usize>,
+    merge: usize,
+}
+
+fn is_plain_cond_branch(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotLT
+    )
+}
+
+/// A full if/else whose THEN arm holds a guard the run structurer carved out
+/// as its own region, cutting the if/else's `Linear` span in the middle.
+///
+/// `FurnitureEntryHelper get_cost` is
+///
+///     if self.gamepass then
+///         if RunService:IsClient() then            -- JUMPIFNOT at 8 -> else (24)
+///             local h = load(..)
+///             if h.owns_gamepass(..) then return 0, false end   -- guard at 19
+///         else                                     -- dead `JUMP -> 63` at 23
+///             assert(..) ... if owned then return 0, false end  -- guard at 59
+///         end
+///     end
+///
+/// `structure_numeric_for_body` emits `Linear 3..19`, then two guard regions.
+/// The branch at 8 escapes `Linear 3..19`, and outside a loop an escaping
+/// branch is discarded: `IsClient()` became a bare statement, the else arm and
+/// its five calls were never lifted (`calls_not_emitted`).
+///
+/// This finds the first such branch and returns the if/else the bytecode
+/// states: cond block, then blocks `[branch end, t)`, else blocks `[t, m)`,
+/// merge `m`, where `t` is the branch target and the instruction ending at `t`
+/// is an unconditional forward JUMP to `m`. Refused unless `m <= end`, every
+/// jump inside `[branch end, m)` stays inside `[branch end, m]`, and no jump
+/// from the rest of the run enters the interior - so the arms own their blocks
+/// outright and nothing is lifted twice.
+fn nested_else_split(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    regions: &[Region],
+    start: usize,
+    end: usize,
+) -> Option<NestedElseSplit> {
+    for region in regions {
+        let Region::Linear { start: s, end: e } = region else { continue };
+        let mut pc = *s;
+        while pc < *e && pc < code.len() {
+            let op = LuauOpcode::from_u8(insn_op(code[pc]));
+            let next = pc + if op.has_aux() { 2 } else { 1 };
+            if is_plain_cond_branch(op) && next < *e {
+                if let Some(split) = nested_else_split_at(code, cfg, pc, next, *e, start, end) {
+                    return Some(split);
+                }
+            }
+            pc = next;
+        }
+    }
+    None
+}
+
+fn nested_else_split_at(
+    code: &[u32],
+    cfg: &ControlFlowGraph,
+    b: usize,
+    bend: usize,
+    linear_end: usize,
+    start: usize,
+    end: usize,
+) -> Option<NestedElseSplit> {
+    let t = (b as i64 + insn_d(code[b]) as i64 + 1) as usize;
+    // The branch must escape the Linear span it sits in, into this run.
+    if t <= linear_end || t >= end {
+        return None;
+    }
+    // The instruction ending at `t` must be a forward unconditional JUMP.
+    let mut q = bend;
+    let mut prev = None;
+    while q < t {
+        let qop = LuauOpcode::from_u8(insn_op(code[q]));
+        let qsz = if qop.has_aux() { 2 } else { 1 };
+        if q + qsz == t {
+            prev = Some((q, qop));
+            break;
+        }
+        q += qsz;
+    }
+    let (j, jop) = prev?;
+    let m = match jop {
+        LuauOpcode::Jump => (j as i64 + insn_d(code[j]) as i64 + 1) as usize,
+        LuauOpcode::JumpX => (j as i64 + insn_e(code[j]) as i64 + 1) as usize,
+        _ => return None,
+    };
+    if m <= t || m > end || !cfg.blocks.contains_key(&m) || !cfg.blocks.contains_key(&t) {
+        return None;
+    }
+    // The branch ends its block; the block starts inside this run.
+    let cond_block = cfg.blocks.values().find(|blk| blk.start <= b && b < blk.end)?;
+    if cond_block.end != bend || cond_block.start < start || cond_block.start != cond_block.id {
+        return None;
+    }
+    // Jump closure: the arms are self-contained.
+    let mut pc = start;
+    while pc < end && pc < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let sz = if op.has_aux() { 2 } else { 1 };
+        let in_arms = pc >= bend && pc < m;
+        let target = match op {
+            LuauOpcode::Jump => Some(pc as i64 + 1 + insn_d(code[pc]) as i64),
+            LuauOpcode::JumpBack => return None,
+            LuauOpcode::JumpX => Some(pc as i64 + 1 + insn_e(code[pc]) as i64),
+            LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS => Some(pc as i64 + 1 + insn_d(code[pc]) as i64),
+            o if is_plain_cond_branch(o) => Some(pc as i64 + 1 + insn_d(code[pc]) as i64),
+            // Loops inside the arms are out of scope for this repair.
+            LuauOpcode::ForNPrep
+            | LuauOpcode::ForNLoop
+            | LuauOpcode::ForGPrep
+            | LuauOpcode::ForGLoop
+            | LuauOpcode::ForGPrepNext
+            | LuauOpcode::ForGPrepINext
+                if in_arms =>
+            {
+                return None;
+            }
+            _ => None,
+        };
+        if let Some(tg) = target {
+            if tg < 0 {
+                return None;
+            }
+            let tg = tg as usize;
+            if in_arms {
+                if tg < bend || tg > m {
+                    return None;
+                }
+            } else if tg > bend && tg < m && pc != b {
+                return None;
+            }
+        }
+        pc += sz;
+    }
+    let then_blocks: Vec<usize> =
+        cfg.blocks.keys().copied().filter(|&k| k >= bend && k < t).collect();
+    let else_blocks: Vec<usize> =
+        cfg.blocks.keys().copied().filter(|&k| k >= t && k < m).collect();
+    if then_blocks.is_empty() || else_blocks.is_empty() {
+        return None;
+    }
+    Some(NestedElseSplit { cond_block: cond_block.id, then_blocks, else_blocks, merge: m })
 }
 
 /// Lift a `structure_numeric_for_body` region list in caller context.
