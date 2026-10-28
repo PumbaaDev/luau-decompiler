@@ -53,7 +53,7 @@ pub fn relieve(stmts: &mut Vec<Stat>) {
     relieve_block(stmts, 0);
 }
 
-fn direct_locals(stmts: &[Stat]) -> usize {
+pub(super) fn direct_locals(stmts: &[Stat]) -> usize {
     stmts
         .iter()
         .map(|s| match s {
@@ -93,7 +93,7 @@ fn relieve_functions(e: &mut Expr) {
 // ---------------------------------------------------------------------------
 
 /// Visit the expression slots a statement owns directly (not nested blocks).
-fn stat_exprs_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Expr)) {
+pub(super) fn stat_exprs_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Expr)) {
     match s {
         Stat::Local { values, .. } | Stat::Return { values } => values.iter_mut().for_each(|e| f(e)),
         Stat::Assign { targets, values } => {
@@ -124,7 +124,7 @@ fn stat_exprs_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Expr)) {
 }
 
 /// Visit the nested statement blocks of a statement.
-fn stat_blocks_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Vec<Stat>)) {
+pub(super) fn stat_blocks_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Vec<Stat>)) {
     match s {
         Stat::If { then_body, elseif_clauses, else_body, .. } => {
             f(then_body);
@@ -143,7 +143,7 @@ fn stat_blocks_mut(s: &mut Stat, f: &mut dyn FnMut(&mut Vec<Stat>)) {
 }
 
 /// Visit the direct sub-expressions of an expression (not function bodies).
-fn expr_children_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+pub(super) fn expr_children_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
     match e {
         Expr::Field { object, .. } => f(object),
         Expr::Index { object, key } => {
@@ -196,16 +196,16 @@ fn expr_children_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct Census {
+pub(super) struct Census {
     /// `Expr::Name` occurrences, deep (closures included, assignment targets included).
-    uses: HashMap<String, usize>,
+    pub(super) uses: HashMap<String, usize>,
     /// Declarations of each name (locals, params, loop variables), deep.
-    decls: HashMap<String, usize>,
+    pub(super) decls: HashMap<String, usize>,
     /// Names assigned from inside some closure body.
-    closure_written: HashSet<String>,
+    pub(super) closure_written: HashSet<String>,
 }
 
-fn census_block(stmts: &mut [Stat], c: &mut Census, in_closure: bool) {
+pub(super) fn census_block(stmts: &mut [Stat], c: &mut Census, in_closure: bool) {
     for s in stmts.iter_mut() {
         census_stat(s, c, in_closure);
     }
@@ -246,12 +246,12 @@ fn census_expr(e: &mut Expr, c: &mut Census, in_closure: bool) {
 }
 
 /// Names a statement mentions (deep), used to find a name's first user.
-fn names_in_stat(s: &mut Stat, out: &mut HashSet<String>) {
+pub(super) fn names_in_stat(s: &mut Stat, out: &mut HashSet<String>) {
     stat_exprs_mut(s, &mut |e| names_in_expr(e, out));
     stat_blocks_mut(s, &mut |b| b.iter_mut().for_each(|x| names_in_stat(x, out)));
 }
 
-fn names_in_expr(e: &mut Expr, out: &mut HashSet<String>) {
+pub(super) fn names_in_expr(e: &mut Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Name(n) => {
             out.insert(n.clone());
@@ -280,7 +280,7 @@ fn declared_names_shallow(s: &mut Stat, out: &mut HashSet<String>) {
 
 /// Free variables of a block: names read or written that no enclosing scope
 /// inside it declares. `scopes` holds the enclosing scopes (innermost last).
-fn free_in_block(stmts: &mut [Stat], scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+pub(super) fn free_in_block(stmts: &mut [Stat], scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
     scopes.push(HashSet::new());
     for s in stmts.iter_mut() {
         free_in_stat(s, scopes, free);
@@ -331,7 +331,7 @@ fn free_in_stat(s: &mut Stat, scopes: &mut Vec<HashSet<String>>, free: &mut Hash
     stat_blocks_mut(s, &mut |b| free_in_block(b, scopes, free));
 }
 
-fn free_in_expr(e: &mut Expr, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+pub(super) fn free_in_expr(e: &mut Expr, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
     match e {
         Expr::Name(n) => {
             if !scopes.iter().any(|sc| sc.contains(n.as_str())) {
@@ -349,7 +349,7 @@ fn free_in_expr(e: &mut Expr, scopes: &mut Vec<HashSet<String>>, free: &mut Hash
 
 /// Names declared anywhere inside a statement (locals, params, loop vars).
 #[allow(dead_code)]
-fn declared_names_in_stat(s: &mut Stat, out: &mut HashSet<String>) {
+pub(super) fn declared_names_in_stat(s: &mut Stat, out: &mut HashSet<String>) {
     match s {
         Stat::Local { names, .. } => out.extend(names.iter().cloned()),
         Stat::LocalFunction { name, .. } => {
@@ -567,7 +567,7 @@ struct Rep<'a> {
     ordered: bool,
     repl_multi: bool,
     repl_prefix_ok: bool,
-    closure_written: &'a HashSet<String>,
+    pub(super) closure_written: &'a HashSet<String>,
     unstable: bool,
     done: bool,
     failed: bool,
