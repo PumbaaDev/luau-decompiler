@@ -145,6 +145,7 @@ mod nested_for_flat_lift_tests;
 #[cfg(test)]
 mod dispatch_tail_for_tests;
 mod declared_never_assigned_ternary_tests;
+mod arith_value_join_tests;
 #[cfg(test)]
 mod andor_nil_call_join_tests;
 mod while_true_if_else_body_tests;

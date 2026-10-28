@@ -824,7 +824,11 @@ fn string_literals(line: &str) -> Vec<String> {
 /// whose right side IS a local read. The table-spill pass emits `slots.vN`.
 fn is_field_access(text: &str, start: usize) -> bool {
     let b = text.as_bytes();
-    start >= 1 && b[start - 1] == b'.' && !(start >= 2 && b[start - 2] == b'.')
+    // `obj:v5(...)` names a METHOD, not a local: obfuscated scripts really do
+    // carry method names shaped like `v5` (NAMECALL K "v5" in the bytecode).
+    start >= 1
+        && matches!(b[start - 1], b'.' | b':')
+        && !(start >= 2 && b[start - 2] == b[start - 1])
 }
 
 fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
@@ -1389,6 +1393,20 @@ print(slots.v32)
         let concat = check("print(\"a\"..v32)
 ", None);
         assert!(concat.iter().any(|f| f.check == "undefined_local"), "`..v32` is a local read");
+    }
+
+    #[test]
+    fn a_method_named_like_a_generated_local_is_not_an_undefined_read() {
+        // Obfuscated bytecode carries real method names such as "v5"
+        // (NAMECALL K "v5"); `self:v5(x)` is a method call, not a local read.
+        let method = check("local r = self:v5(arg1)
+return r
+", None);
+        assert!(!method.iter().any(|f| f.check == "undefined_local"), "{method:?}");
+        let bare = check("local r = v5(arg1)
+return r
+", None);
+        assert!(bare.iter().any(|f| f.check == "undefined_local"));
     }
 
     // ── branch_local_discarded: all three conditions are load-bearing ──────

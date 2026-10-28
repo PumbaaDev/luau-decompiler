@@ -1530,6 +1530,28 @@ const OPEN_ARM_JOIN_MAX_INSNS: usize = 6;
 /// instruction of its range with its target out of range, and the enclosing
 /// construct (an if/else diamond, an `a or b` chain) is lifted as a bare
 /// `continue` guard instead.
+/// Is there a forward conditional in `[span_start, vj_pc)` whose target lies past
+/// `join_start` (and within `end`)?
+fn forward_conditional_open_past(
+    code: &[u32],
+    span_start: usize,
+    vj_pc: usize,
+    join_start: usize,
+    end: usize,
+) -> bool {
+    let mut j = span_start;
+    while j < vj_pc && j < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[j]));
+        if let Some((_, target)) = forward_conditional_jump(op, j, code[j]) {
+            if target > join_start && target <= end {
+                return true;
+            }
+        }
+        j += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 fn value_join_inside_open_arm(
     code: &[u32],
     span_start: usize,
@@ -2088,7 +2110,15 @@ pub(crate) fn structure_numeric_for_body(
                 // A join inside the arm of an open conditional stays in the flat
                 // span: cutting it there strands that conditional's target past
                 // the range and its other arm / `or` links are dropped.
+                // An arithmetic join (new: arithmetic arms used to disqualify
+                // joins) is also kept flat when ANY forward conditional still
+                // open at `pc` jumps past its join: cutting there strands that
+                // conditional's target outside the range being lifted.
+                let arith_in_open_conditional = crate::analysis::value_region::arms_have_arith(
+                    cfg, code, &vj.arms,
+                ) && forward_conditional_open_past(code, linear_start, pc, join_start, body_end);
                 if join_start <= body_end
+                    && !arith_in_open_conditional
                     && !value_join_inside_open_arm(code, linear_start, pc, join_start, body_end)
                 {
                     if linear_start < pc {
