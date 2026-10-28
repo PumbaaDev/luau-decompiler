@@ -17,3 +17,20 @@ fn is_client_test_and_else_arm_survive() {
     assert!(out.contains("get_store"), "else arm inlined check lost:\n{out}");
     assert!(out.contains("if ") && out.contains(":IsClient()"), "{out}");
 }
+
+/// StealAnEgg `BossMastery requestClaim`: the then arm of `if milestone` is an
+/// OR-chain return guard (`JUMPIF R5 -> <shared RETURN>`), which the arm lifter
+/// cannot express. Rebuilding the if/else there lost the claim body (pcall,
+/// InvokeServer, ...) - it must be left to the old path.
+const BOSS: &[u8] = include_bytes!("fixtures/cne_ifelse_shared_return_guard_bossmastery.luac");
+
+#[test]
+fn shared_return_or_guard_arm_is_not_rebuilt_and_loses_no_calls() {
+    let out = crate::decompile(BOSS).expect("fixture decompiles");
+    assert!(
+        !out.contains("-- call recovery:"),
+        "calls were lost:\n{}",
+        out.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    assert!(out.contains("AskClaimMilestone"), "claim body lost");
+}

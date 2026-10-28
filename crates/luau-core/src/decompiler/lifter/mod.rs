@@ -3289,6 +3289,17 @@ fn nested_else_split_at(
                 return None;
             }
             let tg = tg as usize;
+            // A branch INTO a RETURN is an OR-chain return guard
+            // (`if a or b then return end` sharing one RETURN block). The arm
+            // lifter cannot express it, and rebuilding the if/else around it
+            // lost the rest of StealAnEgg `BossMastery requestClaim`.
+            if in_arms
+                && pc != j
+                && tg < code.len()
+                && LuauOpcode::from_u8(insn_op(code[tg])) == LuauOpcode::Return
+            {
+                return None;
+            }
             if in_arms {
                 if tg < bend || tg > m {
                     return None;
