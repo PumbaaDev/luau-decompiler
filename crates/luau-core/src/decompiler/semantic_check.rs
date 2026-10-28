@@ -820,6 +820,13 @@ fn string_literals(line: &str) -> Vec<String> {
 // but never bound. Decompiler-generated names (`vN`, `upval_N`, `cap_N`,
 // `argN`) are the only ones considered, because a real script's globals are
 // legitimately unbound at file scope and would produce false positives.
+/// `obj.v32` names a table field, not a local; `a..v32` is a concatenation
+/// whose right side IS a local read. The table-spill pass emits `slots.vN`.
+fn is_field_access(text: &str, start: usize) -> bool {
+    let b = text.as_bytes();
+    start >= 1 && b[start - 1] == b'.' && !(start >= 2 && b[start - 2] == b'.')
+}
+
 fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
     let mut bound: HashSet<String> = HashSet::new();
     let mut first_use: HashMap<String, usize> = HashMap::new();
@@ -883,9 +890,20 @@ fn check_undefined_locals(source: &str, out: &mut Vec<Finding>) {
         let key_span_end = table_key_field_span(line, &lines, i);
 
         // Uses of decompiler-generated identifiers.
-        for tok in line[key_span_end..].split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-            if is_generated_name(tok) {
-                first_use.entry(tok.to_string()).or_insert(i + 1);
+        let scan = &line[key_span_end..];
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut word_start: Option<usize> = None;
+        for (pos, c) in scan.char_indices().chain(std::iter::once((scan.len(), ' '))) {
+            match (is_word(c), word_start) {
+                (true, None) => word_start = Some(pos),
+                (false, Some(start)) => {
+                    let tok = &scan[start..pos];
+                    if is_generated_name(tok) && !is_field_access(scan, start) {
+                        first_use.entry(tok.to_string()).or_insert(i + 1);
+                    }
+                    word_start = None;
+                }
+                _ => {}
             }
         }
     }
@@ -1358,6 +1376,20 @@ pub fn format_report(findings: &[Finding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_field_named_like_a_generated_local_is_not_an_undefined_read() {
+        let field = check("slots.v32 = 1
+print(slots.v32)
+", None);
+        assert!(!field.iter().any(|f| f.check == "undefined_local"));
+        let bare = check("print(v32)
+", None);
+        assert!(bare.iter().any(|f| f.check == "undefined_local"));
+        let concat = check("print(\"a\"..v32)
+", None);
+        assert!(concat.iter().any(|f| f.check == "undefined_local"), "`..v32` is a local read");
+    }
 
     // ── branch_local_discarded: all three conditions are load-bearing ──────
     //

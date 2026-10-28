@@ -29,10 +29,12 @@ use super::local_pressure::{
 use crate::ast::{Expr, Stat};
 use std::collections::{HashMap, HashSet};
 
-/// Luau's limit is 200 for both; stay under it by a margin because the
-/// estimate counts names, not slots.
-const LOCAL_LIMIT: usize = 190;
-const UPVALUE_LIMIT: usize = 190;
+/// Luau allows exactly 200 of each. The estimates never undercount (an
+/// upvalue estimate counts every free name that is a local anywhere), so
+/// "estimate above 200" catches every real failure and leaves alone any
+/// function that compiles today.
+const LOCAL_LIMIT: usize = 200;
+const UPVALUE_LIMIT: usize = 200;
 
 /// Entry point: rewrite the root function body `stmts` in place.
 pub fn spill(stmts: &mut Vec<Stat>) {
