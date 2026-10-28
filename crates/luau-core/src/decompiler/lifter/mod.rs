@@ -38,6 +38,7 @@ mod loop_exit_preload;
 mod prelude_fold;
 mod opcode_handlers;
 mod inline_tail_loop;
+mod bool_return_thread;
 use opcode_handlers::lift_instruction_range;
 
 // Re-exported solely for the `#[cfg(test)]` submodules under `lifter/tests/`,
@@ -1035,6 +1036,8 @@ fn count_calls_expr(e: &Expr) -> usize {
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let outer_loop_body = ctx.current_loop_body.take();
     let outer_latches = std::mem::take(&mut ctx.emitted_latches);
+    let threaded = bool_return_thread::thread(proto);
+    let proto = threaded.as_ref().unwrap_or(proto);
     let out = lift_proto_with_nil_tail_fallback(ctx, proto, proto_index, depth);
     ctx.emitted_latches = outer_latches;
     ctx.current_loop_body = outer_loop_body;
@@ -2785,6 +2788,156 @@ fn mid_body_structured_else(
         pc += 1 + op.has_aux() as usize;
     }
     Some(k)
+}
+
+/// A `while true` body whose if/elseif/else arms each end in a JUMP to a
+/// MID-BODY tail block (the code after the whole chain, short of the latch) is
+/// lifted per block as bare `continue`s: `mid_body_branch_end_block` only knows
+/// conditional guards, so every arm's JUMP reads as a loop `continue` and the arm
+/// bodies, the tail and their calls vanish (AdoptMe MoneyTreeUseHelper `render`
+/// loop: 9 calls expected, 4 emitted).
+///
+/// Returns true when the run `lo..=hi` (ending at the latch) has such a JUMP and
+/// contains no loop opcode or RETURN before the latch, so the whole span before
+/// the latch can be structured in one pass.
+/// True when the forward `JUMPIF[NOT] R` at `pc` skips a table constructor that
+/// writes `R` itself (the default-value shape `R = R or {..}`).
+fn jump_skips_write_to_tested(code: &[u32], pc: usize) -> bool {
+    use crate::parser::types::{insn_a, insn_d, insn_op};
+    let d = insn_d(code[pc]);
+    if d <= 0 {
+        return false;
+    }
+    let tested = insn_a(code[pc]);
+    let target = pc + 1 + d as usize;
+    let mut k = pc + 1;
+    while k < target.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[k]));
+        let writes = matches!(op, LuauOpcode::NewTable | LuauOpcode::DupTable);
+        if writes && insn_a(code[k]) == tested {
+            return true;
+        }
+        k += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
+/// Blocks of `tail` that end in a forward conditional jump leaving the loop
+/// (landing at or past `loop_end`).
+fn range_has_call(code: &[u32], tail: &[(usize, usize)]) -> bool {
+    use crate::parser::types::insn_op;
+    let (Some(first), Some(last)) = (tail.first(), tail.last()) else { return false };
+    let mut pc = first.0;
+    while pc < last.1.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) {
+            return true;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
+fn loop_exit_branches(code: &[u32], tail: &[(usize, usize)], loop_end: usize) -> usize {
+    use crate::parser::types::{insn_d, insn_op};
+    tail.iter()
+        .filter(|&&(s, e)| {
+            let Some(lp) = last_insn_pc(code, s, e) else { return false };
+            let op = LuauOpcode::from_u8(insn_op(code[lp]));
+            let cond = matches!(
+                op,
+                LuauOpcode::JumpIf
+                    | LuauOpcode::JumpIfNot
+                    | LuauOpcode::JumpIfEq
+                    | LuauOpcode::JumpIfNotEq
+                    | LuauOpcode::JumpIfLE
+                    | LuauOpcode::JumpIfNotLE
+                    | LuauOpcode::JumpIfLT
+                    | LuauOpcode::JumpIfNotLT
+                    | LuauOpcode::JumpXEqKNil
+                    | LuauOpcode::JumpXEqKB
+                    | LuauOpcode::JumpXEqKN
+                    | LuauOpcode::JumpXEqKS
+            );
+            cond && lp as i64 + 1 + i64::from(insn_d(code[lp])) >= loop_end as i64
+        })
+        .count()
+}
+
+fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    use crate::parser::types::{insn_d, insn_op};
+    if !opcode_handlers::midbody_lift_enabled() || hi + 1 != ranges.len() || hi < lo + 2 {
+        return false;
+    }
+    let latch_start = ranges[hi].0;
+    let mut has_join_jump = false;
+    for j in lo..hi {
+        let (s, e) = ranges[j];
+        let Some(lp) = last_insn_pc(code, s, e) else { continue };
+        if LuauOpcode::from_u8(insn_op(code[lp])) != LuauOpcode::Jump {
+            continue;
+        }
+        let target = lp as i64 + insn_d(code[lp]) as i64 + 1;
+        if target <= e as i64 {
+            continue;
+        }
+        let target = target as usize;
+        if target < latch_start && ranges[j + 1..hi].iter().any(|r| r.0 == target) {
+            // An arm that hands a VALUE to the tail (`R = a and b or c`) is a
+            // value join, which the structured run cannot rebuild.
+            if let Some(wp) = last_insn_pc(code, s, lp) {
+                let w = code[wp];
+                let wop = LuauOpcode::from_u8(insn_op(w));
+                // A boolean flag the tail immediately tests is a value join too.
+                let flag_tested = wop == LuauOpcode::LoadB
+                    && code.get(target).is_some_and(|&t| {
+                        matches!(LuauOpcode::from_u8(insn_op(t)), LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+                            && crate::parser::types::insn_a(t) == crate::parser::types::insn_a(w)
+                    });
+                let writes_a = wop == LuauOpcode::Move || flag_tested;
+                if writes_a && reg_live_at(code, target, usize::from(crate::parser::types::insn_a(w))) {
+                    return false;
+                }
+            }
+            // A compound `until a or b` tail (two exits from the loop) loses its
+            // `continue` target when printed as `if a then break end; until b`.
+            if let Some(ti) = ranges[j + 1..hi].iter().position(|r| r.0 == target) {
+                let tail = &ranges[j + 1 + ti..hi];
+                if loop_exit_branches(code, tail, ranges[hi].1) >= 2 && !range_has_call(code, tail) {
+                    return false;
+                }
+            }
+            has_join_jump = true;
+        }
+    }
+    if !has_join_jump {
+        return false;
+    }
+    let mut pc = ranges[lo].0;
+    while pc < latch_start {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+            && jump_skips_write_to_tested(code, pc)
+        {
+            // `x = x or default`: a value join the structured run mis-binds.
+            return false;
+        }
+        if matches!(
+            op,
+            LuauOpcode::Return
+                | LuauOpcode::JumpBack
+                | LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGLoop
+                | LuauOpcode::ForGPrepNext
+                | LuauOpcode::ForGPrepINext
+        ) {
+            return false;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    true
 }
 
 /// A `while true` body block whose last instruction is a conditional jump that
@@ -5339,6 +5492,14 @@ fn lift_region(
                         let (s, e) = ranges[hi];
                         lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                     }
+                } else if while_true_join_tail_run(&proto.code, &ranges, lo, hi) {
+                    liftpath(proto, "while_true_join_tail", ranges[lo].0, ranges[hi].0);
+                    lift_structured_run(
+                        ctx, proto, proto_index, cfg, depth, ranges[lo].0, ranges[hi].0, regs, locals,
+                        &mut body_stmts, true,
+                    );
+                    let (s, e) = ranges[hi];
+                    lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                 } else {
                     let mut i = lo;
                     while i <= hi {
