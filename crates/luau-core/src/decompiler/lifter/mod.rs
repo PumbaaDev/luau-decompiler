@@ -1605,7 +1605,16 @@ fn lift_proto_with_nil_tail_fallback(ctx: &mut DecompileContext, proto: &Proto, 
     let out_off = nil_tail_gate::with_disabled(proto, || lift_proto_with_oor_fallback(ctx, proto, proto_index, depth));
     let exits_off = nil_tail_gate::loop_exits(&out_off);
     let h_off = lift_hazards(ctx, proto, proto_index, &out_off);
-    let off = exits_on > exits_off || h_on.worse_than(h_off);
+    // An ORPHAN write is declared at the top of the chunk by `free_var_decls`
+    // and keeps its value; an unbound READ stays nil. When the rewrite removes
+    // unbound reads, adds no loop exit and clobbers no upvalue, the orphan
+    // writes it trades them for (AdoptMe DisplayStandUseHelper: `v11` read as
+    // nil, against `category2` assigned in both arms) are the lesser hazard.
+    let fewer_unbound_reads = h_on.scope < h_off.scope
+        && h_on.scope_uses < h_off.scope_uses
+        && h_on.upvalue <= h_off.upvalue
+        && exits_on <= exits_off;
+    let off = (exits_on > exits_off || h_on.worse_than(h_off)) && !fewer_unbound_reads;
     if std::env::var("LUAU_NIL_TAIL_TRACE").is_ok() {
         eprintln!(
             "NILTAIL	{}@{}	exits on={} off={} hazards on={:?} off={:?} -> {}",
@@ -10480,7 +10489,14 @@ fn premateralize_branch_escapes_spans(
                 regs.get(reg),
                 Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
             ) || stale_expr)
-                && locals.is_non_param(reg)
+                && (locals.is_non_param(reg)
+                    || (param_slot_rebound_in_both_arms(proto, locals, regs, reg)
+                        // Straight-line arms only: an arm with its own guard (a type
+                        // check around the rewrite) is already handled in place.
+                        && arm_ranges.iter().all(|&(s, e)| {
+                            (s..e.min(proto.code.len()))
+                                .all(|pc| !opcode_handlers::is_cond_jump_op(LuauOpcode::from_u8(insn_op(proto.code[pc]))))
+                        })))
                 && !then_ranges.is_empty()
                 && !else_ranges.is_empty()
                 && ranges_write_reg(&proto.code, then_ranges, reg)
@@ -10528,7 +10544,8 @@ fn premateralize_branch_escapes_spans(
                         .iter()
                         .filter(|(s, e)| e > s)
                         .any(|&(s, e)| reg_read_before_write(&proto.code, s, e, reg));
-                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown)) || stale_expr || overlapped_arms;
+                let param_rebind = locals.is_param(reg);
+                let reg_is_dead = matches!(regs.get(reg), Some(RegVal::Unknown)) || stale_expr || overlapped_arms || param_rebind;
                 let overlap_name = overlapped_arms.then(|| name.clone());
                 let (kind, final_name) = if reg_is_dead {
                     (WriteKind::Shadow, locals.reseed_shadow(reg, &name))
@@ -10556,7 +10573,10 @@ fn premateralize_branch_escapes_spans(
                             proto.debug_name.as_deref().unwrap_or("?"),
                             proto.line_defined, reg, pc, final_name, sc, arm_ranges);
                     }
-                    let entry_init: Vec<Expr> = match (arm_reads_bound_entry, regs.get(reg)) {
+                    // A parameter slot is always initialised from the parameter: an
+                    // arm may overwrite it on only SOME of its paths, and the others
+                    // must still see the caller's argument, not nil.
+                    let entry_init: Vec<Expr> = match (arm_reads_bound_entry || param_rebind, regs.get(reg)) {
                         (true, Some(RegVal::Expr(e))) => vec![e.clone()],
                         _ => Vec::new(),
                     };
@@ -10748,6 +10768,32 @@ fn premateralize_branch_escapes_spans(
             }
         }
     }
+}
+
+/// A PARAMETER slot that both arms of a diamond overwrite and the merge reads
+/// first (`function f(a, b, c) if x then c = g(c) else c = {} end return c end`).
+/// The compiler reuses the parameter register for the merged value; without a
+/// seed each arm writes a different fresh local and the merge read mints an
+/// unbound `vN` (`declared_never_assigned`). Only when no closure captures the
+/// register BY REFERENCE: a by-ref capture shares the parameter's own
+/// variable, so a fresh identity would split it from the closure's view.
+fn param_slot_rebound_in_both_arms(proto: &Proto, locals: &LocalTracker, regs: &[RegVal], reg: usize) -> bool {
+    locals.is_param(reg)
+        && matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
+        && !proto_ref_captures_reg(&proto.code, reg)
+}
+
+/// Does any CAPTURE in this proto take `reg` by reference?
+fn proto_ref_captures_reg(code: &[u32], reg: usize) -> bool {
+    let mut i = 0usize;
+    while i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if op == LuauOpcode::Capture && insn_a(code[i]) == 1 && insn_b(code[i]) as usize == reg {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 thread_local! {

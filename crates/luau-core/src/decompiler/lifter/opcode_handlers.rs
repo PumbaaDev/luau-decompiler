@@ -804,7 +804,7 @@ fn extended_arm_end(code: &[u32], arm_start: usize, target: usize, end: usize) -
 }
 
 /// Is `op` one of the twelve CONDITIONAL jumps?
-fn is_cond_jump_op(op: LuauOpcode) -> bool {
+pub(super) fn is_cond_jump_op(op: LuauOpcode) -> bool {
     matches!(
         op,
         LuauOpcode::JumpIf

@@ -199,6 +199,11 @@ impl LocalTracker {
         reg >= self.param_count
     }
 
+    /// A register that is one of this proto's parameter slots.
+    pub(super) fn is_param(&self, reg: usize) -> bool {
+        reg < self.param_count
+    }
+
     /// Snapshot the current declared set before entering a nested scope.
     pub(super) fn snapshot(&self) -> HashSet<usize> {
         self.declared.clone()
