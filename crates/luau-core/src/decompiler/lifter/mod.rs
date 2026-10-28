@@ -2619,6 +2619,99 @@ fn mid_body_block_at(ranges: &[(usize, usize)], from: usize, hi: usize, pc: usiz
     (from..=hi).find(|&k| ranges[k].0 == pc && k < latch_idx)
 }
 
+/// `mid_body_branch_end_block` refuses a guard whose arm ends in a JUMP to the
+/// loop's JUMPBACK when the code after the arm contains branches of its own, and
+/// the per-block lift it falls back to is wrong for that shape: Brookhaven
+/// `Jukebox`'s poll loop is
+///
+///     while true do
+///         local char = player.Character
+///         if not char then task.wait(1) continue end      -- arm, JUMP -> JUMPBACK
+///         <distance compare join; if state changed then ... end; task.wait(1)>
+///     end
+///
+/// and came out as `if char then continue end task.wait(1) continue` - the
+/// condition inverted and the whole else part (its calls included) gone.
+///
+/// Returns the index of the else-part's first block when block `idx` is that
+/// guard, the arm is straight-line, and the else part runs to the latch with
+/// every jump staying inside `[else_start, latch]` and no loop or return.
+fn mid_body_structured_else(
+    code: &[u32],
+    ranges: &[(usize, usize)],
+    idx: usize,
+    hi: usize,
+) -> Option<usize> {
+    use crate::parser::types::{insn_d, insn_e, insn_op};
+    if !opcode_handlers::midbody_lift_enabled() || hi != ranges.len() - 1 || idx >= hi {
+        return None;
+    }
+    let (s, e) = ranges[idx];
+    let lp = last_insn_pc(code, s, e)?;
+    if !is_plain_cond_branch(LuauOpcode::from_u8(insn_op(code[lp]))) {
+        return None;
+    }
+    let target = lp as i64 + insn_d(code[lp]) as i64 + 1;
+    if target <= e as i64 {
+        return None;
+    }
+    // The guard block itself must be a plain test (no `a and b` value chain).
+    if mid_body_region_unsafe(code, s, lp, None, lp) {
+        return None;
+    }
+    let k = mid_body_block_at(ranges, idx + 1, hi, target as usize)?;
+    let else_start = ranges[k].0;
+    let (ls, le) = ranges[hi];
+    let latch_pc = last_insn_pc(code, ls, le)?;
+    let (ps, pe) = ranges[k - 1];
+    let arm_last = last_insn_pc(code, ps, pe).filter(|&p| p >= e)?;
+    if LuauOpcode::from_u8(insn_op(code[arm_last])) != LuauOpcode::Jump
+        || arm_last as i64 + insn_d(code[arm_last]) as i64 + 1 != latch_pc as i64
+    {
+        return None;
+    }
+    // Arm: straight-line up to its closing JUMP.
+    if mid_body_region_unsafe_ex(code, e, else_start, Some(arm_last), else_start, true) {
+        return None;
+    }
+    // Else part: only the shape the plain path refused (it has a branch), made
+    // of forward jumps that stay inside it or land on the latch.
+    if !range_has_branch(code, else_start, ls) {
+        return None;
+    }
+    if !opcode_handlers::range_has_call(code, e, ls) {
+        return None;
+    }
+    let mut pc = else_start;
+    while pc < ls {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(
+            op,
+            LuauOpcode::Return
+                | LuauOpcode::JumpBack
+                | LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGLoop
+                | LuauOpcode::ForGPrepNext
+                | LuauOpcode::ForGPrepINext
+        ) {
+            return None;
+        }
+        if opcode_handlers::is_control_flow_op(op) {
+            let t = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(code[pc]) as i64 + 1,
+                _ => pc as i64 + insn_d(code[pc]) as i64 + 1,
+            };
+            if t <= pc as i64 || t < else_start as i64 || t > latch_pc as i64 {
+                return None;
+            }
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    Some(k)
+}
+
 /// A `while true` body block whose last instruction is a conditional jump that
 /// skips forward to a LATER block of the same contiguous run, short of the loop
 /// latch, is an inline `if` over `[block, target)`. Lifting the block alone makes
@@ -5080,6 +5173,22 @@ fn lift_region(
                         // A block-ending conditional that skips forward to a
                         // MID-BODY block is an inline `if`, not a `continue`:
                         // lift through its target so the walker sees it in range.
+                        if let Some(k) = mid_body_structured_else(&proto.code, &ranges, i, hi) {
+                            // `if c then <arm>; continue end <else part with its
+                            // own branches>`: the arm is lifted in range, and the
+                            // else part is structured instead of per-block (the
+                            // per-block lift read its first branch as a bare
+                            // `continue` and dropped everything after it).
+                            liftpath(proto, "while_true_structured_else", s, ranges[k].0);
+                            lift_instruction_range(ctx, proto, proto_index, depth, s, ranges[k].0, regs, locals, &mut body_stmts, true);
+                            let latch_idx = ranges.len() - 1;
+                            lift_structured_run(
+                                ctx, proto, proto_index, cfg, depth, ranges[k].0, ranges[latch_idx].0,
+                                regs, locals, &mut body_stmts, true,
+                            );
+                            i = latch_idx;
+                            continue;
+                        }
                         match mid_body_branch_end_block(ctx, &proto.code, &ranges, i, hi) {
                             Some(k) => {
                                 if std::env::var("LUAU_MIDBODY_TRACE").is_ok() {
