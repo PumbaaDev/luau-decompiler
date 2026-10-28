@@ -72,6 +72,7 @@ mod loop_skip_jump_guard_tests;
 mod oor_nonloop_tests;
 #[cfg(test)]
 mod oor_real_oracle_tests;
+mod guards_1029_tests;
 #[cfg(test)]
 mod andchain_callfb_tests;
 #[cfg(test)]

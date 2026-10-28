@@ -10736,7 +10736,16 @@ fn premateralize_branch_escapes_spans(
         if parked_pure
             && !carried_identity
             && split_arms.is_some()
-            && is_cond_join_branch(proto, pc)
+            && (is_cond_join_branch(proto, pc)
+                // Not a cond-join diamond: a parked FIELD/INDEX read that one
+                // arm overwrites with a literal (`else x = nil`) is dead too;
+                // materialising it wrote the stale read into that arm
+                // (DisplayStandUseHelper server_use). Literals stay excluded.
+                || (matches!(regs.get(reg), Some(RegVal::Expr(Expr::Index { .. } | Expr::Field { .. })))
+                    && !arm_ranges
+                        .iter()
+                        .filter(|(s, e)| e > s)
+                        .any(|&(s, e)| jump_tests_reg_before_write(&proto.code, s, e, reg))))
             && !merge_first_touch_is_read(&proto.code, after_start, after_end, reg)
             && !arm_ranges
                 .iter()
@@ -10855,6 +10864,37 @@ pub(super) fn move_alias_goes_stale(code: &[u32], pc: usize, dst: usize, src: us
     false
 }
 
+/// Does a conditional jump in `[start, end)` TEST `reg` (operand A) before any
+/// instruction writes it? `reg_read_before_write` only sees B/C operands, so an
+/// `elseif x == "k"` chain reading a parked value through its jump looks unread.
+fn jump_tests_reg_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let mut pc = start;
+    while pc < end.min(code.len()) {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let a = insn_a(insn) as usize;
+        if a == reg {
+            return matches!(
+                op,
+                LuauOpcode::JumpIf
+                    | LuauOpcode::JumpIfNot
+                    | LuauOpcode::JumpXEqKNil
+                    | LuauOpcode::JumpXEqKB
+                    | LuauOpcode::JumpXEqKN
+                    | LuauOpcode::JumpXEqKS
+                    | LuauOpcode::JumpIfEq
+                    | LuauOpcode::JumpIfNotEq
+                    | LuauOpcode::JumpIfLE
+                    | LuauOpcode::JumpIfNotLE
+                    | LuauOpcode::JumpIfLT
+                    | LuauOpcode::JumpIfNotLT
+            );
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 /// Does ANY span in `ranges` contain an instruction writing `reg`?
 /// Same opcode write-set as `collect_body_writes` — kept in terms of it so the
 /// two can never disagree about what counts as a write.
@@ -10869,6 +10909,18 @@ pub(super) fn move_alias_goes_stale(code: &[u32], pc: usize, dst: usize, src: us
 /// scratch slot and three of that session's four predicate attempts failed for
 /// want of exactly this print.
 pub(crate) fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    reg_read_before_write_ex(code, start, end, reg, false)
+}
+
+/// As `reg_read_before_write`; `for_vars_defined` also treats the loop
+/// variables a generic `for` defines (A+3..) as written at its FORGPREP.
+pub(crate) fn reg_read_before_write_ex(
+    code: &[u32],
+    start: usize,
+    end: usize,
+    reg: usize,
+    for_vars_defined: bool,
+) -> bool {
     if end <= start || end > code.len() {
         return false;
     }
@@ -10881,6 +10933,15 @@ pub(crate) fn reg_read_before_write(code: &[u32], start: usize, end: usize, reg:
         let a = insn_a(insn) as usize;
         let b = insn_b(insn) as usize;
         let c = insn_c(insn) as usize;
+        // A generic `for` defines its loop variables (A+3..) itself: a later
+        // read of one inside the body is not a read of the earlier value
+        // (renderReact: `for _, tab in ...` reused R9/R10 after a guarded arm).
+        if for_vars_defined
+            && matches!(op, LuauOpcode::ForGPrep | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext)
+            && reg >= a + 3
+        {
+            return false;
+        }
         // ONLY where B/C ARE REGISTERS.
         //
         // Rotation 102, from `LUAU_CARRY_TRACE`: the previous form read B and C

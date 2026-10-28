@@ -323,6 +323,105 @@ pub fn recognize_or_and_chain(code: &[u32], pc: usize) -> Option<OrAndChain> {
     })
 }
 
+/// `(A and B) or C` merged into one register, where `A` is tested in a
+/// register other than the result:
+///
+/// ```text
+///     JUMPIFNOT Ra -> T      ; A falsy: go straight to the `or` fallback
+///     <body>                 ; writes Rd (B)
+///     JUMPIF Rd -> E         ; B truthy: keep it
+///   T: <fallback>            ; writes Rd (C)
+///   E: <Rd is the result>
+/// ```
+///
+/// The first jump lands INSIDE the `or` chain's last operand, so the plain
+/// chain recogniser never sees it and the flat lift split it into
+/// `if A then Rd = B end; Rd = C`, which overwrites B unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AndOrValue {
+    pub dest: usize,
+    pub body: (usize, usize),
+    pub fallback: (usize, usize),
+    pub end_pc: usize,
+}
+
+fn is_plain_value_op(op: LuauOpcode) -> bool {
+    !(is_conditional_jump(op)
+        || matches!(
+            op,
+            LuauOpcode::Jump
+                | LuauOpcode::JumpBack
+                | LuauOpcode::JumpX
+                | LuauOpcode::Return
+                | LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGLoop
+                | LuauOpcode::ForGPrepINext
+                | LuauOpcode::ForGPrepNext
+        ))
+}
+
+/// Does `[start, end)` hold only straight-line value code whose last real
+/// instruction leaves a value in `dest`?
+fn straight_span_writes(code: &[u32], start: usize, end: usize, dest: usize) -> bool {
+    let mut last: Option<usize> = None;
+    let mut w = start;
+    while w < end {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if !is_plain_value_op(op) {
+            return false;
+        }
+        if op != LuauOpcode::Nop {
+            last = Some(w);
+        }
+        w += if op.has_aux() { 2 } else { 1 };
+    }
+    let Some(l) = last else { return false };
+    let insn = code[l];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    writes_reg_a(op)
+        && insn_a(insn) as usize == dest
+        && !(op == LuauOpcode::Call && insn_c(insn) == 1)
+}
+
+pub fn recognize_and_or_value(code: &[u32], pc: usize, end: usize) -> Option<AndOrValue> {
+    let end = end.min(code.len());
+    if pc >= end || LuauOpcode::from_u8(insn_op(code[pc])) != LuauOpcode::JumpIfNot {
+        return None;
+    }
+    let t = (pc as i32 + insn_d(code[pc]) as i32 + 1) as usize;
+    if t <= pc + 2 || t >= end {
+        return None;
+    }
+    // The instruction just before T must be the `or` jump (walk aligned).
+    let mut w = pc + 1;
+    let mut last = pc;
+    while w < t {
+        last = w;
+        w += if LuauOpcode::from_u8(insn_op(code[w])).has_aux() { 2 } else { 1 };
+    }
+    if w != t || last <= pc {
+        return None;
+    }
+    let jinsn = code[last];
+    if LuauOpcode::from_u8(insn_op(jinsn)) != LuauOpcode::JumpIf {
+        return None;
+    }
+    let dest = insn_a(jinsn) as usize;
+    let e = (last as i32 + insn_d(jinsn) as i32 + 1) as usize;
+    if e <= t || e > end {
+        return None;
+    }
+    if !straight_span_writes(code, pc + 1, last, dest)
+        || !straight_span_writes(code, t, e, dest)
+        || span_has_external_entry(code, pc, e)
+    {
+        return None;
+    }
+    Some(AndOrValue { dest, body: (pc + 1, last), fallback: (t, e), end_pc: e })
+}
+
 /// Is `[start, end)` in the HEADER prefix of a loop? True when a backward jump
 /// at or after `end` lands at or before `start` AND nothing between that loop
 /// head and `start` branches out of the prefix, so the chain's block would swallow the whole

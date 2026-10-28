@@ -330,7 +330,7 @@ fn carries_value_except(code: &[u32], from: usize, to: usize, t: usize, pre_init
     super::collect_body_writes(code, from, hi)
         .into_iter()
         .filter(|r| !pre_init.contains(r))
-        .any(|r| reg_read_before_write(code, t, (t + JOIN_WINDOW).min(code.len()), r))
+        .any(|r| super::reg_read_before_write_ex(code, t, (t + JOIN_WINDOW).min(code.len()), r, true))
 }
 
 /// Registers whose LAST write before the range `[start, ..)` is a literal load

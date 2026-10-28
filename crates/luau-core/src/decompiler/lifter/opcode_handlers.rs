@@ -16,7 +16,7 @@
 //! `pub(super)` visibility from `naming.rs`; we pull them in via
 //! `super::{RegVal, LocalTracker, WriteKind}`.
 
-use crate::analysis::bool_idiom::{recognize_bool_idiom, recognize_or_and_chain, OrAndChain};
+use crate::analysis::bool_idiom::{recognize_and_or_value, recognize_bool_idiom, recognize_or_and_chain, OrAndChain};
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
 use crate::decompiler::{constant_to_expr, is_stdlib_shadow_name, is_valid_luau_identifier, DecompileContext, EmittedLoop};
 use crate::parser::opcodes::{builtin_name, LuauOpcode};
@@ -283,6 +283,19 @@ fn find_leading_guard_jump(
     then_end: usize,
     else_start: usize,
 ) -> Option<(usize, bool, usize)> {
+    find_leading_guard_jump_ex(code, arm_start, then_end, else_start, false)
+}
+
+/// As `find_leading_guard_jump`; `allow_pure` also accepts a guard span with no
+/// call (`GETTABLEKS` then `JUMPXEQKS`): a jump straight to the else is an `and`
+/// term of the arm's condition whatever computed the tested register.
+fn find_leading_guard_jump_ex(
+    code: &[u32],
+    arm_start: usize,
+    then_end: usize,
+    else_start: usize,
+    allow_pure: bool,
+) -> Option<(usize, bool, usize)> {
     let mut w = arm_start;
     let mut saw_call = false;
     let mut defines_reg = false;
@@ -297,7 +310,7 @@ fn find_leading_guard_jump(
                 let reg = insn_a(code[w]) as usize;
                 // The tested register must be the value this span just computed
                 // with a call: the guard idiom, not a bare second register test.
-                if t == else_start && saw_call && last_def == Some(reg) && defines_reg {
+                if t == else_start && (saw_call || allow_pure) && last_def == Some(reg) && defines_reg {
                     return Some((w, op == LuauOpcode::JumpIf, reg));
                 }
                 return None;
@@ -328,13 +341,29 @@ fn find_leading_guard_jump(
 /// the caller abandons the fold.
 fn recover_guard_expr(
     stmts: &mut Vec<Stat>,
-    regs: &[RegVal],
+    regs: &mut [RegVal],
     g_reg: usize,
     before_len: usize,
 ) -> Option<Expr> {
     match regs.get(g_reg) {
         Some(RegVal::Expr(Expr::Name(n))) => {
             let n = n.clone();
+            // The tested register was already a bound temp name, so the span's
+            // write came out as `n = <value>`; the guard is its only reader.
+            if stmts.len() == before_len + 1 {
+                if let Some(Stat::Assign { targets, values }) = stmts.last() {
+                    if targets.len() == 1
+                        && values.len() == 1
+                        && matches!(&targets[0], Expr::Name(t) if *t == n)
+                        && !expr_references_name(&values[0], &n)
+                    {
+                        let v = values[0].clone();
+                        stmts.truncate(before_len);
+                        regs[g_reg] = RegVal::Expr(v.clone());
+                        return Some(v);
+                    }
+                }
+            }
             if stmts.len() == before_len + 1 {
                 if let Some(Stat::Local { names, values }) = stmts.last() {
                     if names.len() == 1
@@ -557,7 +586,7 @@ fn fold_type_guard_chain(
     // Phase 1: locate the guard chain (no lifting).
     let mut probe = jump_next;
     let mut single_call = true;
-    while let Some((g, _, _)) = find_leading_guard_jump(code, probe, then_end, else_start) {
+    while let Some((g, _, _)) = find_leading_guard_jump_ex(code, probe, then_end, else_start, true) {
         if g <= probe {
             break;
         }
@@ -588,7 +617,7 @@ fn fold_type_guard_chain(
         return arm_start;
     }
     // Phase 3: lift each guard span and fold its call into the condition.
-    while let Some((g, _, g_reg)) = find_leading_guard_jump(code, arm_start, then_end, else_start) {
+    while let Some((g, _, g_reg)) = find_leading_guard_jump_ex(code, arm_start, then_end, else_start, true) {
         if g <= arm_start {
             break;
         }
@@ -5955,6 +5984,84 @@ pub(super) fn lift_instruction_range(
                 // OR the FIRE conditions of every jump targeting the body, then
                 // OR the NEGATED fire condition of the final jump, which is the
                 // one that skips the body.
+                // `(A and B) or C` with A tested in a register other than the
+                // result: the first jump lands inside the `or` chain's last
+                // operand. Rebuild the value instead of splitting it into
+                // `if A then r = B end; r = C`, which clobbers B.
+                if op == LuauOpcode::JumpIfNot {
+                    if let Some(av) = recognize_and_or_value(code, pc, end) {
+                        let snap = regs.clone();
+                        let locals_snap = locals.clone();
+                        let cond = reg_expr(regs, a);
+                        let mut operands: Vec<Expr> = Vec::new();
+                        let mut ok = true;
+                        for &(seg_start, seg_end) in &[av.body, av.fallback] {
+                            let mut seg = Vec::new();
+                            lift_instruction_range(
+                                ctx, proto, proto_index, depth + 1, seg_start, seg_end,
+                                regs, locals, &mut seg, in_loop,
+                            );
+                            let value = if seg.is_empty() {
+                                Some(reg_expr(regs, av.dest))
+                            } else {
+                                // The bound temp names turn each write into an
+                                // assignment; they are straight-line dataflow
+                                // all the same, so fold them as a prelude.
+                                let as_locals: Option<Vec<Stat>> = seg
+                                    .iter()
+                                    .map(|st| match st {
+                                        Stat::Local { .. } => Some(st.clone()),
+                                        Stat::Assign { targets, values }
+                                            if targets.len() == 1
+                                                && values.len() == 1
+                                                && matches!(targets[0], Expr::Name(_)) =>
+                                        {
+                                            let Expr::Name(n) = &targets[0] else { return None };
+                                            Some(Stat::Local {
+                                                names: vec![n.clone()],
+                                                values: values.clone(),
+                                            })
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                as_locals.and_then(|pre| {
+                                    super::prelude_fold::fold_prelude_temps(&pre, reg_expr(regs, av.dest))
+                                })
+                            };
+                            let Some(value) = value else {
+                                ok = false;
+                                break;
+                            };
+                            operands.push(value);
+                        }
+                        if ok && operands.len() == 2 {
+                            let fallback = operands.pop().expect("two operands");
+                            let body_value = operands.pop().expect("two operands");
+                            let raw = Expr::BinOp {
+                                left: Box::new(Expr::BinOp {
+                                    left: Box::new(cond),
+                                    op: BinOp::And,
+                                    right: Box::new(body_value),
+                                }),
+                                op: BinOp::Or,
+                                right: Box::new(fallback),
+                            };
+                            let simplified = simplify_expr(&raw);
+                            if super::prelude_fold::call_count(&simplified)
+                                >= super::prelude_fold::call_count(&raw)
+                            {
+                                locals.forget_declared_since(&locals_snap, av.dest);
+                                store_complex(ctx, proto, regs, locals, stmts, av.dest, pc, simplified);
+                                pc = av.end_pc;
+                                continue;
+                            }
+                        }
+                        regs.clear();
+                        regs.extend_from_slice(&snap);
+                        *locals = locals_snap;
+                    }
+                }
                 if let Some((chain_cond, body, exit_pc)) =
                     compose_guard_chain(code, regs, pc, end)
                 {

@@ -90,7 +90,11 @@ fn arm_value_read_after_an_outside_join_is_not_bound_to_a_throwaway_local() {
     // read, so the Add path never set Op.
     let out = decompiled(ARM_VALUE);
     assert!(!out.contains("= sel3"), "arm result bound to a throwaway local:\n{out}");
-    assert!(out.contains("Op = (Op2 .. \"-\")"), "Add arm no longer writes Op:\n{out}");
+    // Name-agnostic (the scratch copy of Op may be called Op2 or Value2).
+    assert!(
+        out.contains("Op = (") && out.contains(" .. \"-\") .. math.abs(Value)"),
+        "Add arm no longer writes Op:\n{out}"
+    );
 }
 
 const LOOP_GAP_ORPHAN: &[u8] = include_bytes!("fixtures/oor_real_loop_gap_orphan.luac");
