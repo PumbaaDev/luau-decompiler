@@ -149,3 +149,5 @@ mod andor_nil_call_join_tests;
 mod while_true_if_else_body_tests;
 mod combine7r_regression_tests;
 mod capture_blind_inline_tests;
+#[cfg(test)]
+mod arm_zero_result_call_chain_tests;
