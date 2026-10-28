@@ -1121,12 +1121,40 @@ fn is_pure_preamble_chain_link(
     code: &[u32],
     block_id: usize,
     prev_link: usize,
+    terminal: usize,
 ) -> bool {
     let Some(block) = cfg.blocks.get(&block_id) else { return false };
     block.successors.len() == 2
         && block.predecessors.len() == 1
         && block.predecessors[0] == prev_link
         && is_pure_or_link_block(code, block)
+        // A link that calls splits into its own guard, which repeats the
+        // terminal's body: only a bare `return` may be repeated.
+        && (!block_preamble_has_call(code, block) || terminal_is_bare_return(cfg, code, terminal))
+}
+
+fn block_preamble_has_call(code: &[u32], block: &BasicBlock) -> bool {
+    let Some(branch_pc) = block.branch_pc else { return false };
+    let mut i = block.start;
+    while i < branch_pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if matches!(op, LuauOpcode::NameCall | LuauOpcode::Call) {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// A terminal block that is nothing but `return` (no values, no side effects).
+fn terminal_is_bare_return(cfg: &ControlFlowGraph, code: &[u32], terminal: usize) -> bool {
+    let Some(block) = cfg.blocks.get(&terminal) else { return false };
+    let Some(branch_pc) = block.branch_pc else { return false };
+    let Some(ret) = code.get(branch_pc) else { return false };
+    if LuauOpcode::from_u8(insn_op(*ret)) != LuauOpcode::Return || insn_b(*ret) != 1 {
+        return false;
+    }
+    (block.start..branch_pc).all(|k| code[k] == 0)
 }
 
 /// Recognise an `if a or b or c then return end` chain rooted at `entry`.
@@ -1208,7 +1236,7 @@ fn or_chain_return_guard_with(
             // (unrestricted) acceptance, so nothing that matched before changes.
             if !allow_pure_links
                 || eb.predecessors.len() > 1
-                || !is_pure_preamble_chain_link(cfg, code, cur, *chain.last()?)
+                || !is_pure_preamble_chain_link(cfg, code, cur, *chain.last()?, terminal)
             {
                 break;
             }
@@ -1462,7 +1490,9 @@ fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
     let mut i = block.start;
     while i < branch_pc && i < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[i]));
-        if !(is_pure_guard_setup_op(op) || op == LuauOpcode::Length) {
+        if !(is_pure_guard_setup_op(op)
+            || matches!(op, LuauOpcode::Length | LuauOpcode::NameCall | LuauOpcode::Call))
+        {
             return false;
         }
         i += if op.has_aux() { 2 } else { 1 };
