@@ -62,7 +62,12 @@ fn is_d_jump(op: LuauOpcode) -> bool {
 /// Returns a patched copy of `proto` when it holds the boolean-guard shape.
 pub(super) fn thread(proto: &Proto) -> Option<Proto> {
     let code = &proto.code;
-    // Cheap pre-filter: a JUMPIF/JUMPIFNOT directly followed by RETURN.
+    // A proto that also materialises a boolean for a non-return test keeps its
+    // old shape: that value join binds its conditions wrongly once the body is
+    // no longer dropped (BloxFruits AnimateEntrance `dropped_arm_value`).
+    if has_non_return_bool_join(code) {
+        return None;
+    }
     let mut patched: Option<Vec<u32>> = None;
     let mut pc = 0usize;
     while pc + 4 < code.len() {
@@ -78,6 +83,31 @@ pub(super) fn thread(proto: &Proto) -> Option<Proto> {
     let mut out = proto.clone();
     out.code = code;
     Some(out)
+}
+
+/// True when some `LOADB R v; JUMP +1; LOADB R w; JUMPIF[NOT] R` boolean
+/// materialisation is NOT followed by a bare RETURN.
+fn has_non_return_bool_join(code: &[u32]) -> bool {
+    let is = |x: u32, o: LuauOpcode| LuauOpcode::from_u8(insn_op(x)) == o;
+    let mut pc = 0usize;
+    while pc + 3 < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        let step = 1 + usize::from(op.has_aux());
+        if op == LuauOpcode::LoadB
+            && is(code[pc + 1], LuauOpcode::Jump)
+            && is(code[pc + 2], LuauOpcode::LoadB)
+            && insn_a(code[pc + 2]) == insn_a(code[pc])
+            && matches!(
+                LuauOpcode::from_u8(insn_op(code[pc + 3])),
+                LuauOpcode::JumpIf | LuauOpcode::JumpIfNot
+            )
+            && !code.get(pc + 4).is_some_and(|&r| is(r, LuauOpcode::Return) && insn_b(r) == 1)
+        {
+            return true;
+        }
+        pc += step;
+    }
+    false
 }
 
 /// `pc` is the candidate `T: LOADB R <v>`.

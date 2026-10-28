@@ -2756,6 +2756,48 @@ fn jump_skips_write_to_tested(code: &[u32], pc: usize) -> bool {
     false
 }
 
+/// Blocks of `tail` that end in a forward conditional jump leaving the loop
+/// (landing at or past `loop_end`).
+fn range_has_call(code: &[u32], tail: &[(usize, usize)]) -> bool {
+    use crate::parser::types::insn_op;
+    let (Some(first), Some(last)) = (tail.first(), tail.last()) else { return false };
+    let mut pc = first.0;
+    while pc < last.1.min(code.len()) {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(op, LuauOpcode::Call | LuauOpcode::NameCall) {
+            return true;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    false
+}
+
+fn loop_exit_branches(code: &[u32], tail: &[(usize, usize)], loop_end: usize) -> usize {
+    use crate::parser::types::{insn_d, insn_op};
+    tail.iter()
+        .filter(|&&(s, e)| {
+            let Some(lp) = last_insn_pc(code, s, e) else { return false };
+            let op = LuauOpcode::from_u8(insn_op(code[lp]));
+            let cond = matches!(
+                op,
+                LuauOpcode::JumpIf
+                    | LuauOpcode::JumpIfNot
+                    | LuauOpcode::JumpIfEq
+                    | LuauOpcode::JumpIfNotEq
+                    | LuauOpcode::JumpIfLE
+                    | LuauOpcode::JumpIfNotLE
+                    | LuauOpcode::JumpIfLT
+                    | LuauOpcode::JumpIfNotLT
+                    | LuauOpcode::JumpXEqKNil
+                    | LuauOpcode::JumpXEqKB
+                    | LuauOpcode::JumpXEqKN
+                    | LuauOpcode::JumpXEqKS
+            );
+            cond && lp as i64 + 1 + i64::from(insn_d(code[lp])) >= loop_end as i64
+        })
+        .count()
+}
+
 fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
     use crate::parser::types::{insn_d, insn_op};
     if !opcode_handlers::midbody_lift_enabled() || hi + 1 != ranges.len() || hi < lo + 2 {
@@ -2779,8 +2821,23 @@ fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, 
             // value join, which the structured run cannot rebuild.
             if let Some(wp) = last_insn_pc(code, s, lp) {
                 let w = code[wp];
-                let writes_a = LuauOpcode::from_u8(insn_op(w)) == LuauOpcode::Move;
+                let wop = LuauOpcode::from_u8(insn_op(w));
+                // A boolean flag the tail immediately tests is a value join too.
+                let flag_tested = wop == LuauOpcode::LoadB
+                    && code.get(target).is_some_and(|&t| {
+                        matches!(LuauOpcode::from_u8(insn_op(t)), LuauOpcode::JumpIf | LuauOpcode::JumpIfNot)
+                            && crate::parser::types::insn_a(t) == crate::parser::types::insn_a(w)
+                    });
+                let writes_a = wop == LuauOpcode::Move || flag_tested;
                 if writes_a && reg_live_at(code, target, usize::from(crate::parser::types::insn_a(w))) {
+                    return false;
+                }
+            }
+            // A compound `until a or b` tail (two exits from the loop) loses its
+            // `continue` target when printed as `if a then break end; until b`.
+            if let Some(ti) = ranges[j + 1..hi].iter().position(|r| r.0 == target) {
+                let tail = &ranges[j + 1 + ti..hi];
+                if loop_exit_branches(code, tail, ranges[hi].1) >= 2 && !range_has_call(code, tail) {
                     return false;
                 }
             }
