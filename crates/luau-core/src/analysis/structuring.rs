@@ -1462,7 +1462,9 @@ fn is_pure_or_link_block(code: &[u32], block: &BasicBlock) -> bool {
     let mut i = block.start;
     while i < branch_pc && i < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[i]));
-        if !(is_pure_guard_setup_op(op) || op == LuauOpcode::Length) {
+        if !(is_pure_guard_setup_op(op)
+            || matches!(op, LuauOpcode::Length | LuauOpcode::NameCall | LuauOpcode::Call))
+        {
             return false;
         }
         i += if op.has_aux() { 2 } else { 1 };

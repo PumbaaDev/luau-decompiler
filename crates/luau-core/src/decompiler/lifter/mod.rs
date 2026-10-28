@@ -38,6 +38,7 @@ mod loop_exit_preload;
 mod prelude_fold;
 mod opcode_handlers;
 mod inline_tail_loop;
+mod bool_return_thread;
 use opcode_handlers::lift_instruction_range;
 
 // Re-exported solely for the `#[cfg(test)]` submodules under `lifter/tests/`,
@@ -1011,6 +1012,8 @@ fn count_calls_expr(e: &Expr) -> usize {
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
     let outer_loop_body = ctx.current_loop_body.take();
     let outer_latches = std::mem::take(&mut ctx.emitted_latches);
+    let threaded = bool_return_thread::thread(proto);
+    let proto = threaded.as_ref().unwrap_or(proto);
     let out = lift_proto_with_nil_tail_fallback(ctx, proto, proto_index, depth);
     ctx.emitted_latches = outer_latches;
     ctx.current_loop_body = outer_loop_body;
@@ -2719,6 +2722,62 @@ fn mid_body_structured_else(
         pc += 1 + op.has_aux() as usize;
     }
     Some(k)
+}
+
+/// A `while true` body whose if/elseif/else arms each end in a JUMP to a
+/// MID-BODY tail block (the code after the whole chain, short of the latch) is
+/// lifted per block as bare `continue`s: `mid_body_branch_end_block` only knows
+/// conditional guards, so every arm's JUMP reads as a loop `continue` and the arm
+/// bodies, the tail and their calls vanish (AdoptMe MoneyTreeUseHelper `render`
+/// loop: 9 calls expected, 4 emitted).
+///
+/// Returns true when the run `lo..=hi` (ending at the latch) has such a JUMP and
+/// contains no loop opcode or RETURN before the latch, so the whole span before
+/// the latch can be structured in one pass.
+fn while_true_join_tail_run(code: &[u32], ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    use crate::parser::types::{insn_d, insn_op};
+    if !opcode_handlers::midbody_lift_enabled() || hi + 1 != ranges.len() || hi < lo + 2 {
+        return false;
+    }
+    let latch_start = ranges[hi].0;
+    let mut has_join_jump = false;
+    for j in lo..hi {
+        let (s, e) = ranges[j];
+        let Some(lp) = last_insn_pc(code, s, e) else { continue };
+        if LuauOpcode::from_u8(insn_op(code[lp])) != LuauOpcode::Jump {
+            continue;
+        }
+        let target = lp as i64 + insn_d(code[lp]) as i64 + 1;
+        if target <= e as i64 {
+            continue;
+        }
+        let target = target as usize;
+        if target < latch_start && ranges[j + 1..hi].iter().any(|r| r.0 == target) {
+            has_join_jump = true;
+        }
+    }
+    if !has_join_jump {
+        return false;
+    }
+    let mut pc = ranges[lo].0;
+    while pc < latch_start {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if matches!(
+            op,
+            LuauOpcode::Return
+                | LuauOpcode::JumpBack
+                | LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGLoop
+                | LuauOpcode::ForGPrepNext
+                | LuauOpcode::ForGPrepINext
+        ) {
+            return false;
+        }
+        pc += 1 + op.has_aux() as usize;
+    }
+    true
 }
 
 /// A `while true` body block whose last instruction is a conditional jump that
@@ -5206,6 +5265,14 @@ fn lift_region(
                         let (s, e) = ranges[hi];
                         lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                     }
+                } else if while_true_join_tail_run(&proto.code, &ranges, lo, hi) {
+                    liftpath(proto, "while_true_join_tail", ranges[lo].0, ranges[hi].0);
+                    lift_structured_run(
+                        ctx, proto, proto_index, cfg, depth, ranges[lo].0, ranges[hi].0, regs, locals,
+                        &mut body_stmts, true,
+                    );
+                    let (s, e) = ranges[hi];
+                    lift_instruction_range(ctx, proto, proto_index, depth, s, e, regs, locals, &mut body_stmts, true);
                 } else {
                     let mut i = lo;
                     while i <= hi {
