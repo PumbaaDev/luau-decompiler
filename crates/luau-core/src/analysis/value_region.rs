@@ -1,9 +1,9 @@
-//! Detection of **value joins** — acyclic, side-effect-free branch regions
+﻿//! Detection of **value joins** â€” acyclic, side-effect-free branch regions
 //! whose only observable result is the value some register holds at the point
 //! where control flow reconverges.
 //!
-//! Luau compiles `and`/`or`/`a and b or c` — and, more generally, any
-//! conditional that merely *selects a value* — into branches. A plain
+//! Luau compiles `and`/`or`/`a and b or c` â€” and, more generally, any
+//! conditional that merely *selects a value* â€” into branches. A plain
 //! `if/then/else` region cannot always express the result, because the arms of
 //! a short-circuit ladder overlap:
 //!
@@ -16,7 +16,7 @@
 //! ```
 //!
 //! The `LOADN` block is simultaneously the outer branch's else-arm *and* the
-//! inner one's second operand — it has two predecessors, so it belongs to both
+//! inner one's second operand â€” it has two predecessors, so it belongs to both
 //! arms at once. `Region::IfThenElse` requires disjoint arm lists and therefore
 //! cannot represent it; `find_merge_point` compounds the problem by reporting
 //! that block as the merge, which hides the real join entirely.
@@ -54,9 +54,9 @@ pub struct ValueJoin {
 /// May `op` appear inside a value join?
 ///
 /// This is an allowlist, not a blocklist: an opcode has to be positively known
-/// to compute a value without observable effects. Everything absent — `CALL`,
+/// to compute a value without observable effects. Everything absent â€” `CALL`,
 /// `NAMECALL`, every `SET*`, closure creation, upvalue capture, table
-/// allocation, `RETURN`, and all loop opcodes — rejects the region, so a
+/// allocation, `RETURN`, and all loop opcodes â€” rejects the region, so a
 /// side-effecting operand can never be silently evaluated twice, nor a loop
 /// body folded into an expression.
 fn is_pure_value_op(op: LuauOpcode) -> bool {
@@ -95,6 +95,196 @@ fn is_pure_value_op(op: LuauOpcode) -> bool {
     )
 }
 
+/// Arithmetic and concatenation: side-effect free apart from a possible error
+/// on a bad operand. A value join may CONTAIN them (`c and x + 1 or 1`) but the
+/// lifter must keep them inline in the folded expression - hoisting one above
+/// its guard would evaluate it on a path where the source never did.
+fn is_arith_value_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::IDiv
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::IDivK
+            | LuauOpcode::SubRK
+            | LuauOpcode::DivRK
+            | LuauOpcode::Concat
+    )
+}
+
+/// Does any arm of the join contain an arithmetic or concatenation op?
+pub fn arms_have_arith(cfg: &ControlFlowGraph, code: &[u32], arms: &[usize]) -> bool {
+    arms.iter().any(|b| {
+        let Some(block) = cfg.blocks.get(b) else { return false };
+        let mut pc = block.start;
+        while pc < block.end && pc < code.len() {
+            let op = LuauOpcode::from_u8(insn_op(code[pc]));
+            if is_arith_value_op(op) {
+                return true;
+            }
+            pc += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    })
+}
+
+/// Arithmetic is only admitted into a value join in the `c and expr or d` shape,
+/// where the arithmetic result is immediately truth-tested (`JUMPIF R`) to pick
+/// between `expr` and `d`. Any other arithmetic in an arm (`x = x + y` under an
+/// `if`) is an ordinary statement and the region must stay an if/else.
+fn arith_arms_are_value_tested(
+    cfg: &ControlFlowGraph,
+    code: &[u32],
+    arms: &[usize],
+    join_start: usize,
+    entry_start: usize,
+) -> bool {
+    let mut arith_dests: BTreeSet<usize> = BTreeSet::new();
+    let mut tested: BTreeSet<usize> = BTreeSet::new();
+    for b in arms {
+        let Some(block) = cfg.blocks.get(b) else { return false };
+        let mut pc = block.start;
+        while pc < block.end && pc < code.len() {
+            let insn = code[pc];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            let a = insn_a(insn) as usize;
+            if is_arith_value_op(op) {
+                arith_dests.insert(a);
+            } else if matches!(op, LuauOpcode::JumpIf | LuauOpcode::JumpIfNot) {
+                tested.insert(a);
+            }
+            pc += if op.has_aux() { 2 } else { 1 };
+        }
+    }
+    if arith_dests.is_empty() {
+        return true;
+    }
+    // Only the plain `c and expr or d` diamond (two arms): a nested diamond with
+    // arithmetic inside an arm leaves registers of the inner selection undescribed
+    // at the outer join (StealAnEgg serialiser lost `Pretty and " * " or "*"`).
+    if !(arms.len() == 2 && arith_dests.iter().any(|r| tested.contains(r))) {
+        return false;
+    }
+    // The tested register must be the join result: written by BOTH arms. An arm
+    // that only computes a side value (BoatTween `if f then t = 1 - t / s end`)
+    // would otherwise have its write turned into a discarded local.
+    let mut shared: Option<BTreeSet<usize>> = None;
+    for b in arms {
+        let Some(block) = cfg.blocks.get(b) else { return false };
+        let mut writes: BTreeSet<usize> = BTreeSet::new();
+        let mut pc = block.start;
+        while pc < block.end && pc < code.len() {
+            let insn = code[pc];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            if is_arith_value_op(op)
+                || matches!(
+                    op,
+                    LuauOpcode::LoadN
+                        | LuauOpcode::LoadK
+                        | LuauOpcode::LoadB
+                        | LuauOpcode::LoadNil
+                        | LuauOpcode::Move
+                        | LuauOpcode::GetUpval
+                        | LuauOpcode::GetImport
+                        | LuauOpcode::Not
+                        | LuauOpcode::Minus
+                        | LuauOpcode::Length
+                )
+            {
+                writes.insert(insn_a(insn) as usize);
+            }
+            pc += if op.has_aux() { 2 } else { 1 };
+        }
+        shared = Some(match shared {
+            None => writes,
+            Some(s) => s.intersection(&writes).copied().collect(),
+        });
+    }
+    let shared = shared.unwrap_or_default();
+    let result_regs: Vec<usize> =
+        arith_dests.iter().copied().filter(|r| tested.contains(r) && shared.contains(r)).collect();
+    if result_regs.is_empty() {
+        return false;
+    }
+    // A result register that already carried a named value earlier in the proto is
+    // a reassignment of that name (BoatTween 	 = f and 1 - t / s or t / s); the
+    // value-path walk cannot model it and the fallback loses the arm value.
+    // An arm that supplies the `or` value by copying another variable into the
+    // result register (`x = c and a * b or x`, AdoptMe glider `force`) loses the
+    // arithmetic arm on the fallback path; leave those to the statement lift.
+    let copies_into_result = arms.iter().any(|b| {
+        let Some(block) = cfg.blocks.get(b) else { return false };
+        let mut pc = block.start;
+        while pc < block.end && pc < code.len() {
+            let insn = code[pc];
+            let op = LuauOpcode::from_u8(insn_op(insn));
+            if op == LuauOpcode::Move && result_regs.contains(&(insn_a(insn) as usize)) {
+                return true;
+            }
+            pc += if op.has_aux() { 2 } else { 1 };
+        }
+        false
+    });
+    if copies_into_result {
+        return false;
+    }    if result_regs.iter().any(|&r| register_written_before(code, entry_start, r)) {
+        return false;
+    }
+    // A copy `MOVE dst, src` of the arithmetic result right at the join (Spr
+    // `luvToRgb`, AdoptMe `LerpCIELUV`) is handled by the overlapped-arith path;
+    // folding it here aliases the copy to a register that is rewritten later.
+    let copies_result = join_start < code.len() && {
+        let insn = code[join_start];
+        LuauOpcode::from_u8(insn_op(insn)) == LuauOpcode::Move
+            && arith_dests.contains(&(insn_b(insn) as usize))
+    };
+    !copies_result
+}
+
+/// Does any instruction before `end` write register `reg` (instruction-aligned scan)?
+fn register_written_before(code: &[u32], end: usize, reg: usize) -> bool {
+    let mut pc = 0;
+    while pc < end && pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if insn_a(insn) as usize == reg
+            && (is_arith_value_op(op)
+                || matches!(
+                    op,
+                    LuauOpcode::LoadN
+                        | LuauOpcode::LoadK
+                        | LuauOpcode::LoadB
+                        | LuauOpcode::LoadNil
+                        | LuauOpcode::Move
+                        | LuauOpcode::GetUpval
+                        | LuauOpcode::GetImport
+                        | LuauOpcode::GetGlobal
+                        | LuauOpcode::GetTableKS
+                        | LuauOpcode::GetTable
+                        | LuauOpcode::NameCall
+                        | LuauOpcode::Call
+                        | LuauOpcode::NewTable
+                        | LuauOpcode::Not
+                        | LuauOpcode::Minus
+                        | LuauOpcode::Length
+                ))
+        {
+            return true;
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
 /// Are all instructions in `[start, end)` pure value computations?
 ///
 /// Walks instruction-aligned so an AUX word is never decoded as an opcode.
@@ -102,7 +292,7 @@ fn is_pure_value_op(op: LuauOpcode) -> bool {
 /// Table construction is admitted under one extra condition: a `SET*` may only
 /// target a table this same block allocated. `local p = c and { q = 1 } or nil`
 /// compiles to `DUPTABLE` followed by `SETTABLEKS`, and the writes are part of
-/// building the literal — nothing outside the region can observe them. Writing
+/// building the literal â€” nothing outside the region can observe them. Writing
 /// through a register that came from *outside* is an ordinary side effect and
 /// still rejects the block.
 fn range_is_pure(code: &[u32], start: usize, end: usize) -> bool {
@@ -119,7 +309,7 @@ fn range_is_pure(code: &[u32], start: usize, end: usize) -> bool {
             LuauOpcode::NewTable | LuauOpcode::DupTable => {
                 fresh_tables.insert(a);
             }
-            // `SETTABLE* A B ..` is `R(B)[key] = R(A)` — the TABLE is B.
+            // `SETTABLE* A B ..` is `R(B)[key] = R(A)` â€” the TABLE is B.
             // `SETLIST A B ..` is the other way round: the table is A.
             LuauOpcode::SetTable | LuauOpcode::SetTableKS | LuauOpcode::SetTableN => {
                 if !fresh_tables.contains(&(insn_b(insn) as usize)) {
@@ -132,7 +322,7 @@ fn range_is_pure(code: &[u32], start: usize, end: usize) -> bool {
                 }
             }
             _ => {
-                if !is_pure_value_op(op) {
+                if !is_pure_value_op(op) && !is_arith_value_op(op) {
                     return false;
                 }
                 // Overwriting a register drops its "freshly allocated" status.
@@ -147,13 +337,13 @@ fn range_is_pure(code: &[u32], start: usize, end: usize) -> bool {
 /// Try to recognise a value join whose branching entry is `entry`.
 ///
 /// Grows a set of member blocks from `entry`, always absorbing the lowest
-/// pending exit, until exactly one exit remains — that exit is the join. Every
+/// pending exit, until exactly one exit remains â€” that exit is the join. Every
 /// absorbed block must be reached *only* from inside the region, must lie
 /// forward of the entry, and must be pure.
 ///
 /// `loop_headers` guards the one thing the forward-only walk cannot see for
 /// itself: claiming a loop header as a region member would stop the loop from
-/// being recognised at all. Loop *bodies* need no such guard — every back edge
+/// being recognised at all. Loop *bodies* need no such guard â€” every back edge
 /// is rejected structurally (a successor at or before the entry, or one already
 /// in the region), and `JUMPBACK`/`FOR*LOOP` are absent from the purity
 /// allowlist. A value join is therefore free to occur inside a loop body, which
@@ -223,7 +413,7 @@ pub fn find_value_join(
         member.insert(b);
         for &s in &block.successors {
             if s <= entry || member.contains(&s) {
-                // Backward edge inside the region — this is a loop, not a join.
+                // Backward edge inside the region â€” this is a loop, not a join.
                 return None;
             }
             exits.insert(s);
@@ -236,7 +426,7 @@ pub fn find_value_join(
     }
     // The members must tile one contiguous pc range that ends exactly where the
     // join begins. Anything else would leave a gap holding a block that is not
-    // part of the region but sits inside its span — the lifter's fallback path
+    // part of the region but sits inside its span â€” the lifter's fallback path
     // lifts that span wholesale, and would then emit the stray block twice.
     let mut cursor = cfg.blocks.get(&entry)?.start;
     for &b in &member {
@@ -252,6 +442,11 @@ pub fn find_value_join(
 
     let arms: Vec<usize> = member.iter().copied().filter(|&b| b != entry).collect();
     if arms.is_empty() {
+        return None;
+    }
+    let join_start = cfg.blocks.get(&join)?.start;
+    let entry_start = cfg.blocks.get(&entry)?.start;
+    if !arith_arms_are_value_tested(cfg, code, &arms, join_start, entry_start) {
         return None;
     }
     Some(ValueJoin { entry, arms, join })
@@ -308,6 +503,32 @@ mod tests {
         assert_eq!(vj.entry, 0);
         assert_eq!(vj.arms, vec![1, 4]);
         assert_eq!(vj.join, 5);
+    }
+
+    /// `v = v + 1 <= 8 and v + 1 or 1` (Enchants `SetNextIncremental`): the arm
+    /// holds an ADDK, which used to disqualify the region and left the arm's
+    /// value in a discarded fresh local.
+    #[test]
+    fn arithmetic_arm_is_a_value_join() {
+        // 0: ADDK R1 R2 + K0   1: LOADN R2 8   2: JUMPIFNOTLE R1 R2 -> 7
+        // 4: MOVE R1 R3        5: ADDK R0 R1 + K0   6: JUMPIF R0 -> 8
+        // 7: LOADN R0 1        8: CALL (join)
+        let code = vec![
+            abc(LuauOpcode::AddK, 1, 2, 0),
+            abc(LuauOpcode::LoadN, 2, 8, 0),
+            ad(LuauOpcode::JumpIfNotLE, 1, 4),
+            2,
+            abc(LuauOpcode::Move, 1, 3, 0),
+            abc(LuauOpcode::AddK, 0, 1, 0),
+            ad(LuauOpcode::JumpIf, 0, 1),
+            ad(LuauOpcode::LoadN, 0, 1),
+            abc(LuauOpcode::Call, 6, 1, 1),
+        ];
+        let proto = proto_with(code.clone());
+        let cfg = ControlFlowGraph::build(&proto);
+        let vj = find_value_join(&cfg, &code, 0, &BTreeSet::new()).expect("arith ternary");
+        assert_eq!(vj.join, 8);
+        assert_eq!(vj.arms.len(), 2);
     }
 
     /// A plain value diamond is also a value join.

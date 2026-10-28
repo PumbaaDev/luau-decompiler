@@ -1530,6 +1530,28 @@ const OPEN_ARM_JOIN_MAX_INSNS: usize = 6;
 /// instruction of its range with its target out of range, and the enclosing
 /// construct (an if/else diamond, an `a or b` chain) is lifted as a bare
 /// `continue` guard instead.
+/// Is there a forward conditional in `[span_start, vj_pc)` whose target lies past
+/// `join_start` (and within `end`)?
+fn forward_conditional_open_past(
+    code: &[u32],
+    span_start: usize,
+    vj_pc: usize,
+    join_start: usize,
+    end: usize,
+) -> bool {
+    let mut j = span_start;
+    while j < vj_pc && j < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[j]));
+        if let Some((_, target)) = forward_conditional_jump(op, j, code[j]) {
+            if target > join_start && target <= end {
+                return true;
+            }
+        }
+        j += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
 fn value_join_inside_open_arm(
     code: &[u32],
     span_start: usize,
@@ -1664,7 +1686,22 @@ fn or_guard_with_head(
     if hb.predecessors.is_empty() || !hb.predecessors.iter().all(|p| link_ids.contains(p)) {
         return None;
     }
-    let body = closed_return_body(cfg, code, head, cont, &link_ids, handled, loop_headers)?;
+    let (body, falls_into_cont) =
+        closed_return_body(cfg, code, head, cont, &link_ids, handled, loop_headers)?;
+    // A body that FALLS INTO the continuation (`if not a or not b then error() end`)
+    // is a self-contained `if` only when it carries no value across the join.
+    if falls_into_cont {
+        let ranges: Vec<(usize, usize)> = body
+            .iter()
+            .filter_map(|b| cfg.blocks.get(b).map(|blk| (blk.start, blk.end)))
+            .collect();
+        let cont_pc = cfg.blocks.get(&cont)?.start;
+        if !crate::decompiler::lifter::ranges_have_side_effect(code, &ranges)
+            || crate::decompiler::lifter::ranges_carry_value_to(code, &ranges, cont_pc)
+        {
+            return None;
+        }
+    }
     if std::env::var("LUAU_ORGUARD_TRACE").is_ok() {
         let conds = body
             .iter()
@@ -1679,7 +1716,8 @@ fn or_guard_with_head(
 }
 
 /// Everything reachable from `head`, if it is a closed, forward-only,
-/// unclaimed region entered only through `head` whose every exit returns.
+/// unclaimed region entered only through `head` whose every exit returns or
+/// falls into `cont`. The flag is true when some exit falls into `cont`.
 fn closed_return_body(
     cfg: &ControlFlowGraph,
     code: &[u32],
@@ -1688,10 +1726,15 @@ fn closed_return_body(
     link_ids: &BTreeSet<usize>,
     handled: &BTreeSet<usize>,
     loop_headers: &BTreeSet<usize>,
-) -> Option<Vec<usize>> {
+) -> Option<(Vec<usize>, bool)> {
     let mut body: BTreeSet<usize> = BTreeSet::new();
     let mut work = vec![head];
+    let mut falls_into_cont = false;
+    let cont_start = cfg.blocks.get(&cont).map(|c| c.start);
     while let Some(b) = work.pop() {
+        if b == cont && b != head {
+            continue;
+        }
         if !body.insert(b) {
             continue;
         }
@@ -1716,6 +1759,17 @@ fn closed_return_body(
         if blk.successors.iter().any(|&s| s <= b) && !block_ends_in_for_loop_back_edge(code, blk) {
             return None; // a backward edge: not a forward-only body
         }
+        if blk.successors.contains(&cont) {
+            // The only way out into the continuation is the body's own last
+            // block falling straight into it. A conditional jump from inside
+            // the body to the continuation (`if x and y then return false end`
+            // nested in the body) is a second guard, not a fall-through, and
+            // the body lift would drop it.
+            if blk.successors.len() != 1 || Some(blk.end) != cont_start {
+                return None;
+            }
+            falls_into_cont = true;
+        }
         work.extend(blk.successors.iter().copied());
     }
     let entered_only_at_head = body.iter().filter(|&&b| b != head).all(|b| {
@@ -1726,7 +1780,7 @@ fn closed_return_body(
     if !entered_only_at_head {
         return None;
     }
-    Some(body.into_iter().collect())
+    Some((body.into_iter().collect(), falls_into_cont))
 }
 
 /// Check if a detected natural loop is a REAL loop by verifying that the
@@ -2056,7 +2110,15 @@ pub(crate) fn structure_numeric_for_body(
                 // A join inside the arm of an open conditional stays in the flat
                 // span: cutting it there strands that conditional's target past
                 // the range and its other arm / `or` links are dropped.
+                // An arithmetic join (new: arithmetic arms used to disqualify
+                // joins) is also kept flat when ANY forward conditional still
+                // open at `pc` jumps past its join: cutting there strands that
+                // conditional's target outside the range being lifted.
+                let arith_in_open_conditional = crate::analysis::value_region::arms_have_arith(
+                    cfg, code, &vj.arms,
+                ) && forward_conditional_open_past(code, linear_start, pc, join_start, body_end);
                 if join_start <= body_end
+                    && !arith_in_open_conditional
                     && !value_join_inside_open_arm(code, linear_start, pc, join_start, body_end)
                 {
                     if linear_start < pc {

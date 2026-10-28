@@ -1771,6 +1771,86 @@ fn should_emit_as_method(params: &[String], body: &[Stat]) -> bool {
     first_any_uses == 0
 }
 
+/// Does `name` appear anywhere in `stmts`, as a read OR an assignment target?
+fn name_mentioned_in_stmts(stmts: &[Stat], name: &str) -> bool {
+    fn targets_mention(stmts: &[Stat], name: &str) -> bool {
+        stmts.iter().any(|s| match s {
+            Stat::Assign { targets, .. } => targets.iter().any(|t| {
+                let mut c = 0usize;
+                count_name_uses_in_expr(t, name, &mut c);
+                c > 0
+            }),
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                targets_mention(then_body, name)
+                    || elseif_clauses.iter().any(|(_, b)| targets_mention(b, name))
+                    || else_body.as_ref().is_some_and(|b| targets_mention(b, name))
+            }
+            Stat::While { body, .. }
+            | Stat::Repeat { body, .. }
+            | Stat::NumericFor { body, .. }
+            | Stat::GenericFor { body, .. }
+            | Stat::DoBlock { body } => targets_mention(body, name),
+            // Closures may assign a captured local: be conservative.
+            Stat::LocalFunction { .. } | Stat::MethodFunction { .. } => true,
+            Stat::Local { values, .. } => values.iter().any(|v| matches!(v, Expr::Function { .. })),
+            Stat::ExprStat(e) => matches!(e, Expr::Function { .. }),
+            _ => false,
+        })
+    }
+    let mut c = 0usize;
+    count_name_uses_in_stmts(stmts, name, &mut c);
+    if c > 0 || targets_mention(stmts, name) {
+        return true;
+    }
+    // Confirm with a structural scan so no AST shape is missed (closures nested
+    // in call arguments, table fields, and so on).
+    format!("{stmts:?}").contains(&format!("\"{name}\""))
+}
+
+/// Remove a bare `local x` whose name is never mentioned again in its block.
+/// Left behind when a value join's arms are turned into direct returns; the
+/// stray declaration is a never-assigned local that confuses later readers.
+pub(super) fn drop_unreferenced_bare_locals(stmts: &mut Vec<Stat>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                drop_unreferenced_bare_locals(then_body);
+                for (_, body) in elseif_clauses {
+                    drop_unreferenced_bare_locals(body);
+                }
+                if let Some(eb) = else_body {
+                    drop_unreferenced_bare_locals(eb);
+                }
+            }
+            Stat::While { body, .. }
+            | Stat::Repeat { body, .. }
+            | Stat::NumericFor { body, .. }
+            | Stat::GenericFor { body, .. }
+            | Stat::DoBlock { body } => drop_unreferenced_bare_locals(body),
+            Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+                if let Expr::Function { body, .. } = func {
+                    drop_unreferenced_bare_locals(body);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < stmts.len() {
+        let drop_it = match &stmts[i] {
+            Stat::Local { names, values } if names.len() == 1 && values.is_empty() => {
+                !name_mentioned_in_stmts(&stmts[i + 1..], &names[0])
+            }
+            _ => false,
+        };
+        if drop_it {
+            stmts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn count_name_uses_in_stmts(stmts: &[Stat], name: &str, count: &mut usize) {
     for s in stmts { count_name_uses_in_stmt(s, name, count); }
 }
