@@ -625,7 +625,7 @@ fn fold_type_guard_chain(
 /// else r=b end` degrades the short-circuit call `x:m()` into an unconditional
 /// one that errors when `x` is nil (`rc_0066`). Requiring a real side effect in
 /// an arm means the branch keeps its shape and the guard stays protected.
-fn range_has_side_effect(code: &[u32], start: usize, end: usize) -> bool {
+pub(super) fn range_has_side_effect(code: &[u32], start: usize, end: usize) -> bool {
     let mut pc = start;
     while pc < end && pc < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[pc]));
@@ -933,7 +933,13 @@ fn or_link_shape(
 /// loop edges) counting any operand that names `reg` as a read
 /// ([`insn_reads_reg`], whose opcode list bounds what counts as a read).
 /// Running out of budget answers true.
-fn reg_maybe_live(code: &[u32], start: usize, reg: usize) -> bool {
+pub(super) fn reg_maybe_live(code: &[u32], start: usize, reg: usize) -> bool {
+    reg_maybe_live_ex(code, start, reg, false)
+}
+
+/// [`reg_maybe_live`]; with `namecall_self_write` a NAMECALL also kills `A + 1`
+/// (the self slot it writes), which `insn_writes_regs` does not list.
+pub(super) fn reg_maybe_live_ex(code: &[u32], start: usize, reg: usize, namecall_self_write: bool) -> bool {
     const BUDGET: usize = 4096;
     let n = code.len();
     let mut seen = vec![false; n];
@@ -952,6 +958,12 @@ fn reg_maybe_live(code: &[u32], start: usize, reg: usize) -> bool {
             return true;
         }
         if insn_writes_regs(code, pc).contains(&reg) {
+            continue;
+        }
+        if namecall_self_write
+            && LuauOpcode::from_u8(insn_op(code[pc])) == LuauOpcode::NameCall
+            && insn_a(code[pc]) as usize + 1 == reg
+        {
             continue;
         }
         let insn = code[pc];
@@ -1003,7 +1015,7 @@ pub(super) fn insn_writes_regs(code: &[u32], pc: usize) -> Vec<usize> {
 }
 
 /// Registers written anywhere in `[start, end)` (see [`insn_writes_regs`]).
-fn range_writes_regs(code: &[u32], start: usize, end: usize) -> Vec<usize> {
+pub(super) fn range_writes_regs(code: &[u32], start: usize, end: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut pc = start;
     while pc < end && pc < code.len() {
