@@ -8005,6 +8005,46 @@ fn reg_live_after_ex(
                         return true;
                     }
                 }
+                // B/C of these are an upvalue index or an immediate, never a
+                // register: counting them as reads made a dead scratch register
+                // look live whenever it shared a number with an upvalue slot.
+                LuauOpcode::GetUpval
+                | LuauOpcode::LoadN
+                | LuauOpcode::LoadK
+                | LuauOpcode::LoadB
+                | LuauOpcode::LoadNil
+                | LuauOpcode::GetImport
+                    if exact => {}
+                // SETLIST reads the table (A) and the value window B..B+C-2
+                // (C == 0: up to the stack top); CONCAT reads B..=C.
+                LuauOpcode::SetList if exact => {
+                    if !in_range && (a == reg || (reg >= b && (c == 0 || reg + 1 < b + c))) {
+                        return true;
+                    }
+                }
+                // Loop prep/step ops read the three consecutive control registers.
+                LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGPrepINext
+                | LuauOpcode::ForGPrepNext
+                | LuauOpcode::ForGLoop
+                    if exact =>
+                {
+                    if !in_range && reg >= a && reg <= a + 3 {
+                        return true;
+                    }
+                }
+                LuauOpcode::Concat if exact => {
+                    if !in_range && (reg >= b && reg <= c) {
+                        return true;
+                    }
+                }
+                LuauOpcode::SetUpval if exact => {
+                    if !in_range && a == reg {
+                        return true;
+                    }
+                }
                 LuauOpcode::Call => {
                     // Reads the function (A) and its arguments A+1..A+B-1; B == 0
                     // means every register above A up to the stack top.

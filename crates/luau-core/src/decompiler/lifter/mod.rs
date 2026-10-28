@@ -2065,6 +2065,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // case is already collapsed; any surviving scattered-unpack cluster is
     // the N-ary pattern this fold targets.
     post_passes::fold_multireturn_unpack(&mut stmts);
+    post_passes::drop_unreferenced_bare_locals(&mut stmts);
 
     // Run chain collapse again — inlining may create new consecutive chain opportunities
     collapse_method_chains(&mut stmts);
@@ -2185,7 +2186,48 @@ fn collect_value_joins_in_span(
         }
         pc = block.end;
     }
+    // Splicing lifts the gaps between joins as separate ranges, and the nested
+    // conditional handler drops any jump whose target lies past its range. A
+    // span holding an arithmetic join is therefore only spliced when no gap
+    // jumps out of itself; otherwise it is lifted whole, as before arithmetic
+    // arms could be joins (Slayers2 marker loop lost its whole guarded tail).
+    let has_arith_join = out.iter().any(|(_, arms, _, _)| {
+        crate::analysis::value_region::arms_have_arith(cfg, &proto.code, arms)
+    });
+    if has_arith_join {
+        let mut cursor = start;
+        let mut gaps: Vec<(usize, usize)> = Vec::new();
+        for (entry, _, _, join_start) in &out {
+            let entry_start = cfg.blocks.get(entry).map(|b| b.start).unwrap_or(cursor);
+            gaps.push((cursor, entry_start));
+            cursor = *join_start;
+        }
+        gaps.push((cursor, end));
+        if gaps.iter().any(|&(lo, hi)| span_has_escaping_jump(&proto.code, lo, hi)) {
+            return Vec::new();
+        }
+    }
     out
+}
+
+/// Does any jump in `[lo, hi)` land past `hi`?
+fn span_has_escaping_jump(code: &[u32], lo: usize, hi: usize) -> bool {
+    let mut pc = lo;
+    while pc < hi && pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        if opcode_handlers::is_control_flow_op(op) {
+            let target = match op {
+                LuauOpcode::JumpX => pc as i64 + insn_e(insn) as i64 + 1,
+                _ => pc as i64 + insn_d(insn) as i64 + 1,
+            };
+            if target > hi as i64 {
+                return true;
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 /// Rotation 84: which lift path actually handles a given pc?
@@ -3669,6 +3711,15 @@ fn fold_register_paths(paths: &[ValuePath], values: &[Expr]) -> Option<Expr> {
     Some(acc)
 }
 
+/// Does `e` contain arithmetic or concatenation? Such a temp must not be hoisted
+/// out of a value-join arm: the guard may be what keeps its operand non-nil.
+fn expr_has_arith(e: &Expr) -> bool {
+    let s = format!("{e:?}");
+    ["Add", "Sub", "Mul", "Div", "IDiv", "Mod", "Pow", "Concat"]
+        .iter()
+        .any(|op| s.contains(&format!("op: {op},")) || s.contains(&format!("op: {op} ")))
+}
+
 /// Enumerate every root-to-join path of a value join, lifting each with its own
 /// register file. Returns `None` if any path emits a statement (the region is
 /// then not a pure value selection after all) or if the caps are exceeded.
@@ -3738,16 +3789,40 @@ fn enumerate_value_paths(
             if !scratch.is_empty() {
                 let all_pure_temps = scratch.iter().all(|st| match st {
                     Stat::Local { names, values } => {
-                        names.len() == 1
-                            && values.len() == 1
-                            && !has_side_effects(&values[0])
+                        names.len() == 1 && values.len() == 1 && !has_side_effects(&values[0])
                     }
                     _ => false,
                 });
                 if !all_pure_temps {
                     return None;
                 }
-                hoist.extend(scratch.drain(..));
+                // An arithmetic temp must NOT be hoisted above the guard that
+                // keeps its operand non-nil (`x and x * x * 2 or 1`). Fold it
+                // back into the registers that read it instead, so it stays
+                // inline in the path value.
+                for st in scratch.drain(..) {
+                    match &st {
+                        Stat::Local { names, values } if expr_has_arith(&values[0]) => {
+                            // A temp name already live in the incoming registers
+                            // means names collide across joins: refuse.
+                            for r in base_regs.iter() {
+                                if let RegVal::Expr(e) = r {
+                                    let mut probe = e.clone();
+                                    replace_name_in_expr(&mut probe, &names[0], &Expr::Bool(true));
+                                    if format!("{probe:?}") != format!("{e:?}") {
+                                        return None;
+                                    }
+                                }
+                            }
+                            for r in regs.iter_mut() {
+                                if let RegVal::Expr(e) = r {
+                                    replace_name_in_expr(e, &names[0], &values[0]);
+                                }
+                            }
+                        }
+                        _ => hoist.push(st),
+                    }
+                }
             }
         }
 
@@ -3952,6 +4027,7 @@ fn lift_value_join(
     // the two-way merge, which can only agree or forget.
     let width = paths.iter().map(|p| p.regs.len()).min().unwrap_or(0);
     let mut divergent: Vec<usize> = Vec::new();
+    let mut dead_divergent: Vec<usize> = Vec::new();
     for i in 0..width {
         let first = &paths[0].regs[i];
         let same = paths[1..].iter().all(|p| match (first, &p.regs[i]) {
@@ -3972,6 +4048,15 @@ fn lift_value_join(
             crate::decompiler::mint_trace::note_unknown("UNK_JOIN_ANY_PATH", i);
             continue;
         }
+        // A scratch register nothing reads after the join (an arm's operand
+        // temp, `GETUPVAL R1` feeding an `ADDK`) carries no value worth
+        // reconstructing. Folding it would force the whole join onto the
+        // statement fallback and assign the dead temp inside the arms.
+        // Applied only when the full fold fails (below), so joins that already
+        // fold keep their old output.
+        if opcode_handlers::reg_dead_from(&proto.code, join_start, i) {
+            dead_divergent.push(i);
+        }
         divergent.push(i);
     }
 
@@ -3979,15 +4064,39 @@ fn lift_value_join(
     // is all-or-nothing: a partial fold would leave some registers described by
     // an expression and others by a statement chain guarded by the same
     // conditions, evaluating them twice.
+    let fold_all = |divergent: &[usize]| -> Option<Vec<(usize, Expr)>> {
+        let mut folded: Vec<(usize, Expr)> = Vec::new();
+        for &i in divergent {
+            let values: Vec<Expr> = paths.iter().map(|p| reg_expr(&p.regs, i)).collect();
+            folded.push((i, simplify_expr(&fold_register_paths(&paths, &values)?)));
+        }
+        Some(folded)
+    };
     let mut folded: Vec<(usize, Expr)> = Vec::new();
     let mut all_folded = true;
-    for &i in &divergent {
-        let values: Vec<Expr> = paths.iter().map(|p| reg_expr(&p.regs, i)).collect();
-        match fold_register_paths(&paths, &values) {
-            Some(e) => folded.push((i, simplify_expr(&e))),
-            None => {
-                all_folded = false;
-                break;
+    match fold_all(&divergent) {
+        Some(f) => folded = f,
+        None => {
+            all_folded = false;
+            // A scratch register nothing reads after the join (an arm's operand
+            // temp, `GETUPVAL R1` feeding an `ADDK`) carries no value worth
+            // reconstructing; folding it forces the whole join onto the
+            // statement fallback. Drop those and retry.
+            if !dead_divergent.is_empty()
+                && (paths.len() == 2
+                    || (paths.len() == 3
+                        && crate::analysis::value_region::arms_have_arith(cfg, &proto.code, arms)))
+            {
+                let live: Vec<usize> =
+                    divergent.iter().copied().filter(|r| !dead_divergent.contains(r)).collect();
+                if let Some(f) = fold_all(&live) {
+                    for &d in &dead_divergent {
+                        regs[d] = RegVal::Unknown;
+                    }
+                    divergent = live;
+                    folded = f;
+                    all_folded = true;
+                }
             }
         }
     }
