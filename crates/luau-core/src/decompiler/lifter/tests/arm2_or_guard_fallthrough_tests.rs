@@ -25,3 +25,24 @@ fn error_guard_keeps_both_terms_and_stays_conditional() {
     );
     assert!(!body.contains("local isType"), "IsA parked as a dead local:\n{body}");
 }
+
+const SCORES_DUELERS: &[u8] = include_bytes!("fixtures/arm2_scores_duelers.luac");
+
+/// `a and a.B and a.B.C[1] and (v or "")` compiles to JUMPIFNOTs that all land
+/// on the same join as a lone `LOADK ""`. That body only selects a value, so it
+/// is not an or-guard body: the guards must stay around the field reads.
+#[test]
+fn value_select_body_is_not_an_or_guard() {
+    let out = crate::decompile(SCORES_DUELERS).expect("fixture decompiles");
+    let start = out.find("local function update_score").expect("function present");
+    let body = &out[start..];
+    let body = &body[..body.find("local v13").expect("tail present")];
+    assert!(
+        body.contains("if arg2 then"),
+        "the arg2 guard must survive:\n{body}"
+    );
+    assert!(
+        body.find("if arg2 then").unwrap() < body.find("arg2.ClientFighter").unwrap(),
+        "ClientFighter read must sit inside the guard:\n{body}"
+    );
+}

@@ -79,6 +79,14 @@ thread_local! {
         std::cell::Cell::new(false);
 }
 
+/// True when some range holds a call, store or other observable effect. A body
+/// that only loads values is a value select (`x or default`), not a statement.
+pub(crate) fn ranges_have_side_effect(code: &[u32], ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(s, e)| opcode_handlers::range_has_side_effect(code, s, e))
+}
+
 /// Does any register written inside `ranges` stay live at `cont`? An or-guard
 /// body that falls through into the continuation may only be lifted as a
 /// self-contained `if` when it carries no value across the join.

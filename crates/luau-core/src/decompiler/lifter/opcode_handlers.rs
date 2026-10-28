@@ -625,7 +625,7 @@ fn fold_type_guard_chain(
 /// else r=b end` degrades the short-circuit call `x:m()` into an unconditional
 /// one that errors when `x` is nil (`rc_0066`). Requiring a real side effect in
 /// an arm means the branch keeps its shape and the guard stays protected.
-fn range_has_side_effect(code: &[u32], start: usize, end: usize) -> bool {
+pub(super) fn range_has_side_effect(code: &[u32], start: usize, end: usize) -> bool {
     let mut pc = start;
     while pc < end && pc < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[pc]));

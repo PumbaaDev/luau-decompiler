@@ -1674,7 +1674,9 @@ fn or_guard_with_head(
             .filter_map(|b| cfg.blocks.get(b).map(|blk| (blk.start, blk.end)))
             .collect();
         let cont_pc = cfg.blocks.get(&cont)?.start;
-            if crate::decompiler::lifter::ranges_carry_value_to(code, &ranges, cont_pc) {
+        if !crate::decompiler::lifter::ranges_have_side_effect(code, &ranges)
+            || crate::decompiler::lifter::ranges_carry_value_to(code, &ranges, cont_pc)
+        {
             return None;
         }
     }
