@@ -10875,6 +10875,8 @@ fn premateralize_branch_escapes_spans(
                 // materialising it wrote the stale read into that arm
                 // (DisplayStandUseHelper server_use). Literals stay excluded.
                 || (matches!(regs.get(reg), Some(RegVal::Expr(Expr::Index { .. } | Expr::Field { .. })))
+                    // The branch itself may test the value (`x ~= <parked>`).
+                    && !jump_tests_reg_before_write(&proto.code, pc, pc + 2, reg)
                     && !arm_ranges
                         .iter()
                         .filter(|(s, e)| e > s)
@@ -11006,6 +11008,19 @@ fn jump_tests_reg_before_write(code: &[u32], start: usize, end: usize, reg: usiz
         let insn = code[pc];
         let op = LuauOpcode::from_u8(insn_op(insn));
         let a = insn_a(insn) as usize;
+        // JUMPIFEQ/NOTEQ/LE/LT compare A against the register in the AUX word.
+        if matches!(
+            op,
+            LuauOpcode::JumpIfEq
+                | LuauOpcode::JumpIfNotEq
+                | LuauOpcode::JumpIfLE
+                | LuauOpcode::JumpIfNotLE
+                | LuauOpcode::JumpIfLT
+                | LuauOpcode::JumpIfNotLT
+        ) && code.get(pc + 1).map(|&x| (x & 0xFF) as usize) == Some(reg)
+        {
+            return true;
+        }
         if a == reg {
             return matches!(
                 op,
@@ -11021,6 +11036,15 @@ fn jump_tests_reg_before_write(code: &[u32], start: usize, end: usize, reg: usiz
                     | LuauOpcode::JumpIfNotLE
                     | LuauOpcode::JumpIfLT
                     | LuauOpcode::JumpIfNotLT
+                    // Operand A is READ (stored, called, returned).
+                    | LuauOpcode::SetTableKS
+                    | LuauOpcode::SetTable
+                    | LuauOpcode::SetTableN
+                    | LuauOpcode::SetUpval
+                    | LuauOpcode::SetGlobal
+                    | LuauOpcode::SetList
+                    | LuauOpcode::Call
+                    | LuauOpcode::Return
             );
         }
         pc += if op.has_aux() { 2 } else { 1 };
