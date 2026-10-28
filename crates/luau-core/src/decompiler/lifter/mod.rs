@@ -80,10 +80,34 @@ thread_local! {
         std::cell::Cell::new(false);
 }
 
-/// Reset the proto-wide statement counter. Called at the top of every
-/// `lift_proto_inner` invocation (including recursive closure lifts — nested
-/// closures reuse the main proto's budget intentionally, so if the parent is
-/// tripped children short-circuit too).
+/// True when some range holds a call, store or other observable effect. A body
+/// that only loads values is a value select (`x or default`), not a statement.
+pub(crate) fn ranges_have_side_effect(code: &[u32], ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(s, e)| opcode_handlers::range_has_side_effect(code, s, e))
+}
+
+/// Does any register written inside `ranges` stay live at `cont`? An or-guard
+/// body that falls through into the continuation may only be lifted as a
+/// self-contained `if` when it carries no value across the join.
+pub(crate) fn ranges_carry_value_to(code: &[u32], ranges: &[(usize, usize)], cont: usize) -> bool {
+    ranges.iter().any(|&(s, e)| {
+        let mut written = opcode_handlers::range_writes_regs(code, s, e);
+        let mut pc = s;
+        while pc < e && pc < code.len() {
+            let op = LuauOpcode::from_u8(insn_op(code[pc]));
+            if op == LuauOpcode::NameCall {
+                written.push(insn_a(code[pc]) as usize + 1);
+            }
+            pc += if op.has_aux() { 2 } else { 1 };
+        }
+        written
+            .into_iter()
+            .any(|r| opcode_handlers::reg_maybe_live_ex(code, cont, r, true))
+    })
+}
+
 pub(crate) fn reset_stmt_budget() {
     STMTS_EMITTED.with(|c| c.set(0));
     STMT_BUDGET_TRIPPED.with(|c| c.set(false));

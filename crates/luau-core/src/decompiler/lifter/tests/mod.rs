@@ -157,3 +157,4 @@ mod arm_and_isa_chain_tests;
 mod cne_ifelse_dead_jump_tests;
 mod cne_while_true_structured_else_tests;
 mod calls_1029_tests;
+mod arm2_or_guard_fallthrough_tests;
