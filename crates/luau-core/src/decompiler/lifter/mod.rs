@@ -3300,6 +3300,26 @@ fn nested_else_split_at(
             {
                 return None;
             }
+            // A constant-compare branch in the THEN arm (`if x ~= "Okay" then
+            // return end`) that skips straight to the merge: the arm lifter
+            // drops its test and keeps the guard body unconditionally (AdoptMe
+            // TradeHub `send_offer` lost the whole post-dialog tail). The same
+            // guard in the else arm lifts correctly (BackpackApp), so only the
+            // then arm is refused.
+            if in_arms
+                && pc < t
+                && pc != j
+                && tg == m
+                && matches!(
+                    op,
+                    LuauOpcode::JumpXEqKNil
+                        | LuauOpcode::JumpXEqKB
+                        | LuauOpcode::JumpXEqKN
+                        | LuauOpcode::JumpXEqKS
+                )
+            {
+                return None;
+            }
             if in_arms {
                 if tg < bend || tg > m {
                     return None;

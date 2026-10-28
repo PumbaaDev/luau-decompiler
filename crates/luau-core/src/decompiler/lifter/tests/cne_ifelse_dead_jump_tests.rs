@@ -34,3 +34,18 @@ fn shared_return_or_guard_arm_is_not_rebuilt_and_loses_no_calls() {
     );
     assert!(out.contains("AskClaimMilestone"), "claim body lost");
 }
+
+/// AdoptMe TradeHub `send_offer`: the then arm of `if success` holds two
+/// guards, the second a constant compare (`if dialog ~= "Okay" then return
+/// false end`) that jumps straight to the merge. Rebuilding the if/else dropped
+/// that test, kept `return false` unconditionally and lost the whole post
+/// counter tail (`post_counter_async`, `escrow_breadcrumbs`, 8 calls).
+const TRADEHUB: &[u8] = include_bytes!("fixtures/cne_then_arm_xeqk_guard_to_merge_tradehub.luac");
+
+#[test]
+fn then_arm_constant_compare_guard_to_merge_keeps_the_tail() {
+    let out = crate::decompile(TRADEHUB).expect("fixture decompiles");
+    assert!(out.contains("post_counter_async"), "post counter call lost:\n{out}");
+    assert!(out.contains("escrow_breadcrumbs"), "escrow call lost:\n{out}");
+    assert!(out.contains("~= \"Okay\""), "Okay guard test lost:\n{out}");
+}
