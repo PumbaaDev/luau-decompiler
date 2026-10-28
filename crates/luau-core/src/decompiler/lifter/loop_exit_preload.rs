@@ -205,7 +205,7 @@ pub(super) fn detect(code: &[u32], prep_pc: usize, loop_pc: usize) -> Option<Exi
             pc += n;
             continue;
         }
-        if reg_used_in_range(code, pc, pc + n, reg) {
+        if exit_run_touches(code, pc, pc + n, reg) {
             return None;
         }
         // A break to the join that no write precedes would carry the OLD value

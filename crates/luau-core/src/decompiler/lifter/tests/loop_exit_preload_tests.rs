@@ -162,3 +162,31 @@ fn a_statement_that_touches_the_flag_before_the_exit_load_is_refused() {
     let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7);
     assert!(found.is_none());
 }
+
+/// AdoptMe VehicleClient `state_manager`: the break `JUMP` offset (+6) equals
+/// the hit register's number (R6). A raw A/B/C scan of the loop body reads the
+/// jump's D bytes as a use of R6 and refused the preload, so the first of two
+/// inlined searches kept an unassigned flag.
+#[test]
+fn jump_offset_equal_to_the_flag_register_is_not_a_use_of_it() {
+    let code = vec![
+        abc(OP_MOVE, 2, 1, 0),   // 0
+        ad(OP_LOADN, 3, 1),      // 1
+        ad(OP_LOADN, 4, 1),      // 2
+        ad(OP_FORNPREP, 2, 4),   // 3: exit at 8
+        ad(OP_JUMPIFNOT, 0, 2),  // 4: -> 7
+        abc(OP_MOVE, 6, 3, 0),   // 5: hit = i
+        ad(OP_JUMP, 0, 6),       // 6: break -> 13 (join), D == 6 == hit reg
+        ad(OP_FORNLOOP, 2, -4),  // 7
+        ad(OP_LOADN, 7, 1),      // 8: unrelated exit statements
+        ad(OP_LOADN, 7, 2),      // 9
+        ad(OP_LOADN, 7, 3),      // 10
+        ad(OP_LOADN, 7, 4),      // 11
+        abc(OP_LOADB, 6, 0, 0),  // 12: hit = false (normal exit)
+        abc(OP_MOVE, 7, 6, 0),   // 13: join reads hit
+        abc(OP_RETURN, 7, 2, 0), // 14
+    ];
+    let found = crate::decompiler::lifter::loop_exit_preload::detect(&code, 3, 7)
+        .expect("jump offset must not count as a use of R6");
+    assert_eq!(found.reg, 6);
+}
