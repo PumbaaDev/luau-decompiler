@@ -10784,7 +10784,7 @@ fn premateralize_branch_escapes_spans(
                 Some(RegVal::Expr(Expr::Name(_))) | Some(RegVal::Unknown)
             ) || stale_expr)
                 && (locals.is_non_param(reg)
-                    || (param_slot_rebound_in_both_arms(proto, locals, regs, reg)
+                    || (param_slot_rebound_in_both_arms(proto, locals, regs, reg, pc, after_start)
                         // Straight-line arms only: an arm with its own guard (a type
                         // check around the rewrite) is already handled in place.
                         && arm_ranges.iter().all(|&(s, e)| {
@@ -11094,24 +11094,64 @@ fn premateralize_branch_escapes_spans(
 /// first (`function f(a, b, c) if x then c = g(c) else c = {} end return c end`).
 /// The compiler reuses the parameter register for the merged value; without a
 /// seed each arm writes a different fresh local and the merge read mints an
-/// unbound `vN` (`declared_never_assigned`). Only when no closure captures the
-/// register BY REFERENCE: a by-ref capture shares the parameter's own
-/// variable, so a fresh identity would split it from the closure's view.
-fn param_slot_rebound_in_both_arms(proto: &Proto, locals: &LocalTracker, regs: &[RegVal], reg: usize) -> bool {
+/// unbound `vN` (`declared_never_assigned`). Only when no closure captured the
+/// register BY REFERENCE before the merge: a by-ref capture shares the
+/// parameter's own variable, so a fresh identity would split it from that
+/// closure's view. A closure created AFTER the merge (`merge_start` onward)
+/// captures whatever name the register holds then, i.e. the fresh one, so it
+/// is safe, provided no back edge can carry the register into a later
+/// iteration of the diamond (the closure would then outlive the fresh local).
+fn param_slot_rebound_in_both_arms(
+    proto: &Proto,
+    locals: &LocalTracker,
+    regs: &[RegVal],
+    reg: usize,
+    branch_pc: usize,
+    merge_start: usize,
+) -> bool {
     locals.is_param(reg)
         && matches!(regs.get(reg), Some(RegVal::Expr(Expr::Name(_))))
-        && !proto_ref_captures_reg(&proto.code, reg)
+        && match first_ref_capture_pc(&proto.code, reg) {
+            None => true,
+            Some(cap_pc) => cap_pc >= merge_start && !has_back_edge_over(&proto.code, branch_pc),
+        }
 }
 
 /// Does any CAPTURE in this proto take `reg` by reference?
+#[allow(dead_code)]
 fn proto_ref_captures_reg(code: &[u32], reg: usize) -> bool {
+    first_ref_capture_pc(code, reg).is_some()
+}
+
+/// Lowest pc of a CAPTURE that takes `reg` by reference.
+fn first_ref_capture_pc(code: &[u32], reg: usize) -> Option<usize> {
     let mut i = 0usize;
     while i < code.len() {
         let op = LuauOpcode::from_u8(insn_op(code[i]));
         if op == LuauOpcode::Capture && insn_a(code[i]) == 1 && insn_b(code[i]) as usize == reg {
-            return true;
+            return Some(i);
         }
         i += if op.has_aux() { 2 } else { 1 };
+    }
+    None
+}
+
+/// Is there a backward jump at or after `pc` whose target is at or before `pc`
+/// (a loop that encloses `pc`)?
+fn has_back_edge_over(code: &[u32], pc: usize) -> bool {
+    let mut w = pc;
+    while w < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[w]));
+        if matches!(
+            op,
+            LuauOpcode::JumpBack | LuauOpcode::Jump | LuauOpcode::ForNLoop | LuauOpcode::ForGLoop
+        ) {
+            let target = w as i64 + insn_d(code[w]) as i64 + 1;
+            if target <= pc as i64 && (insn_d(code[w]) as i64) < 0 {
+                return true;
+            }
+        }
+        w += if op.has_aux() { 2 } else { 1 };
     }
     false
 }

@@ -101,6 +101,8 @@ mod capture_stdlib_global_tests;
 #[cfg(test)]
 mod branch_seed_shape_tests;
 mod declared_never_assigned_param_seed_tests;
+mod param_diamond_late_ref_capture_tests;
+mod nested_diamond_pending_table_move_tests;
 mod branch_stale_table_seed_tests;
 #[cfg(test)]
 mod pinned_arm_write_tests;
