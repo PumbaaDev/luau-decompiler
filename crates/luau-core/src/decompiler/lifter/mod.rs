@@ -11035,7 +11035,22 @@ fn premateralize_branch_escapes_spans(
                 // arm overwrites with a literal (`else x = nil`) is dead too;
                 // materialising it wrote the stale read into that arm
                 // (DisplayStandUseHelper server_use). Literals stay excluded.
-                || (matches!(regs.get(reg), Some(RegVal::Expr(Expr::Index { .. } | Expr::Field { .. })))
+                || (arm_ranges.len() == 2
+                    && arm_ranges.iter().all(|(s, e)| e > s)
+                    && arm_ranges.last().is_some_and(|&(s, _)| {
+                        let w = proto.code[s];
+                        insn_a(w) as usize == reg
+                            && matches!(
+                                LuauOpcode::from_u8(insn_op(w)),
+                                LuauOpcode::LoadNil | LuauOpcode::LoadB | LuauOpcode::LoadN | LuauOpcode::LoadK
+                            )
+                    })
+                    && matches!(regs.get(reg), Some(RegVal::Expr(Expr::Index { .. } | Expr::Field { .. })))
+                    // Nothing after the merge reads the register before rewriting it
+                    // (the arms' writes are then a merge VALUE, not scratch).
+                    && !reg_read_before_write(&proto.code, after_start, proto.code.len(), reg)
+                    && !jump_tests_reg_before_write(&proto.code, after_start, proto.code.len(), reg)
+                    && !reg_read_after_any_join(&proto.code, after_start, proto.code.len(), reg)
                     // The branch itself may test the value (`x ~= <parked>`).
                     && !jump_tests_reg_before_write(&proto.code, pc, pc + 2, reg)
                     && !arm_ranges
@@ -11156,6 +11171,31 @@ pub(super) fn move_alias_goes_stale(code: &[u32], pc: usize, dst: usize, src: us
             return reg_used_in_range(code, i, code.len(), dst);
         }
         i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
+}
+
+/// Is `reg` read after ANY forward conditional-jump join in `[start, end)`?
+/// A linear scan stops at a write that sits inside a conditional skip
+/// (`if 0 < d then r7 = 0 end`), missing the read at the join after it
+/// (GreatBloom: `r7 > 160`). Over-approximate: every forward target counts.
+fn reg_read_after_any_join(code: &[u32], start: usize, end: usize, reg: usize) -> bool {
+    let end = end.min(code.len());
+    let mut pc = start;
+    while pc < end {
+        let op = LuauOpcode::from_u8(insn_op(code[pc]));
+        if opcode_handlers::is_cond_jump_op(op) {
+            let d = insn_d(code[pc]);
+            if d > 0 {
+                let t = pc + 1 + d as usize;
+                if t < end
+                    && (reg_read_before_write(code, t, end, reg) || jump_tests_reg_before_write(code, t, end, reg))
+                {
+                    return true;
+                }
+            }
+        }
+        pc += if op.has_aux() { 2 } else { 1 };
     }
     false
 }
