@@ -1546,3 +1546,95 @@ fn or_guard_tail_keeps_return_before_merge() {
         );
     }
 }
+
+/// `if a or b or c or d or (e - 1) > 2 then X() return end; u = 1` (v6
+/// compiler output). Five links, the last with a SUBK preamble: GuardedTailIf
+/// used to stop at four pure links, and the fallback dropped `X()` on the
+/// `(e - 1) > 2` path (31 Oct 2026, Shrine stopCutscene shape).
+#[test]
+fn five_link_or_guard_with_arith_link_is_one_condition() {
+    let code = vec![
+        insn_ad(OP_JUMPIF, 0, 7),        // pc0 a -> pc8
+        insn_ad(OP_JUMPIF, 1, 6),        // pc1 b -> pc8
+        insn_ad(OP_JUMPIF, 2, 5),        // pc2 c -> pc8
+        insn_ad(OP_JUMPIF, 3, 4),        // pc3 d -> pc8
+        insn_abc(OP_SUBK, 5, 4, 0),      // pc4 R5 = e - 1
+        insn_ad(OP_LOADN, 6, 2),         // pc5
+        insn_ad(OP_JUMPIFNOTLT, 6, 5),   // pc6 if not (2 < R5) -> pc12
+        5u32,                            // pc7 AUX R5
+        insn_abc(OP_GETGLOBAL, 5, 0, 0), // pc8 X
+        1u32,                            // pc9 AUX K1
+        insn_abc(OP_CALL, 5, 1, 1),      // pc10 X()
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc11
+        insn_ad(OP_LOADN, 5, 1),         // pc12
+        insn_abc(OP_SETUPVAL, 5, 0, 0),  // pc13 u = 1
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc14
+    ];
+    let consts = vec![Constant::Number(1.0), Constant::String("X".to_string())];
+    let src = decompile(&make_chunk(make_proto(code, consts, 5)));
+    eprintln!("{src}");
+    assert!(
+        src.lines().any(|l| l.contains("arg1") && l.contains("arg4") && l.contains("arg5")),
+        "five links not merged into one condition:\n{src}"
+    );
+    let call = src.find("X()").unwrap_or_else(|| panic!("call lost:\n{src}"));
+    let store = src.find("= 1").unwrap_or_else(|| panic!("store lost:\n{src}"));
+    if store < call {
+        assert!(src[store..call].contains("return"), "store falls into X():\n{src}");
+    }
+}
+
+/// `if v52 or now - v51 < 5 then <message> return end` (v6 compiler build of
+/// StealAnEgg PetList `requestEquipBest`, 31 Oct 2026). Once arithmetic counted
+/// as a pure guard op, the chain matcher emitted one `if` per link and repeated
+/// the body; the repeated copy lost its `local Color` (a global write).
+#[test]
+fn or_guard_with_arith_link_lifts_body_once() {
+    const PETLIST: &[u8] = include_bytes!("fixtures/orguard_arith_link_petlist.luac");
+    let src = crate::decompile(PETLIST).expect("decompiles");
+    assert_eq!(src.matches("M.Bottom(").count(), 1, "body lifted more than once:
+{src}");
+    assert!(
+        src.contains("if v0 or getservertimenow - v1 < 5 then"),
+        "links not merged into one condition:
+{src}"
+    );
+    assert!(src.contains("local Color = "), "body lost its local:
+{src}");
+}
+
+/// `if o then if a or b then X() return end; u = 1 return end; Y()` (v6
+/// compiler output). The OR chain sits inside an `if` arm, which is lifted by
+/// the run structurer, not the top-level one; the flat lift kept only `b` and
+/// dropped `a` (31 Oct 2026, Shrine stopCutscene lost four of five links).
+#[test]
+fn or_guard_tail_inside_if_arm_keeps_every_link() {
+    let code = vec![
+        insn_ad(OP_JUMPIFNOT, 0, 9),     // pc0 if not o -> pc10
+        insn_ad(OP_JUMPIF, 1, 1),        // pc1 a -> pc3
+        insn_ad(OP_JUMPIFNOT, 2, 4),     // pc2 not b -> pc7
+        insn_abc(OP_GETGLOBAL, 3, 0, 0), // pc3 X
+        0u32,                            // pc4 AUX K0
+        insn_abc(OP_CALL, 3, 1, 1),      // pc5 X()
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc6
+        insn_ad(OP_LOADN, 3, 1),         // pc7
+        insn_abc(OP_SETUPVAL, 3, 0, 0),  // pc8 u = 1
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc9
+        insn_abc(OP_GETGLOBAL, 3, 0, 0), // pc10 Y
+        1u32,                            // pc11 AUX K1
+        insn_abc(OP_CALL, 3, 1, 1),      // pc12 Y()
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc13
+    ];
+    let consts = vec![Constant::String("X".to_string()), Constant::String("Y".to_string())];
+    let src = decompile(&make_chunk(make_proto(code, consts, 3)));
+    eprintln!("{src}");
+    assert!(
+        src.lines().any(|l| l.contains("arg2") && l.contains("arg3")),
+        "an OR link was dropped:\n{src}"
+    );
+    let call = src.find("X()").unwrap_or_else(|| panic!("call lost:\n{src}"));
+    let store = src.find("= 1").unwrap_or_else(|| panic!("store lost:\n{src}"));
+    if store < call {
+        assert!(src[store..call].contains("return"), "store falls into X():\n{src}");
+    }
+}

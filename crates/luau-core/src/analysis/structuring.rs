@@ -831,6 +831,59 @@ fn is_pure_guard_setup_op(op: LuauOpcode) -> bool {
             | LuauOpcode::GetTable
             | LuauOpcode::GetTableKS
             | LuauOpcode::GetTableN
+            // 31 Oct 2026: arithmetic/unary only park a value too, with the same
+            // metamethod caveat GETTABLE already carries. Shrine stopCutscene's
+            // last OR link is `(pos - cam.CFrame.Position).Magnitude > 140`.
+            | LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::SubRK
+            | LuauOpcode::DivRK
+            | LuauOpcode::IDiv
+            | LuauOpcode::IDivK
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
+            | LuauOpcode::Length
+    )
+}
+
+/// The arithmetic and unary members of `is_pure_guard_setup_op` (added
+/// 31 Oct 2026). `is_pure_preamble_chain_link` takes a link using them only
+/// when the terminal is a bare `return`: that matcher emits each link as its
+/// own `if ... end` and REPEATS the terminal body per link, and a repeated body
+/// loses its `local` declarations (StealAnEgg PetList `requestEquipBest`:
+/// `if v52 or now - v51 < 5`). Left to `OrGuardIf`, such a link folds into one
+/// `or` condition.
+fn is_arith_park_op(op: LuauOpcode) -> bool {
+    matches!(
+        op,
+        LuauOpcode::Add
+            | LuauOpcode::Sub
+            | LuauOpcode::Mul
+            | LuauOpcode::Div
+            | LuauOpcode::Mod
+            | LuauOpcode::Pow
+            | LuauOpcode::AddK
+            | LuauOpcode::SubK
+            | LuauOpcode::MulK
+            | LuauOpcode::DivK
+            | LuauOpcode::ModK
+            | LuauOpcode::PowK
+            | LuauOpcode::SubRK
+            | LuauOpcode::DivRK
+            | LuauOpcode::IDiv
+            | LuauOpcode::IDivK
+            | LuauOpcode::Not
+            | LuauOpcode::Minus
     )
 }
 
@@ -898,14 +951,14 @@ fn block_ends_in_return(code: &[u32], block: &BasicBlock) -> bool {
 /// structured correctly as `if/else` (both arms present, nothing orphaned); it
 /// is only when the FIRST guard's advance edge lands on a SECOND guard that the
 /// plain structurer flattens the inner guard to nothing and orphans the tail.
-fn try_match_guarded_tail_if(
+pub(crate) fn try_match_guarded_tail_if(
     cfg: &ControlFlowGraph,
     code: &[u32],
     entry: usize,
     handled: &BTreeSet<usize>,
     loop_headers: &BTreeSet<usize>,
 ) -> Option<(Vec<(usize, bool)>, Vec<usize>, usize)> {
-    const MAX_GUARDS: usize = 4;
+    const MAX_GUARDS: usize = 8; // Shrine stopCutscene has 5 links (31 Oct 2026)
     let trace = std::env::var("LUAU_GTI_TRACE").is_ok();
     let eb = cfg.blocks.get(&entry)?;
     if trace {
@@ -1129,8 +1182,24 @@ fn is_pure_preamble_chain_link(
         && block.predecessors[0] == prev_link
         && is_pure_or_link_block(code, block)
         // A link that calls splits into its own guard, which repeats the
-        // terminal's body: only a bare `return` may be repeated.
-        && (!block_preamble_has_call(code, block) || terminal_is_bare_return(cfg, code, terminal))
+        // terminal's body: only a bare `return` may be repeated. An arithmetic
+        // link is held to the same rule: `OrGuardIf` folds it into one `or`
+        // condition instead, where a repeated body would lose its locals.
+        && (!(block_preamble_has_call(code, block) || block_preamble_has_arith(code, block))
+            || terminal_is_bare_return(cfg, code, terminal))
+}
+
+fn block_preamble_has_arith(code: &[u32], block: &BasicBlock) -> bool {
+    let Some(branch_pc) = block.branch_pc else { return false };
+    let mut i = block.start;
+    while i < branch_pc && i < code.len() {
+        let op = LuauOpcode::from_u8(insn_op(code[i]));
+        if is_arith_park_op(op) {
+            return true;
+        }
+        i += if op.has_aux() { 2 } else { 1 };
+    }
+    false
 }
 
 fn block_preamble_has_call(code: &[u32], block: &BasicBlock) -> bool {

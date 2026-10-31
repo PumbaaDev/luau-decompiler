@@ -38,6 +38,7 @@ mod loop_exit_preload;
 mod prelude_fold;
 mod opcode_handlers;
 mod inline_tail_loop;
+mod guarded_tail_split;
 mod bool_return_thread;
 use opcode_handlers::lift_instruction_range;
 
@@ -3367,6 +3368,34 @@ fn lift_structured_run(
             return;
         }
     }
+    if !in_loop {
+        if let Some(split) =
+            guarded_tail_split::guarded_tail_split(&proto.code, cfg, &loop_headers, start, end)
+        {
+            liftpath(proto, "guarded_tail_split", start, end);
+            if split.entry_start > start {
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, start, split.entry_start, regs, locals,
+                    out, in_loop,
+                );
+            }
+            lift_guarded_tail_if(
+                ctx, proto, proto_index, cfg, depth, &split.guards, &split.tail, split.merge,
+                regs, locals, out,
+            );
+            lift_structured_run(
+                ctx, proto, proto_index, cfg, depth, split.merge_start, split.tail_start, regs,
+                locals, out, in_loop,
+            );
+            if split.tail_end < end {
+                lift_structured_run(
+                    ctx, proto, proto_index, cfg, depth, split.tail_end, end, regs, locals, out,
+                    in_loop,
+                );
+            }
+            return;
+        }
+    }
     lift_structured_regions(
         ctx, proto, proto_index, cfg, depth, &regions, regs, locals, out, in_loop,
     );
@@ -4361,7 +4390,11 @@ fn lift_guarded_tail_if(
     // observable effect; a pure temp it might emit is dropped, and the parked
     // expression flows straight into the condition instead.
     let mut condition = Expr::Bool(true);
-    for &(g, advance_is_taken) in guards {
+    // Temps a LATER link's preamble materialised (`local v = ...`), resolved to
+    // their pure expressions. Later links and the tail may read them, so they
+    // are substituted everywhere downstream, not just in their own link.
+    let mut temps: Vec<(String, Expr)> = Vec::new();
+    for (i, &(g, advance_is_taken)) in guards.iter().enumerate() {
         let Some(block) = cfg.blocks.get(&g) else { continue };
         let branch_pc = block_branch_pc(block);
         let mut scratch = Vec::new();
@@ -4373,11 +4406,44 @@ fn lift_guarded_tail_if(
         // `advance_is_taken` is true when the edge advancing the chain toward the
         // tail is the branch (taken) edge, whose condition is the negation of the
         // fall-through condition `extract_branch_condition` returns.
-        let this = if advance_is_taken {
+        let mut this = if advance_is_taken {
             negate_condition(&fall_cond)
         } else {
             fall_cond
         };
+        if i == 0 {
+            // The entry link's preamble runs on every path: emit it as is.
+            // Slayers2 SafeDirection declares `local v22 = arg2 - arg1` here and
+            // every later link reads `v22` (31 Oct 2026).
+            stmts.extend(scratch);
+        } else {
+            // A later link runs only when every earlier link passed, so its
+            // statements cannot be hoisted (Shrine stopCutscene: `local Pos =
+            // arg2.Pos - cam.CFrame.Position` would do nil arithmetic). The
+            // lifter materialised them only as pure temps; fold them back in.
+            // A re-assignment of such a temp (`Magnitude = Magnitude.Magnitude`)
+            // folds the same way; a write to any other name is left alone.
+            for st in &scratch {
+                let (name, value) = match st {
+                    Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                        (names[0].clone(), &values[0])
+                    }
+                    Stat::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+                        match &targets[0] {
+                            Expr::Name(n) if temps.iter().any(|t| &t.0 == n) => {
+                                (n.clone(), &values[0])
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                let resolved = substitute_temps(value, &temps);
+                temps.retain(|t| t.0 != name);
+                temps.push((name, resolved));
+            }
+        }
+        this = substitute_temps(&this, &temps);
         condition = and_conditions(&condition, this);
     }
 
@@ -4389,6 +4455,11 @@ fn lift_guarded_tail_if(
         ctx, proto, proto_index, cfg, depth, &tail_sorted, regs, locals, &mut then_stmts, false,
     );
     *regs = regs_after_guards;
+    for st in then_stmts.iter_mut() {
+        for (name, value) in &temps {
+            replace_name_in_stmt(st, name, value);
+        }
+    }
     // Detection guarantees the tail is ONE straight-line block ending in RETURN.
     // When that RETURN is the proto's last instruction the lift treats it as the
     // implicit end-of-function return and emits nothing, so the guarded tail
@@ -4413,6 +4484,15 @@ fn lift_guarded_tail_if(
             else_body: None,
         });
     }
+}
+
+/// `e` with every resolved guard temp replaced by its pure expression.
+fn substitute_temps(e: &Expr, temps: &[(String, Expr)]) -> Expr {
+    let mut out = e.clone();
+    for (name, value) in temps {
+        replace_name_in_expr(&mut out, name, value);
+    }
+    out
 }
 
 /// Lift `Region::OrGuardIf` as `if c0 or c1 or ... then <body> end`.
