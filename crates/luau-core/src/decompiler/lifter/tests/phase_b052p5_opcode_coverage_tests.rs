@@ -1517,3 +1517,32 @@ fn jumpxeqkb_not_true_keeps_equality_against_true() {
         "boolean compare lost, emitted:\n{src}"
     );
 }
+
+/// `if a or b then X() return end; u = 1` (31 Oct 2026, Shrine stopCutscene
+/// shape). The tail `u = 1; RETURN` ends the proto, so its RETURN was elided
+/// and the guarded tail fell through into `X()`, which must run only when the
+/// guard fails. Bytecode is the v6 compiler's output for that source.
+#[test]
+fn or_guard_tail_keeps_return_before_merge() {
+    let code = vec![
+        insn_ad(OP_JUMPIF, 0, 1),        // pc0 if a -> pc2
+        insn_ad(OP_JUMPIFNOT, 1, 4),     // pc1 if not b -> pc6
+        insn_abc(OP_GETGLOBAL, 2, 0, 0), // pc2 X
+        0u32,                            // pc3 AUX K0
+        insn_abc(OP_CALL, 2, 1, 1),      // pc4 X()
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc5 return
+        insn_ad(OP_LOADN, 2, 1),         // pc6
+        insn_abc(OP_SETUPVAL, 2, 0, 0),  // pc7 u = 1
+        insn_abc(OP_RETURN, 0, 1, 0),    // pc8
+    ];
+    let src = decompile(&make_chunk(make_proto(code, vec![Constant::String("X".to_string())], 2)));
+    eprintln!("{src}");
+    let call = src.find("X()").unwrap_or_else(|| panic!("call lost:\n{src}"));
+    let store = src.find("= 1").unwrap_or_else(|| panic!("store lost:\n{src}"));
+    if store < call {
+        assert!(
+            src[store..call].contains("return"),
+            "guarded store falls through into X():\n{src}"
+        );
+    }
+}

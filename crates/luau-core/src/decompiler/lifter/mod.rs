@@ -4389,6 +4389,16 @@ fn lift_guarded_tail_if(
         ctx, proto, proto_index, cfg, depth, &tail_sorted, regs, locals, &mut then_stmts, false,
     );
     *regs = regs_after_guards;
+    // Detection guarantees the tail is ONE straight-line block ending in RETURN.
+    // When that RETURN is the proto's last instruction the lift treats it as the
+    // implicit end-of-function return and emits nothing, so the guarded tail
+    // would fall through into the merge, which runs only when the guards FAIL.
+    // `if a or b then X() return end; u = 1` became
+    // `if not a and not b then u = 1 end; X()` (31 Oct 2026, Shrine stopCutscene
+    // and every control build back to 003ffe0). Put the bare return back.
+    if !exits_on_all_paths(&then_stmts) {
+        then_stmts.push(Stat::Return { values: Vec::new() });
+    }
 
     if matches!(&condition, Expr::Bool(true)) {
         // No reconstructable guard survived — emit the body unguarded rather
