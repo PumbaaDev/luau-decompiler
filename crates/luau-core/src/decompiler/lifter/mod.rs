@@ -7944,6 +7944,25 @@ fn expr_uses_name(expr: &Expr, name: &str) -> bool {
 /// Returns true for constant literals (Nil, Bool, Number, String).
 /// Used by boolean-comparison simplifications to avoid folding
 /// `"str" == true` into `"str"` (which changes the value).
+/// True when `e` can only evaluate to `true` or `false` (never nil, a number,
+/// a table...). Folding `e == true` into `e` is sound only for these.
+fn is_boolean_valued(e: &Expr) -> bool {
+    match e {
+        Expr::Bool(_) => false, // literal: leave literal folds to the const folder
+        Expr::UnOp { op: UnOp::Not, .. } => true,
+        Expr::BinOp { op, left, right } => match op {
+            BinOp::Eq | BinOp::NotEq | BinOp::LT | BinOp::LE | BinOp::GT | BinOp::GE => true,
+            BinOp::And | BinOp::Or => is_boolean_or_lit(left) && is_boolean_or_lit(right),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_boolean_or_lit(e: &Expr) -> bool {
+    matches!(e, Expr::Bool(_)) || is_boolean_valued(e)
+}
+
 fn is_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_))
 }
@@ -8154,10 +8173,14 @@ fn simplify_expr(expr: &Expr) -> Expr {
                     if matches!(l, Expr::Nil) {
                         return Expr::BinOp { left: Box::new(r), op: BinOp::Eq, right: Box::new(Expr::Nil) };
                     }
-                    if matches!(r, Expr::Bool(true)) && !is_literal(&l) {
+                    // 31 Oct 2026: only when `x` is always a boolean. For a
+                    // table/number `x == true` is false but `x` is truthy, and
+                    // for nil `x == false` is false but `not x` is true
+                    // (Shrine stopCutscene `JUMPXEQKB R0 true`).
+                    if matches!(r, Expr::Bool(true)) && is_boolean_valued(&l) {
                         return l;
                     }
-                    if matches!(r, Expr::Bool(false)) && !is_literal(&l) {
+                    if matches!(r, Expr::Bool(false)) && is_boolean_valued(&l) {
                         return Expr::UnOp { op: UnOp::Not, operand: Box::new(l) };
                     }
                 }
@@ -8168,10 +8191,10 @@ fn simplify_expr(expr: &Expr) -> Expr {
                     if matches!(l, Expr::Nil) {
                         return Expr::BinOp { left: Box::new(r), op: BinOp::NotEq, right: Box::new(Expr::Nil) };
                     }
-                    if matches!(r, Expr::Bool(true)) && !is_literal(&l) {
+                    if matches!(r, Expr::Bool(true)) && is_boolean_valued(&l) {
                         return Expr::UnOp { op: UnOp::Not, operand: Box::new(l) };
                     }
-                    if matches!(r, Expr::Bool(false)) && !is_literal(&l) {
+                    if matches!(r, Expr::Bool(false)) && is_boolean_valued(&l) {
                         return l;
                     }
                 }

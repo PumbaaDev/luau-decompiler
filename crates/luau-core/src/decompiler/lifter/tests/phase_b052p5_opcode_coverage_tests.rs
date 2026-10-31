@@ -1491,3 +1491,29 @@ fn getimport_valid_identifier_string_emits_name() {
         "valid identifier should emit as bare Name, got: {src}"
     );
 }
+
+/// Shrine stopCutscene pc24/pc149 (31 Oct 2026): `JUMPXEQKB R0 NOT true` must
+/// stay an equality test against `true`, never collapse into truthiness
+/// (`if p then`), because a truthy non-boolean (a table, a number) takes the
+/// other branch in the real bytecode.
+#[test]
+fn jumpxeqkb_not_true_keeps_equality_against_true() {
+    // pc0 JUMPXEQKB R0 (jump if R0 ~= true) -> pc4
+    // pc1 AUX 0x8000_0001 (NOT flag | true)
+    // pc2 LOADN R1 1 ; pc3 RETURN R1 1 value
+    // pc4 LOADN R1 2 ; pc5 RETURN R1 1 value
+    let code = vec![
+        insn_ad(OP_JUMPXEQKB, 0, 3),
+        0x8000_0001u32,
+        insn_ad(OP_LOADN, 1, 1),
+        insn_abc(OP_RETURN, 1, 2, 0),
+        insn_ad(OP_LOADN, 1, 2),
+        insn_abc(OP_RETURN, 1, 2, 0),
+    ];
+    let src = decompile(&make_chunk(make_proto(code, vec![], 1)));
+    eprintln!("{src}");
+    assert!(
+        src.contains("== true") || src.contains("~= true"),
+        "boolean compare lost, emitted:\n{src}"
+    );
+}
