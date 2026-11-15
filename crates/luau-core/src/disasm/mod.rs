@@ -51,7 +51,14 @@ fn disassemble_proto(
     if !proto.constants.is_empty() {
         out.push_str(&format!("; constants ({}):\n", proto.constants.len()));
         for (i, k) in proto.constants.iter().enumerate() {
-            out.push_str(&format!(";   K{}: {}\n", i, k.display(&chunk.strings)));
+            // Import IDs index this prototype's constants, not chunk.strings.
+            let value = if let Constant::Import(packed) = k {
+                decode_import(*packed).iter().map(|&id| match proto.constants.get(id as usize) {
+                    Some(Constant::String(name)) => name.clone(),
+                    _ => format!("<invalid K{}>", id),
+                }).collect::<Vec<_>>().join(".")
+            } else { k.display(&chunk.strings) };
+            out.push_str(&format!(";   K{}: {}\n", i, value));
         }
     }
 
@@ -179,7 +186,7 @@ fn format_instruction(
 
         LuauOpcode::NameCall => {
             let name = aux.map(|ax| const_str_or_string(proto, strings, ax)).unwrap_or_default();
-            format!("R{} R{}:{}", a, a + 1, name)
+            format!("R{} R{}:{}", a, b, name)
         }
 
         LuauOpcode::Call | LuauOpcode::CallFb => {
@@ -444,4 +451,37 @@ fn pc_placeholder() -> i32 {
     // Used as a placeholder since we don't have actual PC in the format function
     // The actual target address should be computed by the caller
     0
+}
+
+#[cfg(test)]
+mod operand_tests {
+    use super::*;
+    use crate::parser::test_fixtures as fx;
+
+    #[test]
+    fn namecall_displays_the_receiver_register() {
+        let mut proto = fx::canonical(fx::P03_UNARY).protos.remove(0);
+        proto.constants = vec![Constant::String("method".into())];
+        let text = format_instruction(
+            &proto, &[], LuauOpcode::NameCall, 1, 6, 0, 0, 0, Some(0),
+        );
+        assert_eq!(text, "R1 R6:\"method\"");
+    }
+
+    #[test]
+    fn import_paths_use_prototype_constants_not_the_string_table() {
+        let mut chunk = fx::canonical(fx::P03_UNARY);
+        chunk.protos.truncate(1);
+        chunk.main_proto = 0;
+        chunk.strings = vec!["wrong".into(), "table".into()];
+        chunk.protos[0].code.clear();
+        chunk.protos[0].constants = vec![
+            Constant::String("math".into()),
+            Constant::String("sin".into()),
+            Constant::Import((2 << 30) | (1 << 10)),
+        ];
+        let text = disassemble(&chunk, false);
+        assert!(text.contains(";   K2: math.sin\n"), "{text}");
+        assert!(!text.contains("wrong.table"));
+    }
 }

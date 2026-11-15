@@ -20,6 +20,23 @@ pub fn parse(data: &[u8]) -> Result<Chunk> {
     reader.read_chunk()
 }
 
+#[cfg(test)]
+mod line_tests {
+    #[test]
+    fn line_deltas_wrap_and_interval_bases_accumulate() {
+        let mut bytes = vec![2, 0, 0, 0, 0, 0, 4];
+        for word in [0u32, 0, 0, 22 | (1 << 16)] { bytes.extend(word.to_le_bytes()); }
+        bytes.extend([0, 0, 100, 0, 1, 1, 5, 1, 250, 1]);
+        bytes.extend(100i32.to_le_bytes());
+        bytes.extend(20i32.to_le_bytes());
+        bytes.push(0);
+        let mut reader = super::BytecodeReader::new(&bytes);
+        let proto = reader.read_proto(&[], 6).unwrap();
+        assert_eq!(proto.line_info.unwrap().lines, [105, 106, 120, 121]);
+        assert_eq!(reader.offset, bytes.len());
+    }
+}
+
 /// Low-level bytecode reader with cursor tracking
 struct BytecodeReader<'a> {
     data: &'a [u8],
@@ -429,29 +446,28 @@ impl<'a> BytecodeReader<'a> {
                 anyhow::bail!("invalid linegaplog2 value {} (must be < 32)", linegaplog2);
             }
 
-            // Read line offsets (one per instruction, encoded as deltas)
+            // Luau stores byte offsets as wrapping deltas across the whole
+            // prototype, and interval base lines as accumulated i32 deltas.
             let mut intervals = Vec::with_capacity(size_code);
+            let mut last_offset = 0u8;
             for _ in 0..size_code {
-                intervals.push(self.read_byte()? as i8 as i32);
+                last_offset = last_offset.wrapping_add(self.read_byte()?);
+                intervals.push(last_offset as i32);
             }
 
             // Read absolute line positions at intervals
             let interval_size = ((size_code - 1) >> linegaplog2 as usize) + 1;
             let mut abs_lines = Vec::with_capacity(interval_size);
+            let mut last_line = 0i32;
             for _ in 0..interval_size {
-                abs_lines.push(self.read_u32()? as i32);
+                last_line = last_line.wrapping_add(self.read_u32()? as i32);
+                abs_lines.push(last_line);
             }
 
             // Reconstruct full line info
             let mut lines = Vec::with_capacity(size_code);
-            let gap = 1usize << linegaplog2 as usize;
-            let mut current_line = 0i32;
             for i in 0..size_code {
-                if i % gap == 0 {
-                    current_line = abs_lines[i / gap];
-                }
-                current_line += intervals[i];
-                lines.push(current_line);
+                lines.push(abs_lines[i >> linegaplog2].wrapping_add(intervals[i]));
             }
 
             Some(LineInfo {
